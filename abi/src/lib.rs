@@ -198,6 +198,8 @@ pub const BOOT_TICK: Handle = 4;
 pub const BOOT_IRQ: Handle = 4; // IrqLine(1) — R_BIND|R_ACK
 pub const BOOT_KBD_DATA: Handle = 5; // IoPort{0x60,1}
 pub const BOOT_KBD_STATUS: Handle = 6; // IoPort{0x64,1}
+/// The TTY endpoint: kbd/shell hold R_SEND, tty holds R_RECV (slot 7).
+pub const BOOT_TTY: Handle = 7;
 
 /// "PING" — request tag for the v0 roundtrip.
 pub const TAG_PING: u64 = 0x474E4950;
@@ -207,3 +209,8 @@ pub const TAG_PONG: u64 = 0x474E4F50;
 pub const TAG_SHMEM: u64 = 0x4D4D4853;
 /// "NTFY" — a Notification capability rides this message.
 pub const TAG_NOTIF: u64 = 0x5946544E;
+/// TTY protocol tags: kbd→tty a character; shell↔tty read a line; shell→tty output.
+pub const TAG_TTY_CHAR: u64 = 0x52414843; // "CHAR"
+pub const TAG_TTY_READ: u64 = 0x44414552; // "READ"
+pub const TAG_TTY_LINE: u64 = 0x454E494C; // "LINE"
+pub const TAG_TTY_WRITE: u64 = 0x54495257; // "WRIT"

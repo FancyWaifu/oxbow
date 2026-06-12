@@ -25,6 +25,8 @@ use crate::{println, proc, usermem};
 
 /// Endpoint pool index of the boot endpoint EP0.
 pub const EP0: u8 = 0;
+/// The TTY endpoint (kbd/shell → tty).
+pub const EP1: u8 = 1;
 const EP_POOL: usize = 8;
 const REPLY_POOL: usize = 8;
 
@@ -207,10 +209,13 @@ static RECEIVER_FIRST: AtomicBool = AtomicBool::new(false);
 
 // --- Boot -----------------------------------------------------------------
 
-/// Create EP0. No receiver until a user process calls `sys_recv` on it.
+/// Create EP0 (user↔user PONG) and EP1 (the TTY endpoint).
 pub fn init() {
-    ENDPOINTS.lock()[EP0 as usize].in_use = true;
-    println!("[ipc] EP0 created (no receiver until user recv)");
+    let mut eps = ENDPOINTS.lock();
+    eps[EP0 as usize].in_use = true;
+    eps[EP1 as usize].in_use = true;
+    drop(eps);
+    println!("[ipc] EP0 + EP1 created");
 }
 
 // --- The rendezvous -------------------------------------------------------

@@ -176,20 +176,21 @@ fn kmain_stage2() -> ! {
     for (i, file) in mods.iter().enumerate() {
         let bytes = unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) };
         let name = match i {
-            0 => "P1",
-            1 => "P2",
-            2 => "P3",
-            _ => "P4",
+            0 => "pong",
+            1 => "beta",
+            2 => "kbd",
+            3 => "tty",
+            _ => "shell",
         };
         println!("[mod] module {} ({}): {} bytes", i, name, bytes.len());
         let img = elf::Image::validate(bytes);
         let as_i = mm::vm::new_user_pml4();
-        // Role by module index: module 0 = pinger (R_SEND on EP0), module 1 =
-        // ponger (R_RECV). The kernel echo is gone — they talk to each other.
-        let ep0_rights = if i == 0 {
-            oxbow_abi::R_SEND | oxbow_abi::R_ATTENUATE
-        } else {
-            oxbow_abi::R_RECV | oxbow_abi::R_ATTENUATE
+        // EP0 role: module 0 = pinger (R_SEND), module 1 = ponger (R_RECV);
+        // others hold an inert EP0 handle.
+        let ep0_rights = match i {
+            0 => oxbow_abi::R_SEND | oxbow_abi::R_ATTENUATE,
+            1 => oxbow_abi::R_RECV | oxbow_abi::R_ATTENUATE,
+            _ => 0,
         };
         let (pid, entry, user_rsp) = proc::create(&img, as_i, name, ep0_rights);
         // Module 0 gets the tick notification (wait-only) at BOOT_TICK.
@@ -237,6 +238,43 @@ fn kmain_stage2() -> ! {
                         rights: io_rights,
                     },
                 );
+                // The kbd driver sends characters to the TTY endpoint.
+                p.install(
+                    oxbow_abi::BOOT_TTY,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Endpoint(ipc::EP1),
+                        rights: oxbow_abi::R_SEND,
+                    },
+                );
+            });
+        }
+        // Module 3 (tty) is the sole receiver on the TTY endpoint.
+        if i == 3 {
+            proc::with_proc_mut(pid, |p| {
+                p.install(
+                    oxbow_abi::BOOT_TTY,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Endpoint(ipc::EP1),
+                        rights: oxbow_abi::R_RECV,
+                    },
+                )
+            });
+        }
+        // Module 4 (shell) sends read-requests + output to the TTY endpoint, and
+        // nothing else: its default Console grant is REVOKED here. All shell
+        // output flows through the tty (TAG_TTY_WRITE), so the shell holds zero
+        // direct hardware authority — least privilege, enforced at boot.
+        if i == 4 {
+            proc::with_proc_mut(pid, |p| {
+                p.install(
+                    oxbow_abi::BOOT_TTY,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Endpoint(ipc::EP1),
+                        rights: oxbow_abi::R_SEND,
+                    },
+                );
+                // Drop the console: the shell must not write hardware directly.
+                let _ = p.close(oxbow_abi::BOOT_CONSOLE);
             });
         }
         let tcb = thread::spawn_user(pid, as_i, entry, user_rsp);

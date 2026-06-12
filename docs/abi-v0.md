@@ -311,3 +311,47 @@ cap is ever minted, so the capability is the policy.
 LAPIC/IOAPIC/MSI; IRQ sharing; I/O widths > 8-bit; port-range derivation;
 immediate dispatch on signal (driver latency is currently ≤1 tick); multi-waiter
 notifications; untyped/retype for these pools.
+
+---
+
+## 11. TTY / shell protocol (v1-tty-shell)
+
+The terminal is three userspace processes over one endpoint — no new syscalls.
+
+### 11.1 Topology
+`BOOT_TTY` (= `BOOT` handle 7) names the **TTY endpoint** (`EP1`). The kernel
+hands it out at boot with role-split rights:
+- **kbd** (module 2): `R_SEND` — posts keystrokes.
+- **tty** (module 3): `R_RECV` — the *sole* receiver; owns the Console.
+- **shell** (module 4): `R_SEND` — posts read-requests and output.
+
+The tty is the only writer to the Console. The shell's default Console grant is
+**revoked at boot** (`p.close(BOOT_CONSOLE)`), so it holds zero direct hardware
+authority — all of its output flows through the tty. (L1 holds: authority is a
+handle, not a global; least privilege is enforced by *not minting* the cap.)
+
+### 11.2 Messages (one endpoint, tag-multiplexed)
+A single blocking `recv` loop in the tty can't select across senders, so the
+sender's intent rides in the message **tag**:
+- **`TAG_TTY_CHAR`** (kbd, one-way `send`): `data[0]` = one byte (set-1 ASCII,
+  `0x08` = backspace). Runs line discipline: printable → buffer + echo;
+  backspace → rub-out (`\x08 \x08`); CR/LF → terminate the line.
+- **`TAG_TTY_READ`** (shell, `call`): "give me the next complete line." If one is
+  queued, the tty replies immediately with `TAG_TTY_LINE`; otherwise it **stashes
+  the Reply handle** and replies when the next line completes. Completed lines
+  arriving with no waiter queue in a small FIFO (depth 4).
+- **`TAG_TTY_WRITE`** (shell, one-way `send`): NUL-terminated payload; the tty
+  writes it to the Console verbatim. Payloads > 63 B are chunked by the sender.
+- **`TAG_TTY_LINE`** (tty → shell, the `READ` reply): NUL-terminated line bytes.
+
+### 11.3 Shell builtins
+`echo <text>` (prints the remainder of the line), `help` (lists builtins); an
+empty line is a no-op; anything else → `oxbow: <cmd>: command not found`. The
+prompt is `oxbow$ `, written via `TAG_TTY_WRITE` before each `READ`.
+
+### 11.4 Known limitation
+Under aggressive **type-ahead** (keys posted to the endpoint before the shell's
+prompt-write message arrives) the keystroke echo can precede the prompt for that
+line — inherent to async input with a single ordered endpoint. At interactive
+speed the prompt always leads. Cooked-mode prompt/echo synchronization is
+deferred.

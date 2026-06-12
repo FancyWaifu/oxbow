@@ -76,19 +76,29 @@ through a read-only handle is `E_RIGHTS`). See `docs/abi-v0.md` §9.
 process (`servers/kbd`) is a real device driver: it holds the keyboard IRQ line
 and the i8042 I/O ports as **capabilities**, binds the IRQ to a **Notification**
 (an async signal the kernel's handler can fire without blocking), waits on it,
-reads scancodes via `sys_io_in`, translates them, and echoes keystrokes —
-**`[kbd] you typed: o`**. The kernel never touches the keyboard. See
-`docs/abi-v0.md` §10. (Headless test: `just`-style boot + QEMU monitor
-`sendkey`.)
+reads scancodes via `sys_io_in`, translates them, and forwards each keystroke to
+the TTY. The kernel never touches the keyboard. See `docs/abi-v0.md` §10.
+(Headless test: `just`-style boot + QEMU monitor `sendkey`.)
 
-### Next — toward a terminal
+**v1 arc 6 — a TTY + an interactive shell: complete.** Three userspace processes
+form a terminal over one tag-multiplexed endpoint (no new syscalls). `kbd` posts
+keystrokes; **`tty`** (`servers/tty`) is the sole receiver and the sole Console
+writer — it runs the line discipline (echo, backspace rub-out, buffer-to-Enter)
+and answers `READ` requests, stashing the caller's Reply until a line completes;
+**`shell`** (`servers/shell`) prints the `oxbow$ ` prompt, reads a line, and runs
+builtins (`echo`, `help`, unknown → *command not found*). The shell's Console
+grant is **revoked at boot**, so it holds zero direct hardware authority and all
+output flows through the tty — least privilege enforced by not minting the cap.
+The headline works end-to-end at the keyboard: **`oxbow$ echo hi` → `hi`**. See
+`docs/abi-v0.md` §11.
 
-A **TTY/line-discipline server** (the kbd driver sends keystrokes to it; it owns
-the Console, does echo + line buffering) → **process spawning** → a **shell** →
-a **filesystem** (VFS naming server + ramdisk) → coreutils → a **libc/POSIX
-shim**. POSIX and the Unix feel live in *userspace* over the capability kernel
-(the Redox model) — the kernel stays capability-pure. Plus, eventually:
-untyped/retype + `sys_unmap`, SMP, and the `aarch64` port.
+### Next — toward a fuller userspace
+
+**Process spawning** (a shell that launches programs) → a **filesystem** (VFS
+naming server + ramdisk) → coreutils → a **libc/POSIX shim**. POSIX and the Unix
+feel live in *userspace* over the capability kernel (the Redox model) — the
+kernel stays capability-pure. Plus, eventually: untyped/retype + `sys_unmap`,
+SMP, and the `aarch64` port.
 
 ## Building & running
 

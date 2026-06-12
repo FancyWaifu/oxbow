@@ -8,7 +8,10 @@
 #![no_std]
 #![no_main]
 
-use oxbow_abi::{SysError, BOOT_CONSOLE, BOOT_IRQ, BOOT_KBD_DATA, BOOT_KBD_STATUS, R_IN};
+use oxbow_abi::{
+    MsgBuf, SysError, BOOT_CONSOLE, BOOT_IRQ, BOOT_KBD_DATA, BOOT_KBD_STATUS, BOOT_TTY, R_IN,
+    TAG_TTY_CHAR,
+};
 use oxbow_rt as rt;
 
 fn w(s: &[u8]) {
@@ -26,7 +29,7 @@ fn ascii(sc: u8) -> u8 {
         0x16 => b'u', 0x2F => b'v', 0x11 => b'w', 0x2D => b'x', 0x15 => b'y',
         0x2C => b'z', 0x02 => b'1', 0x03 => b'2', 0x04 => b'3', 0x05 => b'4',
         0x06 => b'5', 0x07 => b'6', 0x08 => b'7', 0x09 => b'8', 0x0A => b'9',
-        0x0B => b'0', 0x39 => b' ', 0x1C => b'\n',
+        0x0B => b'0', 0x39 => b' ', 0x1C => b'\n', 0x0E => 0x08, // backspace
         _ => 0,
     }
 }
@@ -54,9 +57,11 @@ fn drain() {
         }
         let c = ascii(sc);
         if c != 0 {
-            w(b"[kbd] you typed: ");
-            w(&[c]);
-            w(b"\n");
+            // Send the character to the TTY (one-way); the tty does the echo now.
+            let mut m = MsgBuf::new(TAG_TTY_CHAR);
+            m.data_len = 1;
+            m.data[0] = c as u64;
+            let _ = rt::sys_send(BOOT_TTY, &m);
         }
     }
 }
