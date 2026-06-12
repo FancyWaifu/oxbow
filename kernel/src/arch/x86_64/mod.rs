@@ -1,14 +1,52 @@
 //! x86_64 architecture backend. Everything CPU- and port-specific lives behind
 //! this wall, so a future aarch64 port only re-implements `arch`.
+pub mod context;
 pub mod gdt;
 pub mod idt;
+pub mod pic;
+pub mod pit;
 pub mod serial;
 pub mod syscall;
 
 use core::arch::asm;
+use core::sync::atomic::Ordering;
 
+pub use context::{context_switch, thread_trampoline};
 pub use serial::{write_bytes as console_write_bytes, _print};
 pub use syscall::enter_user;
+
+/// Program the PIT and unmask the timer IRQ line.
+pub fn timer_init(hz: u32) {
+    pit::init(hz);
+    pic::unmask(0);
+}
+
+/// Current monotonic tick count.
+#[allow(dead_code)] // scheduler heartbeat API; not currently read
+pub fn ticks() -> u64 {
+    idt::TICKS.load(Ordering::Relaxed)
+}
+
+/// Re-mask all IRQ lines.
+#[allow(dead_code)] // API for tearing the timer back down; unused since Phase 4
+pub fn timer_disable() {
+    pic::mask_all();
+}
+
+/// Enable maskable interrupts (`sti`).
+pub fn enable_interrupts() {
+    x86_64::instructions::interrupts::enable();
+}
+
+/// Disable maskable interrupts (`cli`).
+pub fn disable_interrupts() {
+    x86_64::instructions::interrupts::disable();
+}
+
+/// Halt until the next interrupt (`hlt`). Only meaningful with IF=1.
+pub fn wait_for_interrupt() {
+    x86_64::instructions::hlt();
+}
 
 /// Bring up arch-level facilities: serial console, the descriptor tables
 /// (GDT/TSS for the segment layout + kernel fault stack, IDT for exceptions),
@@ -23,6 +61,14 @@ pub fn init() {
 /// Trigger a breakpoint exception — used once to prove the IDT entry/return path.
 pub fn breakpoint() {
     x86_64::instructions::interrupts::int3();
+}
+
+/// Point both TSS.RSP0 and the syscall entry stack at `top` — the kernel stack
+/// of the thread about to run. The scheduler calls this on every context switch
+/// so ring-3 traps and syscalls always land on the current thread's stack.
+pub fn set_kernel_stack(top: u64) {
+    gdt::set_rsp0(top);
+    syscall::set_kernel_stack_top(top);
 }
 
 /// Switch RSP onto the static kernel stack, load the new page tables (CR3), and

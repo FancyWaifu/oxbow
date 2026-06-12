@@ -85,5 +85,19 @@ pub extern "C" fn oxbow_main() -> ! {
         }
         _ => w(b"call failed\n"),
     }
+
+    // Spin in ring 3 (IF=1) so the timer can visibly preempt us — printing a
+    // `u` between bursts of pure user-mode compute. Proves the user thread
+    // survives many preemptions before exiting.
+    for _ in 0..6 {
+        w(b"u ");
+        let mut x: u64 = 0;
+        for i in 0..3_000_000u64 {
+            x = x.wrapping_add(i);
+        }
+        core::hint::black_box(x);
+    }
+    w(b"\n");
+
     rt::sys_exit(0)
 }

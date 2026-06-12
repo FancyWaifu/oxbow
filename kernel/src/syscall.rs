@@ -73,9 +73,9 @@ pub extern "C" fn syscall_dispatch(
         SYS_ATTENUATE => sys_attenuate(a1, a2),
         SYS_CLOSE => SyscallRet::from_result(PROCESS.lock().close(a1 as Handle)),
         SYS_EXIT => {
-            PROCESS.lock().close_all();
+            PROCESS.lock().close_all(); // lock dropped before we switch away
             println!("[proc] server exited ({})", a1);
-            arch::halt();
+            crate::thread::exit_current(); // kill this thread; the machine lives on
         }
         _ => SyscallRet::err(SysError::Nosys),
     }

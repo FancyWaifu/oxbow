@@ -8,6 +8,7 @@ mod x86_64;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)] // exit_qemu/QemuExit are for the future test harness
 pub use x86_64::{
-    breakpoint, console_write_bytes, enter_user, exit_qemu, halt, init, switch_address_space,
-    QemuExit, _print,
+    breakpoint, console_write_bytes, context_switch, disable_interrupts, enable_interrupts,
+    enter_user, exit_qemu, halt, init, set_kernel_stack, switch_address_space, thread_trampoline,
+    ticks, timer_disable, timer_init, wait_for_interrupt, QemuExit, _print,
 };

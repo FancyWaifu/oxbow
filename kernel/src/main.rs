@@ -14,6 +14,7 @@ mod mm;
 mod object;
 mod proc;
 mod syscall;
+mod thread;
 mod usermem;
 
 use core::panic::PanicInfo;
@@ -145,7 +146,11 @@ extern "C" fn kmain() -> ! {
 fn kmain_stage2() -> ! {
     println!("[vm] cr3 switched -- still alive");
 
-    // -- Phase 6: load the server from the module and run it -----------------
+    // The boot thread becomes the idle thread (TCB 0); arm the preemption timer.
+    thread::init();
+    arch::timer_init(100); // PIT @ 100 Hz, IRQ0 unmasked (stays on)
+
+    // Load the server module and hand-build process P1 (as in v0).
     let resp = MODULE_REQUEST
         .get_response()
         .expect("limine: no module response");
@@ -155,15 +160,21 @@ fn kmain_stage2() -> ! {
     let bytes = unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) };
     println!("[mod] server.elf: {} bytes", bytes.len());
 
-    // Create EP0 and arm the kernel echo BEFORE installing P1's endpoint handle.
     ipc::init();
-
     let img = elf::Image::validate(bytes);
     println!("[elf] ET_EXEC x86_64, entry {:#x}", img.entry);
     let (entry, user_rsp) = proc::load(&img);
 
-    println!("[user] entering ring 3 at {:#x}", entry);
-    arch::enter_user(entry, user_rsp);
+    // -- v1 Phases 4-6: P1 runs as a preemptible thread among kernel threads --
+    let u = thread::spawn_user(entry, user_rsp);
+    let w = thread::spawn_witness();
+    println!(
+        "[user] P1 scheduled as tcb {} (ring 3, IF=1); witness = tcb {}",
+        u, w
+    );
+
+    // The boot thread becomes the idle thread and runs the scheduler forever.
+    thread::run_idle();
 }
 
 /// Bare-metal panic handler: report to serial, then halt. There is no unwinding.

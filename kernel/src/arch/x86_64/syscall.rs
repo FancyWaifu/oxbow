@@ -9,37 +9,33 @@
 //! needs the swapgs dance at once; (2) there is a 1-2 instruction window at
 //! entry/exit where CPL0 runs on the user `rsp`; only an NMI could exploit it,
 //! and v0 has no NMI sources under QEMU. The fix later is an IST NMI handler.
-use core::ptr::addr_of;
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
 
 use super::gdt;
 
-const SYSCALL_STACK_SIZE: usize = 32 * 1024;
-
-#[repr(align(16))]
-#[allow(dead_code)] // backing buffer; only its address is used
-struct Stack([u8; SYSCALL_STACK_SIZE]);
-static mut SYSCALL_STACK: Stack = Stack([0; SYSCALL_STACK_SIZE]);
-
-/// Top of the dedicated kernel entry stack — loaded by the asm stub, and also
-/// installed as TSS.RSP0 so ring-3 exceptions land here (NOT on the boot
-/// thread's KERNEL_STACK, which holds live frames).
-static mut SYSCALL_STACK_TOP: u64 = 0;
+/// The kernel stack the syscall entry stub switches to — the CURRENT thread's
+/// kernel stack, updated by the scheduler on every context switch (v1). Mirrors
+/// TSS.RSP0 so ring-3 traps and syscalls land on the same per-thread stack.
+static mut CURRENT_KSTACK_TOP: u64 = 0;
 
 /// Scratch slot for the user `rsp` across the stack switch. Safe as a single
-/// static only because v0 syscalls never nest (one thread, no interrupts).
+/// static while there is one user thread and the kernel is non-preemptible
+/// (IF=0 in all kernel code). MOVE INTO THE TCB when a second user thread lands.
 static mut USER_RSP: u64 = 0;
 
-/// Configure the syscall MSRs and the dedicated entry stack. Call from
-/// `arch::init`, after `gdt::init` (it needs the selectors and the TSS).
+/// Set the kernel stack the syscall entry stub switches to (the incoming
+/// thread's kernel stack). Called by the scheduler on every context switch.
+pub fn set_kernel_stack_top(top: u64) {
+    unsafe { CURRENT_KSTACK_TOP = top };
+}
+
+/// Configure the syscall MSRs. The per-thread kernel stack and TSS.RSP0 are now
+/// owned by the scheduler (set on every context switch), so init just wires the
+/// MSRs. Call from `arch::init`, after `gdt::init` (it needs the selectors).
 pub fn init() {
     unsafe {
-        let top = addr_of!(SYSCALL_STACK) as u64 + SYSCALL_STACK_SIZE as u64;
-        SYSCALL_STACK_TOP = top;
-        gdt::set_rsp0(top);
-
         // EFER.SCE enables the `syscall`/`sysret` instructions.
         Efer::update(|f| f.insert(EferFlags::SYSTEM_CALL_EXTENSIONS));
     }
@@ -75,7 +71,7 @@ pub fn init() {
 extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
         "mov [rip + {user_rsp}], rsp",      // stash user rsp (no GPR clobbered)
-        "mov rsp, [rip + {stack_top}]",     // switch to kernel entry stack
+        "mov rsp, [rip + {stack_top}]",     // switch to this thread's kernel stack
         // -- 8 pushes; rsp stays 16-aligned (top is 16-aligned) --
         "push qword ptr [rip + {user_rsp}]", // user rsp
         "push r11",                          // user RFLAGS
@@ -100,7 +96,7 @@ extern "C" fn syscall_entry() {
         "pop rsp",                           // restore user rsp
         "sysretq",
         user_rsp = sym USER_RSP,
-        stack_top = sym SYSCALL_STACK_TOP,
+        stack_top = sym CURRENT_KSTACK_TOP,
         dispatch = sym crate::syscall::syscall_dispatch,
     );
 }
@@ -117,7 +113,7 @@ pub fn enter_user(entry: u64, user_rsp: u64) -> ! {
             // iretq pops (low->high): RIP, CS, RFLAGS, RSP, SS. Push reverse.
             "push r12",        // SS
             "push r13",        // RSP
-            "push 0x2",        // RFLAGS: only the mandatory reserved bit; IF=0
+            "push 0x202",      // RFLAGS: reserved bit + IF=1 (ring 3 is preemptible)
             "push r14",        // CS
             "push r15",        // RIP
             // Zero every GPR so no kernel value leaks to ring 3 (rsp/rip/rflags

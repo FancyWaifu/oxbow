@@ -36,11 +36,21 @@ error path (`E_BAD_HANDLE`, `E_RIGHTS`, `E_FAULT`, `E_MSG`, `E_NOSYS`) from ring
 Built in nine verified phases (physical memory → CPU tables → paging → ring-3
 syscall → module plumbing → ELF loader → capabilities → IPC → hardening).
 
-### Next (v1)
+**v1 arc 1 — threads + preemptive scheduler: complete.** A PIT timer (IRQ0 via
+the remapped 8259 PIC) drives a round-robin scheduler over a fixed pool of
+kernel threads. The kernel is non-preemptible (IF=0 in all kernel code);
+preemption lands only in ring 3 (IF=1) and at idle `sti; hlt` points. The user
+process P1 runs as a schedulable thread — preempted mid-userspace and running
+concurrently with kernel threads — and `sys_exit` kills the thread, not the
+machine (the idle thread survives). Single address space still (per-process CR3
+is a later arc). `just run` shows `PONG` plus the preemption trace.
 
-Real threads + a scheduler, per-process address spaces (CR3 switching), untyped
-memory + user-driven mapping, user-mode receivers with pooled Reply objects, and
-the `aarch64` port (the `arch/` wall is already in place for it).
+### Next (v1, later arcs)
+
+Per-process address spaces (CR3 switching) + a second user process, user-driven
+memory (untyped/retype, `sys_map`), user-mode IPC receivers with pooled Reply
+objects + blocking, IRQ capabilities for real drivers, and the `aarch64` port
+(the `arch/` wall is already in place for it).
 
 ## Building & running
 
