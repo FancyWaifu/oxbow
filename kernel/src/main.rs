@@ -10,7 +10,9 @@
 mod arch;
 mod elf;
 mod ipc;
+mod irq;
 mod mm;
+mod notif;
 mod object;
 mod proc;
 mod syscall;
@@ -158,6 +160,10 @@ fn kmain_stage2() -> ! {
 
     ipc::init();
 
+    // The timer-driven tick notification (granted to module 0 as BOOT_TICK).
+    let tick_idx = notif::create().expect("tick notif");
+    notif::arm_tick(tick_idx);
+
     // One process per Limine module, each in its OWN address space (a fresh
     // PML4 sharing the kernel upper half). Both binaries link at 0x200000 but
     // never collide — that's the point.
@@ -186,6 +192,53 @@ fn kmain_stage2() -> ! {
             oxbow_abi::R_RECV | oxbow_abi::R_ATTENUATE
         };
         let (pid, entry, user_rsp) = proc::create(&img, as_i, name, ep0_rights);
+        // Module 0 gets the tick notification (wait-only) at BOOT_TICK.
+        if i == 0 {
+            proc::with_proc_mut(pid, |p| {
+                p.install(
+                    oxbow_abi::BOOT_TICK,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Notification(tick_idx),
+                        rights: oxbow_abi::R_WAIT,
+                    },
+                )
+            });
+        }
+        // Module 2 (kbd driver) gets the i8042 I/O ports as capabilities. The
+        // kernel is the root of hardware authority; it delegates here (L1 holds
+        // — authority lives in a handle, not a global). IRQ line cap = Phase 4.
+        if i == 2 {
+            let io_rights = oxbow_abi::R_IN
+                | oxbow_abi::R_OUT
+                | oxbow_abi::R_GRANT
+                | oxbow_abi::R_ATTENUATE;
+            proc::with_proc_mut(pid, |p| {
+                p.install(
+                    oxbow_abi::BOOT_IRQ,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Irq(1), // keyboard line
+                        rights: oxbow_abi::R_BIND
+                            | oxbow_abi::R_ACK
+                            | oxbow_abi::R_GRANT
+                            | oxbow_abi::R_ATTENUATE,
+                    },
+                );
+                p.install(
+                    oxbow_abi::BOOT_KBD_DATA,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::IoPort { base: 0x60, len: 1 },
+                        rights: io_rights,
+                    },
+                );
+                p.install(
+                    oxbow_abi::BOOT_KBD_STATUS,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::IoPort { base: 0x64, len: 1 },
+                        rights: io_rights,
+                    },
+                );
+            });
+        }
         let tcb = thread::spawn_user(pid, as_i, entry, user_rsp);
         println!("[user] {} scheduled as tcb {} (ring 3, IF=1)", name, tcb);
     }

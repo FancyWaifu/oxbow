@@ -8,8 +8,8 @@
 #![no_main]
 
 use oxbow_abi::{
-    MsgBuf, SysError, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, PROT_READ, PROT_WRITE, R_GRANT, R_MAP,
-    TAG_PONG, TAG_PING,
+    MsgBuf, SysError, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_TICK, PROT_READ, PROT_WRITE, R_GRANT,
+    R_MAP, R_SIGNAL, TAG_PONG, TAG_PING,
 };
 use oxbow_rt as rt;
 
@@ -138,6 +138,40 @@ pub extern "C" fn oxbow_main() -> ! {
         }
         Err(_) => w(b"[P1] sys_map failed\n"),
     }
+
+    // Notification: create one, latch 3 signals while no one waits, then wait
+    // and drain the count. Also prove a signal-only (attenuated) handle cannot
+    // wait. (Headless — no IRQ involved yet; that's the next phase.)
+    if let Ok(n) = rt::sys_notif_create() {
+        let _ = rt::sys_notif_signal(n);
+        let _ = rt::sys_notif_signal(n);
+        let _ = rt::sys_notif_signal(n);
+        match rt::sys_notif_wait(n) {
+            Ok(c) => {
+                w(b"[P1] notif wait -> count=");
+                w(&[b'0' + c as u8]);
+                w(b"\n");
+            }
+            Err(_) => w(b"[P1] notif wait failed\n"),
+        }
+        let sig_only = rt::sys_attenuate(n, R_SIGNAL).unwrap_or(n);
+        match rt::sys_notif_wait(sig_only) {
+            Err(SysError::Rights) => w(b"[P1] wait on signal-only notif denied (E_RIGHTS) ok\n"),
+            _ => w(b"[P1] signal-only wait NOT denied\n"),
+        }
+    }
+
+    // Wait for two timer-driven ticks (~1 Hz) — the kernel's IRQ handler signals
+    // the notification from interrupt context; this user thread wakes on it.
+    let mut ticks = 0u8;
+    for _ in 0..2 {
+        if rt::sys_notif_wait(BOOT_TICK).is_ok() {
+            ticks += 1;
+        }
+    }
+    w(b"[P1] tick notif x");
+    w(&[b'0' + ticks]);
+    w(b" (irq-context signal ok)\n");
 
     // Shared memory: mint a Frame, map it writable, write a message, then
     // attenuate to a READ-ONLY grantable handle and hand it to the ponger in

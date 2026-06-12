@@ -266,3 +266,48 @@ static); ranged untypeds + a derivation tree + revocation; `sys_unmap`/`free` +
 a free-capable PMM (this arc is map-only — growth is bounded by the budget); a
 `VSpace` object (`sys_map` implicitly targets the caller's own AS); per-call
 charging of `sys_frame_map`'s intermediate tables.
+
+---
+
+## 10. ABI additions — IRQ / device drivers (v1 arc)
+
+Append-only (ABI_VERSION stays 0). Lets a USER process be a device driver:
+hardware access becomes a capability. Syscall numbers 11–17.
+
+### 10.1 New objects
+- **Notification** — a counting, latching async semaphore. `signal` is callable
+  from an IRQ handler (never blocks); `wait` blocks the caller until signalled
+  and returns the latched count. A signal with no waiter latches (it is never
+  lost). One waiter per notification. Rights: `R_SIGNAL` (= `R_SEND`), `R_WAIT`
+  (= `R_RECV`), `R_GRANT`, `R_ATTENUATE`.
+- **IoPort `{base, len}`** — authorizes `in`/`out` over a contiguous port range
+  (8-bit this arc). Rights: `R_IN` (1<<18), `R_OUT` (1<<19), `R_GRANT`,
+  `R_ATTENUATE`. Attenuating away `R_OUT` yields a read-only port handle.
+- **IrqLine `{line}`** — authorizes binding/acking a hardware IRQ line. Rights:
+  `R_BIND` (1<<20), `R_ACK` (1<<21), `R_GRANT`, `R_ATTENUATE`. The kernel mints
+  hardware caps once, at boot, into the designated driver's table (L1 holds:
+  authority lives in a handle, not a global; the kernel is the root resource).
+
+### 10.2 Syscalls
+- **11 `sys_notif_create()` → Notification handle.**
+- **12 `sys_notif_signal(notif)`** — requires `R_SIGNAL`.
+- **13 `sys_notif_wait(notif)` → count in rdx** — requires `R_WAIT`.
+- **14 `sys_io_in(ioport, port)` → byte in rdx** — requires `R_IN`; `E_MSG` if
+  the port is outside the cap's range.
+- **15 `sys_io_out(ioport, port, value)`** — requires `R_OUT`.
+- **16 `sys_irq_bind(irq, notif)`** — requires `R_BIND` on the line + `R_SIGNAL`
+  on the notification; routes IRQ → notification. Does not unmask.
+- **17 `sys_irq_ack(irq)`** — requires `R_ACK`; re-arms (unmasks) the line.
+
+### 10.3 IRQ delivery discipline
+On fire, the kernel handler MASKS the line, EOIs in the kernel (never deferred —
+an in-service ISR bit held across a context switch freezes equal/lower lines),
+and signals the bound notification (wake-only, no block). The driver waits,
+drains the device, then `ack`s (unmask) — drain-before-ack is mandatory for an
+edge-triggered line. IRQ0 stays kernel-internal (the scheduler tick); no `Irq(0)`
+cap is ever minted, so the capability is the policy.
+
+### 10.4 Deferred
+LAPIC/IOAPIC/MSI; IRQ sharing; I/O widths > 8-bit; port-range derivation;
+immediate dispatch on signal (driver latency is currently ≤1 tick); multi-waiter
+notifications; untyped/retype for these pools.

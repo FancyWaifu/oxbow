@@ -21,6 +21,7 @@ build:
 build-server:
     RUSTFLAGS="-C relocation-model=static" cargo build -p pong
     RUSTFLAGS="-C relocation-model=static" cargo build -p beta
+    RUSTFLAGS="-C relocation-model=static" cargo build -p kbd
 
 # Same, but with the ABI negative-path selftests compiled in.
 build-server-selftest:
@@ -44,6 +45,7 @@ _iso:
     cp {{KERNEL}} iso_root/boot/oxbow
     cp target/x86_64-unknown-none/debug/pong iso_root/boot/server.elf
     cp target/x86_64-unknown-none/debug/beta iso_root/boot/beta.elf
+    cp target/x86_64-unknown-none/debug/kbd iso_root/boot/kbd.elf
     cp limine.conf iso_root/boot/limine/
     cp {{LIMINE_DIR}}/limine-bios.sys {{LIMINE_DIR}}/limine-bios-cd.bin {{LIMINE_DIR}}/limine-uefi-cd.bin iso_root/boot/limine/
     cp {{LIMINE_DIR}}/BOOTX64.EFI {{LIMINE_DIR}}/BOOTIA32.EFI iso_root/EFI/BOOT/

@@ -104,6 +104,21 @@ fn slot(tid: usize) -> *mut IpcSlot {
     unsafe { addr_of_mut!(IPC_SLOTS[tid]) }
 }
 
+/// Deposit a syscall return for a blocked thread (used by `notif::signal` — no
+/// message, no copy-out, just the `(rax, rdx)` pair).
+pub(crate) fn deposit_ret(tid: usize, rax: u64, rdx: u64) {
+    unsafe {
+        (*slot(tid)).copy_out = false;
+        (*slot(tid)).ret_rax = rax;
+        (*slot(tid)).ret_rdx = rdx;
+    }
+}
+
+/// Read the deposited `(rax, rdx)` on resume.
+pub(crate) fn take_ret(tid: usize) -> (u64, u64) {
+    unsafe { ((*slot(tid)).ret_rax, (*slot(tid)).ret_rdx) }
+}
+
 // --- Reply pool -----------------------------------------------------------
 
 #[derive(Clone, Copy)]

@@ -41,6 +41,18 @@ pub const R_ATTENUATE: u32 = 1 << 3;
 pub const R_WRITE: u32 = 1 << 16;
 /// Memory: may debit (sys_map / sys_frame_alloc). Frame: may be mapped.
 pub const R_MAP: u32 = 1 << 17;
+/// IoPort: may read a port.
+pub const R_IN: u32 = 1 << 18;
+/// IoPort: may write a port.
+pub const R_OUT: u32 = 1 << 19;
+/// IrqLine: may bind the line to a notification.
+pub const R_BIND: u32 = 1 << 20;
+/// IrqLine: may ack (re-arm) the line.
+pub const R_ACK: u32 = 1 << 21;
+
+// Notifications reuse the IPC verbs: signalling is "send", waiting is "recv".
+pub const R_SIGNAL: u32 = R_SEND;
+pub const R_WAIT: u32 = R_RECV;
 
 // Mapping protection flags for sys_map / sys_frame_map (NOT rights; per call).
 // Exec is intentionally absent — W^X forbids writable+executable, and there is
@@ -65,6 +77,15 @@ pub const SYS_EXIT: u64 = 7;
 pub const SYS_MAP: u64 = 8; // sys_map(mem, vaddr, len, prot)
 pub const SYS_FRAME_ALLOC: u64 = 9; // sys_frame_alloc(mem) -> Frame handle
 pub const SYS_FRAME_MAP: u64 = 10; // sys_frame_map(frame, vaddr, prot)
+
+// v1 additions — IRQ / device drivers.
+pub const SYS_NOTIF_CREATE: u64 = 11; // () -> Notification handle
+pub const SYS_NOTIF_SIGNAL: u64 = 12; // (notif)          needs R_SIGNAL
+pub const SYS_NOTIF_WAIT: u64 = 13; // (notif) -> count   needs R_WAIT
+pub const SYS_IO_IN: u64 = 14; // (ioport, port) -> byte  needs R_IN
+pub const SYS_IO_OUT: u64 = 15; // (ioport, port, value)  needs R_OUT
+pub const SYS_IRQ_BIND: u64 = 16; // (irq, notif)          needs R_BIND + R_SIGNAL
+pub const SYS_IRQ_ACK: u64 = 17; // (irq)                  needs R_ACK
 
 // ---------------------------------------------------------------------------
 // Error codes (§6) — returned in rax; values are stable forever (append-only)
@@ -171,6 +192,12 @@ pub const BOOT_EP: Handle = 1;
 pub const BOOT_CONSOLE: Handle = 2;
 /// Memory budget handle a process is born holding (R_MAP | R_GRANT | R_ATTENUATE).
 pub const BOOT_MEM: Handle = 3;
+/// Tick notification (module 0 only): the timer signals it ~1 Hz. R_WAIT.
+pub const BOOT_TICK: Handle = 4;
+/// Driver (module 2) boot handles: the keyboard IRQ line and i8042 I/O ports.
+pub const BOOT_IRQ: Handle = 4; // IrqLine(1) — R_BIND|R_ACK
+pub const BOOT_KBD_DATA: Handle = 5; // IoPort{0x60,1}
+pub const BOOT_KBD_STATUS: Handle = 6; // IoPort{0x64,1}
 
 /// "PING" — request tag for the v0 roundtrip.
 pub const TAG_PING: u64 = 0x474E4950;
@@ -178,3 +205,5 @@ pub const TAG_PING: u64 = 0x474E4950;
 pub const TAG_PONG: u64 = 0x474E4F50;
 /// "SHMM" — a Frame capability rides this message (shared-memory demo).
 pub const TAG_SHMEM: u64 = 0x4D4D4853;
+/// "NTFY" — a Notification capability rides this message.
+pub const TAG_NOTIF: u64 = 0x5946544E;

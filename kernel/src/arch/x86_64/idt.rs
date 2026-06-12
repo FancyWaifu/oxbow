@@ -36,10 +36,11 @@ pub fn init() {
             .set_stack_index(DOUBLE_FAULT_IST_INDEX);
 
         // Hardware IRQ vectors (PIC remapped base 0x20).
-        idt[TIMER_VECTOR].set_handler_fn(timer);
+        idt[TIMER_VECTOR].set_handler_fn(timer); // IRQ0 — scheduler tick
+        idt[0x21].set_handler_fn(keyboard); // IRQ1 — i8042 keyboard (bindable)
         idt[0x27].set_handler_fn(spurious_master); // IRQ7 spurious: no EOI
         idt[0x2F].set_handler_fn(spurious_slave); // IRQ15 spurious: EOI master
-        for v in 0x21u8..=0x2E {
+        for v in 0x22u8..=0x2E {
             if v != 0x27 {
                 idt[v].set_handler_fn(unexpected_irq);
             }
@@ -63,12 +64,26 @@ extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
     // resumes — a silent scheduler freeze. Safe here because IF=0 in the gate.
     pic::eoi(0);
 
+    // ~1 Hz: signal the tick notification from IRQ context (wake-only, no block).
+    if tick % 100 == 0 {
+        crate::notif::fire_tick();
+    }
+
     // Were we interrupting ring 3? (RPL bits of the saved CS.) Announce the
     // first few user preemptions as the Phase-5 proof that ring 3 is preemptible.
     if frame.code_segment.0 & 3 == 3 && USER_PREEMPTS.fetch_add(1, Ordering::Relaxed) < 3 {
         println!("[sched] preempt user @ tick {}", tick);
     }
     crate::thread::preempt();
+}
+
+extern "x86-interrupt" fn keyboard(_frame: InterruptStackFrame) {
+    // Mask the line first (so it can't re-fire after EOI), EOI in the kernel at
+    // fire time (never deferred to the driver's ack), then signal the bound
+    // notification (wake-only). The driver drains the i8042 and acks (unmask).
+    pic::mask(1);
+    pic::eoi(1);
+    crate::irq::fire(1);
 }
 
 extern "x86-interrupt" fn spurious_master(_frame: InterruptStackFrame) {

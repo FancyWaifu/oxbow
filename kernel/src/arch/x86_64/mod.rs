@@ -107,6 +107,21 @@ pub fn switch_address_space(pml4_phys: u64, stage2: fn() -> !) -> ! {
     }
 }
 
+/// Unmask a PIC IRQ line (re-arm it — used by `irq::ack`).
+pub fn pic_unmask(line: u8) {
+    pic::unmask(line);
+}
+
+/// Read a byte from an I/O port (backs `sys_io_in`).
+pub fn io_in(port: u16) -> u8 {
+    unsafe { x86_64::instructions::port::Port::<u8>::new(port).read() }
+}
+
+/// Write a byte to an I/O port (backs `sys_io_out`).
+pub fn io_out(port: u16, value: u8) {
+    unsafe { x86_64::instructions::port::Port::<u8>::new(port).write(value) }
+}
+
 /// Halt the CPU forever. `hlt` parks the core in a low-power state until an
 /// interrupt — and we have none enabled yet, so this never wakes.
 pub fn halt() -> ! {

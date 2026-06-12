@@ -11,6 +11,9 @@ pub enum ObjType {
     Console,
     Memory,
     Frame,
+    Notification,
+    IoPort,
+    Irq,
 }
 
 /// What a handle points at: a pool index for Endpoint/Reply/Memory/Frame, or the
@@ -22,6 +25,9 @@ pub enum ObjectRef {
     Console,
     Memory(u8),
     Frame(u8),
+    Notification(u8),
+    IoPort { base: u16, len: u16 },
+    Irq(u8),
 }
 
 impl ObjectRef {
@@ -32,6 +38,9 @@ impl ObjectRef {
             ObjectRef::Console => ObjType::Console,
             ObjectRef::Memory(_) => ObjType::Memory,
             ObjectRef::Frame(_) => ObjType::Frame,
+            ObjectRef::Notification(_) => ObjType::Notification,
+            ObjectRef::IoPort { .. } => ObjType::IoPort,
+            ObjectRef::Irq(_) => ObjType::Irq,
         }
     }
 }

@@ -234,6 +234,7 @@ pub fn wake(tid: usize) {
 
 /// Terminate the current thread and switch away forever.
 pub fn exit_current() -> ! {
+    crate::notif::clear_waiter(current()); // defensive: never wake an Exited thread
     set_state(current(), State::Exited);
     let next = pick_next().unwrap_or(IDLE);
     switch_to(next);

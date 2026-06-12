@@ -12,7 +12,8 @@ pub use oxbow_abi as abi;
 
 use oxbow_abi::{
     Handle, MsgBuf, SysError, SysResult, BOOT_CONSOLE, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE,
-    SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_MAP, SYS_RECV, SYS_REPLY,
+    SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK,
+    SYS_IRQ_BIND, SYS_MAP, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT, SYS_RECV, SYS_REPLY,
     SYS_SEND,
 };
 
@@ -160,6 +161,42 @@ pub fn sys_frame_alloc(mem: Handle) -> SysResult<Handle> {
 
 pub fn sys_frame_map(frame: Handle, vaddr: u64, prot: u64) -> SysResult {
     let (rax, _) = unsafe { syscall3(SYS_FRAME_MAP, frame as u64, vaddr, prot) };
+    SysError::from_raw(rax)
+}
+
+pub fn sys_notif_create() -> SysResult<Handle> {
+    let (rax, rdx) = unsafe { syscall1(SYS_NOTIF_CREATE, 0) };
+    SysError::from_raw(rax).map(|_| rdx as Handle)
+}
+
+pub fn sys_notif_signal(notif: Handle) -> SysResult {
+    let (rax, _) = unsafe { syscall1(SYS_NOTIF_SIGNAL, notif as u64) };
+    SysError::from_raw(rax)
+}
+
+/// Block until the notification is signalled; returns the latched signal count.
+pub fn sys_notif_wait(notif: Handle) -> SysResult<u64> {
+    let (rax, rdx) = unsafe { syscall1(SYS_NOTIF_WAIT, notif as u64) };
+    SysError::from_raw(rax).map(|_| rdx)
+}
+
+pub fn sys_io_in(ioport: Handle, port: u16) -> SysResult<u8> {
+    let (rax, rdx) = unsafe { syscall2(SYS_IO_IN, ioport as u64, port as u64) };
+    SysError::from_raw(rax).map(|_| rdx as u8)
+}
+
+pub fn sys_io_out(ioport: Handle, port: u16, value: u8) -> SysResult {
+    let (rax, _) = unsafe { syscall3(SYS_IO_OUT, ioport as u64, port as u64, value as u64) };
+    SysError::from_raw(rax)
+}
+
+pub fn sys_irq_bind(irq: Handle, notif: Handle) -> SysResult {
+    let (rax, _) = unsafe { syscall2(SYS_IRQ_BIND, irq as u64, notif as u64) };
+    SysError::from_raw(rax)
+}
+
+pub fn sys_irq_ack(irq: Handle) -> SysResult {
+    let (rax, _) = unsafe { syscall1(SYS_IRQ_ACK, irq as u64) };
     SysError::from_raw(rax)
 }
 

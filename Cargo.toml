@@ -8,6 +8,7 @@ members = [
     "rt",
     "servers/pong",
     "servers/beta",
+    "servers/kbd",
     # "tools/*",  # initrd packer, etc.
 ]
 # Servers are excluded from the default build because they need a DIFFERENT

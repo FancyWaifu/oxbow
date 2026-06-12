@@ -75,6 +75,20 @@ pub fn unmask(irq: u8) {
     }
 }
 
+/// Mask (disable) one IRQ line.
+pub fn mask(irq: u8) {
+    unsafe {
+        let (port, line) = if irq < 8 {
+            (PIC1_DATA, irq)
+        } else {
+            (PIC2_DATA, irq - 8)
+        };
+        let mut p = Port::<u8>::new(port);
+        let val = p.read() | (1 << line);
+        p.write(val);
+    }
+}
+
 /// Acknowledge an IRQ. Slave-line IRQs (8-15) also EOI the master cascade.
 pub fn eoi(irq: u8) {
     unsafe {

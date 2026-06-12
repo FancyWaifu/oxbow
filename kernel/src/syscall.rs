@@ -7,14 +7,14 @@
 use core::mem::size_of;
 use oxbow_abi::{
     Handle, MsgBuf, SysError, SysResult, HANDLE_NULL, MSG_DATA_WORDS, MSG_HANDLES, PROT_READ,
-    PROT_WRITE, R_ATTENUATE, R_GRANT, R_MAP, R_RECV, R_SEND, R_WRITE, SYS_ATTENUATE, SYS_CALL,
-    SYS_CLOSE, SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_MAP, SYS_RECV,
-    SYS_REPLY, SYS_SEND,
+    PROT_WRITE, R_ATTENUATE, R_GRANT, R_MAP, R_RECV, R_SEND, R_SIGNAL, R_WAIT, R_WRITE,
+    SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP,
+    SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND, SYS_MAP, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL,
+    SYS_NOTIF_WAIT, SYS_RECV, SYS_REPLY, SYS_SEND, R_ACK, R_BIND, R_IN, R_OUT,
 };
 
-use crate::mm;
 use crate::object::{HandleEntry, ObjType, ObjectRef};
-use crate::{arch, ipc, println, proc, usermem};
+use crate::{arch, ipc, mm, notif, println, proc, usermem};
 
 /// One past the canonical lower half (the user range).
 const LOWER_HALF_END: u64 = 0x0000_8000_0000_0000;
@@ -76,6 +76,13 @@ pub extern "C" fn syscall_dispatch(
         SYS_MAP => sys_map(a1, a2, a3, a4),
         SYS_FRAME_ALLOC => sys_frame_alloc(a1),
         SYS_FRAME_MAP => sys_frame_map(a1, a2, a3),
+        SYS_NOTIF_CREATE => sys_notif_create(),
+        SYS_NOTIF_SIGNAL => sys_notif_signal(a1),
+        SYS_NOTIF_WAIT => sys_notif_wait(a1),
+        SYS_IO_IN => sys_io_in(a1, a2),
+        SYS_IO_OUT => sys_io_out(a1, a2, a3),
+        SYS_IRQ_BIND => sys_irq_bind(a1, a2),
+        SYS_IRQ_ACK => sys_irq_ack(a1),
         SYS_CONSOLE_WRITE => sys_console_write(a1, a2, a3),
         SYS_ATTENUATE => sys_attenuate(a1, a2),
         SYS_CLOSE => SyscallRet::from_result(proc::with_current_mut(|p| p.close(a1 as Handle))),
@@ -180,6 +187,131 @@ fn sys_map(mem: u64, vaddr: u64, len: u64, prot: u64) -> SyscallRet {
             vaddr,
             mm::mem::remaining(midx) / 1024
         );
+        Ok(())
+    })())
+}
+
+/// `sys_notif_create()` — mint a fresh Notification, returned as a handle.
+fn sys_notif_create() -> SyscallRet {
+    match notif::create() {
+        Some(idx) => {
+            let r = proc::with_current_mut(|p| {
+                p.alloc_slot(HandleEntry {
+                    obj: ObjectRef::Notification(idx),
+                    rights: R_SIGNAL | R_WAIT | R_GRANT | R_ATTENUATE,
+                })
+            });
+            match r {
+                Ok(h) => SyscallRet::ok_handle(h),
+                Err(e) => SyscallRet::err(e), // notif pool slot leaks (bounded)
+            }
+        }
+        None => SyscallRet::err(SysError::NoMem),
+    }
+}
+
+/// `sys_notif_signal(notif)` — bump a notification (requires R_SIGNAL).
+fn sys_notif_signal(notif_h: u64) -> SyscallRet {
+    SyscallRet::from_result((|| -> SysResult {
+        let entry =
+            proc::with_current(|p| p.lookup(notif_h as Handle, ObjType::Notification, R_SIGNAL))?;
+        let ObjectRef::Notification(idx) = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        notif::signal(idx);
+        Ok(())
+    })())
+}
+
+/// `sys_notif_wait(notif)` — block until signalled; returns the latched count in
+/// rdx (requires R_WAIT).
+fn sys_notif_wait(notif_h: u64) -> SyscallRet {
+    let validated = (|| -> SysResult<u8> {
+        let entry =
+            proc::with_current(|p| p.lookup(notif_h as Handle, ObjType::Notification, R_WAIT))?;
+        let ObjectRef::Notification(idx) = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        Ok(idx)
+    })();
+    match validated {
+        Ok(idx) => {
+            let (rax, rdx) = notif::wait(idx);
+            SyscallRet { rax, rdx }
+        }
+        Err(e) => SyscallRet::err(e),
+    }
+}
+
+/// `sys_irq_bind(irq, notif)` — route a hardware line to a notification. The
+/// binder must hold R_BIND on the line and R_SIGNAL on the notification (binding
+/// delegates signal authority to the kernel). Does not unmask — the first ack
+/// arms the line.
+fn sys_irq_bind(irq_h: u64, notif_h: u64) -> SyscallRet {
+    SyscallRet::from_result((|| -> SysResult {
+        let irq = proc::with_current(|p| p.lookup(irq_h as Handle, ObjType::Irq, R_BIND))?;
+        let ObjectRef::Irq(line) = irq.obj else {
+            return Err(SysError::BadType);
+        };
+        let n = proc::with_current(|p| {
+            p.lookup(notif_h as Handle, ObjType::Notification, R_SIGNAL)
+        })?;
+        let ObjectRef::Notification(nidx) = n.obj else {
+            return Err(SysError::BadType);
+        };
+        crate::irq::bind(line, nidx);
+        Ok(())
+    })())
+}
+
+/// `sys_irq_ack(irq)` — re-arm (unmask) a bound line for the next interrupt
+/// (requires R_ACK). Called by the driver after draining the device.
+fn sys_irq_ack(irq_h: u64) -> SyscallRet {
+    SyscallRet::from_result((|| -> SysResult {
+        let irq = proc::with_current(|p| p.lookup(irq_h as Handle, ObjType::Irq, R_ACK))?;
+        let ObjectRef::Irq(line) = irq.obj else {
+            return Err(SysError::BadType);
+        };
+        if !crate::irq::is_bound(line) {
+            return Err(SysError::Msg);
+        }
+        crate::irq::ack(line);
+        Ok(())
+    })())
+}
+
+/// `sys_io_in(ioport, port)` — read a byte from a port authorized by an IoPort
+/// capability (requires R_IN). The byte is returned in rdx.
+fn sys_io_in(io: u64, port: u64) -> SyscallRet {
+    let r = (|| -> SysResult<u64> {
+        let entry = proc::with_current(|p| p.lookup(io as Handle, ObjType::IoPort, R_IN))?;
+        let ObjectRef::IoPort { base, len } = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        let port = port as u16;
+        if port < base || port >= base + len {
+            return Err(SysError::Msg);
+        }
+        Ok(arch::io_in(port) as u64)
+    })();
+    match r {
+        Ok(v) => SyscallRet { rax: 0, rdx: v },
+        Err(e) => SyscallRet::err(e),
+    }
+}
+
+/// `sys_io_out(ioport, port, value)` — write a byte to a port (requires R_OUT).
+fn sys_io_out(io: u64, port: u64, value: u64) -> SyscallRet {
+    SyscallRet::from_result((|| -> SysResult {
+        let entry = proc::with_current(|p| p.lookup(io as Handle, ObjType::IoPort, R_OUT))?;
+        let ObjectRef::IoPort { base, len } = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        let port = port as u16;
+        if port < base || port >= base + len {
+            return Err(SysError::Msg);
+        }
+        arch::io_out(port, value as u8);
         Ok(())
     })())
 }

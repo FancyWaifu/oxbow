@@ -72,12 +72,23 @@ IPC, a frame can be **shared zero-copy** between two isolated address spaces,
 with read-only sharing falling out of capability attenuation (a writable map
 through a read-only handle is `E_RIGHTS`). See `docs/abi-v0.md` §9.
 
-### Next (later arcs)
+**v1 arc 5 — IRQ capabilities + a user-mode keyboard driver: complete.** A user
+process (`servers/kbd`) is a real device driver: it holds the keyboard IRQ line
+and the i8042 I/O ports as **capabilities**, binds the IRQ to a **Notification**
+(an async signal the kernel's handler can fire without blocking), waits on it,
+reads scancodes via `sys_io_in`, translates them, and echoes keystrokes —
+**`[kbd] you typed: o`**. The kernel never touches the keyboard. See
+`docs/abi-v0.md` §10. (Headless test: `just`-style boot + QEMU monitor
+`sendkey`.)
 
-User-mode IRQ capabilities + drivers (a timer, then a keyboard → the first
-interactivity); userspace process spawning; a filesystem; untyped/retype +
-`sys_unmap` + a free-capable allocator; a multi-receiver endpoint; SMP; and the
-`aarch64` port (the `arch/` wall is already in place for it).
+### Next — toward a terminal
+
+A **TTY/line-discipline server** (the kbd driver sends keystrokes to it; it owns
+the Console, does echo + line buffering) → **process spawning** → a **shell** →
+a **filesystem** (VFS naming server + ramdisk) → coreutils → a **libc/POSIX
+shim**. POSIX and the Unix feel live in *userspace* over the capability kernel
+(the Redox model) — the kernel stays capability-pure. Plus, eventually:
+untyped/retype + `sys_unmap`, SMP, and the `aarch64` port.
 
 ## Building & running
 
