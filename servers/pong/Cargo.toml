@@ -13,6 +13,10 @@ path = "src/main.rs"
 [features]
 # Run the ABI negative-path selftests before the PONG trace (`just run-selftest`).
 selftest = []
+# Dereference an unmapped address at startup to test fault containment.
+faulttest = []
+# Print our own bytes at 0x200000 (paired with beta's, to show isolation).
+isolation = []
 
 [dependencies]
 oxbow-rt = { path = "../../rt" }

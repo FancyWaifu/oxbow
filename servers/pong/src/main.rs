@@ -15,6 +15,13 @@ fn w(s: &[u8]) {
     let _ = rt::sys_console_write(BOOT_CONSOLE, s.as_ptr(), s.len());
 }
 
+/// Print the byte `v` as two hex digits.
+#[cfg(feature = "isolation")]
+fn hex_byte(v: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    w(&[HEX[(v >> 4) as usize], HEX[(v & 0xf) as usize]]);
+}
+
 /// Exercise the ABI's failure modes — each should be rejected with the exact
 /// documented error, all enforced by the kernel against an unprivileged caller.
 #[cfg(feature = "selftest")]
@@ -74,6 +81,24 @@ fn selftest() {
 /// Server entry, called by oxbow-rt's `_start`.
 #[no_mangle]
 pub extern "C" fn oxbow_main() -> ! {
+    // Fault-containment test: touch an unmapped user address. The kernel should
+    // kill this thread/process and keep running everything else.
+    #[cfg(feature = "faulttest")]
+    unsafe {
+        core::ptr::read_volatile(0x10 as *const u64);
+    }
+
+    #[cfg(feature = "isolation")]
+    {
+        // Read our OWN 8 bytes at 0x200000 — different from beta's, same vaddr.
+        w(b"[P1] @0x200000 = ");
+        for i in 0..8 {
+            let b = unsafe { core::ptr::read_volatile((0x200000 + i) as *const u8) };
+            hex_byte(b);
+        }
+        w(b"\n");
+    }
+
     #[cfg(feature = "selftest")]
     selftest();
 

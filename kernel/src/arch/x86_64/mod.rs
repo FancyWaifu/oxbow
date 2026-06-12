@@ -71,6 +71,22 @@ pub fn set_kernel_stack(top: u64) {
     syscall::set_kernel_stack_top(top);
 }
 
+/// Physical address of the live PML4 (CR3).
+pub fn current_cr3() -> u64 {
+    use x86_64::registers::control::Cr3;
+    Cr3::read().0.start_address().as_u64()
+}
+
+/// Load a new address space root into CR3 (preserving the current CR3 flags).
+pub fn load_cr3(pml4_phys: u64) {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::PhysFrame;
+    use x86_64::PhysAddr;
+    let (_, flags) = Cr3::read();
+    let frame = PhysFrame::containing_address(PhysAddr::new(pml4_phys));
+    unsafe { Cr3::write(frame, flags) };
+}
+
 /// Switch RSP onto the static kernel stack, load the new page tables (CR3), and
 /// jump into `stage2` (which must never return). The stack switch is mandatory:
 /// the current stack is Limine-provided memory that may not be mapped in the new

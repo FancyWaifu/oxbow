@@ -134,11 +134,64 @@ pub fn init(memmap: &MemoryMapResponse, kernel_phys_base: u64, kernel_virt_base:
     pml4_phys
 }
 
-/// Map one 4 KiB user page into the live address space (the single v0 address
-/// space). USER_ACCESSIBLE is set on the leaf only — the `x86_64` crate
-/// propagates it to the parent tables (incl. pre-existing ones). Goes through
-/// the W^X assert like every other mapping (ABI L4).
-pub fn map_user_4k(virt: u64, phys: u64, writable: bool, executable: bool) {
+/// Create a fresh per-process PML4 that SHARES the kernel's upper half. We
+/// raw-copy entries 256..512 of the current PML4 — those point at the same
+/// PDPT frames, so the kernel image (slot 511), the HHDM (slot 256), and every
+/// kernel stack live in `.bss` are present in every address space. The low half
+/// (user space) starts empty. Invariant for arc 2+: the kernel never creates a
+/// NEW upper-half PML4 entry after `init`, so this snapshot stays complete.
+pub fn new_user_pml4() -> u64 {
+    let frame = pmm::alloc_frame().expect("vm: no frame for user PML4"); // zeroed
+    let new_pml4 = unsafe { &mut *(super::phys_to_virt(frame) as *mut PageTable) };
+
+    let (cur_frame, _) = Cr3::read();
+    let cur_pml4 =
+        unsafe { &*(super::phys_to_virt(cur_frame.start_address().as_u64()) as *const PageTable) };
+
+    for i in 256..512 {
+        new_pml4[i] = cur_pml4[i].clone();
+    }
+    frame
+}
+
+/// Boot self-test (canary for the share-copy): create a second address space,
+/// switch CR3 into it, execute kernel code + read through the HHDM under it,
+/// then switch back. Must run with IF=0 (no timer yet). Stays as a permanent
+/// boot assert — a missed upper-half slot here triple-faults instead of later.
+pub fn as_hop_selftest() {
+    let as1 = new_user_pml4();
+    crate::println!("[vm] as#1 pml4={:#x} (upper 256 slots shared)", as1);
+
+    let (boot_frame, flags) = Cr3::read();
+    let as1_frame = PhysFrame::containing_address(PhysAddr::new(as1));
+
+    // A sentinel in physical RAM, reached via the HHDM under both address spaces.
+    let probe = pmm::alloc_frame().expect("vm: no probe frame");
+    let probe_va = super::phys_to_virt(probe) as *mut u64;
+    let ok_in;
+    unsafe {
+        probe_va.write_volatile(0xCAFE_BABE_DEAD_BEEF);
+        Cr3::write(as1_frame, flags); // hop into the new address space
+        ok_in = probe_va.read_volatile() == 0xCAFE_BABE_DEAD_BEEF; // HHDM read under as1
+        Cr3::write(boot_frame, flags); // hop back
+    }
+    crate::println!(
+        "[vm] cr3 hop: in -- {}; back -- alive",
+        if ok_in { "alive" } else { "FAIL" }
+    );
+}
+
+/// Physical address of the currently-loaded PML4 (the live address space).
+#[allow(dead_code)] // handy AS helper; not currently on the boot path
+pub fn current_pml4() -> u64 {
+    Cr3::read().0.start_address().as_u64()
+}
+
+/// Map one 4 KiB user page into the address space rooted at `pml4_phys` (which
+/// need NOT be the live one — used to populate a process before it runs).
+/// USER_ACCESSIBLE is set on the leaf only; the `x86_64` crate propagates it to
+/// the parent tables. Goes through the W^X assert like every mapping (ABI L4).
+pub fn map_user_4k_in(pml4_phys: u64, virt: u64, phys: u64, writable: bool, executable: bool) {
     assert!(!(writable && executable), "W^X violation in user mapping");
     assert!(
         virt < 0x0000_8000_0000_0000,
@@ -154,9 +207,8 @@ pub fn map_user_4k(virt: u64, phys: u64, writable: bool, executable: bool) {
     }
 
     let hhdm = VirtAddr::new(super::hhdm_offset());
-    let (l4_frame, _) = Cr3::read();
     let l4: &mut PageTable =
-        unsafe { &mut *(super::phys_to_virt(l4_frame.start_address().as_u64()) as *mut PageTable) };
+        unsafe { &mut *(super::phys_to_virt(pml4_phys) as *mut PageTable) };
     let mut mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
     let mut falloc = PmmAlloc;
 
@@ -165,8 +217,8 @@ pub fn map_user_4k(virt: u64, phys: u64, writable: bool, executable: bool) {
     unsafe {
         mapper
             .map_to(page, frame, flags, &mut falloc)
-            .expect("vm: map_user_4k")
-            .flush(); // live tables: flush this entry
+            .expect("vm: map_user_4k_in")
+            .ignore(); // target table may not be live; the CR3 load flushes it
     }
 }
 

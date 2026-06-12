@@ -9,11 +9,20 @@
 //! code) — preemption only lands at ring-3 boundaries and `sti; hlt` idle points
 //! — so `CURRENT`/the TCB array are plain globals with no locking (D-T1).
 use core::ptr::{addr_of, addr_of_mut};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch::{
     context_switch, disable_interrupts, enable_interrupts, thread_trampoline, wait_for_interrupt,
 };
 use crate::println;
+
+/// Announce the first real CR3 reload (first user dispatch) as a checkpoint.
+fn announce_first_cr3(proc: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::Relaxed) {
+        println!("[sched] cr3 -> proc {} (first user dispatch)", proc);
+    }
+}
 
 pub const MAX_THREADS: usize = 8;
 const KSTACK_SIZE: usize = 16 * 1024;
@@ -34,17 +43,24 @@ pub enum State {
     Exited,
 }
 
+/// Sentinel for "no owning process" (kernel threads: idle, witness).
+pub const NO_PROC: usize = usize::MAX;
+
 #[derive(Clone, Copy)]
 struct Tcb {
     state: State,
-    ctx_rsp: u64,   // saved stack pointer (the whole context lives on the stack)
+    ctx_rsp: u64,    // saved stack pointer (the whole context lives on the stack)
     kstack_top: u64,
+    proc: usize,     // owning process id, or NO_PROC for kernel threads
+    cr3: u64,        // address-space root to load on switch (0 = keep live CR3)
 }
 
 static mut TCBS: [Tcb; MAX_THREADS] = [Tcb {
     state: State::Free,
     ctx_rsp: 0,
     kstack_top: 0,
+    proc: NO_PROC,
+    cr3: 0,
 }; MAX_THREADS];
 
 static mut CURRENT: usize = IDLE;
@@ -65,10 +81,22 @@ fn ctx_slot(s: usize) -> *mut u64 {
 fn kstack_top(s: usize) -> u64 {
     unsafe { (*addr_of!(TCBS[s])).kstack_top }
 }
+fn cr3_of(s: usize) -> u64 {
+    unsafe { (*addr_of!(TCBS[s])).cr3 }
+}
+fn proc_of(s: usize) -> usize {
+    unsafe { (*addr_of!(TCBS[s])).proc }
+}
 
 /// The currently-running TCB slot.
 pub fn current() -> usize {
     unsafe { *addr_of!(CURRENT) }
+}
+
+/// The process owning the current thread (valid during a syscall — those only
+/// come from user threads).
+pub fn current_proc() -> usize {
+    proc_of(current())
 }
 
 /// Mark the boot thread (slot 0) as the running idle thread.
@@ -96,7 +124,7 @@ fn init_stack(slot: usize, entry: u64, arg1: u64, arg2: u64) -> (u64, u64) {
     (sp, top)
 }
 
-fn spawn(entry: u64, arg1: u64, arg2: u64) -> usize {
+fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64) -> usize {
     for slot in 1..MAX_THREADS {
         if state(slot) == State::Free {
             let (ctx_rsp, kstack_top) = init_stack(slot, entry, arg1, arg2);
@@ -105,6 +133,8 @@ fn spawn(entry: u64, arg1: u64, arg2: u64) -> usize {
                     state: State::Ready,
                     ctx_rsp,
                     kstack_top,
+                    proc,
+                    cr3,
                 };
             }
             return slot;
@@ -113,9 +143,9 @@ fn spawn(entry: u64, arg1: u64, arg2: u64) -> usize {
     panic!("thread: out of TCB slots");
 }
 
-/// Spawn a kernel thread; returns its TCB slot.
+/// Spawn a kernel thread (no owning process; runs under whatever CR3 is live).
 pub fn spawn_kernel(entry: extern "C" fn(u64), arg: u64) -> usize {
-    spawn(entry as *const () as u64, arg, 0)
+    spawn(entry as *const () as u64, arg, 0, NO_PROC, 0)
 }
 
 /// Round-robin scan for the next Ready thread after CURRENT (never returns
@@ -144,6 +174,16 @@ fn switch_to(next: usize) {
     // stack BEFORE the switch — safe because IF=0 throughout the kernel, so
     // nothing can trap from ring 3 between this update and the switch.
     crate::arch::set_kernel_stack(kstack_top(next));
+    // Load the incoming process's address space (skip for kernel threads, cr3=0,
+    // and when unchanged). Safe to reload CR3 here: the executing code, this
+    // kernel stack (in .bss), and the next thread's saved context all live in
+    // the shared kernel upper half present in EVERY PML4 — so nothing the switch
+    // touches becomes unmapped. IF=0 means nothing interrupts mid-switch.
+    let next_cr3 = cr3_of(next);
+    if next_cr3 != 0 && next_cr3 != crate::arch::current_cr3() {
+        announce_first_cr3(proc_of(next));
+        crate::arch::load_cr3(next_cr3);
+    }
     context_switch(ctx_slot(prev), ctx_rsp(next));
 }
 
@@ -158,6 +198,14 @@ pub fn yield_now() {
         }
         None => {}
     }
+}
+
+/// A ring-3 fault: terminate the faulting thread AND its process (close its
+/// handles, mark it Dead), then switch away. Same move as `exit_current`; the
+/// kernel and every other thread continue.
+pub fn kill_current_user() -> ! {
+    crate::proc::kill(current_proc());
+    exit_current();
 }
 
 /// Terminate the current thread and switch away forever.
@@ -216,10 +264,11 @@ extern "C" fn user_thread_entry(entry: u64, user_rsp: u64) {
     crate::arch::enter_user(entry, user_rsp);
 }
 
-/// Spawn the user process P1 as a thread. It enters ring 3 (IF=1) the first time
-/// it is scheduled, and the timer preempts it mid-userspace thereafter.
-pub fn spawn_user(entry: u64, user_rsp: u64) -> usize {
-    spawn(user_thread_entry as *const () as u64, entry, user_rsp)
+/// Spawn a user process's main thread, bound to process `proc` and address space
+/// `cr3`. It enters ring 3 (IF=1) the first time it is scheduled (under its own
+/// CR3) and the timer preempts it mid-userspace thereafter.
+pub fn spawn_user(proc: usize, cr3: u64, entry: u64, user_rsp: u64) -> usize {
+    spawn(user_thread_entry as *const () as u64, entry, user_rsp, proc, cr3)
 }
 
 // --- A witness kernel thread, showing concurrency alongside the user ------

@@ -106,8 +106,18 @@ extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn general_protection_fault(frame: InterruptStackFrame, error_code: u64) {
+    // A fault from ring 3 kills the offending thread/process; the kernel lives on.
+    if frame.code_segment.0 & 3 == 3 {
+        println!(
+            "[trap] #GP user err={:#x} -- killing tcb {} (proc {})",
+            error_code,
+            crate::thread::current(),
+            crate::thread::current_proc()
+        );
+        crate::thread::kill_current_user();
+    }
     panic!(
-        "#GP error_code={:#x} at rip={:#x}\n{:#?}",
+        "#GP (kernel) error_code={:#x} at rip={:#x}\n{:#?}",
         error_code,
         frame.instruction_pointer.as_u64(),
         frame
@@ -116,8 +126,19 @@ extern "x86-interrupt" fn general_protection_fault(frame: InterruptStackFrame, e
 
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
     let cr2 = x86_64::registers::control::Cr2::read();
+    // A user-mode page fault kills the offending thread/process, not the machine.
+    if error_code.contains(PageFaultErrorCode::USER_MODE) {
+        println!(
+            "[trap] #PF user cr2={:?} err={:?} -- killing tcb {} (proc {})",
+            cr2,
+            error_code,
+            crate::thread::current(),
+            crate::thread::current_proc()
+        );
+        crate::thread::kill_current_user();
+    }
     panic!(
-        "#PF accessing {:?}, error={:?}, at rip={:#x}\n{:#?}",
+        "#PF (kernel) accessing {:?}, error={:?}, at rip={:#x}\n{:#?}",
         cr2,
         error_code,
         frame.instruction_pointer.as_u64(),

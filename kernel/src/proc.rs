@@ -1,8 +1,8 @@
-//! Process construction.
+//! Processes — an address space (PML4) + a flat capability handle table.
 //!
-//! v0 hand-builds the single user process P1 from the Limine module — there is
-//! no spawn syscall (ABI §4.2). This phase loads the image and stack and returns
-//! the entry point; the capability/handle table arrives in Phase 7.
+//! v1 arc 2: a fixed pool of processes (no heap, law L6). Each process owns its
+//! own PML4 (per-process isolation, CR3 switched by the scheduler). The "current
+//! process" is resolved from the current thread (`thread::current_proc`).
 use oxbow_abi::{
     Handle, SysError, BOOT_CONSOLE, BOOT_EP, HANDLE_TABLE_SIZE, R_ATTENUATE, R_SEND, R_WRITE,
 };
@@ -16,18 +16,31 @@ use crate::println;
 
 const FRAME: u64 = pmm::FRAME_SIZE;
 
-/// The single v0 process and its flat handle table (ABI §3). One process, one
-/// thread, no scheduler — so a plain global behind a spinlock is enough.
+/// Maximum concurrent processes (static pool).
+pub const MAX_PROCS: usize = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PState {
+    Free,
+    Alive,
+    Dead,
+}
+
+/// A process: its address space root and its capability handle table (ABI §3).
+#[derive(Clone, Copy)]
 pub struct Process {
+    pub state: PState,
+    pub pml4_phys: u64,
     handles: [Option<HandleEntry>; HANDLE_TABLE_SIZE],
 }
 
-/// The (only) process in v0. Populated at boot by [`load`].
-pub static PROCESS: Mutex<Process> = Mutex::new(Process::new());
+static PROCESSES: Mutex<[Process; MAX_PROCS]> = Mutex::new([Process::new(); MAX_PROCS]);
 
 impl Process {
     pub const fn new() -> Self {
         Process {
+            state: PState::Free,
+            pml4_phys: 0,
             handles: [None; HANDLE_TABLE_SIZE],
         }
     }
@@ -47,7 +60,7 @@ impl Process {
     }
 
     /// Look up a handle, enforcing the expected object type and rights (law L2).
-    /// Order matters and matches the ABI: handle → type → rights.
+    /// Order matches the ABI: handle → type → rights.
     pub fn lookup(&self, h: Handle, ty: ObjType, rights: u32) -> Result<HandleEntry, SysError> {
         let entry = self.get(h)?;
         if entry.obj.ty() != ty {
@@ -70,7 +83,7 @@ impl Process {
         Err(SysError::NoSlots)
     }
 
-    /// Free a handle slot. Object teardown/refcounting lands in Phase 8.
+    /// Free a handle slot.
     pub fn close(&mut self, h: Handle) -> Result<(), SysError> {
         let idx = h as usize;
         if idx == 0 || idx >= HANDLE_TABLE_SIZE || self.handles[idx].is_none() {
@@ -80,10 +93,30 @@ impl Process {
         Ok(())
     }
 
-    /// Close every handle (on `sys_exit`).
+    /// Close every handle.
     pub fn close_all(&mut self) {
         self.handles = [None; HANDLE_TABLE_SIZE];
     }
+}
+
+/// Run `f` with the calling thread's process. The lock is statement-scoped and
+/// never held across a context switch or an IPC side effect (the v0 lock rule).
+pub fn with_current<R>(f: impl FnOnce(&Process) -> R) -> R {
+    let id = crate::thread::current_proc();
+    let procs = PROCESSES.lock();
+    f(&procs[id])
+}
+pub fn with_current_mut<R>(f: impl FnOnce(&mut Process) -> R) -> R {
+    let id = crate::thread::current_proc();
+    let mut procs = PROCESSES.lock();
+    f(&mut procs[id])
+}
+
+/// Mark a process dead and drop its handles (on a ring-3 fault or `sys_exit`).
+pub fn kill(id: usize) {
+    let mut procs = PROCESSES.lock();
+    procs[id].close_all();
+    procs[id].state = PState::Dead;
 }
 
 /// Top of the user stack (exclusive). Canonical lower-half.
@@ -94,16 +127,15 @@ const USER_STACK_PAGES: u64 = 16;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 
-/// Build P1 from a validated ELF image: map each PT_LOAD W^X-clean (U=1) and a
-/// 64 KiB stack with an unmapped guard page below it. Returns `(entry, rsp)`.
-pub fn load(img: &Image) -> (u64, u64) {
+/// Map an ELF image's PT_LOAD segments (W^X-clean, U=1) and a guarded 64 KiB
+/// stack into the given address space. Returns `(entry, user_rsp)`.
+fn load_into(img: &Image, pml4_phys: u64) -> (u64, u64) {
     let bytes = img.bytes();
     let mut segments = 0u32;
 
     for ph in img.loads() {
         let writable = ph.p_flags & PF_W != 0;
         let executable = ph.p_flags & PF_X != 0;
-        // Enforce W^X at load time (law L4); the mapper asserts again per page.
         assert!(!(writable && executable), "elf: W|X segment rejected (law L4)");
         println!(
             "[elf]   load {:#x} {} filesz={} memsz={}",
@@ -120,11 +152,7 @@ pub fn load(img: &Image) -> (u64, u64) {
 
         let mut page = v_start & !(FRAME - 1);
         while page < v_end_aligned {
-            // Fresh zeroed frame (so the bss tail of the segment is already 0).
             let frame = pmm::alloc_frame().expect("elf: out of frames");
-
-            // Copy the file-backed bytes overlapping this page (if any) through
-            // the HHDM RW alias — the user mapping below is RX/R, never W+X.
             let copy_start = core::cmp::max(page, v_start);
             let copy_end = core::cmp::min(page + FRAME, file_end);
             if copy_end > copy_start {
@@ -140,25 +168,47 @@ pub fn load(img: &Image) -> (u64, u64) {
                     );
                 }
             }
-
-            mm::vm::map_user_4k(page, frame, writable, executable);
+            mm::vm::map_user_4k_in(pml4_phys, page, frame, writable, executable);
             page += FRAME;
         }
         segments += 1;
     }
 
-    // Stack: 64 KiB RW+NX, with the page below left unmapped as a guard.
     let stack_base = USER_STACK_TOP - USER_STACK_PAGES * FRAME;
     for i in 0..USER_STACK_PAGES {
         let frame = pmm::alloc_frame().expect("elf: out of stack frames");
-        mm::vm::map_user_4k(stack_base + i * FRAME, frame, true, false);
+        mm::vm::map_user_4k_in(pml4_phys, stack_base + i * FRAME, frame, true, false);
     }
 
-    // Grant P1 its boot capabilities — the ONLY handles it is born holding (no
-    // ambient authority, laws L1/L3). EP0 with send (not recv — the kernel keeps
-    // the receive side) and not grant; Console with write. Both attenuable.
+    println!(
+        "[elf] {} segment(s), stack {} KiB @ {:#x} (guard below)",
+        segments,
+        USER_STACK_PAGES * FRAME / 1024,
+        stack_base
+    );
+    (img.entry, USER_STACK_TOP)
+}
+
+/// Create a process: claim a pool slot, map the image into `pml4_phys`, grant
+/// the boot capabilities, and return `(proc id, entry, user_rsp)`.
+pub fn create(img: &Image, pml4_phys: u64, name: &str) -> (usize, u64, u64) {
+    let id = {
+        let mut procs = PROCESSES.lock();
+        let id = (0..MAX_PROCS)
+            .find(|&i| procs[i].state == PState::Free)
+            .expect("proc: out of process slots");
+        procs[id].state = PState::Alive;
+        procs[id].pml4_phys = pml4_phys;
+        id
+    };
+
+    let (entry, user_rsp) = load_into(img, pml4_phys);
+
+    // Grant the ONLY handles the process is born holding (laws L1/L3): EP0 with
+    // send (the kernel keeps the receive side), Console with write.
     {
-        let mut p = PROCESS.lock();
+        let mut procs = PROCESSES.lock();
+        let p = &mut procs[id];
         p.install(
             BOOT_EP,
             HandleEntry {
@@ -175,16 +225,6 @@ pub fn load(img: &Image) -> (u64, u64) {
         );
     }
 
-    println!(
-        "[proc] P1: {} segment(s), stack {} KiB @ {:#x} (guard below)",
-        segments,
-        USER_STACK_PAGES * FRAME / 1024,
-        stack_base
-    );
-    println!(
-        "[cap] P1 slot {}=Endpoint0(send|attenuate) slot {}=Console(write|attenuate)",
-        BOOT_EP, BOOT_CONSOLE
-    );
-
-    (img.entry, USER_STACK_TOP)
+    println!("[proc] {} = proc {} (as pml4={:#x})", name, id, pml4_phys);
+    (id, entry, user_rsp)
 }

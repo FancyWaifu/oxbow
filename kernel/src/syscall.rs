@@ -12,8 +12,7 @@ use oxbow_abi::{
 };
 
 use crate::object::{HandleEntry, ObjType, ObjectRef};
-use crate::proc::PROCESS;
-use crate::{arch, ipc, println, usermem};
+use crate::{arch, ipc, println, proc, usermem};
 
 /// Max bytes per `sys_console_write` (ABI §4.3).
 const CONSOLE_MAX: u64 = 1024;
@@ -71,9 +70,9 @@ pub extern "C" fn syscall_dispatch(
         SYS_REPLY => sys_reply(a1),
         SYS_CONSOLE_WRITE => sys_console_write(a1, a2, a3),
         SYS_ATTENUATE => sys_attenuate(a1, a2),
-        SYS_CLOSE => SyscallRet::from_result(PROCESS.lock().close(a1 as Handle)),
+        SYS_CLOSE => SyscallRet::from_result(proc::with_current_mut(|p| p.close(a1 as Handle))),
         SYS_EXIT => {
-            PROCESS.lock().close_all(); // lock dropped before we switch away
+            proc::kill(crate::thread::current_proc()); // close handles, mark Dead
             println!("[proc] server exited ({})", a1);
             crate::thread::exit_current(); // kill this thread; the machine lives on
         }
@@ -86,8 +85,8 @@ pub extern "C" fn syscall_dispatch(
 /// transferred handle, §3.4) — ALL before any side effect.
 fn sys_ipc(ep: u64, msg_ptr: u64, is_call: bool) -> SyscallRet {
     SyscallRet::from_result((|| -> SysResult {
-        // 1. Capability check (statement-temporary PROCESS lock, then dropped).
-        let entry = PROCESS.lock().lookup(ep as Handle, ObjType::Endpoint, R_SEND)?;
+        // 1. Capability check (statement-temporary process lock, then dropped).
+        let entry = proc::with_current(|p| p.lookup(ep as Handle, ObjType::Endpoint, R_SEND))?;
         let ObjectRef::Endpoint(idx) = entry.obj else {
             return Err(SysError::BadType);
         };
@@ -107,13 +106,15 @@ fn sys_ipc(ep: u64, msg_ptr: u64, is_call: bool) -> SyscallRet {
         //    transferred handles are accepted-and-discarded; receiver-side slot
         //    allocation lands with user receivers in v1.)
         if msg.handle_count > 0 {
-            let p = PROCESS.lock();
-            for &h in &msg.handles[..msg.handle_count as usize] {
-                if p.get(h)?.rights & R_GRANT == 0 {
-                    return Err(SysError::Rights);
+            proc::with_current(|p| -> SysResult {
+                for &h in &msg.handles[..msg.handle_count as usize] {
+                    if p.get(h)?.rights & R_GRANT == 0 {
+                        return Err(SysError::Rights);
+                    }
                 }
-            }
-        } // PROCESS dropped before delivery — never held with ENDPOINTS
+                Ok(())
+            })?;
+        } // process lock dropped before delivery — never held with ENDPOINTS
 
         if is_call {
             ipc::do_call(idx, &msg, msg_ptr)
@@ -128,9 +129,7 @@ fn sys_ipc(ep: u64, msg_ptr: u64, is_call: bool) -> SyscallRet {
 /// E_RIGHTS. The post-lookup arm is unreachable in v0 (user receive is v1).
 fn sys_recv(ep: u64) -> SyscallRet {
     SyscallRet::from_result((|| -> SysResult {
-        PROCESS
-            .lock()
-            .lookup(ep as Handle, ObjType::Endpoint, R_RECV)?;
+        proc::with_current(|p| p.lookup(ep as Handle, ObjType::Endpoint, R_RECV))?;
         Err(SysError::Nosys)
     })())
 }
@@ -139,9 +138,7 @@ fn sys_recv(ep: u64) -> SyscallRet {
 /// valid Reply handle can't exist. Lookup fails first; the arm is unreachable.
 fn sys_reply(reply: u64) -> SyscallRet {
     SyscallRet::from_result((|| -> SysResult {
-        PROCESS
-            .lock()
-            .lookup(reply as Handle, ObjType::Reply, 0)?;
+        proc::with_current(|p| p.lookup(reply as Handle, ObjType::Reply, 0))?;
         Err(SysError::Nosys)
     })())
 }
@@ -149,10 +146,8 @@ fn sys_reply(reply: u64) -> SyscallRet {
 /// `sys_console_write(con, buf, len)` — write user bytes through a Console cap.
 fn sys_console_write(con: u64, buf: u64, len: u64) -> SyscallRet {
     let result = (|| -> SysResult {
-        // Capability check (drop the lock before the side effect).
-        PROCESS
-            .lock()
-            .lookup(con as Handle, ObjType::Console, R_WRITE)?;
+        // Capability check (lock dropped before the side effect).
+        proc::with_current(|p| p.lookup(con as Handle, ObjType::Console, R_WRITE))?;
         if len > CONSOLE_MAX {
             return Err(SysError::Msg);
         }
@@ -167,28 +162,28 @@ fn sys_console_write(con: u64, buf: u64, len: u64) -> SyscallRet {
 /// `sys_attenuate(src, new_rights)` — derive a strictly-weaker handle (law L5).
 fn sys_attenuate(src: u64, new_rights: u64) -> SyscallRet {
     let new_rights = new_rights as u32;
-    let mut proc = PROCESS.lock();
-
-    let entry = match proc.get(src as Handle) {
-        Ok(e) => e,
-        Err(e) => return SyscallRet::err(e),
-    };
-    // Reply objects are not attenuable (ABI §2.2).
-    if entry.obj.ty() == ObjType::Reply {
-        return SyscallRet::err(SysError::BadType);
-    }
-    if entry.rights & R_ATTENUATE == 0 {
-        return SyscallRet::err(SysError::Rights);
-    }
-    // New rights must be a subset of the source's (no amplification).
-    if new_rights & entry.rights != new_rights {
-        return SyscallRet::err(SysError::Rights);
-    }
-    match proc.alloc_slot(HandleEntry {
-        obj: entry.obj,
-        rights: new_rights,
-    }) {
-        Ok(h) => SyscallRet::ok_handle(h),
-        Err(e) => SyscallRet::err(e),
-    }
+    proc::with_current_mut(|p| {
+        let entry = match p.get(src as Handle) {
+            Ok(e) => e,
+            Err(e) => return SyscallRet::err(e),
+        };
+        // Reply objects are not attenuable (ABI §2.2).
+        if entry.obj.ty() == ObjType::Reply {
+            return SyscallRet::err(SysError::BadType);
+        }
+        if entry.rights & R_ATTENUATE == 0 {
+            return SyscallRet::err(SysError::Rights);
+        }
+        // New rights must be a subset of the source's (no amplification).
+        if new_rights & entry.rights != new_rights {
+            return SyscallRet::err(SysError::Rights);
+        }
+        match p.alloc_slot(HandleEntry {
+            obj: entry.obj,
+            rights: new_rights,
+        }) {
+            Ok(h) => SyscallRet::ok_handle(h),
+            Err(e) => SyscallRet::err(e),
+        }
+    })
 }

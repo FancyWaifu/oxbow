@@ -40,17 +40,25 @@ syscall → module plumbing → ELF loader → capabilities → IPC → hardenin
 the remapped 8259 PIC) drives a round-robin scheduler over a fixed pool of
 kernel threads. The kernel is non-preemptible (IF=0 in all kernel code);
 preemption lands only in ring 3 (IF=1) and at idle `sti; hlt` points. The user
-process P1 runs as a schedulable thread — preempted mid-userspace and running
-concurrently with kernel threads — and `sys_exit` kills the thread, not the
-machine (the idle thread survives). Single address space still (per-process CR3
-is a later arc). `just run` shows `PONG` plus the preemption trace.
+process runs as a schedulable thread — preempted mid-userspace, concurrent with
+kernel threads — and `sys_exit` kills the thread, not the machine.
+
+**v1 arc 2 — per-process address spaces + isolation: complete.** Each process
+gets its own PML4 (sharing the kernel upper half), and the scheduler reloads CR3
+when dispatching a thread in a different address space. Two user processes
+(`pong`, `beta`), both linked at `0x200000`, run concurrently in *separate*
+address spaces — same vaddr, different memory. A ring-3 fault kills the
+offending thread and its process while everything else continues (`just
+run-faulttest`); `just run-isolation` shows two processes reading different bytes
+at the same address and a hostile one dying alone. User-to-user IPC is still the
+kernel echo (arc 3).
 
 ### Next (v1, later arcs)
 
-Per-process address spaces (CR3 switching) + a second user process, user-driven
-memory (untyped/retype, `sys_map`), user-mode IPC receivers with pooled Reply
-objects + blocking, IRQ capabilities for real drivers, and the `aarch64` port
-(the `arch/` wall is already in place for it).
+Blocking user-to-user IPC (real `sys_recv`/`sys_reply`, pooled Reply objects,
+rendezvous + handle transfer — the kernel echo retired); user-driven memory
+(untyped/retype, `sys_map`); IRQ capabilities for real drivers; and the
+`aarch64` port (the `arch/` wall is already in place for it).
 
 ## Building & running
 

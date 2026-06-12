@@ -1,0 +1,19 @@
+[package]
+name = "beta"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "beta"
+path = "src/main.rs"
+
+[features]
+# Probe an unmapped address to prove cross-process isolation (Phase 6).
+isolation = []
+
+[dependencies]
+oxbow-rt = { path = "../../rt" }
+oxbow-abi = { path = "../../abi" }
