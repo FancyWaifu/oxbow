@@ -221,3 +221,48 @@ This trace is normative. v0 is **done** when this exact sequence works under QEM
 - **IRQ capabilities and device drivers** beyond the kernel-owned serial Console object.
 - **Multicore** (kernel is single-core, synchronous, coarse-locked).
 - **A POSIX shim / filesystem / naming server** — there is no name anywhere in this ABI, by law L3.
+
+---
+
+## 9. ABI additions — user-driven memory (v1 arc)
+
+Appended, not a rewrite of v0. `ABI_VERSION` stays 0 (additions are append-only;
+nothing in §1–8 changes). Syscall numbers 8–10, reserved by §4.2, are now assigned.
+This partially discharges §8's "real memory accountability" bullet: the kernel no
+longer allocates user frames from static pools — every frame is debited against a
+**Memory** capability the caller holds (law L6 is now literally enforced).
+
+### 9.1 New objects
+- **Memory** — a byte *budget* (the degenerate seL4 "untyped"). Authorizes
+  allocation; `sys_map`/`sys_frame_alloc` debit it; exhaustion → `E_NOMEM`.
+  Rights: `R_MAP`, `R_GRANT`, `R_ATTENUATE`. A process is born holding one at
+  `BOOT_MEM = 3` (256 KiB).
+- **Frame** — one physical frame, nameable and mappable. Because handles transfer
+  over IPC, a Frame can be *shared* between address spaces. Rights: `R_MAP` (may
+  map), `R_WRITE` (may map *writable* — object-specific reuse of bit 16),
+  `R_GRANT`, `R_ATTENUATE`. Attenuating away `R_WRITE` yields a read-only share.
+
+`R_MAP = 1 << 17`. Mapping protection (per call, NOT rights): `PROT_READ = 1`,
+`PROT_WRITE = 2` (implies read). **No exec** — W^X (L4) forbids writable+exec and
+there is no `mprotect`, so an anonymous executable page would be useless.
+
+### 9.2 Syscalls
+- **8 `sys_map(mem, vaddr, len, prot)` → `SysResult`** — map `len/4096` anonymous,
+  zeroed pages at `vaddr` in the caller's own address space, debiting `mem`
+  (intermediate page tables are charged too). All validation precedes any side
+  effect; the map cannot partially fail. Errors: `E_BAD_HANDLE/E_BAD_TYPE`,
+  `E_RIGHTS` (no `R_MAP`), `E_MSG` (mis-aligned/zero len/bad prot), `E_NOMEM`
+  (budget), `E_FAULT` (range wraps, leaves the lower half, or overlaps any present
+  mapping).
+- **9 `sys_frame_alloc(mem)` → `SysResult<Handle>`** — debit one frame from `mem`,
+  mint a Frame, return its handle (`R_MAP|R_WRITE|R_GRANT|R_ATTENUATE`).
+- **10 `sys_frame_map(frame, vaddr, prot)` → `SysResult`** — map that specific
+  Frame in the caller's AS. `PROT_WRITE` requires `R_WRITE` on the *handle*
+  (`E_RIGHTS` otherwise) — the read-only-share enforcement point.
+
+### 9.3 Still deferred to a later "untyped/retype" arc
+`sys_retype` (minting kernel objects from a Memory cap — kernel pools stay
+static); ranged untypeds + a derivation tree + revocation; `sys_unmap`/`free` +
+a free-capable PMM (this arc is map-only — growth is bounded by the budget); a
+`VSpace` object (`sys_map` implicitly targets the caller's own AS); per-call
+charging of `sys_frame_map`'s intermediate tables.

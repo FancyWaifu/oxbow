@@ -4,7 +4,8 @@
 //! own PML4 (per-process isolation, CR3 switched by the scheduler). The "current
 //! process" is resolved from the current thread (`thread::current_proc`).
 use oxbow_abi::{
-    Handle, SysError, BOOT_CONSOLE, BOOT_EP, HANDLE_TABLE_SIZE, R_ATTENUATE, R_GRANT, R_WRITE,
+    Handle, SysError, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, HANDLE_TABLE_SIZE, R_ATTENUATE, R_GRANT,
+    R_MAP, R_WRITE,
 };
 use spin::Mutex;
 
@@ -242,6 +243,19 @@ pub fn create(img: &Image, pml4_phys: u64, name: &str, ep0_rights: u32) -> (usiz
                 // R_GRANT so a process can attenuate + hand its console to a peer.
                 rights: R_WRITE | R_ATTENUATE | R_GRANT,
             },
+        );
+        // A birth Memory budget — the only authority to allocate (law L6).
+        let mem_idx = mm::mem::grant(mm::mem::BOOT_BUDGET);
+        p.install(
+            BOOT_MEM,
+            HandleEntry {
+                obj: ObjectRef::Memory(mem_idx),
+                rights: R_MAP | R_GRANT | R_ATTENUATE,
+            },
+        );
+        println!(
+            "[mem] proc {} granted Memory#{} = {} B (slot {})",
+            id, mem_idx, mm::mem::BOOT_BUDGET, BOOT_MEM
         );
     }
 

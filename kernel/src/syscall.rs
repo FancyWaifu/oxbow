@@ -6,13 +6,18 @@
 //! IPC syscalls (send/recv/call/reply) arrive in Phase 8.
 use core::mem::size_of;
 use oxbow_abi::{
-    Handle, MsgBuf, SysError, SysResult, HANDLE_NULL, MSG_DATA_WORDS, MSG_HANDLES, R_ATTENUATE,
-    R_GRANT, R_RECV, R_SEND, R_WRITE, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE,
-    SYS_EXIT, SYS_RECV, SYS_REPLY, SYS_SEND,
+    Handle, MsgBuf, SysError, SysResult, HANDLE_NULL, MSG_DATA_WORDS, MSG_HANDLES, PROT_READ,
+    PROT_WRITE, R_ATTENUATE, R_GRANT, R_MAP, R_RECV, R_SEND, R_WRITE, SYS_ATTENUATE, SYS_CALL,
+    SYS_CLOSE, SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_MAP, SYS_RECV,
+    SYS_REPLY, SYS_SEND,
 };
 
+use crate::mm;
 use crate::object::{HandleEntry, ObjType, ObjectRef};
 use crate::{arch, ipc, println, proc, usermem};
+
+/// One past the canonical lower half (the user range).
+const LOWER_HALF_END: u64 = 0x0000_8000_0000_0000;
 
 /// Max bytes per `sys_console_write` (ABI §4.3).
 const CONSOLE_MAX: u64 = 1024;
@@ -58,7 +63,7 @@ pub extern "C" fn syscall_dispatch(
     a1: u64,
     a2: u64,
     a3: u64,
-    _a4: u64,
+    a4: u64,
     _a5: u64,
     _a6: u64,
     nr: u64,
@@ -68,6 +73,9 @@ pub extern "C" fn syscall_dispatch(
         SYS_RECV => sys_recv(a1, a2),
         SYS_CALL => sys_ipc(a1, a2, true),
         SYS_REPLY => sys_reply(a1, a2),
+        SYS_MAP => sys_map(a1, a2, a3, a4),
+        SYS_FRAME_ALLOC => sys_frame_alloc(a1),
+        SYS_FRAME_MAP => sys_frame_map(a1, a2, a3),
         SYS_CONSOLE_WRITE => sys_console_write(a1, a2, a3),
         SYS_ATTENUATE => sys_attenuate(a1, a2),
         SYS_CLOSE => SyscallRet::from_result(proc::with_current_mut(|p| p.close(a1 as Handle))),
@@ -121,6 +129,116 @@ fn sys_ipc(ep: u64, msg_ptr: u64, is_call: bool) -> SyscallRet {
         }
         Err(e) => SyscallRet::err(e),
     }
+}
+
+/// `sys_map(mem, vaddr, len, prot)` — map anonymous zeroed pages into the
+/// caller's own address space, debiting the Memory budget `mem` (law L6). All
+/// validation precedes any side effect; the map cannot partially fail.
+fn sys_map(mem: u64, vaddr: u64, len: u64, prot: u64) -> SyscallRet {
+    SyscallRet::from_result((|| -> SysResult {
+        // 1. Capability: a Memory handle with R_MAP.
+        let entry = proc::with_current(|p| p.lookup(mem as Handle, ObjType::Memory, R_MAP))?;
+        let ObjectRef::Memory(midx) = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        // 2. Shape: 4 KiB-aligned vaddr+len, nonzero, valid prot (read implied).
+        if vaddr & 0xfff != 0 || len == 0 || len & 0xfff != 0 {
+            return Err(SysError::Msg);
+        }
+        if prot & !(PROT_READ | PROT_WRITE) != 0 || prot & PROT_READ == 0 {
+            return Err(SysError::Msg);
+        }
+        let pages = len / 4096;
+        // 3. Early budget bound (also caps the probe's work — DoS guard).
+        if pages.saturating_mul(4096) > mm::mem::remaining(midx) {
+            return Err(SysError::NoMem);
+        }
+        // 4. Range must be lower-half and not wrap.
+        let end = vaddr.checked_add(len).ok_or(SysError::Fault)?;
+        if end > LOWER_HALF_END {
+            return Err(SysError::Fault);
+        }
+        // 5. Probe: overlap → E_FAULT; also the exact missing-table count.
+        let pml4 = mm::vm::current_pml4();
+        let missing = mm::vm::probe_user_range(pml4, vaddr, pages).map_err(|_| SysError::Fault)?;
+        // 6. Charge pages + intermediate tables, up front, atomically.
+        let cost = (pages + missing) * 4096;
+        if !mm::mem::debit(midx, cost) {
+            return Err(SysError::NoMem);
+        }
+        // 7. Map (infallible now: budget reserved, no page present, single CPU).
+        let writable = prot & PROT_WRITE != 0;
+        for p in 0..pages {
+            let frame = mm::pmm::alloc_frame().expect("sys_map: PMM exhausted under budget");
+            mm::vm::map_user_4k_live(pml4, vaddr + p * 4096, frame, writable);
+        }
+        println!(
+            "[mem] proc {} map {} pages (+{} pt) @ {:#x} -> {} KiB left",
+            crate::thread::current_proc(),
+            pages,
+            missing,
+            vaddr,
+            mm::mem::remaining(midx) / 1024
+        );
+        Ok(())
+    })())
+}
+
+/// `sys_frame_alloc(mem)` — debit one frame from `mem` and mint a Frame object
+/// (a nameable, mappable, shareable physical frame), returned as a handle.
+fn sys_frame_alloc(mem: u64) -> SyscallRet {
+    let result = (|| -> SysResult<Handle> {
+        let entry = proc::with_current(|p| p.lookup(mem as Handle, ObjType::Memory, R_MAP))?;
+        let ObjectRef::Memory(midx) = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        if !mm::mem::debit(midx, 4096) {
+            return Err(SysError::NoMem);
+        }
+        let phys = mm::pmm::alloc_frame().ok_or(SysError::NoMem)?;
+        let fidx = mm::mem::frame_record(phys).ok_or(SysError::NoMem)?;
+        proc::with_current_mut(|p| {
+            p.alloc_slot(HandleEntry {
+                obj: ObjectRef::Frame(fidx),
+                rights: R_MAP | R_WRITE | R_GRANT | R_ATTENUATE,
+            })
+        })
+    })();
+    match result {
+        Ok(h) => SyscallRet::ok_handle(h),
+        Err(e) => SyscallRet::err(e),
+    }
+}
+
+/// `sys_frame_map(frame, vaddr, prot)` — map a specific Frame into the caller's
+/// AS. PROT_WRITE requires R_WRITE on the HANDLE (not the object) — so an
+/// attenuated read-only handle yields read-only shared memory (the §3.4 payoff).
+fn sys_frame_map(frame: u64, vaddr: u64, prot: u64) -> SyscallRet {
+    SyscallRet::from_result((|| -> SysResult {
+        let entry = proc::with_current(|p| p.lookup(frame as Handle, ObjType::Frame, R_MAP))?;
+        let ObjectRef::Frame(fidx) = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        if vaddr & 0xfff != 0 {
+            return Err(SysError::Msg);
+        }
+        if prot & !(PROT_READ | PROT_WRITE) != 0 || prot & PROT_READ == 0 {
+            return Err(SysError::Msg);
+        }
+        let writable = prot & PROT_WRITE != 0;
+        if writable && entry.rights & R_WRITE == 0 {
+            return Err(SysError::Rights); // read-only handle can't map writable
+        }
+        if vaddr >= LOWER_HALF_END {
+            return Err(SysError::Fault);
+        }
+        let pml4 = mm::vm::current_pml4();
+        mm::vm::probe_user_range(pml4, vaddr, 1).map_err(|_| SysError::Fault)?;
+        // Map the SAME physical frame (intermediate tables uncharged in v1).
+        let phys = mm::mem::frame_phys(fidx);
+        mm::vm::map_user_4k_live(pml4, vaddr, phys, writable);
+        Ok(())
+    })())
 }
 
 /// Receive on an endpoint we hold with R_RECV. Blocks until a sender arrives;

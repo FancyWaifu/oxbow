@@ -3,6 +3,7 @@
 //! v0 keeps this deliberately small (ABI law L6, v0 simplification): a bump
 //! frame allocator over the largest usable region, and the HHDM offset that
 //! lets the kernel reach any physical frame at `HHDM_OFFSET + phys`.
+pub mod mem;
 pub mod pmm;
 pub mod vm;
 

@@ -61,11 +61,23 @@ Capabilities transfer across the rendezvous (`pong` grants an attenuated console
 to `beta`, which writes through it). Both arrival orderings, `E_GONE`, and the
 selftest 7/7 all verified.
 
-### Next (v1, later arcs)
+**v1 arc 4 — user-driven memory: complete.** Each process is born holding a
+`Memory` capability — a byte budget (a degenerate seL4 "untyped"). `sys_map`
+takes that handle and debits it to map anonymous pages into the caller's own
+address space, charging intermediate page-tables too; exhaustion is `E_NOMEM`.
+**Law L6 is now literally enforced** — the kernel never allocates a user frame
+without an authorizing capability, and a process can only consume what it was
+granted. `Frame` objects name a physical frame; because handles transfer over
+IPC, a frame can be **shared zero-copy** between two isolated address spaces,
+with read-only sharing falling out of capability attenuation (a writable map
+through a read-only handle is `E_RIGHTS`). See `docs/abi-v0.md` §9.
 
-User-driven memory (untyped/retype, `sys_map`); IRQ capabilities for real
-drivers; a multi-receiver endpoint + endpoint destroy; and the `aarch64` port
-(the `arch/` wall is already in place for it).
+### Next (later arcs)
+
+User-mode IRQ capabilities + drivers (a timer, then a keyboard → the first
+interactivity); userspace process spawning; a filesystem; untyped/retype +
+`sys_unmap` + a free-capable allocator; a multi-receiver endpoint; SMP; and the
+`aarch64` port (the `arch/` wall is already in place for it).
 
 ## Building & running
 

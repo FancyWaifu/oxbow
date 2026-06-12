@@ -12,7 +12,8 @@ pub use oxbow_abi as abi;
 
 use oxbow_abi::{
     Handle, MsgBuf, SysError, SysResult, BOOT_CONSOLE, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE,
-    SYS_CONSOLE_WRITE, SYS_EXIT, SYS_RECV, SYS_REPLY, SYS_SEND,
+    SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_MAP, SYS_RECV, SYS_REPLY,
+    SYS_SEND,
 };
 
 // --- The server provides this; _start calls it ---------------------------
@@ -88,6 +89,22 @@ unsafe fn syscall3(nr: u64, a1: u64, a2: u64, a3: u64) -> (u64, u64) {
     (rax, rdx)
 }
 
+#[inline]
+unsafe fn syscall4(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> (u64, u64) {
+    let (rax, rdx);
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") nr => rax,
+        in("rdi") a1,
+        in("rsi") a2,
+        inlateout("rdx") a3 => rdx,
+        in("r10") a4, // 4th arg per the kernel's SysV-with-r10 convention
+        lateout("rcx") _,
+        lateout("r11") _,
+    );
+    (rax, rdx)
+}
+
 // --- Typed ABI ------------------------------------------------------------
 
 pub fn sys_send(ep: Handle, msg: *const MsgBuf) -> SysResult {
@@ -129,6 +146,21 @@ pub fn sys_console_write(con: Handle, buf: *const u8, len: usize) -> SysResult {
 /// invoke arbitrary/unknown syscall numbers. Normal code uses the typed wrappers.
 pub fn sys_raw(nr: u64, a1: u64, a2: u64, a3: u64) -> (u64, u64) {
     unsafe { syscall3(nr, a1, a2, a3) }
+}
+
+pub fn sys_map(mem: Handle, vaddr: u64, len: u64, prot: u64) -> SysResult {
+    let (rax, _) = unsafe { syscall4(SYS_MAP, mem as u64, vaddr, len, prot) };
+    SysError::from_raw(rax)
+}
+
+pub fn sys_frame_alloc(mem: Handle) -> SysResult<Handle> {
+    let (rax, rdx) = unsafe { syscall1(SYS_FRAME_ALLOC, mem as u64) };
+    SysError::from_raw(rax).map(|_| rdx as Handle)
+}
+
+pub fn sys_frame_map(frame: Handle, vaddr: u64, prot: u64) -> SysResult {
+    let (rax, _) = unsafe { syscall3(SYS_FRAME_MAP, frame as u64, vaddr, prot) };
+    SysError::from_raw(rax)
 }
 
 pub fn sys_exit(code: u64) -> ! {

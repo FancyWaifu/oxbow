@@ -9,15 +9,19 @@ pub enum ObjType {
     Endpoint,
     Reply,
     Console,
+    Memory,
+    Frame,
 }
 
-/// What a handle points at: an endpoint pool index, a Reply pool index, or the
+/// What a handle points at: a pool index for Endpoint/Reply/Memory/Frame, or the
 /// singleton console.
 #[derive(Clone, Copy)]
 pub enum ObjectRef {
     Endpoint(u8),
     Reply(u8),
     Console,
+    Memory(u8),
+    Frame(u8),
 }
 
 impl ObjectRef {
@@ -26,6 +30,8 @@ impl ObjectRef {
             ObjectRef::Endpoint(_) => ObjType::Endpoint,
             ObjectRef::Reply(_) => ObjType::Reply,
             ObjectRef::Console => ObjType::Console,
+            ObjectRef::Memory(_) => ObjType::Memory,
+            ObjectRef::Frame(_) => ObjType::Frame,
         }
     }
 }

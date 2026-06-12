@@ -37,7 +37,16 @@ pub const R_GRANT: u32 = 1 << 2;
 /// Handle may be the source of `sys_attenuate`.
 pub const R_ATTENUATE: u32 = 1 << 3;
 /// Console-specific: may write bytes to the console.
+/// Frame-specific (reused bit): the frame may be mapped WRITABLE.
 pub const R_WRITE: u32 = 1 << 16;
+/// Memory: may debit (sys_map / sys_frame_alloc). Frame: may be mapped.
+pub const R_MAP: u32 = 1 << 17;
+
+// Mapping protection flags for sys_map / sys_frame_map (NOT rights; per call).
+// Exec is intentionally absent — W^X forbids writable+executable, and there is
+// no mprotect yet, so an executable anonymous page would be useless.
+pub const PROT_READ: u64 = 1;
+pub const PROT_WRITE: u64 = 2; // implies read
 
 // ---------------------------------------------------------------------------
 // Syscall numbers (§4.3) — passed in rax
@@ -51,6 +60,11 @@ pub const SYS_ATTENUATE: u64 = 4;
 pub const SYS_CLOSE: u64 = 5;
 pub const SYS_CONSOLE_WRITE: u64 = 6;
 pub const SYS_EXIT: u64 = 7;
+
+// v1 additions — user-driven memory (numbers 8+ were reserved by §4.2).
+pub const SYS_MAP: u64 = 8; // sys_map(mem, vaddr, len, prot)
+pub const SYS_FRAME_ALLOC: u64 = 9; // sys_frame_alloc(mem) -> Frame handle
+pub const SYS_FRAME_MAP: u64 = 10; // sys_frame_map(frame, vaddr, prot)
 
 // ---------------------------------------------------------------------------
 // Error codes (§6) — returned in rax; values are stable forever (append-only)
@@ -155,8 +169,12 @@ impl MsgBuf {
 pub const BOOT_EP: Handle = 1;
 /// Console handle the kernel grants the first server (R_WRITE | R_ATTENUATE).
 pub const BOOT_CONSOLE: Handle = 2;
+/// Memory budget handle a process is born holding (R_MAP | R_GRANT | R_ATTENUATE).
+pub const BOOT_MEM: Handle = 3;
 
 /// "PING" — request tag for the v0 roundtrip.
 pub const TAG_PING: u64 = 0x474E4950;
 /// "PONG" — reply tag for the v0 roundtrip.
 pub const TAG_PONG: u64 = 0x474E4F50;
+/// "SHMM" — a Frame capability rides this message (shared-memory demo).
+pub const TAG_SHMEM: u64 = 0x4D4D4853;

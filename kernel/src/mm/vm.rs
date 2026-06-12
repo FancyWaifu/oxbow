@@ -222,6 +222,91 @@ pub fn map_user_4k_in(pml4_phys: u64, virt: u64, phys: u64, writable: bool, exec
     }
 }
 
+const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+const PTE_PRESENT: u64 = 1 << 0;
+const PTE_HUGE: u64 = 1 << 7;
+
+/// Walk the caller's tables over `[vaddr, vaddr+pages*4096)`. Returns the number
+/// of intermediate page tables `map_to` would need to allocate for the range
+/// (deduped — adjacent pages share tables), or `Err` if ANY page in range is
+/// already present (overlap, incl. huge-page leaves). One read-only pass buys
+/// both atomic overlap detection and the exact budget cost.
+pub fn probe_user_range(pml4_phys: u64, vaddr: u64, pages: u64) -> Result<u64, ()> {
+    let hhdm = super::hhdm_offset();
+    let table = |phys: u64| -> &'static [u64; 512] {
+        unsafe { &*((hhdm + phys) as *const [u64; 512]) }
+    };
+
+    let mut missing = 0u64;
+    // Region keys of tables already counted as missing (so shared tables across
+    // adjacent pages count once).
+    let (mut seen_pdpt, mut seen_pd, mut seen_pt) = (u64::MAX, u64::MAX, u64::MAX);
+
+    for p in 0..pages {
+        let va = vaddr + p * 4096;
+        let i = [
+            ((va >> 39) & 0x1ff) as usize,
+            ((va >> 30) & 0x1ff) as usize,
+            ((va >> 21) & 0x1ff) as usize,
+            ((va >> 12) & 0x1ff) as usize,
+        ];
+
+        let e0 = table(pml4_phys)[i[0]];
+        if e0 & PTE_PRESENT == 0 {
+            if va >> 39 != seen_pdpt { missing += 1; seen_pdpt = va >> 39; }
+            if va >> 30 != seen_pd { missing += 1; seen_pd = va >> 30; }
+            if va >> 21 != seen_pt { missing += 1; seen_pt = va >> 21; }
+            continue;
+        }
+        let e1 = table(e0 & PTE_ADDR_MASK)[i[1]];
+        if e1 & PTE_PRESENT == 0 {
+            if va >> 30 != seen_pd { missing += 1; seen_pd = va >> 30; }
+            if va >> 21 != seen_pt { missing += 1; seen_pt = va >> 21; }
+            continue;
+        }
+        if e1 & PTE_HUGE != 0 {
+            return Err(()); // 1 GiB huge-page overlap
+        }
+        let e2 = table(e1 & PTE_ADDR_MASK)[i[2]];
+        if e2 & PTE_PRESENT == 0 {
+            if va >> 21 != seen_pt { missing += 1; seen_pt = va >> 21; }
+            continue;
+        }
+        if e2 & PTE_HUGE != 0 {
+            return Err(()); // 2 MiB huge-page overlap
+        }
+        let e3 = table(e2 & PTE_ADDR_MASK)[i[3]];
+        if e3 & PTE_PRESENT != 0 {
+            return Err(()); // page already mapped
+        }
+        // leaf absent, all tables present -> nothing missing for this page
+    }
+    Ok(missing)
+}
+
+/// Map one anonymous 4 KiB page into the live caller AS and FLUSH it (unlike
+/// `map_user_4k_in`'s `.ignore()`, valid there only because a CR3 load follows).
+/// Anonymous pages are always NX (W^X — there is no executable mapping syscall).
+pub fn map_user_4k_live(pml4_phys: u64, virt: u64, phys: u64, writable: bool) {
+    let mut flags = Flags::PRESENT | Flags::USER_ACCESSIBLE | Flags::NO_EXECUTE;
+    if writable {
+        flags |= Flags::WRITABLE;
+    }
+    let hhdm = VirtAddr::new(super::hhdm_offset());
+    let l4: &mut PageTable =
+        unsafe { &mut *(super::phys_to_virt(pml4_phys) as *mut PageTable) };
+    let mut mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
+    let mut falloc = PmmAlloc;
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+    let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys));
+    unsafe {
+        mapper
+            .map_to(page, frame, flags, &mut falloc)
+            .expect("vm: map_user_4k_live")
+            .flush();
+    }
+}
+
 fn map_kernel_section(
     mapper: &mut OffsetPageTable,
     falloc: &mut PmmAlloc,
