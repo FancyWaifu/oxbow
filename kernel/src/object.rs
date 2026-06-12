@@ -11,9 +11,9 @@ pub enum ObjType {
     Console,
 }
 
-/// What a handle points at. Pool indices are filled in by Phase 8.
+/// What a handle points at: an endpoint pool index, a Reply pool index, or the
+/// singleton console.
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // Endpoint/Reply payloads are wired up in Phase 8
 pub enum ObjectRef {
     Endpoint(u8),
     Reply(u8),

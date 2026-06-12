@@ -40,6 +40,7 @@ pub enum State {
     Free,
     Ready,
     Running,
+    Blocked,
     Exited,
 }
 
@@ -99,6 +100,11 @@ pub fn current_proc() -> usize {
     proc_of(current())
 }
 
+/// The process owning thread `tid` (for IPC peer resolution).
+pub fn process_of(tid: usize) -> usize {
+    proc_of(tid)
+}
+
 /// Mark the boot thread (slot 0) as the running idle thread.
 pub fn init() {
     set_state(IDLE, State::Running);
@@ -144,6 +150,7 @@ fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64) -> usize {
 }
 
 /// Spawn a kernel thread (no owning process; runs under whatever CR3 is live).
+#[allow(dead_code)] // scheduler API; kernel-thread demos were retired in arc 3
 pub fn spawn_kernel(entry: extern "C" fn(u64), arg: u64) -> usize {
     spawn(entry as *const () as u64, arg, 0, NO_PROC, 0)
 }
@@ -208,6 +215,23 @@ pub fn kill_current_user() -> ! {
     exit_current();
 }
 
+/// Park the current thread until `wake(tid)`. The caller must already have
+/// published itself wherever its waker will look (an endpoint queue, a Reply).
+/// IF=0 + a single CPU make publish→Blocked→switch atomic, so no wakeup is lost.
+/// INVARIANT: never called while holding a spin lock (it switches away).
+pub fn block_current() {
+    set_state(current(), State::Blocked);
+    let next = pick_next().unwrap_or(IDLE);
+    switch_to(next);
+    // Woken: our waker has already deposited our result (and staging, in IPC).
+}
+
+/// Make a Blocked thread Ready. Does NOT switch — the waker keeps running.
+pub fn wake(tid: usize) {
+    debug_assert!(state(tid) == State::Blocked, "wake of non-Blocked thread");
+    set_state(tid, State::Ready);
+}
+
 /// Terminate the current thread and switch away forever.
 pub fn exit_current() -> ! {
     set_state(current(), State::Exited);
@@ -228,9 +252,10 @@ pub fn preempt() {
     }
 }
 
-/// True if any non-idle thread is still Ready or Running.
+/// True if any non-idle thread is still Ready, Running, or Blocked. A blocked
+/// thread (e.g. a pinger waiting for its reply) is NOT quiescence.
 fn any_active() -> bool {
-    (1..MAX_THREADS).any(|s| matches!(state(s), State::Ready | State::Running))
+    (1..MAX_THREADS).any(|s| matches!(state(s), State::Ready | State::Running | State::Blocked))
 }
 
 /// A thread's parking point: enable interrupts for exactly one `hlt`, so the
@@ -269,22 +294,4 @@ extern "C" fn user_thread_entry(entry: u64, user_rsp: u64) {
 /// CR3) and the timer preempts it mid-userspace thereafter.
 pub fn spawn_user(proc: usize, cr3: u64, entry: u64, user_rsp: u64) -> usize {
     spawn(user_thread_entry as *const () as u64, entry, user_rsp, proc, cr3)
-}
-
-// --- A witness kernel thread, showing concurrency alongside the user ------
-
-extern "C" fn witness(_arg: u64) {
-    for n in 1..=3 {
-        for _ in 0..15 {
-            park_one_tick();
-        }
-        println!("[W] alive {}", n);
-    }
-    println!("[thr] witness exited (tcb {})", current());
-    exit_current();
-}
-
-/// Spawn the witness thread.
-pub fn spawn_witness() -> usize {
-    spawn_kernel(witness, 0)
 }

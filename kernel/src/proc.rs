@@ -4,7 +4,7 @@
 //! own PML4 (per-process isolation, CR3 switched by the scheduler). The "current
 //! process" is resolved from the current thread (`thread::current_proc`).
 use oxbow_abi::{
-    Handle, SysError, BOOT_CONSOLE, BOOT_EP, HANDLE_TABLE_SIZE, R_ATTENUATE, R_SEND, R_WRITE,
+    Handle, SysError, BOOT_CONSOLE, BOOT_EP, HANDLE_TABLE_SIZE, R_ATTENUATE, R_GRANT, R_WRITE,
 };
 use spin::Mutex;
 
@@ -97,6 +97,15 @@ impl Process {
     pub fn close_all(&mut self) {
         self.handles = [None; HANDLE_TABLE_SIZE];
     }
+
+    /// Call `f` with the pool index of every Reply handle this process holds.
+    pub fn for_each_reply(&self, mut f: impl FnMut(u8)) {
+        for h in self.handles.iter().flatten() {
+            if let ObjectRef::Reply(idx) = h.obj {
+                f(idx);
+            }
+        }
+    }
 }
 
 /// Run `f` with the calling thread's process. The lock is statement-scoped and
@@ -112,9 +121,18 @@ pub fn with_current_mut<R>(f: impl FnOnce(&mut Process) -> R) -> R {
     f(&mut procs[id])
 }
 
+/// Run `f` with a specific process by id (e.g. an IPC peer's table). The lock is
+/// never held across a context switch.
+pub fn with_proc_mut<R>(id: usize, f: impl FnOnce(&mut Process) -> R) -> R {
+    let mut procs = PROCESSES.lock();
+    f(&mut procs[id])
+}
+
 /// Mark a process dead and drop its handles (on a ring-3 fault or `sys_exit`).
+/// Any pending Reply it held is abandoned — the blocked caller wakes `E_GONE`.
 pub fn kill(id: usize) {
     let mut procs = PROCESSES.lock();
+    procs[id].for_each_reply(|idx| ipc::reply_abandon(idx as usize));
     procs[id].close_all();
     procs[id].state = PState::Dead;
 }
@@ -190,8 +208,9 @@ fn load_into(img: &Image, pml4_phys: u64) -> (u64, u64) {
 }
 
 /// Create a process: claim a pool slot, map the image into `pml4_phys`, grant
-/// the boot capabilities, and return `(proc id, entry, user_rsp)`.
-pub fn create(img: &Image, pml4_phys: u64, name: &str) -> (usize, u64, u64) {
+/// the boot capabilities, and return `(proc id, entry, user_rsp)`. `ep0_rights`
+/// is the role: the pinger gets `R_SEND`, the ponger gets `R_RECV`.
+pub fn create(img: &Image, pml4_phys: u64, name: &str, ep0_rights: u32) -> (usize, u64, u64) {
     let id = {
         let mut procs = PROCESSES.lock();
         let id = (0..MAX_PROCS)
@@ -205,7 +224,7 @@ pub fn create(img: &Image, pml4_phys: u64, name: &str) -> (usize, u64, u64) {
     let (entry, user_rsp) = load_into(img, pml4_phys);
 
     // Grant the ONLY handles the process is born holding (laws L1/L3): EP0 with
-    // send (the kernel keeps the receive side), Console with write.
+    // the role-specific rights, Console with write.
     {
         let mut procs = PROCESSES.lock();
         let p = &mut procs[id];
@@ -213,14 +232,15 @@ pub fn create(img: &Image, pml4_phys: u64, name: &str) -> (usize, u64, u64) {
             BOOT_EP,
             HandleEntry {
                 obj: ObjectRef::Endpoint(ipc::EP0),
-                rights: R_SEND | R_ATTENUATE,
+                rights: ep0_rights,
             },
         );
         p.install(
             BOOT_CONSOLE,
             HandleEntry {
                 obj: ObjectRef::Console,
-                rights: R_WRITE | R_ATTENUATE,
+                // R_GRANT so a process can attenuate + hand its console to a peer.
+                rights: R_WRITE | R_ATTENUATE | R_GRANT,
             },
         );
     }

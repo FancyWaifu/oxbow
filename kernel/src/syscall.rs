@@ -65,9 +65,9 @@ pub extern "C" fn syscall_dispatch(
 ) -> SyscallRet {
     match nr {
         SYS_SEND => sys_ipc(a1, a2, false),
-        SYS_RECV => sys_recv(a1),
+        SYS_RECV => sys_recv(a1, a2),
         SYS_CALL => sys_ipc(a1, a2, true),
-        SYS_REPLY => sys_reply(a1),
+        SYS_REPLY => sys_reply(a1, a2),
         SYS_CONSOLE_WRITE => sys_console_write(a1, a2, a3),
         SYS_ATTENUATE => sys_attenuate(a1, a2),
         SYS_CLOSE => SyscallRet::from_result(proc::with_current_mut(|p| p.close(a1 as Handle))),
@@ -84,27 +84,22 @@ pub extern "C" fn syscall_dispatch(
 /// ep) → E_FAULT (align + page walk) → E_MSG (limits) → E_RIGHTS (R_GRANT per
 /// transferred handle, §3.4) — ALL before any side effect.
 fn sys_ipc(ep: u64, msg_ptr: u64, is_call: bool) -> SyscallRet {
-    SyscallRet::from_result((|| -> SysResult {
-        // 1. Capability check (statement-temporary process lock, then dropped).
+    // Validate everything BEFORE any side effect; return the ep index + copy-in.
+    let prepared = (|| -> SysResult<(u8, MsgBuf)> {
         let entry = proc::with_current(|p| p.lookup(ep as Handle, ObjType::Endpoint, R_SEND))?;
         let ObjectRef::Endpoint(idx) = entry.obj else {
             return Err(SysError::BadType);
         };
-        // 2. Pointer: 8-aligned (§4.1 — check_user does NOT do this) + mapped
-        //    user memory. `call` needs write (the reply overwrites in place).
+        // Pointer: 8-aligned + mapped. `call` needs write (reply overwrites it).
         if msg_ptr & 7 != 0 {
             return Err(SysError::Fault);
         }
         usermem::check_user(msg_ptr, size_of::<MsgBuf>(), is_call)?;
-        // 3. Copy-in (aligned), then limits.
         let msg: MsgBuf = unsafe { core::ptr::read(msg_ptr as *const MsgBuf) };
         if msg.data_len as usize > MSG_DATA_WORDS || msg.handle_count as usize > MSG_HANDLES {
             return Err(SysError::Msg);
         }
-        // 4. §3.4: every transferred handle needs R_GRANT in the SENDER's table.
-        //    (v0 receiver is the kernel — no handle table — so after this check
-        //    transferred handles are accepted-and-discarded; receiver-side slot
-        //    allocation lands with user receivers in v1.)
+        // §3.4: every transferred handle needs R_GRANT in the sender's table.
         if msg.handle_count > 0 {
             proc::with_current(|p| -> SysResult {
                 for &h in &msg.handles[..msg.handle_count as usize] {
@@ -115,32 +110,70 @@ fn sys_ipc(ep: u64, msg_ptr: u64, is_call: bool) -> SyscallRet {
                 Ok(())
             })?;
         } // process lock dropped before delivery — never held with ENDPOINTS
+        Ok((idx, msg))
+    })();
 
-        if is_call {
-            ipc::do_call(idx, &msg, msg_ptr)
-        } else {
-            ipc::do_send(idx, &msg)
+    match prepared {
+        Ok((idx, msg)) => {
+            // All validation passed (no side effects yet). Rendezvous: may block.
+            let (rax, rdx) = ipc::send_or_call(idx, &msg, msg_ptr, is_call);
+            SyscallRet { rax, rdx }
         }
-    })())
+        Err(e) => SyscallRet::err(e),
+    }
 }
 
-/// v0: no user ever holds R_RECV (the kernel keeps EP0's receive side; L5
-/// forbids amplification), so this is pure law enforcement: handle → type →
-/// E_RIGHTS. The post-lookup arm is unreachable in v0 (user receive is v1).
-fn sys_recv(ep: u64) -> SyscallRet {
-    SyscallRet::from_result((|| -> SysResult {
-        proc::with_current(|p| p.lookup(ep as Handle, ObjType::Endpoint, R_RECV))?;
-        Err(SysError::Nosys)
-    })())
+/// Receive on an endpoint we hold with R_RECV. Blocks until a sender arrives;
+/// returns a Reply handle (in rdx) for a call, or HANDLE_NULL for a plain send.
+fn sys_recv(ep: u64, msg_ptr: u64) -> SyscallRet {
+    let validated = (|| -> SysResult<u8> {
+        let entry = proc::with_current(|p| p.lookup(ep as Handle, ObjType::Endpoint, R_RECV))?;
+        let ObjectRef::Endpoint(idx) = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        if msg_ptr & 7 != 0 {
+            return Err(SysError::Fault);
+        }
+        usermem::check_user(msg_ptr, size_of::<MsgBuf>(), true)?;
+        Ok(idx)
+    })();
+    match validated {
+        Ok(idx) => {
+            let (rax, rdx) = ipc::recv(idx, msg_ptr);
+            SyscallRet { rax, rdx }
+        }
+        Err(e) => SyscallRet::err(e),
+    }
 }
 
-/// v0: Reply handles are minted only by `sys_recv`, which no one can call, so a
-/// valid Reply handle can't exist. Lookup fails first; the arm is unreachable.
-fn sys_reply(reply: u64) -> SyscallRet {
-    SyscallRet::from_result((|| -> SysResult {
-        proc::with_current(|p| p.lookup(reply as Handle, ObjType::Reply, 0))?;
-        Err(SysError::Nosys)
-    })())
+/// Reply to a pending call via a one-shot Reply handle. Consumes the handle on
+/// success (frees the pool slot + our table slot); not consumed on validation
+/// errors (ABI §4.3). Never blocks.
+fn sys_reply(reply: u64, msg_ptr: u64) -> SyscallRet {
+    let prepared = (|| -> SysResult<(u8, MsgBuf)> {
+        let entry = proc::with_current(|p| p.lookup(reply as Handle, ObjType::Reply, 0))?;
+        let ObjectRef::Reply(idx) = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        if msg_ptr & 7 != 0 {
+            return Err(SysError::Fault);
+        }
+        usermem::check_user(msg_ptr, size_of::<MsgBuf>(), false)?;
+        let m: MsgBuf = unsafe { core::ptr::read(msg_ptr as *const MsgBuf) };
+        if m.data_len as usize > MSG_DATA_WORDS || m.handle_count as usize > MSG_HANDLES {
+            return Err(SysError::Msg);
+        }
+        Ok((idx, m))
+    })();
+    match prepared {
+        Ok((idx, m)) => {
+            ipc::do_reply(idx as usize, &m); // copies to caller staging, wakes it
+            // Consume the Reply handle from our own table (success path, §4.3).
+            let _ = proc::with_current_mut(|p| p.close(reply as Handle));
+            SyscallRet::ok()
+        }
+        Err(e) => SyscallRet::err(e),
+    }
 }
 
 /// `sys_console_write(con, buf, len)` — write user bytes through a Console cap.

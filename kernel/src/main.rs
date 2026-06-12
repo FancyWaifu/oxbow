@@ -178,13 +178,17 @@ fn kmain_stage2() -> ! {
         println!("[mod] module {} ({}): {} bytes", i, name, bytes.len());
         let img = elf::Image::validate(bytes);
         let as_i = mm::vm::new_user_pml4();
-        let (pid, entry, user_rsp) = proc::create(&img, as_i, name);
+        // Role by module index: module 0 = pinger (R_SEND on EP0), module 1 =
+        // ponger (R_RECV). The kernel echo is gone — they talk to each other.
+        let ep0_rights = if i == 0 {
+            oxbow_abi::R_SEND | oxbow_abi::R_ATTENUATE
+        } else {
+            oxbow_abi::R_RECV | oxbow_abi::R_ATTENUATE
+        };
+        let (pid, entry, user_rsp) = proc::create(&img, as_i, name, ep0_rights);
         let tcb = thread::spawn_user(pid, as_i, entry, user_rsp);
         println!("[user] {} scheduled as tcb {} (ring 3, IF=1)", name, tcb);
     }
-
-    let w = thread::spawn_witness();
-    println!("[thr] witness = tcb {}", w);
 
     // The boot thread becomes the idle thread and runs the scheduler forever.
     thread::run_idle();

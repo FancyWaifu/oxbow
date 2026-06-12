@@ -7,7 +7,7 @@
 #![no_std]
 #![no_main]
 
-use oxbow_abi::{MsgBuf, BOOT_CONSOLE, BOOT_EP, TAG_PONG, TAG_PING};
+use oxbow_abi::{MsgBuf, SysError, BOOT_CONSOLE, BOOT_EP, R_GRANT, R_WRITE, TAG_PONG, TAG_PING};
 use oxbow_rt as rt;
 
 /// Write a byte string through the console capability.
@@ -102,27 +102,39 @@ pub extern "C" fn oxbow_main() -> ! {
     #[cfg(feature = "selftest")]
     selftest();
 
-    let mut msg = MsgBuf::new(TAG_PING);
-    match rt::sys_call(BOOT_EP, &mut msg) {
-        // The reply landed in the same buffer; data[0] holds "PONG\n\0\0\0".
-        Ok(()) if msg.tag == TAG_PONG => {
-            let _ = rt::sys_console_write(BOOT_CONSOLE, msg.data.as_ptr() as *const u8, 5);
-        }
-        _ => w(b"call failed\n"),
-    }
+    // Call the boot endpoint with PING across three rounds. With the kernel echo
+    // gone, the reply comes from beta (the ponger) in its own address space.
+    // Round 1 is sender-first, rounds 2-3 receiver-first; round 3 sees beta die
+    // mid-call, so the kernel returns E_GONE.
+    // Derive a write-only, grantable console handle to hand to the ponger in
+    // round 1's PING — a real capability moving across the rendezvous (§3.4).
+    let granted = rt::sys_attenuate(BOOT_CONSOLE, R_WRITE | R_GRANT).unwrap_or(BOOT_CONSOLE);
 
-    // Spin in ring 3 (IF=1) so the timer can visibly preempt us — printing a
-    // `u` between bursts of pure user-mode compute. Proves the user thread
-    // survives many preemptions before exiting.
-    for _ in 0..6 {
-        w(b"u ");
-        let mut x: u64 = 0;
-        for i in 0..3_000_000u64 {
-            x = x.wrapping_add(i);
+    for round in 1u8..=3 {
+        let mut msg = MsgBuf::new(TAG_PING);
+        if round == 1 {
+            msg.handle_count = 1;
+            msg.handles[0] = granted;
         }
-        core::hint::black_box(x);
+        match rt::sys_call(BOOT_EP, &mut msg) {
+            Ok(()) if msg.tag == TAG_PONG => {
+                w(b"[P1] round ");
+                w(&[b'0' + round]);
+                w(b": ");
+                let _ = rt::sys_console_write(BOOT_CONSOLE, msg.data.as_ptr() as *const u8, 5);
+            }
+            Err(SysError::Gone) => {
+                w(b"[P1] round ");
+                w(&[b'0' + round]);
+                w(b" -> E_GONE ok\n");
+            }
+            _ => {
+                w(b"[P1] round ");
+                w(&[b'0' + round]);
+                w(b" unexpected\n");
+            }
+        }
     }
-    w(b"\n");
 
     rt::sys_exit(0)
 }

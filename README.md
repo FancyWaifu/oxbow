@@ -45,20 +45,27 @@ kernel threads — and `sys_exit` kills the thread, not the machine.
 
 **v1 arc 2 — per-process address spaces + isolation: complete.** Each process
 gets its own PML4 (sharing the kernel upper half), and the scheduler reloads CR3
-when dispatching a thread in a different address space. Two user processes
-(`pong`, `beta`), both linked at `0x200000`, run concurrently in *separate*
-address spaces — same vaddr, different memory. A ring-3 fault kills the
-offending thread and its process while everything else continues (`just
-run-faulttest`); `just run-isolation` shows two processes reading different bytes
-at the same address and a hostile one dying alone. User-to-user IPC is still the
-kernel echo (arc 3).
+when dispatching a thread in a different address space. Two user processes,
+both linked at `0x200000`, run concurrently in *separate* address spaces. A
+ring-3 fault kills the offending process while everything else continues.
+
+**v1 arc 3 — blocking user-to-user IPC: complete.** The kernel echo is gone:
+`pong` (pinger) and `beta` (ponger) do a real PING→PONG rendezvous across two
+address spaces. A sender that arrives first BLOCKS on the endpoint's send queue;
+a receiver that arrives first blocks as its `recv_waiter`; whoever completes the
+rendezvous wakes the other. Messages cross address spaces via per-thread kernel
+STAGING (each thread only ever touches its own user memory, under its own CR3).
+Reply is a real pooled kernel object handed to the receiver as a handle;
+`sys_reply` consumes it; a replier that dies mid-call wakes the caller `E_GONE`.
+Capabilities transfer across the rendezvous (`pong` grants an attenuated console
+to `beta`, which writes through it). Both arrival orderings, `E_GONE`, and the
+selftest 7/7 all verified.
 
 ### Next (v1, later arcs)
 
-Blocking user-to-user IPC (real `sys_recv`/`sys_reply`, pooled Reply objects,
-rendezvous + handle transfer — the kernel echo retired); user-driven memory
-(untyped/retype, `sys_map`); IRQ capabilities for real drivers; and the
-`aarch64` port (the `arch/` wall is already in place for it).
+User-driven memory (untyped/retype, `sys_map`); IRQ capabilities for real
+drivers; a multi-receiver endpoint + endpoint destroy; and the `aarch64` port
+(the `arch/` wall is already in place for it).
 
 ## Building & running
 
