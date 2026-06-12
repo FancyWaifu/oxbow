@@ -1,0 +1,13 @@
+[package]
+name = "oxbow-rt"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+oxbow-abi = { path = "../abi" }

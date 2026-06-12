@@ -1,0 +1,223 @@
+# oxbow ABI — v0
+
+**Status:** normative for v0 ("first light"). **Scope:** exactly what is needed to boot, hand-build one user server from a Limine module, and complete one synchronous IPC roundtrip ending in `PONG` on serial. Everything else is deferred (§8).
+
+Both the kernel and userland depend on the `oxbow-abi` crate, which is the single source of truth for syscall numbers, rights bits, error codes, and message layout. All types are `#[repr(C)]`, little-endian, on `x86_64-unknown-none`. `oxbow-abi` exports `pub const ABI_VERSION: u32 = 0;`.
+
+---
+
+## 1. Design laws (normative)
+
+These invariants MUST hold in every version of oxbow, starting now. A change that violates one is a bug, not a feature.
+
+- **L1 — Zero ambient authority.** Every syscall MUST operate on a handle the caller already holds (sole exceptions: `sys_exit`, which acts only on the calling thread itself, and the syscall mechanism itself). There MUST be no syscall that grants access to an object the caller could not already name via a handle.
+- **L2 — Handles are unforgeable and process-local.** A handle is an index into the calling process's private handle table. The integer value carries no meaning in any other process. Userspace MUST NOT be able to fabricate a valid handle by guessing integers: the kernel MUST validate index, occupancy, expected object type, and rights on every use.
+- **L3 — No global namespace.** The kernel MUST NOT provide any "open by name", "lookup by id", or enumerate-objects facility. A process is born holding ONLY the handles its parent (in v0: the kernel acting as parent) explicitly granted, and can acquire new handles only by receiving them in messages or deriving them by attenuation.
+- **L4 — W^X, always.** The kernel mapper MUST NOT ever create a mapping that is simultaneously writable and executable, in kernel or user space, including transiently. The ELF loader MUST refuse (panic at boot in v0) any segment requesting `W|X`. All non-executable mappings MUST be NX.
+- **L5 — Attenuation only, never amplification.** Every operation that produces a handle from an existing handle MUST produce rights that are a subset (⊆, equality allowed) of the source handle's rights. There is exactly one attenuation primitive (`sys_attenuate`); no syscall may add rights.
+- **L6 — Memory accountability.** The kernel MUST NOT allocate memory on behalf of userspace except as authorized by a capability the caller holds. *v0 simplification:* kernel objects come from small fixed static pools sized at compile time and exhaustion returns `E_NO_MEM`; the accountable-untyped-memory model (caller-supplied memory capabilities, seL4-style retyping) is the v1 path and MUST NOT be precluded by v0 interfaces.
+- **L7 — Rendezvous IPC, no kernel buffering.** Endpoint IPC is synchronous: the kernel copies a message directly from sender to receiver only when both are present, and MUST NOT queue message payloads in kernel memory.
+
+---
+
+## 2. Kernel object types (v0)
+
+v0 defines exactly **three** object types. There are deliberately **no** Process, Thread, AddressSpace/VSpace, or Untyped objects in v0: the kernel hand-builds the single server process at boot (§7), so nothing in userspace needs to name those objects yet. They become objects in v1 without ABI breakage (new type tags, new syscall numbers).
+
+Objects are reference-counted by handle-table entries; an object is destroyed when its last handle is closed. *v0 simplification:* objects live in static pools and are never reused after destruction.
+
+### 2.1 Endpoint
+A synchronous rendezvous point for IPC. Holds at most a wait-queue of blocked senders or blocked receivers (never payloads, per L7).
+
+- **Operations:** `sys_send`, `sys_call` (require `R_SEND`); `sys_recv` (requires `R_RECV`); `sys_attenuate`, `sys_close`.
+- **Rights:** `R_SEND`, `R_RECV`, plus generic `R_GRANT`, `R_ATTENUATE`.
+
+### 2.2 Reply
+A one-shot capability to answer a pending `sys_call`. Created **only** by the kernel during a call rendezvous and delivered to the receiver by `sys_recv`. Cannot be created, duplicated, attenuated, or transferred in v0.
+
+- **Operations:** `sys_reply` (consumes it; the slot is freed automatically); `sys_close` (discards it — the blocked caller is unblocked with `E_GONE`).
+- **Rights:** implicit single-use send. Its rights word is `0`; it carries neither `R_GRANT` nor `R_ATTENUATE`. *(Forward path: v1 may make replies transferable for proxying.)*
+
+### 2.3 Console
+The serial output device, as a capability. Exists so that even debug output obeys L1 — there is no handle-free "print" syscall.
+
+- **Operations:** `sys_console_write` (requires `R_WRITE`); `sys_attenuate`, `sys_close`.
+- **Rights:** `R_WRITE` (object-specific), plus generic `R_GRANT`, `R_ATTENUATE`.
+
+---
+
+## 3. Handle model
+
+### 3.1 Table
+Each process owns one flat handle table: `[HandleEntry; 64]` in v0 (`oxbow-abi: HANDLE_TABLE_SIZE = 64`). An entry is `{ object_ref, type_tag, rights: u32 }`. This is explicitly **not** a CNode/CSpace tree and never will be exposed as one; growth path is simply a larger/dynamic flat table.
+
+```rust
+// oxbow-abi
+pub type Handle = u32;
+pub const HANDLE_NULL: Handle = 0;   // index 0 is permanently unoccupied
+```
+
+- A handle is an opaque `u32` index. Index `0` is reserved invalid; valid handles are `1..64`.
+- **Allocation:** kernel picks the lowest free index ≥ 1. **Freeing:** `sys_close`, or implicitly when a Reply handle is consumed by `sys_reply`. Table full → `E_NO_SLOTS`.
+- Handles do not carry generation counters in v0 (single-threaded processes make use-after-close a self-inflicted, process-local bug). *(Forward path: 32-bit generation in the upper bits of a 64-bit handle.)*
+
+### 3.2 Rights bitflags
+
+```rust
+// oxbow-abi — bits 0..16 generic, bits 16..32 object-specific
+pub const R_SEND:      u32 = 1 << 0;  // may send / call on an Endpoint
+pub const R_RECV:      u32 = 1 << 1;  // may recv on an Endpoint
+pub const R_GRANT:     u32 = 1 << 2;  // handle may be transferred in a message
+pub const R_ATTENUATE: u32 = 1 << 3;  // handle may be the source of sys_attenuate
+pub const R_WRITE:     u32 = 1 << 16; // Console: may write
+```
+
+### 3.3 Attenuation (the one and only derivation primitive)
+`sys_attenuate(src, new_rights)` creates a **new** handle in the caller's table referring to the **same object**, with rights exactly `new_rights`.
+
+- Requires `R_ATTENUATE` on `src`; otherwise `E_RIGHTS`.
+- `new_rights & src.rights == new_rights` MUST hold (subset, equality allowed — so attenuate-to-equal doubles as `dup`); otherwise `E_RIGHTS`.
+- `src` is unaffected. Dropping `R_ATTENUATE` in `new_rights` makes the derived handle a leaf that cannot be further derived. A pledge/unveil analog is therefore: attenuate what you keep, close what you don't.
+
+### 3.4 Handle transfer in messages
+A message may carry up to `MSG_HANDLES = 4` handles (§5).
+
+- Each transferred handle MUST carry `R_GRANT` in the **sender's** table, else the send fails with `E_RIGHTS` before any rendezvous side effects.
+- Transfer is a **copy**: the receiver gets a fresh slot referring to the same object with **rights identical to the sender's handle** (per L5 this is ⊆, with equality). The sender **retains** its handle. To hand over something weaker, attenuate first, send the derived handle, close it.
+- If the receiver's table cannot hold all transferred handles, delivery is aborted atomically: the sender's syscall returns `E_NO_SLOTS`, the receiver stays blocked waiting for the next sender, and no partial transfer occurs.
+
+---
+
+## 4. Syscall surface (v0)
+
+### 4.1 Calling convention
+- Instruction: `syscall` (SYSCALL/SYSRET; `rcx` and `r11` are clobbered by hardware).
+- Syscall number in `rax`. Arguments in `rdi, rsi, rdx, r10, r8, r9` (System V order with `r10` replacing `rcx`).
+- **Primary return** in `rax`: `0` = `OK`, nonzero = error code (§6). **Secondary return** (a newly allocated `Handle`, when the syscall produces one) in `rdx`; `rdx` is `HANDLE_NULL` when there is nothing to return. All other registers are preserved.
+- Received message payloads are not passed in registers: send/recv/call/reply take a pointer to a user-memory `MsgBuf` (§5) and the kernel copies through it. Any user pointer that is unmapped, not user-accessible, or misaligned (8-byte) yields `E_FAULT`.
+- An unknown syscall number returns `E_NOSYS`.
+
+### 4.2 Process bootstrapping stance
+v0 has **no** spawn/map/exec syscalls. The kernel hand-builds the first (and only) process from the Limine module at boot (§7). The syscalls below are the complete set available to that running server. *(Forward path: v1 adds Process/VSpace objects and `sys_map`/`sys_spawn` operating on them; numbers 8+ are reserved for this.)*
+
+### 4.3 The eight syscalls
+
+| # | Name | Signature (`oxbow-abi` types) |
+|---|------|-------------------------------|
+| 0 | `sys_send` | `fn(ep: Handle, msg: *const MsgBuf) -> SysResult` |
+| 1 | `sys_recv` | `fn(ep: Handle, msg: *mut MsgBuf) -> SysResult<Handle /* reply, in rdx */>` |
+| 2 | `sys_call` | `fn(ep: Handle, msg: *mut MsgBuf) -> SysResult` |
+| 3 | `sys_reply` | `fn(reply: Handle, msg: *const MsgBuf) -> SysResult` |
+| 4 | `sys_attenuate` | `fn(src: Handle, new_rights: u32) -> SysResult<Handle /* in rdx */>` |
+| 5 | `sys_close` | `fn(h: Handle) -> SysResult` |
+| 6 | `sys_console_write` | `fn(con: Handle, buf: *const u8, len: usize) -> SysResult` |
+| 7 | `sys_exit` | `fn(code: u64) -> !` |
+
+**0 — `sys_send(ep, msg)`** *(args: rdi=ep, rsi=msg)*
+Requires Endpoint type and `R_SEND`. Validates `msg` (`E_FAULT`, `E_MSG` if counts exceed limits, `E_RIGHTS` if any transferred handle lacks `R_GRANT`), then blocks until a receiver rendezvouses; the kernel copies the message and handles, and both sides return. One-way: no Reply object is created (receiver sees `HANDLE_NULL` reply). Errors: `E_BAD_HANDLE`, `E_BAD_TYPE`, `E_RIGHTS`, `E_FAULT`, `E_MSG`, `E_NO_SLOTS` (receiver table full), `E_GONE` (endpoint destroyed while blocked).
+
+**1 — `sys_recv(ep, msg)`** *(rdi=ep, rsi=msg; returns reply handle in rdx)*
+Requires Endpoint type and `R_RECV`. Blocks until a sender rendezvouses. On success the kernel has written the message into `*msg`, allocated receiver-side slots for any transferred handles (writing the new indices into `msg.handles`), and — iff the sender used `sys_call` — allocated a one-shot **Reply** handle, returned in `rdx` (`HANDLE_NULL` for plain sends). Errors: `E_BAD_HANDLE`, `E_BAD_TYPE`, `E_RIGHTS`, `E_FAULT`, `E_NO_SLOTS`, `E_GONE`.
+
+**2 — `sys_call(ep, msg)`** *(rdi=ep, rsi=msg)*
+Requires Endpoint type and `R_SEND`. Atomically: send `*msg` as in `sys_send`, then block until the matching `sys_reply`; the reply message is written **into the same buffer**, overwriting it (including `msg.handles` with caller-side fresh indices for any handles the replier transferred). Errors: those of `sys_send`, plus `E_GONE` if the replier closes the Reply handle without replying or the endpoint dies.
+
+**3 — `sys_reply(reply, msg)`** *(rdi=reply, rsi=msg)*
+Requires Reply type (the handle's existence is the authority; no rights bits checked). Validates `msg` like `sys_send`, copies it to the blocked caller, unblocks it, and **consumes** the Reply handle (its slot is freed on the success path; on validation errors `E_FAULT`/`E_MSG`/`E_RIGHTS` the handle is NOT consumed so the server can retry). Never blocks (the caller is by construction already waiting). Errors: `E_BAD_HANDLE`, `E_BAD_TYPE`, `E_FAULT`, `E_MSG`, `E_RIGHTS`, `E_NO_SLOTS` (caller's table full; Reply handle is consumed and the caller unblocks with `E_NO_SLOTS`).
+
+**4 — `sys_attenuate(src, new_rights)`** *(rdi=src, rsi=new_rights; new handle in rdx)*
+Semantics in §3.3. Errors: `E_BAD_HANDLE`, `E_BAD_TYPE` (Reply objects are not attenuable), `E_RIGHTS` (missing `R_ATTENUATE`, or `new_rights` not a subset), `E_NO_SLOTS`.
+
+**5 — `sys_close(h)`** *(rdi=h)*
+Frees slot `h`; decrements the object refcount, destroying the object at zero. Destroying an Endpoint unblocks all waiters with `E_GONE`; closing a Reply handle unblocks its caller with `E_GONE`. Errors: `E_BAD_HANDLE`.
+
+**6 — `sys_console_write(con, buf, len)`** *(rdi=con, rsi=buf, rdx=len)*
+Requires Console type and `R_WRITE`. Writes `len` bytes (`len <= 1024`, else `E_MSG`) from user memory to the serial console, synchronously. Errors: `E_BAD_HANDLE`, `E_BAD_TYPE`, `E_RIGHTS`, `E_FAULT`, `E_MSG`.
+
+**7 — `sys_exit(code)`** *(rdi=code)* — does not return.
+Terminates the calling process (its one thread), closing its whole handle table (with the unblocking effects of `sys_close`). The handle-free exception to L1, noted there. In v0 the kernel logs the exit code and halts.
+
+---
+
+## 5. Message format
+
+```rust
+// oxbow-abi
+pub const MSG_DATA_WORDS: usize = 8;  // 64 bytes inline payload
+pub const MSG_HANDLES:    usize = 4;
+
+#[repr(C)]
+pub struct MsgBuf {
+    pub tag: u64,                        // user-defined label; kernel never interprets
+    pub data_len: u32,                   // valid words in `data`, 0..=MSG_DATA_WORDS
+    pub handle_count: u32,               // valid slots in `handles`, 0..=MSG_HANDLES
+    pub data: [u64; MSG_DATA_WORDS],
+    pub handles: [Handle; MSG_HANDLES],  // sender: handles to transfer (each needs R_GRANT)
+                                         // receiver: kernel-written fresh indices
+}                                        // size: 104 bytes, 8-byte aligned
+```
+
+- v0 messages are **fixed-size, inline only**: at most 8 data words and 4 handles per message, no out-of-line memory, no grants of memory ranges. `data_len`/`handle_count` exceeding the limits → `E_MSG`. *(Forward path: shared-memory VMOs for bulk data; the struct layout is stable.)*
+- Copy semantics: at rendezvous the kernel copies `tag`, `data_len`, `handle_count`, the first `data_len` words of `data`, and performs handle transfer per §3.4, writing receiver-local indices into the receiver's `handles[0..handle_count]`. Unused trailing words/slots in the receiver buffer are left unmodified.
+
+---
+
+## 6. Error codes
+
+Returned in `rax`; values are **stable forever** (append-only enum).
+
+```rust
+// oxbow-abi
+#[repr(u64)]
+pub enum SysError {
+    // 0 is OK (not in this enum); SysResult = Result<(), SysError> over rax
+    BadHandle   = 1,  // index out of range or slot empty
+    BadType     = 2,  // object is not the type this syscall expects
+    Rights      = 3,  // handle lacks required right; attenuation not a subset
+    Fault       = 4,  // bad user pointer (unmapped / not user / misaligned)
+    Msg         = 5,  // message exceeds MSG_* limits or len too large
+    NoSlots     = 6,  // a handle table is full
+    NoMem       = 7,  // kernel object pool exhausted (see L6)
+    Gone        = 8,  // peer or object destroyed while blocked / reply abandoned
+    WouldBlock  = 9,  // reserved: non-blocking variants are v1; never returned in v0
+    Nosys       = 10, // unknown syscall number
+}
+```
+
+---
+
+## 7. The v0 PONG roundtrip (acceptance test)
+
+This trace is normative. v0 is **done** when this exact sequence works under QEMU.
+
+**Well-known boot handles** (`oxbow-abi`): `BOOT_EP: Handle = 1`, `BOOT_CONSOLE: Handle = 2`. **Protocol tags** (`oxbow-abi`): `TAG_PING: u64 = 0x474E4950` (`"PING"`), `TAG_PONG: u64 = 0x474E4F50` (`"PONG"`).
+
+**Kernel boot (no syscalls involved):**
+1. Limine loads the kernel and one module, `server.elf`, listed in `limine.conf`. Kernel brings up serial, GDT/IDT/TSS, physical allocator, and its own page tables (kernel mappings obey L4).
+2. Kernel creates Endpoint `EP0` and Console `CON0` from the static pools. The kernel itself logically holds the `R_RECV` side of `EP0`.
+3. Kernel hand-builds process P1 from the module: parses the ELF (v0 accepts `ET_EXEC`, x86_64, static, no relocations, no TLS; any `W|X` segment → boot panic per L4), maps `PT_LOAD` segments with exact W^X-clean permissions (text RX, rodata R+NX, data/bss RW+NX), maps a 64 KiB stack ending at `0x0000_7FFF_FFFF_0000` (RW+NX, guard page below).
+4. Kernel populates P1's handle table: slot **1** = `EP0` with rights `R_SEND | R_ATTENUATE` (no `R_RECV`, no `R_GRANT` — the server cannot impersonate or leak the kernel side); slot **2** = `CON0` with `R_WRITE | R_ATTENUATE`. Slot 0 is null; all others empty.
+5. Kernel enters user mode at `e_entry` (`oxbow-rt`'s `_start`) with `rsp` at stack top. The kernel's boot thread then performs a kernel-internal receive on `EP0` and blocks (it is the synchronous "echo parent" for v0; in v1 this side belongs to another user process).
+
+**Server side (`oxbow-rt` + server crate):**
+
+6. Server builds `MsgBuf { tag: TAG_PING, data_len: 0, handle_count: 0, .. }` and invokes **`sys_call(BOOT_EP, &mut msg)`** — exercising user→kernel entry via `syscall`, handle lookup, type check (Endpoint), rights check (`R_SEND`).
+7. Rendezvous: the kernel's waiting receive completes; kernel allocates the (kernel-internal) reply continuation; the echo responder checks `tag == TAG_PING` and replies with `MsgBuf { tag: TAG_PONG, data_len: 1, data[0]: u64::from_le_bytes(*b"PONG\n\0\0\0"), handle_count: 0, .. }` — exercising recv, reply, and the reply-capability path.
+8. `sys_call` returns `0` in `rax`; the server's buffer now holds the reply. Server asserts `tag == TAG_PONG`.
+9. Server invokes **`sys_console_write(BOOT_CONSOLE, msg.data.as_ptr() as *const u8, 5)`** — second independent handle lookup + rights check (`R_WRITE`). The serial console now shows the line `PONG`.
+10. Server invokes **`sys_exit(0)`**. Kernel logs `oxbow: server exited (0)` and halts.
+
+**Pass criterion:** QEMU serial output contains, in order: a kernel boot banner, the exact bytes `PONG\n` (emitted by step 9, not by kernel code), and the exit log line. The trace has exercised: user-mode entry, the `syscall` path, capability lookup with rights enforcement (twice, on two object types), IPC call/recv/reply rendezvous with payload copy, and ELF loading under W^X.
+
+---
+
+## 8. Explicitly deferred (not in v0)
+
+- **Threads** beyond one-per-process; any scheduler beyond "run the one ready thing"; priorities; preemption tuning.
+- **Real memory accountability:** Untyped/Frame capabilities, retyping, user-driven `sys_map`; v0 uses kernel static pools per L6's stated simplification.
+- **Process/VSpace objects and `sys_spawn`/`sys_exec`:** the kernel hand-builds the only process; userland process creation is v1 (syscall numbers 8+ reserved).
+- **Endpoint badges**, non-blocking/timeout IPC variants (`WouldBlock` is reserved), and notification (async signal) objects.
+- **Shared memory / out-of-line message data** (messages are 8 words + 4 handles, period).
+- **IRQ capabilities and device drivers** beyond the kernel-owned serial Console object.
+- **Multicore** (kernel is single-core, synchronous, coarse-locked).
+- **A POSIX shim / filesystem / naming server** — there is no name anywhere in this ABI, by law L3.

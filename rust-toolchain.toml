@@ -1,0 +1,6 @@
+# Pinned so `cargo build` "just works" for anyone who clones this.
+# nightly is required for -Zbuild-std (we compile core/alloc for the bare target).
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "llvm-tools"]
+targets = ["x86_64-unknown-none"]

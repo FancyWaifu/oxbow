@@ -1,0 +1,24 @@
+[package]
+name = "oxbow-kernel"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oxbow-kernel"
+path = "src/main.rs"
+
+[dependencies]
+# Limine boot protocol bindings (matches the v11 bootloader binaries).
+limine = "0.5"
+# 16550 UART driver for the serial console.
+uart_16550 = "0.3"
+# Spinlocks (no std::sync on bare metal).
+spin = "0.9"
+# x86_64 structures: GDT/IDT/TSS, paging, MSRs, PhysAddr/VirtAddr.
+x86_64 = "0.15"
+# The shared ABI: syscall numbers, rights, errors, MsgBuf. Unused at
+# milestone-0, but wired in now so the kernel and userland share one source.
+oxbow-abi = { path = "../abi" }

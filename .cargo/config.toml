@@ -1,0 +1,16 @@
+# Build the whole workspace for the bare-metal target by default, and rebuild
+# the sysroot crates (core/alloc) for it via build-std. The kernel's linker
+# script is applied per-crate in kernel/build.rs (NOT here), so abi/ and rt/
+# still build as ordinary rlibs.
+[build]
+target = "x86_64-unknown-none"
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "code-model=kernel",   # kernel lives in the top 2 GiB (higher half)
+]

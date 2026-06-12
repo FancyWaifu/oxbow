@@ -1,0 +1,29 @@
+# oxbow — a secure-minimal capability microkernel in Rust.
+# Workspace root. See docs/abi-v0.md for the kernel ABI this is built around.
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "abi",
+    "rt",
+    "servers/pong",
+    # "tools/*",  # initrd packer, etc.
+]
+# Servers are excluded from the default build because they need a DIFFERENT
+# codegen (no kernel code-model) and link layout. Build them explicitly with
+# their own RUSTFLAGS (see `just build-server`); a bare `cargo build` only
+# touches the kernel side.
+default-members = ["kernel", "abi", "rt"]
+
+[workspace.package]
+edition = "2021"
+license = "BSD-2-Clause"
+authors = ["Bryson Allen"]
+repository = "https://github.com/FancyWaifu/oxbow"
+
+# Bare-metal: no unwinding runtime exists, so panics must abort everywhere.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
