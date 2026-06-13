@@ -174,6 +174,40 @@ pub mod fs {
         })
     }
 
+    /// Create-or-truncate `path` relative to `dir`; returns the file capability.
+    pub fn create(dir: Handle, path: &[u8]) -> Option<Handle> {
+        let mut m = MsgBuf::new(oxbow_abi::TAG_FS_CREATE);
+        pack(&mut m, path);
+        if sys_call(dir, &mut m).is_err() || m.data[0] != 0 {
+            return None;
+        }
+        Some(m.handles[0])
+    }
+
+    /// Write all of `bytes` to a file capability, looping in <=48-byte chunks.
+    pub fn write_all(file: Handle, bytes: &[u8]) {
+        let mut off = 0u64;
+        let mut i = 0;
+        while i < bytes.len() {
+            let n = core::cmp::min(48, bytes.len() - i);
+            let mut m = MsgBuf::new(oxbow_abi::TAG_FS_WRITE);
+            m.data[0] = off;
+            m.data[1] = n as u64;
+            let dst = m.data.as_mut_ptr() as *mut u8;
+            unsafe { core::ptr::copy_nonoverlapping(bytes[i..].as_ptr(), dst.add(16), n) };
+            m.data_len = 8;
+            if sys_call(file, &mut m).is_err() {
+                break;
+            }
+            let wrote = m.data[0] as usize;
+            if wrote == 0 {
+                break;
+            }
+            off += wrote as u64;
+            i += wrote;
+        }
+    }
+
     /// Read an entire file capability into a `Vec`.
     pub fn read_all(file: Handle) -> Vec<u8> {
         let mut out = Vec::new();
@@ -404,6 +438,12 @@ pub fn argv() -> &'static [u8] {
         n += 1;
     }
     unsafe { core::slice::from_raw_parts(p, n) }
+}
+
+/// The program's arguments as whitespace-separated tokens — a real argv vector
+/// (`for arg in rt::args()`), built by splitting `argv()`.
+pub fn args() -> impl Iterator<Item = &'static [u8]> {
+    argv().split(|&b| b == b' ').filter(|s| !s.is_empty())
 }
 
 pub fn sys_notif_signal(notif: Handle) -> SysResult {

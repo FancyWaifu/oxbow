@@ -238,6 +238,7 @@ pub const BOOT_IMG_MKDIR: Handle = 15; // spawned coreutil: mkdir (dir cap + arg
 pub const BOOT_IMG_TOUCH: Handle = 16; // spawned coreutil: touch (dir cap + argv)
 pub const BOOT_IMG_RM: Handle = 17; // spawned coreutil: rm (dir cap + argv)
 pub const BOOT_IMG_MV: Handle = 18; // spawned coreutil: mv (dir cap + argv)
+pub const BOOT_IMG_CP: Handle = 19; // spawned coreutil: cp (dir cap + argv)
 
 // --- Filesystem (§15) ------------------------------------------------------
 /// The shell's root-directory capability: a BADGED endpoint to the fs server,

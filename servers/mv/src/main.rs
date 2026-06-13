@@ -1,10 +1,13 @@
-//! mv — a spawnable coreutil. The shell grants the current directory's capability
-//! at slot 1 (BOOT_EP) and "<old> <new>" as argv; mv splits the two names and
-//! issues RENAME (rename within the directory). Cross-directory moves (two dir
-//! caps) are deferred.
+//! mv — rename within a directory. Reads its two arguments via `rt::args()` (a
+//! real argv vector) and issues RENAME through the directory capability the shell
+//! granted at BOOT_EP. Cross-directory moves are supported by the fs (multi-
+//! component paths, §15.10).
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use oxbow_abi::{MsgBuf, BOOT_EP, SPAWN_STDOUT, TAG_FS_RENAME, TAG_TTY_WRITE};
 use oxbow_rt as rt;
 
@@ -20,32 +23,14 @@ fn tw(s: &[u8]) {
     let _ = rt::sys_send(SPAWN_STDOUT, &m);
 }
 
-/// Split off the first space-delimited token; returns (token, rest-trimmed).
-fn token(s: &[u8]) -> (&[u8], &[u8]) {
-    let mut a = 0;
-    while a < s.len() && s[a] == b' ' {
-        a += 1;
-    }
-    let mut e = a;
-    while e < s.len() && s[e] != b' ' {
-        e += 1;
-    }
-    let mut r = e;
-    while r < s.len() && s[r] == b' ' {
-        r += 1;
-    }
-    (&s[a..e], &s[r..])
-}
-
 #[no_mangle]
 pub extern "C" fn oxbow_main() -> ! {
-    let arg = rt::argv();
-    let (old, rest) = token(arg);
-    let (new, _) = token(rest);
-    if old.is_empty() || new.is_empty() {
+    let a: Vec<&[u8]> = rt::args().collect();
+    if a.len() < 2 {
         tw(b"mv: usage: mv <old> <new>\n");
         rt::sys_exit(1);
     }
+    let (old, new) = (a[0], a[1]);
     // Pack old NUL new NUL into the request data.
     let mut m = MsgBuf::new(TAG_FS_RENAME);
     let dst = m.data.as_mut_ptr() as *mut u8;

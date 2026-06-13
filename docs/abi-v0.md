@@ -811,3 +811,12 @@ regions, so arc-16 reclamation still holds). The shell gains `>>` (append):
 `echo X >> f` opens the file and writes at its current end (creating it if
 absent), so a multi-block file can be built a line at a time. The arena grew to
 128 KiB (TOTAL_BLOCKS = 128) for larger working sets.
+
+### 17.5 argv vector + cp (v1-argv-vector)
+`rt::args()` splits the spawn argument string into whitespace tokens — a real
+argv vector (`for a in rt::args()`), so a program takes any number of arguments
+without re-implementing splitting. The file API gains `fs::create(dir, path)` and
+`fs::write_all(file, bytes)`. The first genuinely two-argument coreutil, `cp src
+dst`, is built on them: `open` src, `read_all`, `create` dst, `write_all` — and
+`mv` now reads its two names via `args()`. (The single-string spawn mechanism is
+unchanged; `args()` is purely a userland convenience over it.)
