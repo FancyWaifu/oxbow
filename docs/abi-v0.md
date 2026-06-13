@@ -1154,3 +1154,41 @@ debug-build curve25519 scalar multiplication overflowed 64 KiB.
 
 The DRIFT handshake (HELLO/HELLO_ACK) over the TCP socket capability API (§23),
 talking to a real bridge, is the next arc.
+
+## 25. A Unix-like filesystem + browsable source (v1-unixfs)
+
+oxbow's filesystem grew from a flat 16-node ramfs into a traditional Unix tree
+you can navigate, with oxbow's own source browsable on oxbow.
+
+### 25.1 fs server changes
+- `MAX_NODES` 16 → 256, `NAME_MAX` 24 → 40.
+- **Nested directories**: `build_tree` parses multi-component tar paths and
+  creates intermediate directories on demand (robust to tar ordering / missing
+  dir entries).
+- **In-place read-only initrd files**: a `Node.data` pointer references a file's
+  bytes directly in the mapped tar instead of copying them into the arena — so a
+  read-only file has no 16 KiB cap and consumes no arena (essential: syscall.rs
+  is 33 KiB). Writable (arena-backed) files are unchanged; initrd files reject
+  writes/truncation.
+
+### 25.2 The filesystem (initrd)
+A Filesystem-Hierarchy-Standard skeleton — `/etc` (motd, os-release, hostname,
+passwd, group), `/home/bryson`, `/bin`, `/tmp`, `/usr` — plus the live oxbow
+source staged under `/usr/src/oxbow` at ISO-build time. So `cat
+/usr/src/oxbow/kernel/src/pci.rs` shows the real source, on oxbow.
+
+### 25.3 Unix-feel shell
+- A path-aware prompt: `oxbow:/usr/src/oxbow$`.
+- `cd` normalizes the target to an absolute path (handling `..`, `.`, absolute +
+  relative) and re-resolves it **from the root capability** the shell holds. The
+  fs forbids `..` *within* a directory capability (you can't escape a cap — a
+  §15 security property), but the shell, holding root, can resolve any absolute
+  path, so `cd ..` works for the user without weakening the cap model.
+
+### 25.4 Quiet runtime
+A `BOOT_VERBOSE` gate silences the per-spawn ELF/mem/exit traces once the
+scheduler takes over, so shell commands run cleanly (a Unix shell doesn't narrate
+every exec). Boot stays verbose.
+
+POSIX compliance and on-device compilation remain long-term goals; this is the
+"feels like a Unix box" groundwork.

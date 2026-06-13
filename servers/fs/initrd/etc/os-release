@@ -1,0 +1,6 @@
+NAME="oxbow"
+PRETTY_NAME="oxbow (capability microkernel)"
+ID=oxbow
+VERSION="v1"
+ARCH=x86_64
+HOME_URL="https://github.com/FancyWaifu/oxbow"

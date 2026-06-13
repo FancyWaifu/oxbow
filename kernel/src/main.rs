@@ -22,11 +22,20 @@ mod thread;
 mod usermem;
 
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
 use limine::request::{
     ExecutableAddressRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker,
     RequestsStartMarker,
 };
 use limine::BaseRevision;
+
+/// Boot chatter gate: the ELF/spawn/mem traces are useful while bringing the
+/// system up, but they would spam the console on every shell-launched command.
+/// On during boot, switched off just before the scheduler takes over.
+static BOOT_VERBOSE: AtomicBool = AtomicBool::new(true);
+pub fn verbose() -> bool {
+    BOOT_VERBOSE.load(Ordering::Relaxed)
+}
 
 /// Print to the serial console (no newline).
 #[macro_export]
@@ -489,6 +498,10 @@ fn kmain_stage2() -> ! {
         let tcb = thread::spawn_user(pid, as_i, entry, user_rsp);
         println!("[user] {} scheduled as tcb {} (ring 3, IF=1)", name, tcb);
     }
+
+    // Boot is done; silence the per-spawn ELF/mem traces so shell commands run
+    // cleanly (a Unix shell doesn't narrate every exec).
+    BOOT_VERBOSE.store(false, Ordering::Relaxed);
 
     // The boot thread becomes the idle thread and runs the scheduler forever.
     thread::run_idle();

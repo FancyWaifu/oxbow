@@ -99,7 +99,9 @@ pub extern "C" fn syscall_dispatch(
         SYS_CLOSE => SyscallRet::from_result(proc::with_current_mut(|p| p.close(a1 as Handle))),
         SYS_EXIT => {
             proc::kill(crate::thread::current_proc()); // close handles, mark Dead
-            println!("[proc] server exited ({})", a1);
+            if crate::verbose() {
+                println!("[proc] server exited ({})", a1);
+            }
             crate::thread::exit_current(); // kill this thread; the machine lives on
         }
         _ => SyscallRet::err(SysError::Nosys),
@@ -194,14 +196,16 @@ fn sys_map(mem: u64, vaddr: u64, len: u64, prot: u64) -> SyscallRet {
             let frame = mm::pmm::alloc_frame().expect("sys_map: PMM exhausted under budget");
             mm::vm::map_user_4k_live(pml4, vaddr + p * 4096, frame, writable);
         }
-        println!(
-            "[mem] proc {} map {} pages (+{} pt) @ {:#x} -> {} KiB left",
-            crate::thread::current_proc(),
-            pages,
-            missing,
-            vaddr,
-            mm::mem::remaining(midx) / 1024
-        );
+        if crate::verbose() {
+            println!(
+                "[mem] proc {} map {} pages (+{} pt) @ {:#x} -> {} KiB left",
+                crate::thread::current_proc(),
+                pages,
+                missing,
+                vaddr,
+                mm::mem::remaining(midx) / 1024
+            );
+        }
         Ok(())
     })())
 }
@@ -478,7 +482,9 @@ fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> Sysca
     // Debit the parent now (guaranteed to succeed — we checked `remaining`).
     let _ = mm::mem::debit(prep.midx, prep.cost);
     let tcb = crate::thread::spawn_user(cid, pml4, entry, rsp);
-    println!("[spawn] pid {} (tcb {}) image#{} -{} KiB", cid, tcb, prep.img_idx, prep.cost / 1024);
+    if crate::verbose() {
+        println!("[spawn] pid {} (tcb {}) image#{} -{} KiB", cid, tcb, prep.img_idx, prep.cost / 1024);
+    }
     SyscallRet::ok_handle(cid as Handle)
 }
 

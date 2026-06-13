@@ -204,13 +204,15 @@ fn load_into(img: &Image, pml4_phys: u64) -> (u64, u64) {
         let writable = ph.p_flags & PF_W != 0;
         let executable = ph.p_flags & PF_X != 0;
         assert!(!(writable && executable), "elf: W|X segment rejected (law L4)");
-        println!(
-            "[elf]   load {:#x} {} filesz={} memsz={}",
-            ph.p_vaddr,
-            perm_str(ph.p_flags),
-            ph.p_filesz,
-            ph.p_memsz
-        );
+        if crate::verbose() {
+            println!(
+                "[elf]   load {:#x} {} filesz={} memsz={}",
+                ph.p_vaddr,
+                perm_str(ph.p_flags),
+                ph.p_filesz,
+                ph.p_memsz
+            );
+        }
 
         let v_start = ph.p_vaddr;
         let v_end = ph.p_vaddr + ph.p_memsz;
@@ -247,12 +249,14 @@ fn load_into(img: &Image, pml4_phys: u64) -> (u64, u64) {
         mm::vm::map_user_4k_in(pml4_phys, stack_base + i * FRAME, frame, true, false);
     }
 
-    println!(
-        "[elf] {} segment(s), stack {} KiB @ {:#x} (guard below)",
-        segments,
-        USER_STACK_PAGES * FRAME / 1024,
-        stack_base
-    );
+    if crate::verbose() {
+        println!(
+            "[elf] {} segment(s), stack {} KiB @ {:#x} (guard below)",
+            segments,
+            USER_STACK_PAGES * FRAME / 1024,
+            stack_base
+        );
+    }
     (img.entry, USER_STACK_TOP)
 }
 
@@ -282,7 +286,9 @@ pub fn create(img: &Image, pml4_phys: u64, name: &str) -> Result<(usize, u64, u6
     }
 
     let (entry, user_rsp) = load_into(img, pml4_phys);
-    println!("[proc] {} = proc {} (as pml4={:#x})", name, id, pml4_phys);
+    if crate::verbose() {
+        println!("[proc] {} = proc {} (as pml4={:#x})", name, id, pml4_phys);
+    }
     Ok((id, entry, user_rsp))
 }
 
@@ -313,5 +319,7 @@ pub fn grant_standard(id: usize, budget: u64) {
             },
         );
     }
-    println!("[mem] proc {} granted Memory#{} = {} B (slot {})", id, mem_idx, budget, BOOT_MEM);
+    if crate::verbose() {
+        println!("[mem] proc {} granted Memory#{} = {} B (slot {})", id, mem_idx, budget, BOOT_MEM);
+    }
 }

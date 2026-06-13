@@ -1,0 +1,2 @@
+Commands (ls, cat, mkdir, ...) are spawned capability programs, not files
+here. The shell launches them from image capabilities it was granted at boot.

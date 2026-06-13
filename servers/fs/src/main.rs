@@ -24,7 +24,8 @@ use oxbow_abi::{
 };
 use oxbow_rt as rt;
 
-const MAX_NODES: usize = 16;
+const MAX_NODES: usize = 256;
+const NAME_MAX: usize = 40;
 const READ_CHUNK: usize = 56; // 7 u64 of data[1..8]
 
 /// Mutable file storage, mapped from the fs Memory budget. The arena hands out
@@ -39,19 +40,24 @@ const TOTAL_BLOCKS: usize = ARENA_SIZE / BLOCK;
 #[derive(Clone, Copy)]
 struct Node {
     kind: u64, // 0 = free, FS_DIR, FS_FILE
-    name: [u8; 24],
+    name: [u8; NAME_MAX],
     name_len: usize,
     parent: u16,
-    blocks: [usize; MAX_BLOCKS], // arena offsets of this file's blocks
+    // A file is EITHER read-only and initrd-backed (`data` = absolute address of
+    // its bytes in the mapped tar, no arena/size cap) OR writable and arena-backed
+    // (`blocks`). `data != 0` marks an initrd file.
+    data: usize,
+    blocks: [usize; MAX_BLOCKS], // arena offsets of this (writable) file's blocks
     nblocks: usize,
     len: usize, // current size in bytes
 }
 
 const FREE: Node = Node {
     kind: 0,
-    name: [0; 24],
+    name: [0; NAME_MAX],
     name_len: 0,
     parent: 0,
+    data: 0,
     blocks: [0; MAX_BLOCKS],
     nblocks: 0,
     len: 0,
@@ -61,12 +67,12 @@ fn w(s: &[u8]) {
     let _ = rt::sys_console_write(BOOT_CONSOLE, s.as_ptr(), s.len());
 }
 
-/// A bare node (name + kind), arena fields zeroed.
+/// A bare node (name + kind), data/arena fields zeroed.
 fn mk(name: &[u8], parent: u16, kind: u64) -> Node {
-    let mut nb = [0u8; 24];
-    let n = core::cmp::min(name.len(), 24);
+    let mut nb = [0u8; NAME_MAX];
+    let n = core::cmp::min(name.len(), NAME_MAX);
     nb[..n].copy_from_slice(&name[..n]);
-    Node { kind, name: nb, name_len: n, parent, blocks: [0; MAX_BLOCKS], nblocks: 0, len: 0 }
+    Node { kind, name: nb, name_len: n, parent, data: 0, blocks: [0; MAX_BLOCKS], nblocks: 0, len: 0 }
 }
 
 /// The file-storage arena: a bump pointer plus a free list of fixed `BLOCK`
@@ -176,9 +182,48 @@ fn parse_octal(b: &[u8]) -> usize {
     v
 }
 
-/// Build the node tree from the USTAR initrd at FS_INITRD, copying each top-level
-/// regular file's bytes into a fresh arena region (so it is writable).
-fn build_tree(nodes: &mut [Node], arena: &mut Arena) {
+/// Find a direct child directory named `name` under `parent`, creating it if
+/// absent. Returns None only if a non-dir with that name exists or we are full.
+fn find_or_make_dir(nodes: &mut [Node], next: &mut usize, parent: usize, name: &[u8]) -> Option<usize> {
+    if let Some(i) = find_child(nodes, parent, name) {
+        return if nodes[i].kind == FS_DIR { Some(i) } else { None };
+    }
+    if *next >= nodes.len() {
+        return None;
+    }
+    nodes[*next] = mk(name, parent as u16, FS_DIR);
+    let id = *next;
+    *next += 1;
+    Some(id)
+}
+
+/// Resolve `path`'s parent directory from the root, creating any intermediate
+/// directories. Returns `(parent_dir_id, last_component)`.
+fn resolve_parent<'a>(
+    nodes: &mut [Node],
+    next: &mut usize,
+    mut path: &'a [u8],
+) -> Option<(usize, &'a [u8])> {
+    let mut dir = 1usize; // root
+    loop {
+        match path.iter().position(|&b| b == b'/') {
+            Some(i) => {
+                let comp = &path[..i];
+                if !comp.is_empty() {
+                    dir = find_or_make_dir(nodes, next, dir, comp)?;
+                }
+                path = &path[i + 1..];
+            }
+            None => return Some((dir, path)),
+        }
+    }
+}
+
+/// Build the node tree from the USTAR initrd at FS_INITRD. Directories nest
+/// (intermediate dirs are created on demand, robust to tar ordering); regular
+/// files are referenced IN PLACE — `data` points at their bytes in the mapped
+/// tar, so a read-only source file has no 16 KiB cap and uses no arena.
+fn build_tree(nodes: &mut [Node]) {
     nodes[1] = mk(b"", 0, FS_DIR);
     let base = FS_INITRD as *const u8;
     let mut off = 0usize;
@@ -194,35 +239,29 @@ fn build_tree(nodes: &mut [Node], arena: &mut Arena) {
         if nm.starts_with(b"./") {
             nm = &nm[2..];
         }
+        let trailing_slash = nm.ends_with(b"/");
+        if trailing_slash {
+            nm = &nm[..nm.len() - 1];
+        }
         let size = parse_octal(unsafe { core::slice::from_raw_parts(hdr.add(124), 12) });
         let typeflag = unsafe { *hdr.add(156) };
-        let is_file = typeflag == b'0' || typeflag == 0;
-        if is_file && !nm.is_empty() && !nm.contains(&b'/') && next < nodes.len() {
-            let clen = core::cmp::min(size, MAX_BLOCKS * BLOCK);
-            let mut nd = mk(nm, 1, FS_FILE);
-            // Spread the content across as many blocks as it needs.
-            let mut copied = 0usize;
-            while copied < clen {
-                match arena.alloc() {
-                    Some(b) => {
-                        let n = core::cmp::min(BLOCK, clen - copied);
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                hdr.add(512 + copied),
-                                (ARENA + b) as *mut u8,
-                                n,
-                            );
-                        }
-                        nd.blocks[nd.nblocks] = b;
-                        nd.nblocks += 1;
-                        copied += n;
+        let is_dir = typeflag == b'5' || trailing_slash;
+        let is_file = !is_dir && (typeflag == b'0' || typeflag == 0);
+        if !nm.is_empty() {
+            if let Some((par, basec)) = resolve_parent(nodes, &mut next, nm) {
+                if !basec.is_empty() && find_child(nodes, par, basec).is_none() && next < nodes.len() {
+                    if is_dir {
+                        nodes[next] = mk(basec, par as u16, FS_DIR);
+                        next += 1;
+                    } else if is_file {
+                        let mut nd = mk(basec, par as u16, FS_FILE);
+                        nd.data = unsafe { hdr.add(512) } as usize; // in-place tar data
+                        nd.len = size;
+                        nodes[next] = nd;
+                        next += 1;
                     }
-                    None => break,
                 }
             }
-            nd.len = copied;
-            nodes[next] = nd;
-            next += 1;
         }
         off += 512 + ((size + 511) & !511); // header + content padded to 512
     }
@@ -234,7 +273,7 @@ pub extern "C" fn oxbow_main() -> ! {
     let _ = rt::sys_map(BOOT_MEM, ARENA as u64, ARENA_SIZE as u64, PROT_READ | PROT_WRITE);
     let mut arena = Arena::new();
     let mut nodes = [FREE; MAX_NODES];
-    build_tree(&mut nodes, &mut arena);
+    build_tree(&mut nodes);
 
     w(b"[fs] ready\n");
 
@@ -289,22 +328,27 @@ pub extern "C" fn oxbow_main() -> ! {
                 let off = m.data[0] as usize;
                 if valid && nodes[node_id].kind == FS_FILE {
                     let nd = &nodes[node_id];
-                    let bi = off / BLOCK;
-                    let within = off % BLOCK;
-                    // A read never crosses a block boundary (READ_CHUNK < BLOCK);
-                    // the client loops for the next block.
                     let avail = nd.len.saturating_sub(off);
-                    let count =
-                        core::cmp::min(READ_CHUNK, core::cmp::min(BLOCK - within, avail));
-                    if count > 0 && bi < nd.nblocks {
-                        let dst = r.data.as_mut_ptr() as *mut u8;
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                (ARENA + nd.blocks[bi] + within) as *const u8,
-                                dst.add(8), // bytes into data[1..]
-                                count,
-                            );
+                    let mut count = core::cmp::min(READ_CHUNK, avail);
+                    let src: *const u8 = if nd.data != 0 {
+                        // Read-only initrd file: contiguous bytes in the mapped tar.
+                        (nd.data + off) as *const u8
+                    } else {
+                        // Writable arena file: a read never crosses a block boundary
+                        // (READ_CHUNK < BLOCK); the client loops for the next block.
+                        let bi = off / BLOCK;
+                        let within = off % BLOCK;
+                        count = core::cmp::min(count, BLOCK - within);
+                        if bi < nd.nblocks {
+                            (ARENA + nd.blocks[bi] + within) as *const u8
+                        } else {
+                            count = 0;
+                            core::ptr::null()
                         }
+                    };
+                    if count > 0 {
+                        let dst = r.data.as_mut_ptr() as *mut u8;
+                        unsafe { core::ptr::copy_nonoverlapping(src, dst.add(8), count) };
                         r.data[0] = count as u64;
                     } else {
                         r.data[0] = 0;
@@ -369,6 +413,8 @@ pub extern "C" fn oxbow_main() -> ! {
                 let child = match target {
                     Some((par, base)) if name_ok(base) => {
                         match find_child(&nodes, par, base) {
+                            // A read-only initrd file can't be truncated/overwritten.
+                            Some(i) if nodes[i].kind == FS_FILE && nodes[i].data != 0 => None,
                             Some(i) if nodes[i].kind == FS_FILE => {
                                 free_blocks(&mut nodes[i], &mut arena); // truncate
                                 Some(i)
@@ -414,7 +460,9 @@ pub extern "C" fn oxbow_main() -> ! {
                 let off = m.data[0] as usize;
                 let count = (m.data[1] as usize).min(48);
                 let mut written = 0usize;
-                if valid && nodes[node_id].kind == FS_FILE {
+                // Read-only initrd files (data != 0) reject writes; only writable
+                // arena-backed files accept them.
+                if valid && nodes[node_id].kind == FS_FILE && nodes[node_id].data == 0 {
                     let src = unsafe { (m.data.as_ptr() as *const u8).add(16) };
                     while written < count {
                         let pos = off + written;
@@ -556,8 +604,8 @@ pub extern "C" fn oxbow_main() -> ! {
                     {
                         match find_child(&nodes, spar, sbase) {
                             Some(i) => {
-                                let mut nb = [0u8; 24];
-                                let k = core::cmp::min(dbase.len(), 24);
+                                let mut nb = [0u8; NAME_MAX];
+                                let k = core::cmp::min(dbase.len(), NAME_MAX);
                                 nb[..k].copy_from_slice(&dbase[..k]);
                                 nodes[i].name = nb;
                                 nodes[i].name_len = k;

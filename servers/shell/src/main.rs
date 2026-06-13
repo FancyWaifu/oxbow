@@ -14,7 +14,65 @@ use oxbow_abi::{
 };
 use oxbow_rt as rt;
 
-const PROMPT: &[u8] = b"oxbow$ ";
+/// The current-directory path string, tracked alongside the cwd capability so
+/// the prompt can show it (a Unix shell shows where you are).
+#[derive(Clone, Copy)]
+struct Path {
+    buf: [u8; 128],
+    len: usize,
+}
+impl Path {
+    fn root() -> Self {
+        let mut buf = [0u8; 128];
+        buf[0] = b'/';
+        Path { buf, len: 1 }
+    }
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+    fn push(&mut self, comp: &[u8]) {
+        if self.buf[self.len - 1] != b'/' && self.len < self.buf.len() {
+            self.buf[self.len] = b'/';
+            self.len += 1;
+        }
+        for &c in comp {
+            if self.len < self.buf.len() {
+                self.buf[self.len] = c;
+                self.len += 1;
+            }
+        }
+    }
+    fn pop(&mut self) {
+        if self.len <= 1 {
+            self.len = 1;
+            return;
+        }
+        let mut i = self.len;
+        while i > 1 && self.buf[i - 1] != b'/' {
+            i -= 1;
+        }
+        self.len = if i > 1 { i - 1 } else { 1 };
+    }
+    /// Update the path for a `cd` target (handles `/`, `..`, `.`, multi-component).
+    fn apply(&mut self, name: &[u8]) {
+        if name.is_empty() || name == b"/" {
+            self.len = 1;
+            self.buf[0] = b'/';
+            return;
+        }
+        if name[0] == b'/' {
+            self.len = 1;
+            self.buf[0] = b'/';
+        }
+        for comp in name.split(|&b| b == b'/') {
+            match comp {
+                b"" | b"." => {}
+                b".." => self.pop(),
+                _ => self.push(comp),
+            }
+        }
+    }
+}
 
 /// Capabilities the shell mints once at startup to launch programs with.
 struct Spawner {
@@ -499,17 +557,27 @@ fn write_file(dir: Handle, name: &[u8], text: &[u8], append: bool) {
 /// arg (or `/`) returns to the root; `cd <name>` opens a subdir relative to the
 /// current one. Confinement: there is no `cd ..` — you can't walk above a dir cap
 /// you hold; `cd /` works only because the shell still holds the root cap.
-fn cd(name: &[u8], cwd: &mut Handle) {
-    if name.is_empty() || name == b"/" {
+fn cd(name: &[u8], cwd: &mut Handle, path: &mut Path) {
+    // Normalize to an absolute target (handles `..`, `.`, absolute + relative),
+    // then re-resolve it FROM ROOT. The fs forbids `..` within a directory cap
+    // (you can't escape a capability), but the shell holds the root cap, so it
+    // can always resolve any absolute path — that's what makes `cd ..` work.
+    let mut target = *path;
+    target.apply(name);
+    let commit = |cwd: &mut Handle, cap: Handle| {
         if *cwd != BOOT_FS_ROOT {
             let _ = rt::sys_close(*cwd);
         }
-        *cwd = BOOT_FS_ROOT;
+        *cwd = cap;
+    };
+    if target.len == 1 {
+        commit(cwd, BOOT_FS_ROOT);
+        *path = target;
         return;
     }
     let mut m = MsgBuf::new(TAG_FS_OPEN);
-    pack_name(&mut m, name);
-    if rt::sys_call(*cwd, &mut m).is_err() || m.data[0] != 0 {
+    pack_name(&mut m, target.as_bytes());
+    if rt::sys_call(BOOT_FS_ROOT, &mut m).is_err() || m.data[0] != 0 {
         tw(b"cd: ");
         tw(name);
         tw(b": no such directory\n");
@@ -523,13 +591,11 @@ fn cd(name: &[u8], cwd: &mut Handle) {
         let _ = rt::sys_close(cap);
         return;
     }
-    if *cwd != BOOT_FS_ROOT {
-        let _ = rt::sys_close(*cwd);
-    }
-    *cwd = cap;
+    commit(cwd, cap);
+    *path = target;
 }
 
-fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
+fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
     // Output redirect: `echo TEXT > FILE` (truncate) or `>> FILE` (append).
     if let Some(gt) = line.iter().position(|&b| b == b'>') {
         let append = gt + 1 < line.len() && line[gt + 1] == b'>';
@@ -566,7 +632,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
         b"rm" => spawn_with(BOOT_IMG_RM, *cwd, rest, sp),
         b"mv" => spawn_with(BOOT_IMG_MV, *cwd, rest, sp),
         b"cp" => spawn_with(BOOT_IMG_CP, *cwd, rest, sp),
-        b"cd" => cd(rest, cwd),
+        b"cd" => cd(rest, cwd, path),
         b"dns" => dns_cmd(rest),
         b"http" => http_cmd(rest),
         b"drift" => spawn_with(BOOT_IMG_DRIFT, HANDLE_NULL, rest, sp),
@@ -616,12 +682,16 @@ pub extern "C" fn oxbow_main() -> ! {
         exit: rt::sys_notif_create().unwrap_or(HANDLE_NULL),
         ep: rt::sys_ep_create().unwrap_or(HANDLE_NULL),
     };
-    // The current-directory capability (starts at the filesystem root).
+    // The current-directory capability + its path string (starts at the root).
     let mut cwd: Handle = BOOT_FS_ROOT;
+    let mut path = Path::root();
     let mut line = [0u8; 64];
     loop {
-        tw(PROMPT);
+        // Path-aware prompt, e.g. `oxbow:/usr/src$ `.
+        tw(b"oxbow:");
+        tw(path.as_bytes());
+        tw(b"$ ");
         let n = read_line(&mut line);
-        run(&line[..n], &sp, &mut cwd);
+        run(&line[..n], &sp, &mut cwd, &mut path);
     }
 }

@@ -2,3 +2,4 @@
 /iso_root
 /oxbow.iso
 *.elf
+/build/

@@ -79,7 +79,19 @@ _iso:
     cp target/x86_64-unknown-none/debug/mv iso_root/boot/mv.elf
     cp target/x86_64-unknown-none/debug/cp iso_root/boot/cp.elf
     cp target/x86_64-unknown-none/debug/drift iso_root/boot/drift.elf
-    COPYFILE_DISABLE=1 tar --format=ustar -cf iso_root/boot/initrd.tar -C servers/fs/initrd .
+    # Stage the filesystem: the FHS skeleton (servers/fs/initrd) plus the live
+    # oxbow source under /usr/src/oxbow so it is browsable on oxbow itself.
+    rm -rf build/initrd
+    mkdir -p build/initrd build/initrd/usr/src/oxbow
+    cp -R servers/fs/initrd/. build/initrd/
+    cp -R kernel abi rt docs build/initrd/usr/src/oxbow/
+    mkdir -p build/initrd/usr/src/oxbow/servers
+    for d in servers/*/src; do s=$(basename $(dirname $d)); mkdir -p build/initrd/usr/src/oxbow/servers/$s; cp -R $d build/initrd/usr/src/oxbow/servers/$s/; done
+    cp Cargo.toml justfile limine.conf build/initrd/usr/src/oxbow/ 2>/dev/null || true
+    # Drop build artifacts + the (self-referential) initrd skeleton copy.
+    find build/initrd/usr/src/oxbow -type d -name target -prune -exec rm -rf {} + 2>/dev/null || true
+    rm -rf build/initrd/usr/src/oxbow/servers/fs/initrd
+    COPYFILE_DISABLE=1 tar --format=ustar -cf iso_root/boot/initrd.tar -C build/initrd .
     cp limine.conf iso_root/boot/limine/
     cp {{LIMINE_DIR}}/limine-bios.sys {{LIMINE_DIR}}/limine-bios-cd.bin {{LIMINE_DIR}}/limine-uefi-cd.bin iso_root/boot/limine/
     cp {{LIMINE_DIR}}/BOOTX64.EFI {{LIMINE_DIR}}/BOOTIA32.EFI iso_root/EFI/BOOT/
