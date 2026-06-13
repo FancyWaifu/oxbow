@@ -28,6 +28,8 @@ build-server:
     RUSTFLAGS="-C relocation-model=static" cargo build -p hello
     RUSTFLAGS="-C relocation-model=static" cargo build -p badge
     RUSTFLAGS="-C relocation-model=static" cargo build -p fs
+    RUSTFLAGS="-C relocation-model=static" cargo build -p cat
+    RUSTFLAGS="-C relocation-model=static" cargo build -p ls
 
 # Same, but with the ABI negative-path selftests compiled in.
 build-server-selftest:
@@ -58,6 +60,8 @@ _iso:
     cp target/x86_64-unknown-none/debug/hello iso_root/boot/hello.elf
     cp target/x86_64-unknown-none/debug/badge iso_root/boot/badge.elf
     cp target/x86_64-unknown-none/debug/fs iso_root/boot/fs.elf
+    cp target/x86_64-unknown-none/debug/cat iso_root/boot/cat.elf
+    cp target/x86_64-unknown-none/debug/ls iso_root/boot/ls.elf
     COPYFILE_DISABLE=1 tar --format=ustar -cf iso_root/boot/initrd.tar -C servers/fs/initrd .
     cp limine.conf iso_root/boot/limine/
     cp {{LIMINE_DIR}}/limine-bios.sys {{LIMINE_DIR}}/limine-bios-cd.bin {{LIMINE_DIR}}/limine-uefi-cd.bin iso_root/boot/limine/

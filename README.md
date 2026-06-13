@@ -158,11 +158,20 @@ opens a subdir cap, `cd /` returns to root — and there is no `cd ..` (you can'
 walk above a directory cap you hold; the capability tree *is* the access boundary,
 so a subdir's files are invisible from its parent). See `docs/abi-v0.md` §15.7.
 
+**v1 arc 13 — spawned coreutils: complete.** `ls` and `cat` are real programs
+the shell launches (`servers/{ls,cat}`), not builtins — the first capability
+transfer between *unrelated* processes. For `cat foo`, the shell (holding the dir
+cap) resolves the name, opens the file, and grants the resulting **file
+capability** to a freshly-spawned `cat`, which reads exactly that one file and
+nothing else — it never sees a name, holds no directory. A spawned coreutil
+can't take a *name* (no argv yet), which is exactly why `cat`/`ls` spawn (they
+take a cap) while `mkdir`/`cd`/`echo >` stay builtins. Least privilege, enforced
+by the kernel. See `docs/abi-v0.md` §15.8.
+
 ### Next — toward a fuller userspace
 
-Spawned **coreutils** (each receiving an open-file capability — the first real
-cap-passing between unrelated processes) → file growth/realloc + multi-component
-path walk → a **libc/POSIX shim**. POSIX and the Unix feel live in *userspace*
+**argv** (so coreutils resolve their own names) → file growth/realloc +
+multi-component path walk → a **libc/POSIX shim**. POSIX and the Unix feel live in *userspace*
 over the capability kernel (the Redox model) — the kernel stays capability-pure.
 Plus, eventually: frame reclamation + budget refund, the orphaned selftest rework,
 untyped/retype + `sys_unmap`, SMP, and the `aarch64` port.

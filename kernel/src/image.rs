@@ -13,7 +13,7 @@
 use spin::Mutex;
 
 /// Max distinct spawnable images. Bump alongside the boot module list.
-pub const MAX_IMAGES: usize = 6;
+pub const MAX_IMAGES: usize = 8;
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // name/ptr/len read by the sys_spawn path (next phase)

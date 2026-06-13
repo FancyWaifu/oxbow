@@ -15,6 +15,8 @@ members = [
     "servers/hello",
     "servers/badge",
     "servers/fs",
+    "servers/cat",
+    "servers/ls",
     # "tools/*",  # initrd packer, etc.
 ]
 # Servers are excluded from the default build because they need a DIFFERENT

@@ -643,3 +643,24 @@ boundary.
 §15.6's deferred list still stands minus write/mkdir/cd, which are now done; file
 growth/realloc, multi-component path walk, zero-copy frame bulk transfer, spawned
 coreutils, rm/unlink, and an on-disk FS remain deferred.
+
+### 15.8 Spawned coreutils (v1-coreutils)
+`ls` and `cat` are no longer shell builtins — they are spawnable programs
+(`servers/{ls,cat}`, images `BOOT_IMG_LS`/`BOOT_IMG_CAT`) the shell launches via
+`sys_spawn`. This is the first capability transfer between *unrelated* processes:
+
+- **`cat <name>`**: the shell (which holds the directory cap) resolves the name
+  via OPEN, gets a badged file capability, and grants it to a freshly-spawned
+  `cat` at slot 1 (`BOOT_EP`); stdout (a tty endpoint) at slot 2. `cat` loops READ
+  on slot 1 and writes to slot 2, then exits. It never sees a filename and holds
+  exactly one file, read-only — no directory, no namespace.
+- **`ls`**: the shell grants the current-directory capability at slot 1; `ls`
+  loops READDIR and prints, then exits.
+
+A spawned coreutil cannot take a *name* argument (there is no argv yet), so the
+shell must pre-resolve names into capabilities — which is exactly why `cat`/`ls`
+spawn cleanly (they operate on a cap) while `mkdir`/`cd`/`echo >` stay builtins
+(they need a name or shell state). The least-privilege story is literal: a
+spawned `cat` is handed precisely the authority it needs and nothing more, and
+the kernel enforces it — `cat` has no handle to any other file. (Deferred: argv,
+which would let coreutils resolve their own names.)

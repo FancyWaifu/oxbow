@@ -8,8 +8,8 @@
 
 use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA,
-    BOOT_IMG_HELLO, BOOT_IMG_PONG, BOOT_MEM, BOOT_TICK, BOOT_TTY, HANDLE_NULL, R_GRANT, R_RECV,
-    R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR,
+    BOOT_IMG_CAT, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_PONG, BOOT_MEM, BOOT_TICK, BOOT_TTY,
+    HANDLE_NULL, R_GRANT, R_RECV, R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_OPEN,
     TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
@@ -82,19 +82,41 @@ fn wait_exits(sp: &Spawner, n: u64) {
     }
 }
 
-/// Spawn a single self-contained program (just stdout), and wait for it to exit.
-fn spawn_one(image: Handle, sp: &Spawner) {
-    // Spawn MsgBuf (§13): data[0] = child budget (0 → default); the granted
-    // handles land at the §13 slots — NULL skips slot 1, stdout lands at slot 2.
+/// Spawn a program, granting it `cap0` at slot 1 (BOOT_EP) and stdout at slot 2,
+/// then wait for it to exit. `cap0 = HANDLE_NULL` for a program that needs no
+/// input capability (e.g. hello). For ls/cat, `cap0` is the dir/file capability
+/// the shell hands over — the spawned coreutil never sees a name, just the cap.
+fn spawn_with(image: Handle, cap0: Handle, sp: &Spawner) {
     let mut m = MsgBuf::new(0);
     m.data_len = 1;
     m.handle_count = 2;
-    m.handles[0] = HANDLE_NULL; // slot 1: unused
-    m.handles[1] = sp.stdout; // slot 2: SPAWN_STDOUT
+    m.handles[0] = cap0; // slot 1 = BOOT_EP (a file/dir cap, or NULL)
+    m.handles[1] = sp.stdout; // slot 2 = SPAWN_STDOUT
     match rt::sys_spawn(image, BOOT_MEM, &m, sp.exit) {
         Ok(_) => wait_exits(sp, 1),
         Err(_) => tw(b"run: spawn failed\n"),
     }
+}
+
+/// `cat <name>`: resolve the name relative to `dir` (the shell holds the dir cap),
+/// then hand the resulting FILE capability to a freshly-spawned `cat` program —
+/// which reads exactly that one file and nothing else.
+fn cat_cmd(dir: Handle, name: &[u8], sp: &Spawner) {
+    if name.is_empty() {
+        tw(b"cat: usage: cat <file>\n");
+        return;
+    }
+    let mut m = MsgBuf::new(TAG_FS_OPEN);
+    pack_name(&mut m, name);
+    if rt::sys_call(dir, &mut m).is_err() || m.data[0] != 0 {
+        tw(b"cat: ");
+        tw(name);
+        tw(b": not found\n");
+        return;
+    }
+    let file_cap = m.handles[0];
+    spawn_with(BOOT_IMG_CAT, file_cap, sp); // cat reads the file cap, prints, exits
+    let _ = rt::sys_close(file_cap); // cat holds its own copy
 }
 
 /// `run pong`: launch the pong↔beta demo pair, wiring an endpoint between them
@@ -320,62 +342,6 @@ fn cd(name: &[u8], cwd: &mut Handle) {
     *cwd = cap;
 }
 
-/// `ls`: list `dir` by looping READDIR through its capability.
-fn ls(dir: Handle) {
-    let mut i = 0u64;
-    loop {
-        let mut m = MsgBuf::new(TAG_FS_READDIR);
-        m.data[0] = i;
-        m.data_len = 1;
-        if rt::sys_call(dir, &mut m).is_err() || m.data[0] == 0 {
-            break;
-        }
-        let bytes = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(16), 48) };
-        let n = bytes.iter().position(|&b| b == 0).unwrap_or(0);
-        tw(&bytes[..n]);
-        if m.data[1] == oxbow_abi::FS_DIR {
-            tw(b"/"); // mark directories
-        }
-        tw(b"\n");
-        i += 1;
-    }
-}
-
-/// `cat <name>`: OPEN the file relative to `dir`, then loop READ through the file
-/// capability the server minted, printing chunks until EOF.
-fn cat(dir: Handle, name: &[u8]) {
-    if name.is_empty() {
-        tw(b"cat: usage: cat <file>\n");
-        return;
-    }
-    let mut m = MsgBuf::new(TAG_FS_OPEN);
-    pack_name(&mut m, name);
-    if rt::sys_call(dir, &mut m).is_err() || m.data[0] != 0 {
-        tw(b"cat: ");
-        tw(name);
-        tw(b": not found\n");
-        return;
-    }
-    let file_cap = m.handles[0]; // the minted file cap, now in our table
-    let mut off = 0u64;
-    loop {
-        let mut rm = MsgBuf::new(TAG_FS_READ);
-        rm.data[0] = off;
-        rm.data_len = 1;
-        if rt::sys_call(file_cap, &mut rm).is_err() {
-            break;
-        }
-        let count = rm.data[0] as usize;
-        if count == 0 {
-            break;
-        }
-        let bytes = unsafe { core::slice::from_raw_parts((rm.data.as_ptr() as *const u8).add(8), count) };
-        tw(bytes);
-        off += count as u64;
-    }
-    let _ = rt::sys_close(file_cap);
-}
-
 fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
     // Output redirect: `echo TEXT > FILE` writes TEXT to the file instead of the
     // tty (the first taste of the Unix shell feel).
@@ -399,14 +365,14 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
         b"run" => {
             let (prog, _) = split_cmd(rest);
             match prog {
-                b"hello" => spawn_one(BOOT_IMG_HELLO, sp),
+                b"hello" => spawn_with(BOOT_IMG_HELLO, HANDLE_NULL, sp),
                 b"pong" => run_pong(sp),
                 b"" => tw(b"run: usage: run <program>\n"),
                 _ => tw(b"run: no such program\n"),
             }
         }
-        b"ls" => ls(*cwd),
-        b"cat" => cat(*cwd, rest),
+        b"ls" => spawn_with(BOOT_IMG_LS, *cwd, sp),
+        b"cat" => cat_cmd(*cwd, rest, sp),
         b"mkdir" => mkdir(*cwd, rest),
         b"cd" => cd(rest, cwd),
         b"badgetest" => badgetest(sp),

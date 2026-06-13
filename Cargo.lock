@@ -37,6 +37,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
+name = "cat"
+version = "0.0.0"
+dependencies = [
+ "oxbow-abi",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "const_fn"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -82,6 +90,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
  "scopeguard",
+]
+
+[[package]]
+name = "ls"
+version = "0.0.0"
+dependencies = [
+ "oxbow-abi",
+ "oxbow-rt",
 ]
 
 [[package]]

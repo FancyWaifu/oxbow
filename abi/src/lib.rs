@@ -232,6 +232,8 @@ pub const BOOT_IMG_HELLO: Handle = 8;
 pub const BOOT_IMG_PONG: Handle = 9;
 pub const BOOT_IMG_BETA: Handle = 10;
 pub const BOOT_IMG_BADGE: Handle = 11; // §14 badged-endpoint demo server
+pub const BOOT_IMG_CAT: Handle = 13; // spawned coreutil: cat (gets a file cap)
+pub const BOOT_IMG_LS: Handle = 14; // spawned coreutil: ls (gets a dir cap)
 
 // --- Filesystem (§15) ------------------------------------------------------
 /// The shell's root-directory capability: a BADGED endpoint to the fs server,
