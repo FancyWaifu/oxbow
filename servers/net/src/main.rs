@@ -441,7 +441,7 @@ pub extern "C" fn oxbow_main() -> ! {
     let (ral, rah) = unsafe { (reg(RAL), reg(RAH)) };
     let mac = [ral as u8, (ral >> 8) as u8, (ral >> 16) as u8, (ral >> 24) as u8, rah as u8, (rah >> 8) as u8];
     w(format!(
-        "[net] e1000 up — MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  IP 10.0.2.15  STATUS {:#x}\n",
+        "[net] e1000 up — MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  STATUS {:#x}\n",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], unsafe { reg(STATUS) }
     )
     .as_bytes());

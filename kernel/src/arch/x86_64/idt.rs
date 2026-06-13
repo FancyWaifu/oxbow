@@ -13,6 +13,24 @@ use super::gdt::DOUBLE_FAULT_IST_INDEX;
 use super::pic;
 use crate::println;
 
+/// Generate a bindable PCI-device IRQ handler for one line: mask the line, EOI
+/// in-kernel, then signal the bound notification — the standard discipline. We
+/// install one per common PCI line (5/9/10/11) so a NIC works whatever IRQ the
+/// firmware routed it to (QEMU q35 picks 11; a Proxmox i440fx VM may pick 10).
+macro_rules! pci_irq {
+    ($name:ident, $line:literal) => {
+        extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
+            pic::mask($line);
+            pic::eoi($line);
+            crate::irq::fire($line);
+        }
+    };
+}
+pci_irq!(pci_irq5, 5);
+pci_irq!(pci_irq9, 9);
+pci_irq!(pci_irq10, 10);
+pci_irq!(pci_irq11, 11);
+
 /// Vector the PIT timer (IRQ0) lands on after the PIC remap.
 const TIMER_VECTOR: u8 = 0x20;
 
@@ -39,11 +57,14 @@ pub fn init() {
         idt[TIMER_VECTOR].set_handler_fn(timer); // IRQ0 — scheduler tick
         idt[0x21].set_handler_fn(keyboard); // IRQ1 — i8042 keyboard (bindable)
         idt[0x24].set_handler_fn(serial_com1); // IRQ4 — 16550 COM1 RX (bindable)
+        idt[0x25].set_handler_fn(pci_irq5); // IRQ5  — PCI INTx (bindable)
         idt[0x27].set_handler_fn(spurious_master); // IRQ7 spurious: no EOI
-        idt[0x2B].set_handler_fn(net_irq); // IRQ11 — e1000 NIC, PCI INTx (bindable)
+        idt[0x29].set_handler_fn(pci_irq9); // IRQ9   — PCI INTx (bindable)
+        idt[0x2A].set_handler_fn(pci_irq10); // IRQ10 — PCI INTx (bindable)
+        idt[0x2B].set_handler_fn(pci_irq11); // IRQ11 — PCI INTx, e1000 on QEMU q35
         idt[0x2F].set_handler_fn(spurious_slave); // IRQ15 spurious: EOI master
         for v in 0x22u8..=0x2E {
-            if v != 0x24 && v != 0x27 && v != 0x2B {
+            if !matches!(v, 0x24 | 0x25 | 0x27 | 0x29 | 0x2A | 0x2B) {
                 idt[v].set_handler_fn(unexpected_irq);
             }
         }
@@ -92,16 +113,6 @@ extern "x86-interrupt" fn serial_com1(_frame: InterruptStackFrame) {
     pic::mask(4);
     pic::eoi(4);
     crate::irq::fire(4);
-}
-
-extern "x86-interrupt" fn net_irq(_frame: InterruptStackFrame) {
-    // IRQ11 — the e1000 NIC's PCI INTx line (level-triggered). Same discipline:
-    // mask the line, EOI in-kernel (slave + master cascade), then signal the
-    // bound notification. The net driver reads the device's ICR (which deasserts
-    // the line), drains the RX ring, and acks (unmask) for the next interrupt.
-    pic::mask(11);
-    pic::eoi(11);
-    crate::irq::fire(11);
 }
 
 extern "x86-interrupt" fn spurious_master(_frame: InterruptStackFrame) {
