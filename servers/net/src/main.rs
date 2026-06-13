@@ -1,26 +1,39 @@
-//! net — the e1000 network driver (resident boot module).
+//! net — the oxbow network stack (resident boot module).
 //!
-//! This arc turns the bare PCI/MMIO capability (§18) into a working NIC driver:
-//! DMA-allocated TX/RX descriptor rings, the e1000 reset + ring + RCTL/TCTL
-//! bring-up, and an interrupt-driven receive path. It proves the whole stack
-//! end to end by hand-building one broadcast ARP request for the QEMU SLIRP
-//! gateway (10.0.2.2), transmitting it, and receiving the gateway's ARP reply
-//! via the NIC's interrupt — so TX, RX, and IRQ all work over the capability
-//! model. Ethernet/ARP/IP/UDP as proper layers come in the following arcs.
+//! Layer 1 (PCI/MMIO + DMA rings + IRQ) was the e1000 arc (§19). This arc adds
+//! the protocol layers from scratch — Ethernet (eth), ARP (arp), IPv4 (ipv4),
+//! ICMP (icmp), and UDP (udp), plus a tiny DNS client (dns) — and proves them
+//! against QEMU's SLIRP services: it ARP-resolves the gateway, sends a real DNS
+//! query over UDP/IPv4 and prints the resolved address, and pings the gateway
+//! over ICMP. The NIC plumbing lives in `Nic`; the higher layers are pure byte
+//! shuffling over its `tx` / `recv_blocking`.
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+mod arp;
+mod dns;
+mod eth;
+mod icmp;
+mod ipv4;
+mod udp;
+
 use alloc::format;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
+use eth::{ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use oxbow_abi::{BOOT_CONSOLE, BOOT_MEM, BOOT_NET_IRQ, BOOT_PCI, NET_DMA, NET_MMIO};
 use oxbow_rt as rt;
 
 fn w(s: &[u8]) {
     let _ = rt::sys_console_write(BOOT_CONSOLE, s.as_ptr(), s.len());
 }
+
+// Our addressing (the SLIRP default network: gateway .2, DNS forwarder .3).
+const OUR_IP: [u8; 4] = [10, 0, 2, 15];
+const GW_IP: [u8; 4] = [10, 0, 2, 2];
+const DNS_IP: [u8; 4] = [10, 0, 2, 3];
 
 // --- e1000 register offsets (bytes into BAR0) ------------------------------
 const CTRL: usize = 0x0000;
@@ -45,27 +58,21 @@ const MTA: usize = 0x5200;
 const RAL: usize = 0x5400;
 const RAH: usize = 0x5404;
 
-// CTRL bits
-const CTRL_SLU: u32 = 0x0000_0040; // set link up
-const CTRL_RST: u32 = 0x0400_0000; // device reset (self-clearing)
-// RCTL bits
+const CTRL_SLU: u32 = 0x0000_0040;
+const CTRL_RST: u32 = 0x0400_0000;
 const RCTL_EN: u32 = 0x0000_0002;
-const RCTL_UPE: u32 = 0x0000_0008; // unicast promiscuous
-const RCTL_MPE: u32 = 0x0000_0010; // multicast promiscuous
-const RCTL_BAM: u32 = 0x0000_8000; // broadcast accept
-const RCTL_SECRC: u32 = 0x0400_0000; // strip ethernet CRC (BSIZE 2048 = bits 0)
-// TCTL bits
+const RCTL_UPE: u32 = 0x0000_0008;
+const RCTL_MPE: u32 = 0x0000_0010;
+const RCTL_BAM: u32 = 0x0000_8000;
+const RCTL_SECRC: u32 = 0x0400_0000;
 const TCTL_EN: u32 = 0x0000_0002;
-const TCTL_PSP: u32 = 0x0000_0008; // pad short packets
-const TCTL_CT: u32 = 0x0000_00F0; // collision threshold = 0x0F
-const TCTL_COLD: u32 = 0x0004_0000; // collision distance = 0x40 (full duplex)
-// TX descriptor command/status
+const TCTL_PSP: u32 = 0x0000_0008;
+const TCTL_CT: u32 = 0x0000_00F0;
+const TCTL_COLD: u32 = 0x0004_0000;
 const TXD_EOP: u8 = 0x01;
 const TXD_IFCS: u8 = 0x02;
 const TXD_RS: u8 = 0x08;
-// RX descriptor status
 const RXD_DD: u8 = 0x01;
-// Interrupt cause bits we enable
 const INT_LSC: u32 = 0x0000_0004;
 const INT_RXDMT0: u32 = 0x0000_0010;
 const INT_RXO: u32 = 0x0000_0040;
@@ -73,7 +80,7 @@ const INT_RXT0: u32 = 0x0000_0080;
 
 const RX_DESCS: usize = 8;
 const TX_DESCS: usize = 8;
-const BUF: usize = 2048; // per-buffer size (RCTL BSIZE = 2048)
+const BUF: usize = 2048;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -105,7 +112,6 @@ unsafe fn setreg(off: usize, val: u32) {
     write_volatile((NET_MMIO as usize + off) as *mut u32, val);
 }
 
-/// Allocate one DMA page: map it at the next NET_DMA slot, return (vaddr, phys).
 fn dma_page(slot: &mut u64) -> (u64, u64) {
     let vaddr = NET_DMA + *slot * 0x1000;
     let phys = rt::sys_dma_alloc(BOOT_MEM, vaddr).expect("[net] dma_alloc failed");
@@ -113,22 +119,172 @@ fn dma_page(slot: &mut u64) -> (u64, u64) {
     (vaddr, phys)
 }
 
+/// The NIC: descriptor rings, packet buffers, and the bound IRQ notification.
+struct Nic {
+    mac: [u8; 6],
+    notif: oxbow_abi::Handle,
+    rx_ring_v: u64,
+    rx_buf_v: [u64; RX_DESCS],
+    rx_cur: usize,
+    tx_ring_v: u64,
+    tx_buf_v: [u64; TX_DESCS],
+    tx_buf_p: [u64; TX_DESCS],
+    tx_cur: usize,
+}
+
+impl Nic {
+    /// Queue a frame on the TX ring and hand it to the device.
+    fn tx(&mut self, frame: &[u8]) {
+        let i = self.tx_cur;
+        let n = frame.len().min(BUF);
+        unsafe {
+            let buf = self.tx_buf_v[i] as *mut u8;
+            for (k, b) in frame[..n].iter().enumerate() {
+                write_volatile(buf.add(k), *b);
+            }
+            let d = (self.tx_ring_v as usize + i * 16) as *mut TxDesc;
+            write_volatile(
+                d,
+                TxDesc {
+                    addr: self.tx_buf_p[i],
+                    length: n as u16,
+                    cso: 0,
+                    cmd: TXD_EOP | TXD_IFCS | TXD_RS,
+                    status: 0,
+                    css: 0,
+                    special: 0,
+                },
+            );
+            fence(Ordering::SeqCst);
+            setreg(TDT, ((i + 1) % TX_DESCS) as u32);
+        }
+        self.tx_cur = (i + 1) % TX_DESCS;
+    }
+
+    /// Return the next received frame (copied into `out`), blocking on the NIC
+    /// interrupt when the ring is empty.
+    fn recv_blocking(&mut self, out: &mut [u8]) -> usize {
+        loop {
+            let d = (self.rx_ring_v as usize + self.rx_cur * 16) as *mut RxDesc;
+            let status = unsafe { read_volatile(addr_of!((*d).status)) };
+            if status & RXD_DD != 0 {
+                let len = unsafe { read_volatile(addr_of!((*d).length)) } as usize;
+                let n = len.min(out.len());
+                let src = self.rx_buf_v[self.rx_cur] as *const u8;
+                for (k, slot) in out[..n].iter_mut().enumerate() {
+                    *slot = unsafe { read_volatile(src.add(k)) };
+                }
+                unsafe {
+                    write_volatile(addr_of_mut!((*d).status), 0);
+                    fence(Ordering::SeqCst);
+                    setreg(RDT, self.rx_cur as u32);
+                }
+                self.rx_cur = (self.rx_cur + 1) % RX_DESCS;
+                return n;
+            }
+            // Ring empty: park until the NIC raises IRQ11, then re-arm.
+            let _ = rt::sys_notif_wait(self.notif);
+            unsafe {
+                let _ = reg(ICR); // reading ICR deasserts the level-triggered line
+            }
+            let _ = rt::sys_irq_ack(BOOT_NET_IRQ);
+        }
+    }
+}
+
+/// Be a good L2/L3 citizen for any frame we see: cache the sender's ARP binding,
+/// answer ARP requests for our address, and echo-reply pings aimed at us.
+fn handle_background(nic: &mut Nic, cache: &mut arp::Cache, frame: &[u8]) {
+    let Some((_, src_mac, et, off)) = eth::parse(frame) else {
+        return;
+    };
+    if et == ETHERTYPE_ARP {
+        if let Some(a) = arp::parse(&frame[off..]) {
+            cache.insert(a.spa, a.sha);
+            if a.op == arp::OP_REQUEST && a.tpa == OUR_IP {
+                let pkt = arp::packet(arp::OP_REPLY, nic.mac, OUR_IP, a.sha, a.spa);
+                let f = eth::frame(a.sha, nic.mac, ETHERTYPE_ARP, &pkt);
+                nic.tx(&f);
+            }
+        }
+    } else if et == ETHERTYPE_IPV4 {
+        if let Some(ip) = ipv4::parse(&frame[off..]) {
+            cache.insert(ip.src, src_mac);
+            if ip.proto == ipv4::PROTO_ICMP && ip.dst == OUR_IP {
+                if let Some(e) = icmp::parse(&frame[off + ip.payload_off..]) {
+                    if e.typ == icmp::ECHO_REQUEST {
+                        let msg = icmp::echo(icmp::ECHO_REPLY, e.id, e.seq, &[]);
+                        let pkt = ipv4::packet(OUR_IP, ip.src, ipv4::PROTO_ICMP, &msg);
+                        let f = eth::frame(src_mac, nic.mac, ETHERTYPE_IPV4, &pkt);
+                        nic.tx(&f);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Resolve `target` to a MAC: reply from cache, else ARP-request and wait.
+fn arp_resolve(nic: &mut Nic, cache: &mut arp::Cache, target: [u8; 4]) -> [u8; 6] {
+    if let Some(mac) = cache.lookup(target) {
+        return mac;
+    }
+    let pkt = arp::packet(arp::OP_REQUEST, nic.mac, OUR_IP, [0; 6], target);
+    let req = eth::frame(eth::BROADCAST, nic.mac, ETHERTYPE_ARP, &pkt);
+    nic.tx(&req);
+    let mut buf = [0u8; BUF];
+    loop {
+        let n = nic.recv_blocking(&mut buf);
+        handle_background(nic, cache, &buf[..n]);
+        if let Some(mac) = cache.lookup(target) {
+            return mac;
+        }
+    }
+}
+
+/// Send a DNS A-query for `name` to the SLIRP forwarder and return the answer.
+fn dns_query(nic: &mut Nic, cache: &mut arp::Cache, name: &str) -> Option<[u8; 4]> {
+    let dns_mac = arp_resolve(nic, cache, DNS_IP);
+    let sport: u16 = 0xC000;
+    let q = dns::query(0x1234, name);
+    let seg = udp::segment(OUR_IP, DNS_IP, sport, 53, &q);
+    let ip = ipv4::packet(OUR_IP, DNS_IP, ipv4::PROTO_UDP, &seg);
+    nic.tx(&eth::frame(dns_mac, nic.mac, ETHERTYPE_IPV4, &ip));
+
+    let mut buf = [0u8; BUF];
+    loop {
+        let n = nic.recv_blocking(&mut buf);
+        handle_background(nic, cache, &buf[..n]);
+        let Some((_, _, et, off)) = eth::parse(&buf[..n]) else { continue };
+        if et != ETHERTYPE_IPV4 {
+            continue;
+        }
+        let Some(ip) = ipv4::parse(&buf[off..n]) else { continue };
+        if ip.proto != ipv4::PROTO_UDP {
+            continue;
+        }
+        let uoff = off + ip.payload_off;
+        let Some(u) = udp::parse(&buf[uoff..n]) else { continue };
+        if u.dst_port == sport {
+            return dns::first_a(&buf[uoff + u.payload_off..n]);
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn oxbow_main() -> ! {
-    // 1. Confirm the device the capability names, enable mem-space + bus master.
+    // 1. Confirm the device, enable mem-space + bus master, map BAR0.
     let id = rt::sys_pci_read(BOOT_PCI, 0x00).unwrap_or(0);
     w(format!("[net] e1000 {:04x}:{:04x}\n", id & 0xFFFF, id >> 16).as_bytes());
     let cmd = rt::sys_pci_read(BOOT_PCI, 0x04).unwrap_or(0);
     let _ = rt::sys_pci_write(BOOT_PCI, 0x04, cmd | 0x6);
-
-    // 2. Map BAR0 (the register file).
     if rt::sys_pci_bar_map(BOOT_PCI, 0, NET_MMIO).is_err() {
         w(b"[net] BAR0 map FAILED\n");
         rt::sys_exit(1);
     }
 
+    // 2. Reset + link up + clear the multicast table.
     unsafe {
-        // 3. Reset: mask device interrupts, pulse CTRL.RST, wait for self-clear.
         setreg(IMC, 0xFFFF_FFFF);
         setreg(CTRL, reg(CTRL) | CTRL_RST);
         for _ in 0..1_000_000 {
@@ -137,17 +293,14 @@ pub extern "C" fn oxbow_main() -> ! {
             }
         }
         setreg(IMC, 0xFFFF_FFFF);
-        let _ = reg(ICR); // clear any pending cause
-        // Link up.
+        let _ = reg(ICR);
         setreg(CTRL, reg(CTRL) | CTRL_SLU);
-        // Clear the multicast table (128 dwords).
         for i in 0..128 {
             setreg(MTA + i * 4, 0);
         }
     }
 
-    // 4. DMA: descriptor rings + packet buffers. Layout (NET_DMA + n*4K):
-    //    rx_ring | rx_buf x4 | tx_ring | tx_buf x4   (2 buffers per 4K page).
+    // 3. DMA rings + buffers (NET_DMA + n*4K): rx_ring | rx_buf×4 | tx_ring | tx_buf×4.
     let mut slot = 0u64;
     let (rx_ring_v, rx_ring_p) = dma_page(&mut slot);
     let mut rx_buf_v = [0u64; RX_DESCS];
@@ -171,8 +324,6 @@ pub extern "C" fn oxbow_main() -> ! {
     }
 
     unsafe {
-        // 5. RX ring: each descriptor points at a buffer; head/tail bracket the
-        //    free descriptors hardware may fill ([RDH, RDT]).
         for i in 0..RX_DESCS {
             let d = (rx_ring_v as usize + i * 16) as *mut RxDesc;
             write_volatile(
@@ -187,7 +338,6 @@ pub extern "C" fn oxbow_main() -> ! {
         setreg(RDT, (RX_DESCS - 1) as u32);
         setreg(RCTL, RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC);
 
-        // 6. TX ring: empty to start (head == tail).
         for i in 0..TX_DESCS {
             let d = (tx_ring_v as usize + i * 16) as *mut TxDesc;
             write_volatile(
@@ -200,126 +350,88 @@ pub extern "C" fn oxbow_main() -> ! {
         setreg(TDLEN, (TX_DESCS * 16) as u32);
         setreg(TDH, 0);
         setreg(TDT, 0);
-        setreg(TIPG, 0x0060_200A); // standard inter-packet gap (copper)
+        setreg(TIPG, 0x0060_200A);
         setreg(TCTL, TCTL_EN | TCTL_PSP | TCTL_CT | TCTL_COLD);
     }
 
-    // 7. Our MAC, from the receive-address registers (loaded from EEPROM).
     let (ral, rah) = unsafe { (reg(RAL), reg(RAH)) };
     let mac = [ral as u8, (ral >> 8) as u8, (ral >> 16) as u8, (ral >> 24) as u8, rah as u8, (rah >> 8) as u8];
     w(format!(
-        "[net] MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  link STATUS {:#010x}\n",
+        "[net] e1000 up — MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  IP 10.0.2.15  STATUS {:#x}\n",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], unsafe { reg(STATUS) }
     )
     .as_bytes());
 
-    // 8. Bind the NIC interrupt to a notification, then enable device + PIC line.
+    // 4. Bind IRQ -> notification; enable RX interrupts; arm the PIC line.
     let notif = rt::sys_notif_create().expect("[net] notif");
     rt::sys_irq_bind(BOOT_NET_IRQ, notif).expect("[net] irq_bind");
     unsafe {
-        let _ = reg(ICR); // clear
+        let _ = reg(ICR);
         setreg(IMS, INT_RXT0 | INT_RXO | INT_RXDMT0 | INT_LSC);
     }
-    rt::sys_irq_ack(BOOT_NET_IRQ).expect("[net] irq_ack"); // arm IRQ11
+    rt::sys_irq_ack(BOOT_NET_IRQ).expect("[net] irq_ack");
 
-    // 9. Hand-build + transmit a broadcast ARP request for the gateway.
-    let frame = arp_request(&mac, [10, 0, 2, 15], [10, 0, 2, 2]);
-    unsafe {
-        let buf = tx_buf_v[0] as *mut u8;
-        for (i, b) in frame.iter().enumerate() {
-            write_volatile(buf.add(i), *b);
-        }
-        let d = (tx_ring_v as usize) as *mut TxDesc; // descriptor 0
-        write_volatile(
-            d,
-            TxDesc {
-                addr: tx_buf_p[0], // device DMAs from the PHYSICAL buffer address
-                length: frame.len() as u16,
-                cso: 0,
-                cmd: TXD_EOP | TXD_IFCS | TXD_RS,
-                status: 0,
-                css: 0,
-                special: 0,
-            },
-        );
-        fence(Ordering::SeqCst);
-        setreg(TDT, 1); // hand descriptor 0 to hardware
+    let mut nic = Nic {
+        mac,
+        notif,
+        rx_ring_v,
+        rx_buf_v,
+        rx_cur: 0,
+        tx_ring_v,
+        tx_buf_v,
+        tx_buf_p,
+        tx_cur: 0,
+    };
+    let mut cache = arp::Cache::new();
+
+    // 5. Demos against SLIRP: ARP, then a real DNS-over-UDP lookup, then ping.
+    let gw = arp_resolve(&mut nic, &mut cache, GW_IP);
+    w(format!(
+        "[net] ARP: 10.0.2.2 is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+        gw[0], gw[1], gw[2], gw[3], gw[4], gw[5]
+    )
+    .as_bytes());
+
+    match dns_query(&mut nic, &mut cache, "example.com") {
+        Some(ip) => w(format!(
+            "[net] DNS: example.com -> {}.{}.{}.{}  (UDP/IPv4 over the stack)\n",
+            ip[0], ip[1], ip[2], ip[3]
+        )
+        .as_bytes()),
+        None => w(b"[net] DNS: no A record\n"),
     }
-    w(b"[net] ARP who-has 10.0.2.2 -> sent (broadcast)\n");
 
-    // 10. Interrupt-driven receive: wait for the gateway's ARP reply.
-    let mut rx_cur = 0usize;
-    let mut got_reply = false;
+    // ICMP echo to the gateway (best-effort: SLIRP ICMP depends on host policy).
+    let gw_mac = arp_resolve(&mut nic, &mut cache, GW_IP);
+    let echo = icmp::echo(icmp::ECHO_REQUEST, 0x1234, 1, b"oxbow-ping");
+    let ip = ipv4::packet(OUR_IP, GW_IP, ipv4::PROTO_ICMP, &echo);
+    nic.tx(&eth::frame(gw_mac, nic.mac, ETHERTYPE_IPV4, &ip));
+    w(b"[net] ICMP echo -> 10.0.2.2 (ping sent)\n");
+    w(b"[net] ready (Ethernet/ARP/IPv4/ICMP/UDP)\n");
+
+    // 6. Steady state: serve the network forever — cache ARP, answer ARP/ping
+    //    for us, and report ICMP echo replies + other inbound traffic.
+    let mut buf = [0u8; BUF];
     loop {
-        let _ = rt::sys_notif_wait(notif);
-        let cause = unsafe { reg(ICR) }; // reading ICR clears it + deasserts INTx
-        let _ = cause;
-        // Drain every descriptor hardware has marked Done.
-        loop {
-            let d = (rx_ring_v as usize + rx_cur * 16) as *mut RxDesc;
-            let status = unsafe { read_volatile(addr_of!((*d).status)) };
-            if status & RXD_DD == 0 {
-                break;
+        let n = nic.recv_blocking(&mut buf);
+        handle_background(&mut nic, &mut cache, &buf[..n]);
+        if let Some((_, src, et, off)) = eth::parse(&buf[..n]) {
+            if et == ETHERTYPE_IPV4 {
+                if let Some(ip) = ipv4::parse(&buf[off..n]) {
+                    if ip.proto == ipv4::PROTO_ICMP && ip.dst == OUR_IP {
+                        if let Some(e) = icmp::parse(&buf[off + ip.payload_off..n]) {
+                            if e.typ == icmp::ECHO_REPLY {
+                                w(format!(
+                                    "[net] ICMP echo reply from {}.{}.{}.{} seq {} via {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                                    ip.src[0], ip.src[1], ip.src[2], ip.src[3], e.seq,
+                                    src[0], src[1], src[2], src[3], src[4], src[5]
+                                )
+                                .as_bytes());
+                            }
+                        }
+                    }
+                }
             }
-            let len = unsafe { read_volatile(addr_of!((*d).length)) } as usize;
-            let bufv = rx_buf_v[rx_cur] as *const u8;
-            handle_frame(bufv, len, &mut got_reply);
-            // Recycle: clear status, hand the descriptor back via RDT.
-            unsafe {
-                write_volatile(addr_of_mut!((*d).status), 0);
-                fence(Ordering::SeqCst);
-                setreg(RDT, rx_cur as u32);
-            }
-            rx_cur = (rx_cur + 1) % RX_DESCS;
-        }
-        // Re-arm the PIC line for the next interrupt.
-        let _ = rt::sys_irq_ack(BOOT_NET_IRQ);
-        if got_reply {
-            w(b"[net] ready (e1000 TX + RX + IRQ over capabilities)\n");
-            got_reply = false; // keep parking as a resident driver
         }
     }
-}
-
-/// Inspect one received Ethernet frame; flag + report an ARP reply (the gateway).
-fn handle_frame(buf: *const u8, len: usize, got_reply: &mut bool) {
-    if len < 14 {
-        return;
-    }
-    let at = |i: usize| unsafe { read_volatile(buf.add(i)) };
-    let ethertype = ((at(12) as u16) << 8) | at(13) as u16;
-    let src = [at(6), at(7), at(8), at(9), at(10), at(11)];
-    if ethertype == 0x0806 && len >= 42 {
-        let oper = ((at(20) as u16) << 8) | at(21) as u16;
-        if oper == 0x0002 {
-            // ARP reply: sender protocol addr at offset 28, sender hw addr at 22.
-            let spa = [at(28), at(29), at(30), at(31)];
-            w(format!(
-                "[net] ARP reply: {}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
-                spa[0], spa[1], spa[2], spa[3], src[0], src[1], src[2], src[3], src[4], src[5]
-            )
-            .as_bytes());
-            *got_reply = true;
-            return;
-        }
-    }
-    w(format!("[net] rx {} bytes ethertype {:#06x}\n", len, ethertype).as_bytes());
-}
-
-/// Build a broadcast ARP request frame (Ethernet + ARP, 42 bytes).
-fn arp_request(mac: &[u8; 6], spa: [u8; 4], tpa: [u8; 4]) -> [u8; 42] {
-    let mut f = [0u8; 42];
-    f[0..6].copy_from_slice(&[0xFF; 6]); // dst: broadcast
-    f[6..12].copy_from_slice(mac); // src: us
-    f[12..14].copy_from_slice(&[0x08, 0x06]); // ethertype ARP
-    f[14..16].copy_from_slice(&[0x00, 0x01]); // htype: ethernet
-    f[16..18].copy_from_slice(&[0x08, 0x00]); // ptype: IPv4
-    f[18] = 6; // hlen
-    f[19] = 4; // plen
-    f[20..22].copy_from_slice(&[0x00, 0x01]); // oper: request
-    f[22..28].copy_from_slice(mac); // sender hw addr
-    f[28..32].copy_from_slice(&spa); // sender protocol addr
-    // target hw addr left zero
-    f[38..42].copy_from_slice(&tpa); // target protocol addr
-    f
 }

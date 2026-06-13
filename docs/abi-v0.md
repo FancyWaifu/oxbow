@@ -925,3 +925,40 @@ coherent PCI bus (QEMU).
 by transmitting a broadcast ARP request and receiving the unicast reply through
 IRQ 11. Next arcs layer proper Ethernet/ARP/IPv4/UDP (from scratch) and then
 smoltcp for TCP, plus a socket capability API — all userland over this driver.
+
+## 20. Network stack — Ethernet / ARP / IPv4 / ICMP / UDP (v1-udp)
+
+With the e1000 driver (§19) moving frames, `net` grows the protocol layers from
+scratch — one small module per layer, all pure byte-shuffling over the NIC's
+`tx` / `recv_blocking`. No new syscalls: the whole stack is userland over the
+capabilities the driver already holds.
+
+### 20.1 Layers
+| module | layer | does |
+|--------|-------|------|
+| `eth`  | L2 | Ethernet II frame build/parse (the NIC pads + appends FCS) |
+| `arp`  | L2/3 | ARP request/reply build/parse + a small direct-mapped IPv4→MAC cache |
+| `ipv4` | L3 | IPv4 header build/parse + the RFC 1071 internet checksum (shared) |
+| `icmp` | L3 | ICMP echo request/reply (ping), checksummed |
+| `udp`  | L4 | UDP datagram build/parse with the full IPv4 pseudo-header checksum |
+| `dns`  | app | minimal A-record query builder + first-answer parser (name compression aware) |
+
+### 20.2 Driver shape
+`Nic` owns the rings/buffers/IRQ notification and exposes two primitives:
+`tx(frame)` (round-robins the TX ring, hands the device the buffer's physical
+address) and `recv_blocking(out)` (drains the RX ring, parking on IRQ11 when
+empty). Everything above is layered calls that build a `Vec<u8>` bottom-up and
+hand it to `tx`, or parse a received slice top-down. `handle_background` makes
+the stack a good citizen for *any* inbound frame: it caches the sender's ARP
+binding, answers ARP requests for 10.0.2.15, and echo-replies pings aimed at us.
+
+### 20.3 Demonstrated (against QEMU SLIRP)
+The driver runs three real exchanges at boot, then serves the network forever:
+- **ARP** — resolves the gateway: `10.0.2.2 is at 52:55:0a:00:02:02`.
+- **UDP/DNS** — a genuine recursive lookup through SLIRP's forwarder (10.0.2.3:53):
+  `example.com -> 172.66.147.243`, proving UDP + IPv4 + checksums + ARP end to end.
+- **ICMP** — pings the gateway and prints the echo reply (`seq 1`).
+
+Addressing is the SLIRP default (us 10.0.2.15, gateway .2, DNS .3); DHCP and a
+proper socket *capability* API (a separate server handing out bound-port caps),
+plus smoltcp for TCP, are the next arcs.
