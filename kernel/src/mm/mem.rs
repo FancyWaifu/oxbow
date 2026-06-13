@@ -31,12 +31,17 @@ static MEMORY: Mutex<[MemObj; MEM_POOL]> = Mutex::new(
 struct FrameObj {
     in_use: bool,
     phys: u64,
+    /// How many live address-space mappings reference this frame. The frame (and
+    /// this pool slot) is reclaimed when the last mapping is torn down — so a
+    /// shared zero-copy frame outlives any single mapper but doesn't leak.
+    maps: u32,
 }
 
 static FRAMES: Mutex<[FrameObj; FRAME_POOL]> = Mutex::new(
     [FrameObj {
         in_use: false,
         phys: 0,
+        maps: 0,
     }; FRAME_POOL],
 );
 
@@ -68,10 +73,39 @@ pub fn credit(idx: u8, bytes: u64) {
 }
 
 /// Is `phys` a frame backing a live Frame object (zero-copy shared memory)? Such
-/// frames must NOT be auto-freed on address-space teardown — a peer may still map
-/// them. (Frame lifetime / refcounting is deferred.)
+/// frames are mapping-refcounted (see `frame_unmap`), not freed directly on
+/// address-space teardown — a peer may still map them.
 pub fn is_shared_frame(phys: u64) -> bool {
     FRAMES.lock().iter().any(|f| f.in_use && f.phys == phys)
+}
+
+/// Account a new mapping of Frame `idx` (called by `sys_frame_map`).
+pub fn frame_inc_map(idx: u8) {
+    FRAMES.lock()[idx as usize].maps += 1;
+}
+
+/// Drop one mapping of the Frame backing `phys` (called as an address space is
+/// torn down). When the last mapping goes, free the physical frame and the pool
+/// slot — so shared frames are reclaimed exactly when nobody maps them anymore.
+pub fn frame_unmap(phys: u64) {
+    let freed = {
+        let mut f = FRAMES.lock();
+        match f.iter_mut().find(|e| e.in_use && e.phys == phys) {
+            Some(e) => {
+                e.maps = e.maps.saturating_sub(1);
+                if e.maps == 0 {
+                    e.in_use = false;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
+    };
+    if freed {
+        super::pmm::free_frame(phys);
+    }
 }
 
 /// Remaining budget on Memory `idx`.
@@ -98,7 +132,7 @@ pub fn frame_record(phys: u64) -> Option<u8> {
     let mut f = FRAMES.lock();
     for i in 0..FRAME_POOL {
         if !f[i].in_use {
-            f[i] = FrameObj { in_use: true, phys };
+            f[i] = FrameObj { in_use: true, phys, maps: 0 };
             return Some(i as u8);
         }
     }

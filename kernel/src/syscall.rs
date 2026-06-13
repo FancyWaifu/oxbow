@@ -565,6 +565,7 @@ fn sys_frame_map(frame: u64, vaddr: u64, prot: u64) -> SyscallRet {
         // Map the SAME physical frame (intermediate tables uncharged in v1).
         let phys = mm::mem::frame_phys(fidx);
         mm::vm::map_user_4k_live(pml4, vaddr, phys, writable);
+        mm::mem::frame_inc_map(fidx); // refcount the mapping (§9 reclamation)
         Ok(())
     })())
 }

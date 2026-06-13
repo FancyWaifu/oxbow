@@ -195,7 +195,11 @@ pub fn free_user_pml4(pml4_phys: u64) {
                             continue;
                         }
                         let leaf = e1.addr().as_u64();
-                        if !super::mem::is_shared_frame(leaf) {
+                        if super::mem::is_shared_frame(leaf) {
+                            // A shared Frame: drop this mapping's reference; the
+                            // frame is freed when the last mapper tears down.
+                            super::mem::frame_unmap(leaf);
+                        } else {
                             pmm::free_frame(leaf);
                         }
                     }

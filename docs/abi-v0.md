@@ -748,11 +748,17 @@ The fs storage arena gains a free list (uniform `FILE_CAP` regions): `rm` return
 a removed file's region, and `CREATE` reuses it before extending. Repeated
 create/rm cycles no longer leak the arena.
 
-### 16.5 Still deferred
-Frame-object refcounting (shared shmem frames leak — skipped, not freed); freeing
-a `Dead` slot's frames at exit rather than at reuse (a reaper); file growth /
-realloc. These are bounded leaks on rare paths, not the unbounded per-command
-leak this arc removed.
+### 16.5 Frame reclamation (v1-frame-refcount)
+A Frame object (zero-copy shmem) is **mapping-refcounted**: `sys_frame_map`
+increments its count, and address-space teardown decrements it; when the last
+mapping is torn down the physical frame and the pool slot are freed. So a shared
+frame outlives any single mapper but is reclaimed once nobody maps it — no leak.
+(A Frame allocated but never mapped, an edge oxbow's code never hits, is the one
+remaining slow path.)
+
+### 16.6 Still deferred
+Freeing a `Dead` slot's frames at exit rather than at reuse (a reaper); file
+growth / realloc. Bounded, not the unbounded per-command leak arc 16 removed.
 
 ### 15.10 Multi-component paths (v1-paths)
 The fs now resolves `/`-separated paths, not just single names. OPEN walks the
