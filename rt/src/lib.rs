@@ -429,6 +429,29 @@ pub fn sys_ep_create() -> SysResult<Handle> {
     SysError::from_raw(rax).map(|_| rdx as Handle)
 }
 
+/// Read a PCI config-space register of the device `pcidev` (§18).
+pub fn sys_pci_read(pcidev: Handle, offset: u32) -> SysResult<u32> {
+    let (rax, rdx) =
+        unsafe { syscall2(oxbow_abi::SYS_PCI_READ, pcidev as u64, offset as u64) };
+    SysError::from_raw(rax).map(|_| rdx as u32)
+}
+
+/// Write a PCI config-space register of `pcidev`.
+pub fn sys_pci_write(pcidev: Handle, offset: u32, value: u32) -> SysResult {
+    let (rax, _) = unsafe {
+        syscall3(oxbow_abi::SYS_PCI_WRITE, pcidev as u64, offset as u64, value as u64)
+    };
+    SysError::from_raw(rax)
+}
+
+/// Map the device's memory BAR `bar` (uncacheable) into this AS at `vaddr`.
+pub fn sys_pci_bar_map(pcidev: Handle, bar: u32, vaddr: u64) -> SysResult {
+    let (rax, _) = unsafe {
+        syscall3(oxbow_abi::SYS_PCI_BAR_MAP, pcidev as u64, bar as u64, vaddr)
+    };
+    SysError::from_raw(rax)
+}
+
 /// This program's argument string (the kernel mapped it at SPAWN_ARGV on spawn).
 /// Empty if spawned without an argument.
 pub fn argv() -> &'static [u8] {

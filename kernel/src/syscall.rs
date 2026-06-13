@@ -10,8 +10,9 @@ use oxbow_abi::{
     PROT_READ, PROT_WRITE, R_ATTENUATE, R_GRANT, R_MAP, R_RECV, R_SEND, R_SIGNAL, R_WAIT, R_WRITE,
     SPAWN_DEFAULT_BUDGET, SPAWN_SLOTS, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE,
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
-    SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT, SYS_RECV,
-    SYS_REPLY, SYS_SEND, SYS_SPAWN, R_ACK, R_BIND, R_IN, R_OUT, R_SPAWN,
+    SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
+    SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE, SYS_RECV, SYS_REPLY, SYS_SEND, SYS_SPAWN, R_ACK,
+    R_BIND, R_IN, R_OUT, R_SPAWN,
 };
 
 use crate::object::{HandleEntry, ObjType, ObjectRef};
@@ -87,6 +88,9 @@ pub extern "C" fn syscall_dispatch(
         SYS_SPAWN => sys_spawn(a1, a2, a3, a4),
         SYS_EP_CREATE => sys_ep_create(),
         SYS_MINT => sys_mint(a1, a2, a3),
+        SYS_PCI_READ => sys_pci_read(a1, a2),
+        SYS_PCI_WRITE => sys_pci_write(a1, a2, a3),
+        SYS_PCI_BAR_MAP => sys_pci_bar_map(a1, a2, a3),
         SYS_CONSOLE_WRITE => sys_console_write(a1, a2, a3),
         SYS_ATTENUATE => sys_attenuate(a1, a2),
         SYS_CLOSE => SyscallRet::from_result(proc::with_current_mut(|p| p.close(a1 as Handle))),
@@ -689,6 +693,69 @@ fn sys_mint(src: u64, badge: u64, new_rights: u64) -> SyscallRet {
             Err(e) => SyscallRet::err(e),
         }
     })
+}
+
+/// Decode a PciDevice cap (with the required right) into (bus, dev, func).
+fn pci_dev(handle: u64, right: u32) -> SysResult<(u8, u8, u8)> {
+    let e = proc::with_current(|p| p.lookup(handle as Handle, ObjType::PciDevice, right))?;
+    let ObjectRef::PciDevice(bdf) = e.obj else {
+        return Err(SysError::BadType);
+    };
+    Ok(((bdf >> 16) as u8, (bdf >> 8) as u8, bdf as u8))
+}
+
+/// `sys_pci_read(pcidev, offset) -> u32` — read a config-space register of the
+/// device this capability names (requires R_IN). The value is returned in rdx.
+fn sys_pci_read(dev: u64, offset: u64) -> SyscallRet {
+    match pci_dev(dev, R_IN) {
+        Ok((b, d, f)) => SyscallRet {
+            rax: 0,
+            rdx: crate::pci::config_read(b, d, f, offset as u8) as u64,
+        },
+        Err(e) => SyscallRet::err(e),
+    }
+}
+
+/// `sys_pci_write(pcidev, offset, value)` — write a config-space register
+/// (requires R_OUT). Used e.g. to enable bus-mastering / MMIO decode.
+fn sys_pci_write(dev: u64, offset: u64, value: u64) -> SyscallRet {
+    SyscallRet::from_result((|| -> SysResult {
+        let (b, d, f) = pci_dev(dev, R_OUT)?;
+        crate::pci::config_write(b, d, f, offset as u8, value as u32);
+        Ok(())
+    })())
+}
+
+/// `sys_pci_bar_map(pcidev, bar, vaddr)` — map the device's memory BAR `bar`
+/// (uncacheable) into the caller's address space at `vaddr` (requires R_MAP). The
+/// kernel reads the BAR's physical base + size from config space; this is the
+/// only way a driver reaches its device registers.
+fn sys_pci_bar_map(dev: u64, bar: u64, vaddr: u64) -> SyscallRet {
+    SyscallRet::from_result((|| -> SysResult {
+        let (b, d, f) = pci_dev(dev, R_MAP)?;
+        if vaddr & 0xfff != 0 || vaddr >= LOWER_HALF_END {
+            return Err(SysError::Fault);
+        }
+        let device = crate::pci::Device {
+            bus: b,
+            dev: d,
+            func: f,
+            vendor: 0,
+            device: 0,
+            class: 0,
+            subclass: 0,
+        };
+        let (base, size) = device.bar_region(bar as u8);
+        if base == 0 || size == 0 || size > 0x10_0000 {
+            return Err(SysError::Msg); // not a memory BAR, or implausibly large
+        }
+        let pml4 = mm::vm::current_pml4();
+        let pages = (size + 0xfff) / 0x1000;
+        for i in 0..pages {
+            mm::vm::map_mmio_4k_in(pml4, vaddr + i * 0x1000, base + i * 0x1000);
+        }
+        Ok(())
+    })())
 }
 
 /// `sys_attenuate(src, new_rights)` — derive a strictly-weaker handle (law L5).

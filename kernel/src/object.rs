@@ -15,6 +15,7 @@ pub enum ObjType {
     IoPort,
     Irq,
     Image,
+    PciDevice,
 }
 
 /// What a handle points at: a pool index for Endpoint/Reply/Memory/Frame, or the
@@ -31,6 +32,8 @@ pub enum ObjectRef {
     Irq(u8),
     /// A spawnable program image, by registry index (see `kernel/src/image.rs`).
     Image(u8),
+    /// A single PCI device (bus<<16 | dev<<8 | func) — config-space + BAR access.
+    PciDevice(u32),
 }
 
 impl ObjectRef {
@@ -45,6 +48,7 @@ impl ObjectRef {
             ObjectRef::IoPort { .. } => ObjType::IoPort,
             ObjectRef::Irq(_) => ObjType::Irq,
             ObjectRef::Image(_) => ObjType::Image,
+            ObjectRef::PciDevice(_) => ObjType::PciDevice,
         }
     }
 }

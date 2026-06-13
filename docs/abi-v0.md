@@ -820,3 +820,57 @@ without re-implementing splitting. The file API gains `fs::create(dir, path)` an
 dst`, is built on them: `open` src, `read_all`, `create` dst, `write_all` — and
 `mv` now reads its two names via `args()`. (The single-string spawn mechanism is
 unchanged; `args()` is purely a userland convenience over it.)
+
+## 18. PCI / MMIO capability (v1-pci)
+
+The first step toward a network stack is **not** networking — it is a capability
+mechanism for talking to a real device. oxbow lets a userland driver hold a
+`PciDevice` capability scoped to exactly one PCI function, read/write its config
+space, and map its MMIO BARs — with no ambient authority over the bus or over
+physical memory it was not granted.
+
+### 18.1 Enumeration (kernel)
+At boot (`kmain_stage2`, after IPC init) the kernel does a legacy PCI
+configuration-space scan via I/O ports `0xCF8` (CONFIG_ADDRESS) / `0xCFC`
+(CONFIG_DATA): 256 buses × 32 devices × 8 functions. Each present function is
+logged; the first **network-class** function (class `0x02`) is remembered as the
+boot NIC. Under QEMU's `-device e1000` this is `8086:100e at 00:02.0`, BAR0
+`0xfebc0000` (128 KiB). Enumeration is kernel-only because it pokes a global
+ports pair — it is not itself a capability operation.
+
+### 18.2 The `PciDevice` capability
+A new object type. `ObjectRef::PciDevice(u32)` packs the bus/device/function as
+`bus<<16 | dev<<8 | func` (its "BDF"). It is granted from the boot loop: typing
+`net` at the shell hands the resident `net` server a `PciDevice` cap to the
+enumerated NIC with rights `R_IN | R_OUT | R_MAP` (config read / config write /
+BAR map). The cap names **one function** — mirroring the IoPort/Irq model, a
+driver gets its device, never the bus.
+
+### 18.3 Syscalls
+| # | name | rights | effect |
+|---|------|--------|--------|
+| 21 | `SYS_PCI_READ(dev, offset)` | `R_IN` | returns the config-space `u32` at `offset` (in `rdx`) |
+| 22 | `SYS_PCI_WRITE(dev, offset, value)` | `R_OUT` | writes a config-space `u32` (e.g. the command register, to enable the device) |
+| 23 | `SYS_PCI_BAR_MAP(dev, bar, vaddr)` | `R_MAP` | maps BAR`bar`'s MMIO region into the caller's address space at `vaddr`, uncacheable |
+
+`SYS_PCI_BAR_MAP` reads the BAR's base+size by the standard write-`0xFFFFFFFF`/
+read-mask/restore probe, then maps each 4 KiB page via `vm::map_mmio_4k_in`
+with `PRESENT | USER_ACCESSIBLE | WRITABLE | NO_EXECUTE | NO_CACHE`. No frame is
+consumed — a BAR is a device physical address, not RAM — so this never touches
+the frame allocator. The mapped size is capped (≤ 1 MiB) so a bad BAR can't map
+the world. `NET_MMIO = 0x4000_0000` is the conventional vaddr a driver maps its
+registers to.
+
+### 18.4 Proof: the `net` driver
+`servers/net` is a resident boot module that, holding only `BOOT_PCI`:
+1. reads config offset `0x00` → confirms `8086:100e`;
+2. writes the command register (offset `0x04`) with bits 1+2 → memory-space
+   decode + bus mastering enabled;
+3. `SYS_PCI_BAR_MAP(BOOT_PCI, 0, NET_MMIO)` → BAR0 mapped;
+4. reads real e1000 registers through MMIO: `RAL`/`RAH` (`0x5400`/`0x5404`) →
+   the MAC `52:54:00:12:34:56`, and `STATUS` (`0x0008`) → `0x80080783`
+   (link-up). It prints `[net] ready` and parks on a notification.
+
+This establishes the substrate; the following arcs build the e1000 TX/RX
+descriptor rings + IRQ on top, then Ethernet/ARP/IPv4/UDP, then smoltcp for TCP
+and a socket capability API — all as userland servers over this mechanism.

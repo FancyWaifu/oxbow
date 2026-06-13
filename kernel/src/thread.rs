@@ -24,7 +24,7 @@ fn announce_first_cr3(proc: usize) {
     }
 }
 
-pub const MAX_THREADS: usize = 8;
+pub const MAX_THREADS: usize = 12;
 const KSTACK_SIZE: usize = 16 * 1024;
 /// The boot thread becomes the idle thread; it is never in the Ready set.
 const IDLE: usize = 0;

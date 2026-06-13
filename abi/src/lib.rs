@@ -96,6 +96,11 @@ pub const SYS_EP_CREATE: u64 = 19; // () -> fresh Endpoint handle
 // Badged endpoints (§14).
 pub const SYS_MINT: u64 = 20; // (ep, badge, new_rights) -> badged Endpoint handle
 
+// PCI / MMIO (§18). A PciDevice capability scopes access to ONE device.
+pub const SYS_PCI_READ: u64 = 21; // (pcidev, offset) -> u32   needs R_IN
+pub const SYS_PCI_WRITE: u64 = 22; // (pcidev, offset, value)  needs R_OUT
+pub const SYS_PCI_BAR_MAP: u64 = 23; // (pcidev, bar, vaddr)   needs R_MAP; maps BAR MMIO
+
 // ---------------------------------------------------------------------------
 // Error codes (§6) — returned in rax; values are stable forever (append-only)
 // ---------------------------------------------------------------------------
@@ -239,6 +244,12 @@ pub const BOOT_IMG_TOUCH: Handle = 16; // spawned coreutil: touch (dir cap + arg
 pub const BOOT_IMG_RM: Handle = 17; // spawned coreutil: rm (dir cap + argv)
 pub const BOOT_IMG_MV: Handle = 18; // spawned coreutil: mv (dir cap + argv)
 pub const BOOT_IMG_CP: Handle = 19; // spawned coreutil: cp (dir cap + argv)
+
+// --- Networking (§18) ------------------------------------------------------
+/// The net driver's PciDevice capability (the NIC), at this boot handle.
+pub const BOOT_PCI: Handle = 8;
+/// Fixed vaddr where the net driver maps the NIC's MMIO BAR0.
+pub const NET_MMIO: u64 = 0x4000_0000;
 
 // --- Filesystem (§15) ------------------------------------------------------
 /// The shell's root-directory capability: a BADGED endpoint to the fs server,

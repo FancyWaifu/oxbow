@@ -7,7 +7,7 @@ ISO        := "oxbow.iso"
 # QEMU flags shared by `run` and `gdb`. q35 machine, serial routed to stdio,
 # no display, and the isa-debug-exit device so a future test harness can exit
 # QEMU from inside the kernel.
-qemu_flags := "-M q35 -m 256M -cdrom " + ISO + " -boot d -serial stdio -display none -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04"
+qemu_flags := "-M q35 -m 256M -cdrom " + ISO + " -boot d -serial stdio -display none -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04 -netdev user,id=net0 -device e1000,netdev=net0"
 
 default: run
 
@@ -28,6 +28,7 @@ build-server:
     RUSTFLAGS="-C relocation-model=static" cargo build -p hello
     RUSTFLAGS="-C relocation-model=static" cargo build -p badge
     RUSTFLAGS="-C relocation-model=static" cargo build -p fs
+    RUSTFLAGS="-C relocation-model=static" cargo build -p net
     RUSTFLAGS="-C relocation-model=static" cargo build -p cat
     RUSTFLAGS="-C relocation-model=static" cargo build -p ls
     RUSTFLAGS="-C relocation-model=static" cargo build -p mkdir
@@ -65,6 +66,7 @@ _iso:
     cp target/x86_64-unknown-none/debug/hello iso_root/boot/hello.elf
     cp target/x86_64-unknown-none/debug/badge iso_root/boot/badge.elf
     cp target/x86_64-unknown-none/debug/fs iso_root/boot/fs.elf
+    cp target/x86_64-unknown-none/debug/net iso_root/boot/net.elf
     cp target/x86_64-unknown-none/debug/cat iso_root/boot/cat.elf
     cp target/x86_64-unknown-none/debug/ls iso_root/boot/ls.elf
     cp target/x86_64-unknown-none/debug/mkdir iso_root/boot/mkdir.elf
@@ -115,7 +117,7 @@ run-tty: iso
 # block at startup until the harness connects, so no boot output is lost.
 # (By design this hangs until a client connects — that's the point.)
 run-serial-tcp PORT="45454": iso
-    qemu-system-x86_64 -M q35 -m 256M -cdrom {{ISO}} -boot d -serial tcp:127.0.0.1:{{PORT}},server=on,wait=on -display none -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04
+    qemu-system-x86_64 -M q35 -m 256M -cdrom {{ISO}} -boot d -serial tcp:127.0.0.1:{{PORT}},server=on,wait=on -display none -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04 -netdev user,id=net0 -device e1000,netdev=net0
 
 # Boot stopped, waiting for a debugger:  (in another shell) gdb -ex 'target remote :1234'
 gdb: iso

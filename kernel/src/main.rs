@@ -15,6 +15,7 @@ mod irq;
 mod mm;
 mod notif;
 mod object;
+mod pci;
 mod proc;
 mod syscall;
 mod thread;
@@ -160,6 +161,20 @@ fn kmain_stage2() -> ! {
     arch::timer_init(100); // PIT @ 100 Hz, IRQ0 unmasked (stays on)
 
     ipc::init();
+
+    // Enumerate the PCI bus — the kernel is the root of hardware authority and
+    // will hand a future net driver a capability to the NIC it finds here.
+    let nic = pci::enumerate();
+    match nic {
+        Some(d) => {
+            let (base, size) = d.bar_region(0);
+            println!(
+                "[pci] NIC {:04x}:{:04x} at {:02x}:{:02x}.{} — BAR0 {:#x} ({} KiB)",
+                d.vendor, d.device, d.bus, d.dev, d.func, base, size / 1024
+            );
+        }
+        None => println!("[pci] no network controller found"),
+    }
 
     // The timer-driven tick notification (granted to module 0 as BOOT_TICK).
     let tick_idx = notif::create().expect("tick notif");
@@ -414,6 +429,22 @@ fn kmain_stage2() -> ! {
                     },
                 );
             });
+        }
+        // The net driver gets a capability to the ONE NIC the kernel found:
+        // config-space read/write + the authority to map its MMIO BARs.
+        if cmd == b"net" {
+            if let Some(d) = nic {
+                proc::with_proc_mut(pid, |p| {
+                    p.install(
+                        oxbow_abi::BOOT_PCI,
+                        object::HandleEntry {
+                            obj: object::ObjectRef::PciDevice(d.bdf()),
+                            rights: oxbow_abi::R_IN | oxbow_abi::R_OUT | oxbow_abi::R_MAP,
+                            badge: 0,
+                        },
+                    );
+                });
+            }
         }
         let tcb = thread::spawn_user(pid, as_i, entry, user_rsp);
         println!("[user] {} scheduled as tcb {} (ring 3, IF=1)", name, tcb);

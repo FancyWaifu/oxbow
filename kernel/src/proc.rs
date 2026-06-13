@@ -18,7 +18,7 @@ use crate::println;
 const FRAME: u64 = pmm::FRAME_SIZE;
 
 /// Maximum concurrent processes (static pool).
-pub const MAX_PROCS: usize = 8;
+pub const MAX_PROCS: usize = 12;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PState {

@@ -281,6 +281,31 @@ pub fn map_user_4k_in(pml4_phys: u64, virt: u64, phys: u64, writable: bool, exec
     }
 }
 
+/// Map one 4 KiB MMIO page (device registers) into a user address space,
+/// **uncacheable** (PCD) and NX — for a driver's PCI BAR. Writable always (device
+/// registers are RW). The phys range is a device address, not RAM, so no frame
+/// is consumed; only the page tables are.
+pub fn map_mmio_4k_in(pml4_phys: u64, virt: u64, phys: u64) {
+    assert!(virt < 0x0000_8000_0000_0000, "mmio vaddr must be lower half");
+    let flags = Flags::PRESENT
+        | Flags::USER_ACCESSIBLE
+        | Flags::WRITABLE
+        | Flags::NO_EXECUTE
+        | Flags::NO_CACHE;
+    let hhdm = VirtAddr::new(super::hhdm_offset());
+    let l4: &mut PageTable = unsafe { &mut *(super::phys_to_virt(pml4_phys) as *mut PageTable) };
+    let mut mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
+    let mut falloc = PmmAlloc;
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+    let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys));
+    unsafe {
+        mapper
+            .map_to(page, frame, flags, &mut falloc)
+            .expect("vm: map_mmio_4k_in")
+            .ignore();
+    }
+}
+
 const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_HUGE: u64 = 1 << 7;
