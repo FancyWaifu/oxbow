@@ -66,20 +66,32 @@ impl<'a> Image<'a> {
     /// Validate the ELF header per the v0 contract (ABI §7 / D6): 64-bit LE
     /// ET_EXEC for x86_64. Boot-panics on anything else.
     pub fn validate(bytes: &'a [u8]) -> Image<'a> {
-        assert!(bytes.len() >= core::mem::size_of::<Elf64Ehdr>(), "elf: too small");
+        Self::try_validate(bytes).expect("elf: invalid boot module")
+    }
+
+    /// Fallible header validation for the `sys_spawn` path — a bad image must be
+    /// an error, never a kernel panic (the image came from a userspace request).
+    pub fn try_validate(bytes: &'a [u8]) -> Result<Image<'a>, oxbow_abi::SysError> {
+        use oxbow_abi::SysError;
+        if bytes.len() < core::mem::size_of::<Elf64Ehdr>() {
+            return Err(SysError::Msg);
+        }
         let eh: Elf64Ehdr = read(bytes, 0);
-        assert!(&eh.e_ident[0..4] == b"\x7fELF", "elf: bad magic");
-        assert!(eh.e_ident[4] == 2, "elf: not ELFCLASS64");
-        assert!(eh.e_ident[5] == 1, "elf: not little-endian");
-        assert!(eh.e_type == ET_EXEC, "elf: not ET_EXEC (no PIE in v0)");
-        assert!(eh.e_machine == EM_X86_64, "elf: not x86_64");
-        Image {
+        if &eh.e_ident[0..4] != b"\x7fELF"
+            || eh.e_ident[4] != 2 // ELFCLASS64
+            || eh.e_ident[5] != 1 // little-endian
+            || eh.e_type != ET_EXEC // no PIE in v0
+            || eh.e_machine != EM_X86_64
+        {
+            return Err(SysError::Msg);
+        }
+        Ok(Image {
             entry: eh.e_entry,
             bytes,
             phoff: eh.e_phoff as usize,
             phentsize: eh.e_phentsize as usize,
             phnum: eh.e_phnum as usize,
-        }
+        })
     }
 
     /// Iterate the PT_LOAD program headers.

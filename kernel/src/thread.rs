@@ -132,7 +132,10 @@ fn init_stack(slot: usize, entry: u64, arg1: u64, arg2: u64) -> (u64, u64) {
 
 fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64) -> usize {
     for slot in 1..MAX_THREADS {
-        if state(slot) == State::Free {
+        // Reuse Exited slots too: an exited thread never resumes (IF=0, single
+        // CPU), and init_stack rebuilds its kernel stack from the top — so the
+        // slot + its static kstack are free for the next spawn.
+        if matches!(state(slot), State::Free | State::Exited) {
             let (ctx_rsp, kstack_top) = init_stack(slot, entry, arg1, arg2);
             unsafe {
                 *addr_of_mut!(TCBS[slot]) = Tcb {

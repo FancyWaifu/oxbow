@@ -6,10 +6,23 @@
 #![no_std]
 #![no_main]
 
-use oxbow_abi::{MsgBuf, BOOT_CONSOLE, BOOT_TTY, TAG_TTY_READ, TAG_TTY_WRITE};
+use oxbow_abi::{
+    Handle, MsgBuf, BOOT_CONSOLE, BOOT_IMG_BETA, BOOT_IMG_HELLO, BOOT_IMG_PONG, BOOT_MEM, BOOT_TICK,
+    BOOT_TTY, HANDLE_NULL, R_GRANT, R_RECV, R_SEND, R_WAIT, TAG_TTY_READ, TAG_TTY_WRITE,
+};
 use oxbow_rt as rt;
 
 const PROMPT: &[u8] = b"oxbow$ ";
+
+/// Capabilities the shell mints once at startup to launch programs with.
+struct Spawner {
+    /// An attenuated tty send endpoint, handed to children as their stdout.
+    stdout: Handle,
+    /// A notification the kernel signals when a spawned child exits.
+    exit: Handle,
+    /// A spare endpoint used to wire up child↔child IPC (e.g. pong↔beta).
+    ep: Handle,
+}
 
 /// Write a byte string to the console via the tty. Chunks into <=63-byte,
 /// NUL-terminated TAG_TTY_WRITE messages so payloads longer than one MsgBuf
@@ -55,7 +68,73 @@ fn split_cmd(line: &[u8]) -> (&[u8], &[u8]) {
     (cmd, &after[i..])
 }
 
-fn run(line: &[u8]) {
+/// Block until `n` spawned children have exited (the kernel signals `exit`,
+/// a counting notification, once per death).
+fn wait_exits(sp: &Spawner, n: u64) {
+    let mut exited = 0u64;
+    while exited < n {
+        match rt::sys_notif_wait(sp.exit) {
+            Ok(c) => exited += c,
+            Err(_) => break,
+        }
+    }
+}
+
+/// Spawn a single self-contained program (just stdout), and wait for it to exit.
+fn spawn_one(image: Handle, sp: &Spawner) {
+    // Spawn MsgBuf (§13): data[0] = child budget (0 → default); the granted
+    // handles land at the §13 slots — NULL skips slot 1, stdout lands at slot 2.
+    let mut m = MsgBuf::new(0);
+    m.data_len = 1;
+    m.handle_count = 2;
+    m.handles[0] = HANDLE_NULL; // slot 1: unused
+    m.handles[1] = sp.stdout; // slot 2: SPAWN_STDOUT
+    match rt::sys_spawn(image, BOOT_MEM, &m, sp.exit) {
+        Ok(_) => wait_exits(sp, 1),
+        Err(_) => tw(b"run: spawn failed\n"),
+    }
+}
+
+/// `run pong`: launch the pong↔beta demo pair, wiring an endpoint between them
+/// (beta gets the recv side, pong the send side) and delegating the tick to pong.
+/// Proves multi-handle grant-at-spawn and child↔child IPC.
+fn run_pong(sp: &Spawner) {
+    let ep_recv = rt::sys_attenuate(sp.ep, R_RECV | R_GRANT);
+    let ep_send = rt::sys_attenuate(sp.ep, R_SEND | R_GRANT);
+    let tick_w = rt::sys_attenuate(BOOT_TICK, R_WAIT | R_GRANT);
+    let (ep_recv, ep_send, tick_w) = match (ep_recv, ep_send, tick_w) {
+        (Ok(r), Ok(s), Ok(t)) => (r, s, t),
+        _ => {
+            tw(b"run: could not set up pong channel\n");
+            return;
+        }
+    };
+    // beta (receiver) first, so it is ready to recv when pong sends.
+    let mut mb = MsgBuf::new(0);
+    mb.data_len = 1;
+    mb.handle_count = 2;
+    mb.handles[0] = ep_recv; // slot 1 = BOOT_EP (recv)
+    mb.handles[1] = sp.stdout; // slot 2 = SPAWN_STDOUT
+    let beta_ok = rt::sys_spawn(BOOT_IMG_BETA, BOOT_MEM, &mb, sp.exit).is_ok();
+    // pong (sender) gets the send endpoint, stdout, and the tick.
+    let mut mp = MsgBuf::new(0);
+    mp.data_len = 1;
+    mp.handle_count = 3;
+    mp.handles[0] = ep_send; // slot 1 = BOOT_EP (send)
+    mp.handles[1] = sp.stdout; // slot 2 = SPAWN_STDOUT
+    mp.handles[2] = tick_w; // slot 4 = BOOT_TICK
+    let pong_ok = rt::sys_spawn(BOOT_IMG_PONG, BOOT_MEM, &mp, sp.exit).is_ok();
+    if !beta_ok || !pong_ok {
+        tw(b"run: pong spawn failed\n");
+    }
+    wait_exits(sp, beta_ok as u64 + pong_ok as u64);
+    // Release the per-run attenuated handles (the children hold their own copies).
+    let _ = rt::sys_close(ep_recv);
+    let _ = rt::sys_close(ep_send);
+    let _ = rt::sys_close(tick_w);
+}
+
+fn run(line: &[u8], sp: &Spawner) {
     let (cmd, rest) = split_cmd(line);
     match cmd {
         b"" => {}
@@ -63,10 +142,21 @@ fn run(line: &[u8]) {
             tw(rest);
             tw(b"\n");
         }
+        b"run" => {
+            let (prog, _) = split_cmd(rest);
+            match prog {
+                b"hello" => spawn_one(BOOT_IMG_HELLO, sp),
+                b"pong" => run_pong(sp),
+                b"" => tw(b"run: usage: run <program>\n"),
+                _ => tw(b"run: no such program\n"),
+            }
+        }
         b"help" => {
             tw(b"oxbow shell builtins:\n");
-            tw(b"  echo <text>   print text\n");
-            tw(b"  help          this list\n");
+            tw(b"  echo <text>     print text\n");
+            tw(b"  run hello       spawn the hello program\n");
+            tw(b"  run pong        spawn the pong<->beta IPC demo\n");
+            tw(b"  help            this list\n");
         }
         _ => {
             tw(b"oxbow: ");
@@ -87,10 +177,18 @@ pub extern "C" fn oxbow_main() -> ! {
     } else {
         tw(b"[sh] !! direct console write SUCCEEDED (revocation broken)\n");
     }
+    // Mint the spawn capabilities once: an attenuated send-only "stdout" endpoint
+    // to hand children (BOOT_TTY keeps R_GRANT so we can pass it on), and one exit
+    // notification reused for every spawn.
+    let sp = Spawner {
+        stdout: rt::sys_attenuate(BOOT_TTY, R_SEND | R_GRANT).unwrap_or(HANDLE_NULL),
+        exit: rt::sys_notif_create().unwrap_or(HANDLE_NULL),
+        ep: rt::sys_ep_create().unwrap_or(HANDLE_NULL),
+    };
     let mut line = [0u8; 64];
     loop {
         tw(PROMPT);
         let n = read_line(&mut line);
-        run(&line[..n]);
+        run(&line[..n], &sp);
     }
 }

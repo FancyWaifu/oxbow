@@ -40,8 +40,9 @@ static FRAMES: Mutex<[FrameObj; FRAME_POOL]> = Mutex::new(
     }; FRAME_POOL],
 );
 
-/// Grant a fresh Memory budget; returns its pool index (for `ObjectRef::Memory`).
-pub fn grant(budget: u64) -> u8 {
+/// Grant a fresh Memory budget; returns its pool index (for `ObjectRef::Memory`),
+/// or `None` if the pool is exhausted.
+pub fn grant(budget: u64) -> Option<u8> {
     let mut m = MEMORY.lock();
     for i in 0..MEM_POOL {
         if !m[i].in_use {
@@ -49,10 +50,18 @@ pub fn grant(budget: u64) -> u8 {
                 in_use: true,
                 remaining: budget,
             };
-            return i as u8;
+            return Some(i as u8);
         }
     }
-    panic!("mem: out of Memory slots");
+    None
+}
+
+/// Release a Memory budget slot (on process exit). The bytes are NOT refunded —
+/// `pmm` is a bump allocator with no frame reclamation, so the frames really are
+/// gone; only the pool slot is freed for reuse.
+#[allow(dead_code)] // used by proc::kill (Phase 3)
+pub fn release(idx: u8) {
+    MEMORY.lock()[idx as usize].in_use = false;
 }
 
 /// Remaining budget on Memory `idx`.

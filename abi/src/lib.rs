@@ -49,6 +49,8 @@ pub const R_OUT: u32 = 1 << 19;
 pub const R_BIND: u32 = 1 << 20;
 /// IrqLine: may ack (re-arm) the line.
 pub const R_ACK: u32 = 1 << 21;
+/// Image: may be spawned into a new process (`sys_spawn`).
+pub const R_SPAWN: u32 = 1 << 22;
 
 // Notifications reuse the IPC verbs: signalling is "send", waiting is "recv".
 pub const R_SIGNAL: u32 = R_SEND;
@@ -86,6 +88,10 @@ pub const SYS_IO_IN: u64 = 14; // (ioport, port) -> byte  needs R_IN
 pub const SYS_IO_OUT: u64 = 15; // (ioport, port, value)  needs R_OUT
 pub const SYS_IRQ_BIND: u64 = 16; // (irq, notif)          needs R_BIND + R_SIGNAL
 pub const SYS_IRQ_ACK: u64 = 17; // (irq)                  needs R_ACK
+
+// Process spawning (§13).
+pub const SYS_SPAWN: u64 = 18; // (image, mem, &MsgBuf, exit_notif) -> pid
+pub const SYS_EP_CREATE: u64 = 19; // () -> fresh Endpoint handle
 
 // ---------------------------------------------------------------------------
 // Error codes (§6) — returned in rax; values are stable forever (append-only)
@@ -206,6 +212,23 @@ pub const BOOT_TTY: Handle = 7;
 pub const BOOT_SERIAL_IRQ: Handle = 4; // IrqLine(4) — R_BIND|R_ACK
 pub const BOOT_SERIAL_RBR: Handle = 5; // IoPort{0x3F8,1} — R_IN (RBR, read side)
 pub const BOOT_SERIAL_LSR: Handle = 6; // IoPort{0x3FD,1} — R_IN (line status)
+
+// --- Process spawning (§13) ------------------------------------------------
+/// Image capabilities the shell is born holding (R_SPAWN | R_GRANT | R_ATTENUATE).
+pub const BOOT_IMG_HELLO: Handle = 8;
+pub const BOOT_IMG_PONG: Handle = 9;
+pub const BOOT_IMG_BETA: Handle = 10;
+
+/// `sys_spawn` grant convention: the handles in the spawn MsgBuf land in the
+/// child's table at these slots, in order (HANDLE_NULL entries are skipped).
+/// Slot 3 is always the child's fresh Memory budget, so it is not in this list.
+pub const SPAWN_SLOTS: [Handle; 4] = [1, 2, 4, 5];
+/// A spawned program's standard output endpoint (a tty R_SEND endpoint) — the
+/// parent passes it as the 2nd grant so it lands here. Mirrors BOOT_CONSOLE's
+/// number, so programs that printed via BOOT_CONSOLE need no slot change.
+pub const SPAWN_STDOUT: Handle = 2;
+/// Child Memory budget if the spawn MsgBuf requests 0 (256 KiB).
+pub const SPAWN_DEFAULT_BUDGET: u64 = 64 * 4096;
 
 /// "PING" — request tag for the v0 roundtrip.
 pub const TAG_PING: u64 = 0x474E4950;

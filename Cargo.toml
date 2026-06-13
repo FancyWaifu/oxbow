@@ -12,6 +12,7 @@ members = [
     "servers/tty",
     "servers/shell",
     "servers/serial",
+    "servers/hello",
     # "tools/*",  # initrd packer, etc.
 ]
 # Servers are excluded from the default build because they need a DIFFERENT

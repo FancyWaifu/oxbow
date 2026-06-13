@@ -6,11 +6,12 @@
 //! IPC syscalls (send/recv/call/reply) arrive in Phase 8.
 use core::mem::size_of;
 use oxbow_abi::{
-    Handle, MsgBuf, SysError, SysResult, HANDLE_NULL, MSG_DATA_WORDS, MSG_HANDLES, PROT_READ,
-    PROT_WRITE, R_ATTENUATE, R_GRANT, R_MAP, R_RECV, R_SEND, R_SIGNAL, R_WAIT, R_WRITE,
-    SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP,
-    SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND, SYS_MAP, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL,
-    SYS_NOTIF_WAIT, SYS_RECV, SYS_REPLY, SYS_SEND, R_ACK, R_BIND, R_IN, R_OUT,
+    Handle, MsgBuf, SysError, SysResult, BOOT_MEM, HANDLE_NULL, MSG_DATA_WORDS, MSG_HANDLES,
+    PROT_READ, PROT_WRITE, R_ATTENUATE, R_GRANT, R_MAP, R_RECV, R_SEND, R_SIGNAL, R_WAIT, R_WRITE,
+    SPAWN_DEFAULT_BUDGET, SPAWN_SLOTS, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE,
+    SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
+    SYS_EP_CREATE, SYS_MAP, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT, SYS_RECV, SYS_REPLY,
+    SYS_SEND, SYS_SPAWN, R_ACK, R_BIND, R_IN, R_OUT, R_SPAWN,
 };
 
 use crate::object::{HandleEntry, ObjType, ObjectRef};
@@ -83,6 +84,8 @@ pub extern "C" fn syscall_dispatch(
         SYS_IO_OUT => sys_io_out(a1, a2, a3),
         SYS_IRQ_BIND => sys_irq_bind(a1, a2),
         SYS_IRQ_ACK => sys_irq_ack(a1),
+        SYS_SPAWN => sys_spawn(a1, a2, a3, a4),
+        SYS_EP_CREATE => sys_ep_create(),
         SYS_CONSOLE_WRITE => sys_console_write(a1, a2, a3),
         SYS_ATTENUATE => sys_attenuate(a1, a2),
         SYS_CLOSE => SyscallRet::from_result(proc::with_current_mut(|p| p.close(a1 as Handle))),
@@ -278,6 +281,167 @@ fn sys_irq_ack(irq_h: u64) -> SyscallRet {
         crate::irq::ack(line);
         Ok(())
     })())
+}
+
+/// `sys_ep_create()` — mint a fresh Endpoint, returned as a full-rights handle.
+/// Lets a parent set up an IPC channel between the children it spawns.
+fn sys_ep_create() -> SyscallRet {
+    match ipc::ep_create() {
+        Some(idx) => {
+            let r = proc::with_current_mut(|p| {
+                p.alloc_slot(HandleEntry {
+                    obj: ObjectRef::Endpoint(idx),
+                    rights: R_SEND | R_RECV | R_GRANT | R_ATTENUATE,
+                })
+            });
+            match r {
+                Ok(h) => SyscallRet::ok_handle(h),
+                Err(e) => SyscallRet::err(e), // ep pool slot leaks (bounded)
+            }
+        }
+        None => SyscallRet::err(SysError::NoMem),
+    }
+}
+
+/// Pages `load_into` will map for an image: per PT_LOAD, the page span from the
+/// page containing p_vaddr to the page after p_vaddr+p_memsz.
+fn spawn_load_pages(img: &crate::elf::Image) -> u64 {
+    let mut pages = 0u64;
+    for ph in img.loads() {
+        let start = ph.p_vaddr & !0xfff;
+        let end = (ph.p_vaddr + ph.p_memsz + 0xfff) & !0xfff;
+        pages += (end - start) / 4096;
+    }
+    pages
+}
+
+/// `sys_spawn(image, mem, &MsgBuf, exit_notif)` — load a spawnable Image into a
+/// fresh process, granting it the capabilities named in the spawn MsgBuf, and
+/// start it. The parent's Memory budget pays for the child's frames + budget
+/// (the seL4-honest model: spawning consumes the spawner's untyped). Returns the
+/// child pid in rdx (informational — no authority). See ABI §13.
+fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> SyscallRet {
+    // 16 stack pages + a conservative page-table overhead (fresh PML4 + tables
+    // for ≤2 mapped regions needs ≤7); mirrors proc::load_into's stack size.
+    const STACK_PAGES: u64 = 16;
+    const PT_OVERHEAD: u64 = 8;
+
+    // ---- Validate everything; no side effects (handle→type→rights, then the
+    // MsgBuf, then per-grant R_GRANT, then the image, then the budget bound). ----
+    struct Prep {
+        img_idx: u8,
+        midx: u8,
+        exit_idx: Option<u8>,
+        grants: [Option<HandleEntry>; MSG_HANDLES],
+        grant_count: usize,
+        child_budget: u64,
+        cost: u64,
+    }
+    let prep = (|| -> SysResult<Prep> {
+        let ie = proc::with_current(|p| p.lookup(image_h as Handle, ObjType::Image, R_SPAWN))?;
+        let ObjectRef::Image(img_idx) = ie.obj else {
+            return Err(SysError::BadType);
+        };
+        let me = proc::with_current(|p| p.lookup(mem_h as Handle, ObjType::Memory, R_MAP))?;
+        let ObjectRef::Memory(midx) = me.obj else {
+            return Err(SysError::BadType);
+        };
+        let exit_idx = if exit_notif_h != HANDLE_NULL as u64 {
+            let ne = proc::with_current(|p| {
+                p.lookup(exit_notif_h as Handle, ObjType::Notification, R_SIGNAL)
+            })?;
+            let ObjectRef::Notification(nidx) = ne.obj else {
+                return Err(SysError::BadType);
+            };
+            Some(nidx)
+        } else {
+            None
+        };
+        if msg_ptr & 7 != 0 {
+            return Err(SysError::Fault);
+        }
+        usermem::check_user(msg_ptr, size_of::<MsgBuf>(), false)?;
+        let msg: MsgBuf = unsafe { core::ptr::read(msg_ptr as *const MsgBuf) };
+        let grant_count = msg.handle_count as usize;
+        if grant_count > MSG_HANDLES || grant_count > SPAWN_SLOTS.len() {
+            return Err(SysError::Msg);
+        }
+        let child_budget = if msg.data[0] == 0 { SPAWN_DEFAULT_BUDGET } else { msg.data[0] };
+        // Collect the granted handle entries; each non-null needs R_GRANT (§3.4).
+        let mut grants: [Option<HandleEntry>; MSG_HANDLES] = [None; MSG_HANDLES];
+        proc::with_current(|p| -> SysResult {
+            for i in 0..grant_count {
+                let h = msg.handles[i];
+                if h == HANDLE_NULL {
+                    continue;
+                }
+                let e = p.get(h)?;
+                if e.rights & R_GRANT == 0 {
+                    return Err(SysError::Rights);
+                }
+                grants[i] = Some(e);
+            }
+            Ok(())
+        })?;
+        // Validate the image now (a bad image is an error, not a panic).
+        let bytes = crate::image::bytes(img_idx).ok_or(SysError::Msg)?;
+        let img = crate::elf::Image::try_validate(bytes)?;
+        let cost = (spawn_load_pages(&img) + STACK_PAGES + PT_OVERHEAD) * 4096 + child_budget;
+        // Authority bound: the parent must be able to afford it. We CHECK rather
+        // than debit here so a later slot-full failure costs nothing; the kernel
+        // is non-preemptible (IF=0, single CPU), so nothing allocates between the
+        // check and the debit below.
+        if mm::mem::remaining(midx) < cost {
+            return Err(SysError::NoMem);
+        }
+        Ok(Prep {
+            img_idx,
+            midx,
+            exit_idx,
+            grants,
+            grant_count,
+            child_budget,
+            cost,
+        })
+    })();
+    let prep = match prep {
+        Ok(p) => p,
+        Err(e) => return SyscallRet::err(e),
+    };
+
+    // ---- Side effects. Create the child (claims a slot, loads the image), then
+    // mint its budget, install its handles, debit the parent, and start it. ----
+    let bytes = crate::image::bytes(prep.img_idx).expect("spawn: image vanished");
+    let img = crate::elf::Image::try_validate(bytes).expect("spawn: image re-validate");
+    let pml4 = mm::vm::new_user_pml4();
+    let (cid, entry, rsp) = match proc::create(&img, pml4, "spawned") {
+        Ok(t) => t,
+        Err(e) => return SyscallRet::err(e), // pool full — nothing debited yet
+    };
+    let child_mem = match mm::mem::grant(prep.child_budget) {
+        Some(m) => m,
+        None => return SyscallRet::err(SysError::NoMem),
+    };
+    proc::with_proc_mut(cid, |p| {
+        p.install(
+            BOOT_MEM,
+            HandleEntry {
+                obj: ObjectRef::Memory(child_mem),
+                rights: R_MAP | R_GRANT | R_ATTENUATE,
+            },
+        );
+        for i in 0..prep.grant_count {
+            if let Some(e) = prep.grants[i] {
+                p.install(SPAWN_SLOTS[i], e);
+            }
+        }
+    });
+    proc::set_lifecycle(cid, prep.exit_idx, child_mem);
+    // Debit the parent now (guaranteed to succeed — we checked `remaining`).
+    let _ = mm::mem::debit(prep.midx, prep.cost);
+    let tcb = crate::thread::spawn_user(cid, pml4, entry, rsp);
+    println!("[spawn] pid {} (tcb {}) image#{} -{} KiB", cid, tcb, prep.img_idx, prep.cost / 1024);
+    SyscallRet::ok_handle(cid as Handle)
 }
 
 /// `sys_io_in(ioport, port)` — read a byte from a port authorized by an IoPort

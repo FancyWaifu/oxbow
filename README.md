@@ -105,15 +105,27 @@ keyboard input in the one line discipline (DEL and 0x08 both rub out). See
 `docs/abi-v0.md` §12. (Headless test: COM1 on a TCP socket, driven by
 `tools/serial_expect.py`.)
 
+**v1 arc 8 — userspace process spawning: complete.** The boot now drops straight
+into a clean `oxbow$ ` prompt (no demo spam); the pong/beta demo is registered as
+**spawnable Image capabilities** and launched on demand. `sys_spawn` loads an
+Image into a fresh address space and grants it a starter capability set named in
+a spawn message — the parent's Memory budget *pays* for the child (the seL4-honest
+model), and a Notification is signalled when the child exits (lifecycle without
+leaks; process/thread slots are reused). The shell gains `run`: **`run hello`**
+spawns a one-line program, **`run pong`** wires an endpoint between two freshly
+spawned children (the full PONG regression — IPC, zero-copy shmem, E_GONE, tick,
+sys_map — on demand). A program can only launch images it was *granted* (zero
+ambient authority; spawn-by-handle). See `docs/abi-v0.md` §13.
+
 ### Next — toward a fuller userspace
 
-**Process spawning** (a shell that launches programs; also lets the boot drop
-straight into a clean shell instead of running the pong/beta demo) → a
-**filesystem** (VFS naming server + ramdisk) → coreutils → a **libc/POSIX shim**.
-POSIX and the Unix feel live in *userspace* over the capability kernel (the Redox
-model) — the kernel stays capability-pure. A nearer-term polish item: **cooked-
-mode echo synchronization** in the tty (see §12.5) for clean paste/type-ahead.
-Plus, eventually: untyped/retype + `sys_unmap`, SMP, and the `aarch64` port.
+A **filesystem** (VFS naming server + ramdisk) → coreutils → a **libc/POSIX
+shim**. POSIX and the Unix feel live in *userspace* over the capability kernel
+(the Redox model) — the kernel stays capability-pure. A nearer-term polish item:
+**cooked-mode echo synchronization** in the tty (see §12.5) for clean
+paste/type-ahead. Plus, eventually: frame reclamation + budget refund, the
+orphaned selftest rework, untyped/retype + `sys_unmap`, SMP, and the `aarch64`
+port.
 
 ## Building & running
 

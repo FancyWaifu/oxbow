@@ -8,11 +8,24 @@
 #![no_std]
 #![no_main]
 
-use oxbow_abi::{MsgBuf, SysError, BOOT_CONSOLE, BOOT_EP, PROT_READ, PROT_WRITE, TAG_PONG, TAG_PING};
+use oxbow_abi::{
+    MsgBuf, SysError, BOOT_EP, PROT_READ, PROT_WRITE, SPAWN_STDOUT, TAG_PONG, TAG_PING,
+    TAG_TTY_WRITE,
+};
 use oxbow_rt as rt;
 
+/// Write a short (<63 byte) line to our stdout — a tty R_SEND endpoint the parent
+/// granted at SPAWN_STDOUT (spawned beta holds no Console of its own).
 fn w(s: &[u8]) {
-    let _ = rt::sys_console_write(BOOT_CONSOLE, s.as_ptr(), s.len());
+    let mut m = MsgBuf::new(TAG_TTY_WRITE);
+    let n = core::cmp::min(s.len(), 63);
+    let dst = m.data.as_mut_ptr() as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(s.as_ptr(), dst, n);
+        *dst.add(n) = 0;
+    }
+    m.data_len = ((n + 1 + 7) / 8) as u32;
+    let _ = rt::sys_send(SPAWN_STDOUT, &m);
 }
 
 /// If a Frame capability rode along, map it read-only and read the shared
@@ -25,7 +38,8 @@ fn handle_shared_frame(frame: u32) {
             len += 1;
         }
         w(b"[P2] shmem: ");
-        let _ = rt::sys_console_write(BOOT_CONSOLE, SHARED as *const u8, len as usize);
+        let shared = unsafe { core::slice::from_raw_parts(SHARED as *const u8, len as usize) };
+        w(shared);
         w(b" (zero copy)\n");
     }
     // The handle is read-only (attenuated) — a writable map must be refused.

@@ -208,6 +208,24 @@ pub fn init() {
     println!("[ipc] EP0 + EP1 created");
 }
 
+/// Mint a fresh endpoint from the pool (for `sys_ep_create`); returns its pool
+/// index, or `None` if the pool is exhausted. (No reclamation in v1 — the pool
+/// is bounded and a long-lived shell mints only a couple.)
+pub fn ep_create() -> Option<u8> {
+    let mut eps = ENDPOINTS.lock();
+    for i in 0..EP_POOL {
+        if !eps[i].in_use {
+            eps[i] = Endpoint {
+                in_use: true,
+                send_q: WaitQ::new(),
+                recv_waiter: None,
+            };
+            return Some(i as u8);
+        }
+    }
+    None
+}
+
 // --- The rendezvous -------------------------------------------------------
 
 /// Mint a Reply for `caller` and install it (rights 0) in process `to_proc`'s

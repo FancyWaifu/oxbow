@@ -415,3 +415,74 @@ shell is busy) and flush it when the next `READ` is posted, after the prompt.
 That is a line-discipline enhancement (it applies to the PS/2 path too), tracked
 for a future arc. At human interactive speed — type, see the prompt, type the
 next command — echo is clean.
+
+---
+
+## 13. Process spawning (v1-spawn)
+
+The shell launches programs at runtime; the boot no longer runs the pong/beta
+demo (it goes straight to the prompt). Demo/program binaries that are not
+boot-spawned are **registered as Image capabilities** and launched on demand.
+
+### 13.1 Image objects
+A spawnable program is an `Image` object (a registered Limine-module blob). The
+shell is born holding three Image handles — `BOOT_IMG_HELLO=8`, `BOOT_IMG_PONG=9`,
+`BOOT_IMG_BETA=10` — each with `R_SPAWN | R_GRANT | R_ATTENUATE`. A process can
+only launch images it holds a handle to (zero ambient authority: spawn-by-handle,
+never spawn-by-name-string). `R_SPAWN = 1<<22`.
+
+### 13.2 `sys_spawn(image, mem, &MsgBuf, exit_notif) -> pid` (18)
+Loads `image` into a fresh address space and starts it. Validation order
+(all before any side effect): `image` (Image, `R_SPAWN`) → `mem` (Memory,
+`R_MAP`) → `exit_notif` (Notification, `R_SIGNAL`, or `HANDLE_NULL`) → MsgBuf
+pointer (8-aligned, mapped) → per-grant `R_GRANT` → image ELF validation →
+budget bound. `pid` (informational, no authority) is returned in rdx.
+
+The spawn **MsgBuf** is kernel-interpreted:
+- `data[0]` = the child's Memory budget in bytes (0 → `SPAWN_DEFAULT_BUDGET`,
+  256 KiB).
+- `handles[0..handle_count]` = capabilities to grant the child (each non-null
+  needs `R_GRANT` in the parent, §3.4 semantics — rights copied as-is). They land
+  in the child's table at `SPAWN_SLOTS = [1, 2, 4, 5]`, in order; a `HANDLE_NULL`
+  entry skips its slot. **Slot 3 is always the child's fresh Memory budget**, so
+  it is not in `SPAWN_SLOTS`. `SPAWN_STDOUT = 2` is the conventional output
+  endpoint (a tty `R_SEND` handle) — it shares `BOOT_CONSOLE`'s number, so a
+  program that printed via `BOOT_CONSOLE` needs no slot change, only a switch
+  from `sys_console_write` to a `TAG_TTY_WRITE` send.
+
+### 13.3 Memory: the parent pays, no refund
+`sys_spawn` charges the parent's Memory budget for the child's load pages + 16
+stack pages + a page-table overhead + the child's budget bytes. The kernel
+*checks* the parent can afford it before any side effect (so a later slot-full
+failure costs nothing), then debits after the child is built. The bytes are
+**never refunded** on child exit — `pmm` is a bump allocator with no frame
+reclamation, so the frames really are gone; only the child's Memory *pool slot*
+is freed (for reuse). The shell, as the system spawner, is born with an 8 MiB
+budget; everything else gets 256 KiB.
+
+### 13.4 Lifecycle: exit notification + reaping
+The parent passes a Notification as `exit_notif`; the kernel signals it (a
+counting notification, once) when the child dies — on `sys_exit` or a ring-3
+fault, which converge in `proc::kill`. `kill` abandons the child's Replies (so a
+blocked caller wakes `E_GONE`), frees the child's Memory slot, marks the process
+slot reusable, and signals the parent. A parent waits with `sys_notif_wait`,
+summing the drained counts to the number of children spawned. There is no exit
+*status* in v1 (deferred). Fire-and-forget = pass `HANDLE_NULL`.
+
+Process and thread slots are reused on death (a `Dead` process / `Exited` thread
+slot is reclaimed by the next spawn — safe because an exited thread never resumes
+on a single CPU with IF=0). Spawn-when-full / over-budget is a clean `E_NOMEM`,
+never a panic.
+
+### 13.5 `sys_ep_create() -> Endpoint handle` (19)
+Mints a fresh endpoint (`R_SEND|R_RECV|R_GRANT|R_ATTENUATE`) so a parent can wire
+an IPC channel between the children it spawns (e.g. `run pong` gives beta the
+attenuated recv side and pong the send side). No reclamation in v1 (the pool is
+bounded; a long-lived shell mints only one).
+
+### 13.6 Deferred
+Exit *status* codes; argv/environment; frame reclamation (which would also let
+budgets refund) + endpoint/notification pool free; passing Image handles to
+non-shell holders (a real init/launcher); a Process handle for kill/wait by the
+parent. The `--features selftest` Console-probe path on pong is orphaned by the
+move off boot-spawn and needs reworking into a spawnable test.

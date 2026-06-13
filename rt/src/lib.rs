@@ -14,7 +14,7 @@ use oxbow_abi::{
     Handle, MsgBuf, SysError, SysResult, BOOT_CONSOLE, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE,
     SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK,
     SYS_IRQ_BIND, SYS_MAP, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT, SYS_RECV, SYS_REPLY,
-    SYS_SEND,
+    SYS_SEND, SYS_EP_CREATE, SYS_SPAWN,
 };
 
 // --- The server provides this; _start calls it ---------------------------
@@ -166,6 +166,28 @@ pub fn sys_frame_map(frame: Handle, vaddr: u64, prot: u64) -> SysResult {
 
 pub fn sys_notif_create() -> SysResult<Handle> {
     let (rax, rdx) = unsafe { syscall1(SYS_NOTIF_CREATE, 0) };
+    SysError::from_raw(rax).map(|_| rdx as Handle)
+}
+
+/// Spawn a program `image` into a new process. `mem` (a Memory budget) pays;
+/// `msg` carries the child budget (`data[0]`) and the capabilities to grant it
+/// (`handles`, per the §13 slot convention); `exit_notif` is signalled when the
+/// child exits (or HANDLE_NULL for fire-and-forget). Returns the child pid.
+pub fn sys_spawn(
+    image: Handle,
+    mem: Handle,
+    msg: *const MsgBuf,
+    exit_notif: Handle,
+) -> SysResult<u64> {
+    let (rax, rdx) =
+        unsafe { syscall4(SYS_SPAWN, image as u64, mem as u64, msg as u64, exit_notif as u64) };
+    SysError::from_raw(rax).map(|_| rdx)
+}
+
+/// Mint a fresh Endpoint (R_SEND|R_RECV|R_GRANT|R_ATTENUATE) — for a parent to
+/// set up an IPC channel between the children it spawns.
+pub fn sys_ep_create() -> SysResult<Handle> {
+    let (rax, rdx) = unsafe { syscall1(SYS_EP_CREATE, 0) };
     SysError::from_raw(rax).map(|_| rdx as Handle)
 }
 

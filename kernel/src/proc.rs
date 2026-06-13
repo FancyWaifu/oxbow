@@ -4,8 +4,8 @@
 //! own PML4 (per-process isolation, CR3 switched by the scheduler). The "current
 //! process" is resolved from the current thread (`thread::current_proc`).
 use oxbow_abi::{
-    Handle, SysError, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, HANDLE_TABLE_SIZE, R_ATTENUATE, R_GRANT,
-    R_MAP, R_WRITE,
+    Handle, SysError, BOOT_CONSOLE, BOOT_MEM, HANDLE_TABLE_SIZE, R_ATTENUATE, R_GRANT, R_MAP,
+    R_WRITE,
 };
 use spin::Mutex;
 
@@ -33,6 +33,10 @@ pub struct Process {
     pub state: PState,
     pub pml4_phys: u64,
     handles: [Option<HandleEntry>; HANDLE_TABLE_SIZE],
+    /// Notification the kernel signals when this process exits (set at spawn).
+    exit_notif: Option<u8>,
+    /// This process's own Memory budget pool index, released on exit.
+    mem_idx: Option<u8>,
 }
 
 static PROCESSES: Mutex<[Process; MAX_PROCS]> = Mutex::new([Process::new(); MAX_PROCS]);
@@ -43,6 +47,8 @@ impl Process {
             state: PState::Free,
             pml4_phys: 0,
             handles: [None; HANDLE_TABLE_SIZE],
+            exit_notif: None,
+            mem_idx: None,
         }
     }
 
@@ -129,13 +135,33 @@ pub fn with_proc_mut<R>(id: usize, f: impl FnOnce(&mut Process) -> R) -> R {
     f(&mut procs[id])
 }
 
+/// Record a spawned child's exit notification + own Memory budget so `kill` can
+/// signal the parent and reclaim the budget slot when the child dies.
+pub fn set_lifecycle(id: usize, exit_notif: Option<u8>, mem_idx: u8) {
+    let mut procs = PROCESSES.lock();
+    procs[id].exit_notif = exit_notif;
+    procs[id].mem_idx = Some(mem_idx);
+}
+
 /// Mark a process dead and drop its handles (on a ring-3 fault or `sys_exit`).
 /// Any pending Reply it held is abandoned — the blocked caller wakes `E_GONE`.
+/// Releases the process's Memory budget slot and signals its exit notification
+/// (if any) so a waiting parent wakes. The slot becomes reusable (`Dead`).
 pub fn kill(id: usize) {
-    let mut procs = PROCESSES.lock();
-    procs[id].for_each_reply(|idx| ipc::reply_abandon(idx as usize));
-    procs[id].close_all();
-    procs[id].state = PState::Dead;
+    let (exit_notif, mem_idx) = {
+        let mut procs = PROCESSES.lock();
+        procs[id].for_each_reply(|idx| ipc::reply_abandon(idx as usize));
+        procs[id].close_all();
+        procs[id].state = PState::Dead;
+        (procs[id].exit_notif.take(), procs[id].mem_idx.take())
+    };
+    // Outside the PROCESSES lock (lock rule): reclaim the budget, wake the parent.
+    if let Some(mi) = mem_idx {
+        mm::mem::release(mi);
+    }
+    if let Some(en) = exit_notif {
+        crate::notif::signal(en);
+    }
 }
 
 /// Top of the user stack (exclusive). Canonical lower-half.
@@ -208,44 +234,44 @@ fn load_into(img: &Image, pml4_phys: u64) -> (u64, u64) {
     (img.entry, USER_STACK_TOP)
 }
 
-/// Create a process: claim a pool slot, map the image into `pml4_phys`, grant
-/// the boot capabilities, and return `(proc id, entry, user_rsp)`. `ep0_rights`
-/// is the role: the pinger gets `R_SEND`, the ponger gets `R_RECV`.
-pub fn create(img: &Image, pml4_phys: u64, name: &str, ep0_rights: u32) -> (usize, u64, u64) {
+/// Create a process: claim a pool slot (reusing a `Dead` one), map the image
+/// into `pml4_phys`, and return `(proc id, entry, user_rsp)`. Grants NO handles
+/// — the caller installs the boot set (`grant_standard` + per-name device caps)
+/// or the spawn set (the §13 convention). `E_NOMEM` if the pool is full.
+pub fn create(img: &Image, pml4_phys: u64, name: &str) -> Result<(usize, u64, u64), SysError> {
     let id = {
         let mut procs = PROCESSES.lock();
         let id = (0..MAX_PROCS)
-            .find(|&i| procs[i].state == PState::Free)
-            .expect("proc: out of process slots");
+            .find(|&i| matches!(procs[i].state, PState::Free | PState::Dead))
+            .ok_or(SysError::NoMem)?;
         procs[id].state = PState::Alive;
         procs[id].pml4_phys = pml4_phys;
+        procs[id].handles = [None; HANDLE_TABLE_SIZE]; // clear any stale (Dead reuse)
         id
     };
 
     let (entry, user_rsp) = load_into(img, pml4_phys);
+    println!("[proc] {} = proc {} (as pml4={:#x})", name, id, pml4_phys);
+    Ok((id, entry, user_rsp))
+}
 
-    // Grant the ONLY handles the process is born holding (laws L1/L3): EP0 with
-    // the role-specific rights, Console with write.
+/// Grant a boot process its standard birth capabilities: a Console (write) and a
+/// fresh Memory budget. Per-name device/endpoint caps are installed separately
+/// by the boot loop. (Spawned processes get the §13 set instead — never this.)
+pub fn grant_standard(id: usize, budget: u64) {
+    // Mint the budget BEFORE taking the PROCESSES lock (lock rule: never hold it
+    // across an mm allocation that takes the MEMORY lock).
+    let mem_idx = mm::mem::grant(budget).expect("boot: Memory pool exhausted");
     {
         let mut procs = PROCESSES.lock();
         let p = &mut procs[id];
         p.install(
-            BOOT_EP,
-            HandleEntry {
-                obj: ObjectRef::Endpoint(ipc::EP0),
-                rights: ep0_rights,
-            },
-        );
-        p.install(
             BOOT_CONSOLE,
             HandleEntry {
                 obj: ObjectRef::Console,
-                // R_GRANT so a process can attenuate + hand its console to a peer.
                 rights: R_WRITE | R_ATTENUATE | R_GRANT,
             },
         );
-        // A birth Memory budget — the only authority to allocate (law L6).
-        let mem_idx = mm::mem::grant(mm::mem::BOOT_BUDGET);
         p.install(
             BOOT_MEM,
             HandleEntry {
@@ -253,12 +279,6 @@ pub fn create(img: &Image, pml4_phys: u64, name: &str, ep0_rights: u32) -> (usiz
                 rights: R_MAP | R_GRANT | R_ATTENUATE,
             },
         );
-        println!(
-            "[mem] proc {} granted Memory#{} = {} B (slot {})",
-            id, mem_idx, mm::mem::BOOT_BUDGET, BOOT_MEM
-        );
     }
-
-    println!("[proc] {} = proc {} (as pml4={:#x})", name, id, pml4_phys);
-    (id, entry, user_rsp)
+    println!("[mem] proc {} granted Memory#{} = {} B (slot {})", id, mem_idx, budget, BOOT_MEM);
 }

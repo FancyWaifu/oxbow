@@ -8,14 +8,26 @@
 #![no_main]
 
 use oxbow_abi::{
-    MsgBuf, SysError, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_TICK, PROT_READ, PROT_WRITE, R_GRANT,
-    R_MAP, R_SIGNAL, TAG_PONG, TAG_PING,
+    MsgBuf, SysError, BOOT_EP, BOOT_MEM, BOOT_TICK, PROT_READ, PROT_WRITE, R_GRANT, R_MAP, R_SIGNAL,
+    SPAWN_STDOUT, TAG_PONG, TAG_PING, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
+// Only the (now-orphaned) selftest build still probes a Console directly.
+#[cfg(feature = "selftest")]
+use oxbow_abi::BOOT_CONSOLE;
 
-/// Write a byte string through the console capability.
+/// Write a short (<63 byte) line to our stdout — a tty R_SEND endpoint the
+/// parent granted at SPAWN_STDOUT (spawned pong holds no Console of its own).
 fn w(s: &[u8]) {
-    let _ = rt::sys_console_write(BOOT_CONSOLE, s.as_ptr(), s.len());
+    let mut m = MsgBuf::new(TAG_TTY_WRITE);
+    let n = core::cmp::min(s.len(), 63);
+    let dst = m.data.as_mut_ptr() as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(s.as_ptr(), dst, n);
+        *dst.add(n) = 0;
+    }
+    m.data_len = ((n + 1 + 7) / 8) as u32;
+    let _ = rt::sys_send(SPAWN_STDOUT, &m);
 }
 
 /// Print the byte `v` as two hex digits.
@@ -202,7 +214,8 @@ pub extern "C" fn oxbow_main() -> ! {
                 w(b"[P1] round ");
                 w(&[b'0' + round]);
                 w(b": ");
-                let _ = rt::sys_console_write(BOOT_CONSOLE, msg.data.as_ptr() as *const u8, 5);
+                let reply = unsafe { core::slice::from_raw_parts(msg.data.as_ptr() as *const u8, 5) };
+                w(reply);
             }
             Err(SysError::Gone) => {
                 w(b"[P1] round ");

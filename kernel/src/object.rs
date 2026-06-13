@@ -14,6 +14,7 @@ pub enum ObjType {
     Notification,
     IoPort,
     Irq,
+    Image,
 }
 
 /// What a handle points at: a pool index for Endpoint/Reply/Memory/Frame, or the
@@ -28,6 +29,8 @@ pub enum ObjectRef {
     Notification(u8),
     IoPort { base: u16, len: u16 },
     Irq(u8),
+    /// A spawnable program image, by registry index (see `kernel/src/image.rs`).
+    Image(u8),
 }
 
 impl ObjectRef {
@@ -41,6 +44,7 @@ impl ObjectRef {
             ObjectRef::Notification(_) => ObjType::Notification,
             ObjectRef::IoPort { .. } => ObjType::IoPort,
             ObjectRef::Irq(_) => ObjType::Irq,
+            ObjectRef::Image(_) => ObjType::Image,
         }
     }
 }
