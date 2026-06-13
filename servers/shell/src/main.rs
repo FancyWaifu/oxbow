@@ -8,9 +8,9 @@
 
 use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA,
-    BOOT_IMG_CAT, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_PONG, BOOT_MEM, BOOT_TICK, BOOT_TTY,
-    HANDLE_NULL, R_GRANT, R_RECV, R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_OPEN,
-    TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
+    BOOT_IMG_CAT, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_MKDIR, BOOT_IMG_PONG, BOOT_IMG_TOUCH,
+    BOOT_MEM, BOOT_TICK, BOOT_TTY, HANDLE_NULL, R_GRANT, R_RECV, R_SEND, R_WAIT, R_WRITE,
+    TAG_FS_CREATE, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -86,9 +86,17 @@ fn wait_exits(sp: &Spawner, n: u64) {
 /// then wait for it to exit. `cap0 = HANDLE_NULL` for a program that needs no
 /// input capability (e.g. hello). For ls/cat, `cap0` is the dir/file capability
 /// the shell hands over — the spawned coreutil never sees a name, just the cap.
-fn spawn_with(image: Handle, cap0: Handle, sp: &Spawner) {
+fn spawn_with(image: Handle, cap0: Handle, arg: &[u8], sp: &Spawner) {
     let mut m = MsgBuf::new(0);
-    m.data_len = 1;
+    // data[0] = budget (0 = default); the argument string rides in data[1..]
+    // (byte offset 8), NUL-terminated — the kernel maps it at SPAWN_ARGV (§13).
+    let n = core::cmp::min(arg.len(), 55);
+    let dst = m.data.as_mut_ptr() as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(arg.as_ptr(), dst.add(8), n);
+        *dst.add(8 + n) = 0;
+    }
+    m.data_len = 8;
     m.handle_count = 2;
     m.handles[0] = cap0; // slot 1 = BOOT_EP (a file/dir cap, or NULL)
     m.handles[1] = sp.stdout; // slot 2 = SPAWN_STDOUT
@@ -115,7 +123,7 @@ fn cat_cmd(dir: Handle, name: &[u8], sp: &Spawner) {
         return;
     }
     let file_cap = m.handles[0];
-    spawn_with(BOOT_IMG_CAT, file_cap, sp); // cat reads the file cap, prints, exits
+    spawn_with(BOOT_IMG_CAT, file_cap, b"", sp); // cat reads the file cap, prints, exits
     let _ = rt::sys_close(file_cap); // cat holds its own copy
 }
 
@@ -293,21 +301,6 @@ fn write_file(dir: Handle, name: &[u8], text: &[u8]) {
     let _ = rt::sys_close(cap);
 }
 
-/// `mkdir <name>`: make a subdirectory under `dir`.
-fn mkdir(dir: Handle, name: &[u8]) {
-    if name.is_empty() {
-        tw(b"mkdir: usage: mkdir <name>\n");
-        return;
-    }
-    let mut m = MsgBuf::new(TAG_FS_MKDIR);
-    pack_name(&mut m, name);
-    if rt::sys_call(dir, &mut m).is_err() || m.data[0] != 0 {
-        tw(b"mkdir: cannot create ");
-        tw(name);
-        tw(b"\n");
-    }
-}
-
 /// `cd <name>` / `cd /`: change the current-directory capability. `cd` with no
 /// arg (or `/`) returns to the root; `cd <name>` opens a subdir relative to the
 /// current one. Confinement: there is no `cd ..` — you can't walk above a dir cap
@@ -365,26 +358,27 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
         b"run" => {
             let (prog, _) = split_cmd(rest);
             match prog {
-                b"hello" => spawn_with(BOOT_IMG_HELLO, HANDLE_NULL, sp),
+                b"hello" => spawn_with(BOOT_IMG_HELLO, HANDLE_NULL, b"", sp),
                 b"pong" => run_pong(sp),
                 b"" => tw(b"run: usage: run <program>\n"),
                 _ => tw(b"run: no such program\n"),
             }
         }
-        b"ls" => spawn_with(BOOT_IMG_LS, *cwd, sp),
+        b"ls" => spawn_with(BOOT_IMG_LS, *cwd, b"", sp),
         b"cat" => cat_cmd(*cwd, rest, sp),
-        b"mkdir" => mkdir(*cwd, rest),
+        b"mkdir" => spawn_with(BOOT_IMG_MKDIR, *cwd, rest, sp),
+        b"touch" => spawn_with(BOOT_IMG_TOUCH, *cwd, rest, sp),
         b"cd" => cd(rest, cwd),
         b"badgetest" => badgetest(sp),
         b"help" => {
-            tw(b"oxbow shell builtins:\n");
+            tw(b"oxbow shell:  (ls cat mkdir touch are spawned programs)\n");
             tw(b"  echo <text>     print text (echo .. > f redirects to a file)\n");
             tw(b"  ls              list the current directory\n");
             tw(b"  cat <file>      print a file\n");
             tw(b"  mkdir <name>    make a directory\n");
-            tw(b"  cd <dir> | /    change directory\n");
-            tw(b"  run hello       spawn the hello program\n");
-            tw(b"  run pong        spawn the pong<->beta IPC demo\n");
+            tw(b"  touch <name>    make an empty file\n");
+            tw(b"  cd <dir> | /    change directory (builtin)\n");
+            tw(b"  run hello/pong  spawn a demo program\n");
             tw(b"  badgetest       exercise badged-endpoint mint rules\n");
             tw(b"  help            this list\n");
         }

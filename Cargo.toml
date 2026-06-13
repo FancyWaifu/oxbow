@@ -17,6 +17,8 @@ members = [
     "servers/fs",
     "servers/cat",
     "servers/ls",
+    "servers/mkdir",
+    "servers/touch",
     # "tools/*",  # initrd packer, etc.
 ]
 # Servers are excluded from the default build because they need a DIFFERENT

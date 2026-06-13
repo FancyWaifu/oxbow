@@ -234,6 +234,8 @@ pub const BOOT_IMG_BETA: Handle = 10;
 pub const BOOT_IMG_BADGE: Handle = 11; // §14 badged-endpoint demo server
 pub const BOOT_IMG_CAT: Handle = 13; // spawned coreutil: cat (gets a file cap)
 pub const BOOT_IMG_LS: Handle = 14; // spawned coreutil: ls (gets a dir cap)
+pub const BOOT_IMG_MKDIR: Handle = 15; // spawned coreutil: mkdir (dir cap + argv)
+pub const BOOT_IMG_TOUCH: Handle = 16; // spawned coreutil: touch (dir cap + argv)
 
 // --- Filesystem (§15) ------------------------------------------------------
 /// The shell's root-directory capability: a BADGED endpoint to the fs server,
@@ -277,6 +279,10 @@ pub const SPAWN_SLOTS: [Handle; 4] = [1, 2, 4, 5];
 pub const SPAWN_STDOUT: Handle = 2;
 /// Child Memory budget if the spawn MsgBuf requests 0 (256 KiB).
 pub const SPAWN_DEFAULT_BUDGET: u64 = 64 * 4096;
+/// The argument string (NUL-terminated, <=55 bytes) rides in the spawn MsgBuf's
+/// `data[1..]`; the kernel maps a page at this vaddr in the child and writes it
+/// there. A spawned program reads its argument from `SPAWN_ARGV` (`rt::argv()`).
+pub const SPAWN_ARGV: u64 = 0x0F00_0000;
 
 /// "PING" — request tag for the v0 roundtrip.
 pub const TAG_PING: u64 = 0x474E4950;

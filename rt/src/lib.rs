@@ -199,6 +199,17 @@ pub fn sys_ep_create() -> SysResult<Handle> {
     SysError::from_raw(rax).map(|_| rdx as Handle)
 }
 
+/// This program's argument string (the kernel mapped it at SPAWN_ARGV on spawn).
+/// Empty if spawned without an argument.
+pub fn argv() -> &'static [u8] {
+    let p = oxbow_abi::SPAWN_ARGV as *const u8;
+    let mut n = 0usize;
+    while n < 55 && unsafe { *p.add(n) } != 0 {
+        n += 1;
+    }
+    unsafe { core::slice::from_raw_parts(p, n) }
+}
+
 pub fn sys_notif_signal(notif: Handle) -> SysResult {
     let (rax, _) = unsafe { syscall1(SYS_NOTIF_SIGNAL, notif as u64) };
     SysError::from_raw(rax)

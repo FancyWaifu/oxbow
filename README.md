@@ -168,10 +168,20 @@ can't take a *name* (no argv yet), which is exactly why `cat`/`ls` spawn (they
 take a cap) while `mkdir`/`cd`/`echo >` stay builtins. Least privilege, enforced
 by the kernel. See `docs/abi-v0.md` §15.8.
 
+**v1 arc 14 — spawn arguments (argv): complete.** A spawned program can take a
+string argument: the parent packs it into the spawn message, the kernel maps it
+read-only at a fixed vaddr in the child, and `rt::argv()` reads it. This is what
+lets a coreutil take a *name* — `mkdir`/`touch` are now spawned programs granted
+the current-directory capability plus the new name as argv. The split is
+deliberate: read commands (`cat`/`ls`) take a *capability* the shell pre-resolves
+(maximally confined); name-creating commands (`mkdir`/`touch`) take a *name* via
+argv plus the directory cap. argv names a target *within* authority already
+granted — it never widens it. See `docs/abi-v0.md` §13.7.
+
 ### Next — toward a fuller userspace
 
-**argv** (so coreutils resolve their own names) → file growth/realloc +
-multi-component path walk → a **libc/POSIX shim**. POSIX and the Unix feel live in *userspace*
+A real **argv vector** (multiple arguments) → file growth/realloc +
+multi-component path walk → `rm`/`mv` + an unlink FS op → a **libc/POSIX shim**. POSIX and the Unix feel live in *userspace*
 over the capability kernel (the Redox model) — the kernel stays capability-pure.
 Plus, eventually: frame reclamation + budget refund, the orphaned selftest rework,
 untyped/retype + `sys_unmap`, SMP, and the `aarch64` port.

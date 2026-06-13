@@ -664,3 +664,26 @@ spawn cleanly (they operate on a cap) while `mkdir`/`cd`/`echo >` stay builtins
 spawned `cat` is handed precisely the authority it needs and nothing more, and
 the kernel enforces it — `cat` has no handle to any other file. (Deferred: argv,
 which would let coreutils resolve their own names.)
+
+### 13.7 Spawn arguments (argv) (v1-argv)
+A spawned program can be given a single string argument. The parent packs it
+into the spawn MsgBuf's `data[1..]` (byte offset 8, NUL-terminated, ≤55 bytes —
+`data[0]` is still the budget). The kernel maps one read-only page into the child
+at `SPAWN_ARGV = 0x0F00_0000` and writes the string there (always mapped, empty
+if none; the +1 page is charged to the parent's budget). The child reads it via
+`rt::argv()`.
+
+This is what lets a coreutil take a *name*: `mkdir`/`touch` are spawned programs
+granted the current-directory capability at slot 1 and the new name as argv —
+they issue MKDIR / CREATE relative to the dir cap. A name-creating command can't
+be expressed by cap-passing alone (the thing doesn't exist yet to be handed as a
+capability), which is exactly the niche argv fills.
+
+Note the deliberate split: read commands (`cat`, `ls`) operate on a *capability*
+the shell pre-resolves and hands over (most confined — `cat` holds exactly one
+file); name-creating commands (`mkdir`, `touch`) take a *name* via argv plus the
+directory capability. Both are least-privilege; argv is not a license to widen
+authority, only to name a target within authority already granted.
+
+(Deferred: multiple arguments / a real argv vector; argument parsing beyond a
+single token.)

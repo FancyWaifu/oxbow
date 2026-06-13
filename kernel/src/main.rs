@@ -196,7 +196,10 @@ fn kmain_stage2() -> ! {
         // Demo / on-demand programs are NOT boot-spawned: they are registered as
         // spawnable Image capabilities and launched later from the shell. This is
         // what gives a clean boot straight to the prompt (no demo spam).
-        if matches!(cmd, b"pong" | b"beta" | b"hello" | b"badge" | b"cat" | b"ls") {
+        if matches!(
+            cmd,
+            b"pong" | b"beta" | b"hello" | b"badge" | b"cat" | b"ls" | b"mkdir" | b"touch"
+        ) {
             image::register(cmd, bytes);
             println!("[mod] image '{}' registered ({} bytes)", name, bytes.len());
             continue;
@@ -308,6 +311,8 @@ fn kmain_stage2() -> ! {
                     (oxbow_abi::BOOT_IMG_BADGE, b"badge".as_slice()),
                     (oxbow_abi::BOOT_IMG_CAT, b"cat".as_slice()),
                     (oxbow_abi::BOOT_IMG_LS, b"ls".as_slice()),
+                    (oxbow_abi::BOOT_IMG_MKDIR, b"mkdir".as_slice()),
+                    (oxbow_abi::BOOT_IMG_TOUCH, b"touch".as_slice()),
                 ] {
                     if let Some(idx) = image::find(iname) {
                         p.install(

@@ -343,6 +343,8 @@ fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> Sysca
         grant_count: usize,
         child_budget: u64,
         cost: u64,
+        argv: [u8; 56],
+        argv_len: usize,
     }
     let prep = (|| -> SysResult<Prep> {
         let ie = proc::with_current(|p| p.lookup(image_h as Handle, ObjType::Image, R_SPAWN))?;
@@ -374,6 +376,11 @@ fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> Sysca
             return Err(SysError::Msg);
         }
         let child_budget = if msg.data[0] == 0 { SPAWN_DEFAULT_BUDGET } else { msg.data[0] };
+        // The argument string rides in data[1..] (bytes 8..64), NUL-terminated.
+        let mut argv = [0u8; 56];
+        let db = unsafe { core::slice::from_raw_parts(msg.data.as_ptr() as *const u8, 64) };
+        argv.copy_from_slice(&db[8..64]);
+        let argv_len = argv.iter().position(|&b| b == 0).unwrap_or(argv.len());
         // Collect the granted handle entries; each non-null needs R_GRANT (§3.4).
         let mut grants: [Option<HandleEntry>; MSG_HANDLES] = [None; MSG_HANDLES];
         proc::with_current(|p| -> SysResult {
@@ -393,7 +400,8 @@ fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> Sysca
         // Validate the image now (a bad image is an error, not a panic).
         let bytes = crate::image::bytes(img_idx).ok_or(SysError::Msg)?;
         let img = crate::elf::Image::try_validate(bytes)?;
-        let cost = (spawn_load_pages(&img) + STACK_PAGES + PT_OVERHEAD) * 4096 + child_budget;
+        // +1 page for the argv page the kernel maps into the child (§13).
+        let cost = (spawn_load_pages(&img) + STACK_PAGES + PT_OVERHEAD + 1) * 4096 + child_budget;
         // Authority bound: the parent must be able to afford it. We CHECK rather
         // than debit here so a later slot-full failure costs nothing; the kernel
         // is non-preemptible (IF=0, single CPU), so nothing allocates between the
@@ -409,6 +417,8 @@ fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> Sysca
             grant_count,
             child_budget,
             cost,
+            argv,
+            argv_len,
         })
     })();
     let prep = match prep {
@@ -445,6 +455,17 @@ fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> Sysca
         }
     });
     proc::set_lifecycle(cid, prep.exit_idx, child_mem);
+    // Map the argv page (read-only) into the child at SPAWN_ARGV and write the
+    // argument string there. Always mapped (empty string if no arg) so any child
+    // can read it safely. Charged via the +1 page in `cost`.
+    if let Some(argframe) = mm::pmm::alloc_frame() {
+        unsafe {
+            let dst = mm::phys_to_virt(argframe) as *mut u8;
+            core::ptr::write_bytes(dst, 0, 4096);
+            core::ptr::copy_nonoverlapping(prep.argv.as_ptr(), dst, prep.argv_len);
+        }
+        mm::vm::map_user_4k_in(pml4, oxbow_abi::SPAWN_ARGV, argframe, false, false);
+    }
     // Debit the parent now (guaranteed to succeed — we checked `remaining`).
     let _ = mm::mem::debit(prep.midx, prep.cost);
     let tcb = crate::thread::spawn_user(cid, pml4, entry, rsp);
