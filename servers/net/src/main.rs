@@ -17,6 +17,7 @@ mod dhcp;
 mod eth;
 mod icmp;
 mod ipv4;
+mod tcp;
 mod udp;
 
 use alloc::format;
@@ -26,24 +27,38 @@ use core::sync::atomic::{fence, Ordering};
 use eth::{ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use oxbow_abi::{
     MsgBuf, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_NET_IRQ, BOOT_PCI, NET_DMA, NET_MMIO, R_GRANT,
-    R_SEND, TAG_UDP_BIND, TAG_UDP_RECVFROM, TAG_UDP_SENDTO,
+    R_SEND, TAG_TCP_CLOSE, TAG_TCP_CONNECT, TAG_TCP_RECV, TAG_TCP_SEND, TAG_UDP_BIND,
+    TAG_UDP_RECVFROM, TAG_UDP_SENDTO,
 };
 use oxbow_rt as rt;
+use smoltcp::iface::SocketHandle;
 
 const MAX_SOCKETS: usize = 8;
 
+/// A socket-table slot, identified by its badge (= index + 1).
 #[derive(Clone, Copy)]
-struct Socket {
-    in_use: bool,
-    port: u16,
+enum Sock {
+    Free,
+    Udp(u16),          // bound port
+    Tcp(SocketHandle), // smoltcp socket
 }
 
-/// Choose the next-hop MAC target: a 10.0.2.0/24 host is on-link, else the gateway.
-fn route(ip: [u8; 4]) -> [u8; 4] {
-    if ip[0] == 10 && ip[1] == 0 && ip[2] == 2 {
+/// Resolve a 1-based socket badge to its table slot (copied out).
+fn slot_of(sockets: &[Sock; MAX_SOCKETS], sid: usize) -> Option<Sock> {
+    if (1..=MAX_SOCKETS).contains(&sid) {
+        Some(sockets[sid - 1])
+    } else {
+        None
+    }
+}
+
+/// Choose the next-hop IP: an on-link host (same /24 as us) is itself, else the
+/// gateway. Works on any subnet — SLIRP's 10.0.2.0/24 or a real LAN.
+fn route(ip: [u8; 4], our_ip: [u8; 4], gw: [u8; 4]) -> [u8; 4] {
+    if ip[0] == our_ip[0] && ip[1] == our_ip[1] && ip[2] == our_ip[2] {
         ip
     } else {
-        GW_IP
+        gw
     }
 }
 
@@ -56,7 +71,8 @@ fn send_udp(
     dst_port: u16,
     payload: &[u8],
 ) {
-    let mac = arp_resolve(nic, cache, route(dst_ip));
+    let next = route(dst_ip, nic.our_ip, nic.gw_ip);
+    let mac = arp_resolve(nic, cache, next);
     let seg = udp::segment(nic.our_ip, dst_ip, src_port, dst_port, payload);
     let ip = ipv4::packet(nic.our_ip, dst_ip, ipv4::PROTO_UDP, &seg);
     nic.tx(&eth::frame(mac, nic.mac, ETHERTYPE_IPV4, &ip));
@@ -233,6 +249,7 @@ fn dma_page(slot: &mut u64) -> (u64, u64) {
 struct Nic {
     mac: [u8; 6],
     our_ip: [u8; 4], // leased via DHCP at boot (0.0.0.0 until then)
+    gw_ip: [u8; 4],  // default gateway (from the DHCP lease)
     notif: oxbow_abi::Handle,
     rx_ring_v: u64,
     rx_buf_v: [u64; RX_DESCS],
@@ -302,6 +319,30 @@ impl Nic {
             let _ = rt::sys_irq_ack(BOOT_NET_IRQ);
             let _ = rt::sys_notif_wait(self.notif);
         }
+    }
+
+    /// Non-blocking receive: return the next frame if the ring has one, else
+    /// None. DMA fills the ring independent of the IRQ, so smoltcp can busy-poll
+    /// this without depending on interrupt delivery (used by the TCP path).
+    fn recv_nonblocking(&mut self, out: &mut [u8]) -> Option<usize> {
+        let d = (self.rx_ring_v as usize + self.rx_cur * 16) as *mut RxDesc;
+        let status = unsafe { read_volatile(addr_of!((*d).status)) };
+        if status & RXD_DD == 0 {
+            return None;
+        }
+        let len = unsafe { read_volatile(addr_of!((*d).length)) } as usize;
+        let n = len.min(out.len());
+        let src = self.rx_buf_v[self.rx_cur] as *const u8;
+        for (k, slot) in out[..n].iter_mut().enumerate() {
+            *slot = unsafe { read_volatile(src.add(k)) };
+        }
+        unsafe {
+            write_volatile(addr_of_mut!((*d).status), 0);
+            fence(Ordering::SeqCst);
+            setreg(RDT, self.rx_cur as u32);
+        }
+        self.rx_cur = (self.rx_cur + 1) % RX_DESCS;
+        Some(n)
     }
 }
 
@@ -458,6 +499,7 @@ pub extern "C" fn oxbow_main() -> ! {
     let mut nic = Nic {
         mac,
         our_ip: [0; 4], // until DHCP leases one
+        gw_ip: GW_IP,   // overwritten by the DHCP router option
         notif,
         rx_ring_v,
         rx_buf_v,
@@ -469,15 +511,18 @@ pub extern "C" fn oxbow_main() -> ! {
     };
     let mut cache = arp::Cache::new();
 
-    // 5. DHCP: lease an address from the SLIRP DHCP server (DORA) instead of
-    //    asserting one. Falls back to the well-known SLIRP lease if it fails.
+    // 5. DHCP: lease an address + gateway + DNS (DORA) instead of asserting one.
+    //    Falls back to the well-known SLIRP lease if no server answers.
     match dhcp_acquire(&mut nic, &mut cache) {
         Some(l) => {
             nic.our_ip = l.yiaddr;
+            if l.router != [0; 4] {
+                nic.gw_ip = l.router;
+            }
             w(format!(
                 "[net] DHCP lease: IP {}.{}.{}.{}  gw {}.{}.{}.{}  dns {}.{}.{}.{}\n",
                 l.yiaddr[0], l.yiaddr[1], l.yiaddr[2], l.yiaddr[3],
-                l.router[0], l.router[1], l.router[2], l.router[3],
+                nic.gw_ip[0], nic.gw_ip[1], nic.gw_ip[2], nic.gw_ip[3],
                 l.dns[0], l.dns[1], l.dns[2], l.dns[3]
             )
             .as_bytes());
@@ -488,19 +533,24 @@ pub extern "C" fn oxbow_main() -> ! {
         }
     }
 
-    // Prove routing works: ARP-resolve the gateway (populates the cache).
-    let gw = arp_resolve(&mut nic, &mut cache, GW_IP);
+    // Prove routing works: ARP-resolve the (real) gateway, populating the cache.
+    let gwip = nic.gw_ip;
+    let gw = arp_resolve(&mut nic, &mut cache, gwip);
     w(format!(
-        "[net] ARP: 10.0.2.2 is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
-        gw[0], gw[1], gw[2], gw[3], gw[4], gw[5]
+        "[net] gateway {}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+        gwip[0], gwip[1], gwip[2], gwip[3], gw[0], gw[1], gw[2], gw[3], gw[4], gw[5]
     )
     .as_bytes());
-    w(b"[net] ready (UDP socket service on the network endpoint)\n");
 
-    // 6. Serve the socket capability API: clients bind UDP sockets (each a fresh
-    //    badged endpoint, badge = socket id) and send/recv datagrams through
-    //    them. The badge makes the server stateless beyond a tiny port table.
-    let mut sockets = [Socket { in_use: false, port: 0 }; MAX_SOCKETS];
+    // 6. Stand up the smoltcp TCP stack with our leased address + gateway. It
+    //    shares the NIC by raw pointer (single-threaded; no aliasing in practice).
+    let nic_ptr: *mut Nic = &mut nic;
+    let mut tcp_stack = tcp::TcpStack::new(nic_ptr, nic.mac, nic.our_ip, nic.gw_ip);
+    w(b"[net] ready (UDP + TCP socket service on the network endpoint)\n");
+
+    // 7. Serve the socket capability API: clients bind/connect sockets (each a
+    //    fresh badged endpoint, badge = socket id) and send/recv through them.
+    let mut sockets = [Sock::Free; MAX_SOCKETS];
     loop {
         let mut m = MsgBuf::new(0);
         let reply = match rt::sys_recv(BOOT_EP, &mut m) {
@@ -512,10 +562,10 @@ pub extern "C" fn oxbow_main() -> ! {
             // Control channel (badge = NET_CTL): allocate a socket + mint its cap.
             TAG_UDP_BIND => {
                 let req_port = m.data[0] as u16;
-                match sockets.iter().position(|s| !s.in_use) {
+                match sockets.iter().position(|s| matches!(s, Sock::Free)) {
                     Some(idx) => {
                         let port = if req_port == 0 { 0xC000 + idx as u16 } else { req_port };
-                        sockets[idx] = Socket { in_use: true, port };
+                        sockets[idx] = Sock::Udp(port);
                         match rt::sys_mint(BOOT_EP, (idx + 1) as u64, R_SEND | R_GRANT) {
                             Ok(cap) => {
                                 r.data[0] = 0;
@@ -543,14 +593,13 @@ pub extern "C" fn oxbow_main() -> ! {
             // Socket channel (badge = socket id): send a datagram.
             TAG_UDP_SENDTO => {
                 let sid = m.badge as usize;
-                if sid >= 1 && sid <= MAX_SOCKETS && sockets[sid - 1].in_use {
+                if let Some(Sock::Udp(src_port)) = slot_of(&sockets, sid) {
                     let dst_ip = (m.data[0] as u32).to_be_bytes();
                     let dport = m.data[1] as u16;
                     let len = (m.data[2] as usize).min(40);
                     let bytes =
                         unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(24), len) };
                     let payload: Vec<u8> = bytes.to_vec();
-                    let src_port = sockets[sid - 1].port;
                     send_udp(&mut nic, &mut cache, src_port, dst_ip, dport, &payload);
                     r.data[0] = 0;
                 } else {
@@ -562,8 +611,7 @@ pub extern "C" fn oxbow_main() -> ! {
             // Socket channel: receive a datagram (blocks until one arrives).
             TAG_UDP_RECVFROM => {
                 let sid = m.badge as usize;
-                if sid >= 1 && sid <= MAX_SOCKETS && sockets[sid - 1].in_use {
-                    let port = sockets[sid - 1].port;
+                if let Some(Sock::Udp(port)) = slot_of(&sockets, sid) {
                     let mut out = [0u8; 56];
                     let n = recv_udp_for(&mut nic, &mut cache, port, &mut out);
                     r.data[0] = n as u64;
@@ -574,6 +622,80 @@ pub extern "C" fn oxbow_main() -> ! {
                     r.data[0] = 0;
                     r.data_len = 1;
                 }
+                let _ = rt::sys_reply(reply, &r);
+            }
+            // Control channel: open a TCP connection, mint a socket cap on success.
+            TAG_TCP_CONNECT => {
+                let dst_ip = (m.data[0] as u32).to_be_bytes();
+                let dport = m.data[1] as u16;
+                let free = sockets.iter().position(|s| matches!(s, Sock::Free));
+                match free.and_then(|idx| tcp_stack.connect(dst_ip, dport).map(|h| (idx, h))) {
+                    Some((idx, handle)) => {
+                        sockets[idx] = Sock::Tcp(handle);
+                        match rt::sys_mint(BOOT_EP, (idx + 1) as u64, R_SEND | R_GRANT) {
+                            Ok(cap) => {
+                                r.data[0] = 0;
+                                r.data_len = 1;
+                                r.handle_count = 1;
+                                r.handles[0] = cap;
+                                let _ = rt::sys_reply(reply, &r);
+                                let _ = rt::sys_close(cap);
+                            }
+                            Err(_) => {
+                                tcp_stack.close(handle);
+                                sockets[idx] = Sock::Free;
+                                r.data[0] = 1;
+                                r.data_len = 1;
+                                let _ = rt::sys_reply(reply, &r);
+                            }
+                        }
+                    }
+                    None => {
+                        r.data[0] = 1; // no slot, or connection refused/timed out
+                        r.data_len = 1;
+                        let _ = rt::sys_reply(reply, &r);
+                    }
+                }
+            }
+            // TCP socket channel: send bytes.
+            TAG_TCP_SEND => {
+                let sid = m.badge as usize;
+                if let Some(Sock::Tcp(handle)) = slot_of(&sockets, sid) {
+                    let len = (m.data[0] as usize).min(48);
+                    let bytes =
+                        unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), len) };
+                    r.data[0] = if tcp_stack.send(handle, bytes) { 0 } else { 1 };
+                } else {
+                    r.data[0] = 1;
+                }
+                r.data_len = 1;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            // TCP socket channel: receive bytes (blocks until data or close).
+            TAG_TCP_RECV => {
+                let sid = m.badge as usize;
+                if let Some(Sock::Tcp(handle)) = slot_of(&sockets, sid) {
+                    let mut out = [0u8; 56];
+                    let n = tcp_stack.recv(handle, &mut out);
+                    r.data[0] = n as u64;
+                    let dst = r.data.as_mut_ptr() as *mut u8;
+                    unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), dst.add(8), n) };
+                    r.data_len = 8;
+                } else {
+                    r.data[0] = 0;
+                    r.data_len = 1;
+                }
+                let _ = rt::sys_reply(reply, &r);
+            }
+            // TCP socket channel: close + free the slot.
+            TAG_TCP_CLOSE => {
+                let sid = m.badge as usize;
+                if let Some(Sock::Tcp(handle)) = slot_of(&sockets, sid) {
+                    tcp_stack.close(handle);
+                    sockets[sid - 1] = Sock::Free;
+                }
+                r.data[0] = 0;
+                r.data_len = 1;
                 let _ = rt::sys_reply(reply, &r);
             }
             _ => {

@@ -459,6 +459,13 @@ pub fn sys_dma_alloc(mem: Handle, vaddr: u64) -> SysResult<u64> {
     SysError::from_raw(rax).map(|_| rdx)
 }
 
+/// Monotonic uptime in milliseconds — an ambient clock for timer-driven code
+/// (smoltcp's TCP timers). Not a capability; every process may read the clock.
+pub fn sys_uptime_ms() -> u64 {
+    let (_, rdx) = unsafe { syscall1(oxbow_abi::SYS_UPTIME_MS, 0) };
+    rdx
+}
+
 /// This program's argument string (the kernel mapped it at SPAWN_ARGV on spawn).
 /// Empty if spawned without an argument.
 pub fn argv() -> &'static [u8] {
@@ -634,5 +641,57 @@ pub mod dns {
             off += rdlen;
         }
         None
+    }
+}
+
+/// TCP socket client over the net server's capability API (§23). `connect` on
+/// the NET_CTL control cap returns a fresh badged TCP-socket cap; `send`/`recv`/
+/// `close` ride that cap (badge = socket id), same shape as UDP.
+pub mod tcp {
+    use crate::{sys_call, sys_close, Handle};
+    use oxbow_abi::{MsgBuf, TAG_TCP_CLOSE, TAG_TCP_CONNECT, TAG_TCP_RECV, TAG_TCP_SEND};
+
+    /// Open a TCP connection to `ip:port` via control cap `ctl`; returns a socket
+    /// cap once the handshake completes (None on refusal/timeout).
+    pub fn connect(ctl: Handle, ip: [u8; 4], port: u16) -> Option<Handle> {
+        let mut m = MsgBuf::new(TAG_TCP_CONNECT);
+        m.data[0] = u32::from_be_bytes(ip) as u64;
+        m.data[1] = port as u64;
+        m.data_len = 2;
+        if sys_call(ctl, &mut m).is_err() || m.data[0] != 0 {
+            return None;
+        }
+        Some(m.handles[0])
+    }
+
+    /// Send up to 48 bytes on a TCP socket cap. Returns false on error.
+    pub fn send(sock: Handle, data: &[u8]) -> bool {
+        let n = data.len().min(48);
+        let mut m = MsgBuf::new(TAG_TCP_SEND);
+        m.data[0] = n as u64;
+        let dst = m.data.as_mut_ptr() as *mut u8;
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst.add(8), n) };
+        m.data_len = 8;
+        sys_call(sock, &mut m).is_ok() && m.data[0] == 0
+    }
+
+    /// Receive on a TCP socket cap into `out` (blocks server-side until data or
+    /// close); returns the byte count (0 = connection closed).
+    pub fn recv(sock: Handle, out: &mut [u8]) -> usize {
+        let mut m = MsgBuf::new(TAG_TCP_RECV);
+        if sys_call(sock, &mut m).is_err() {
+            return 0;
+        }
+        let n = (m.data[0] as usize).min(out.len()).min(56);
+        let src = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), n) };
+        out[..n].copy_from_slice(src);
+        n
+    }
+
+    /// Close a TCP socket cap and release the client handle.
+    pub fn close(sock: Handle) {
+        let mut m = MsgBuf::new(TAG_TCP_CLOSE);
+        let _ = sys_call(sock, &mut m);
+        let _ = sys_close(sock);
     }
 }

@@ -13,3 +13,9 @@ path = "src/main.rs"
 [dependencies]
 oxbow-rt = { path = "../../rt" }
 oxbow-abi = { path = "../../abi" }
+smoltcp = { version = "0.12", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+] }

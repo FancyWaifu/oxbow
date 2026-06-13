@@ -12,7 +12,7 @@ use oxbow_abi::{
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
     SYS_DMA_ALLOC, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE, SYS_RECV, SYS_REPLY, SYS_SEND,
-    SYS_SPAWN, R_ACK,
+    SYS_SPAWN, SYS_UPTIME_MS, R_ACK,
     R_BIND, R_IN, R_OUT, R_SPAWN,
 };
 
@@ -93,6 +93,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_PCI_WRITE => sys_pci_write(a1, a2, a3),
         SYS_PCI_BAR_MAP => sys_pci_bar_map(a1, a2, a3),
         SYS_DMA_ALLOC => sys_dma_alloc(a1, a2),
+        SYS_UPTIME_MS => SyscallRet { rax: 0, rdx: crate::arch::ticks().wrapping_mul(10) },
         SYS_CONSOLE_WRITE => sys_console_write(a1, a2, a3),
         SYS_ATTENUATE => sys_attenuate(a1, a2),
         SYS_CLOSE => SyscallRet::from_result(proc::with_current_mut(|p| p.close(a1 as Handle))),

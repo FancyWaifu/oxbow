@@ -107,6 +107,10 @@ pub const SYS_PCI_BAR_MAP: u64 = 23; // (pcidev, bar, vaddr)   needs R_MAP; maps
 // descriptor buffer pointers. Paid from the caller's Memory budget (R_MAP).
 pub const SYS_DMA_ALLOC: u64 = 24; // (mem, vaddr) -> phys      needs R_MAP
 
+/// Monotonic uptime in milliseconds (in rdx). Ambient/unprivileged — a clock is
+/// not a capability — needed by timer-driven userland (e.g. smoltcp's TCP).
+pub const SYS_UPTIME_MS: u64 = 25; // () -> u64 ms
+
 // ---------------------------------------------------------------------------
 // Error codes (§6) — returned in rax; values are stable forever (append-only)
 // ---------------------------------------------------------------------------
@@ -315,6 +319,20 @@ pub const TAG_UDP_SENDTO: u64 = u32::from_le_bytes(*b"USND") as u64;
 /// Receive a datagram on a socket cap (blocks server-side until one arrives for
 /// the bound port). Reply: data[0]=len, payload bytes from offset 8 (<=56).
 pub const TAG_UDP_RECVFROM: u64 = u32::from_le_bytes(*b"URCV") as u64;
+
+// TCP, backed by smoltcp (§23). Same capability shape as UDP: connect on the
+// NET_CTL cap mints a badged TCP-socket cap; send/recv/close ride that cap.
+/// Connect: request on NET_CTL, data[0]=dst IPv4 (BE u32), data[1]=dst port.
+/// Reply: data[0]=status (0=ok), handles[0]=badged TCP-socket cap.
+pub const TAG_TCP_CONNECT: u64 = u32::from_le_bytes(*b"TCON") as u64;
+/// Send on a TCP socket cap: data[0]=len, bytes from offset 8 (<=48).
+/// Reply: data[0]=status.
+pub const TAG_TCP_SEND: u64 = u32::from_le_bytes(*b"TSND") as u64;
+/// Receive on a TCP socket cap (blocks server-side until data or close).
+/// Reply: data[0]=len (0=closed), payload bytes from offset 8 (<=56).
+pub const TAG_TCP_RECV: u64 = u32::from_le_bytes(*b"TRCV") as u64;
+/// Close a TCP socket cap. Reply: data[0]=status.
+pub const TAG_TCP_CLOSE: u64 = u32::from_le_bytes(*b"TCLO") as u64;
 
 /// `sys_spawn` grant convention: the handles in the spawn MsgBuf land in the
 /// child's table at these slots, in order (HANDLE_NULL entries are skipped).

@@ -1049,3 +1049,50 @@ the well-known SLIRP lease (10.0.2.15) so boot never wedges.
 (T1/T2 timers) and honoring the lease time are deferred — the SLIRP lease is
 effectively permanent for a VM session. smoltcp-backed TCP sockets over the §21
 capability shape remain the next arc.
+
+## 23. TCP via smoltcp (v1-tcp)
+
+The last piece of "from scratch through UDP, smoltcp for TCP": real TCP sockets,
+exposed through the same capability shape as UDP (§21). smoltcp is the TCP state
+machine; oxbow supplies the layer below (the e1000 as a smoltcp `phy::Device`)
+and the layer above (the socket-capability glue + a clock).
+
+### 23.1 The clock: `SYS_UPTIME_MS` (25)
+TCP needs timers (retransmit, delayed ACK, TIME_WAIT). `sys_uptime_ms()` returns
+the kernel's monotonic tick (100 Hz) in milliseconds. It is ambient and
+unprivileged — a clock is not a capability — and feeds smoltcp's `Instant`.
+
+### 23.2 e1000 as a smoltcp Device
+`tcp::PhyDevice` implements `phy::Device` over the NIC (held by raw pointer:
+`receive` must return an Rx+Tx token pair that would otherwise need two `&mut`
+borrows; single-threaded use makes the pointer sound). Crucially the tokens hold
+**fixed stack buffers, never heap** — the poll loops call `receive` thousands of
+times and oxbow's bump allocator never frees (§17), so a per-poll `Vec` would
+exhaust the budget in milliseconds (it did, the first time). The empty-ring path
+allocates nothing.
+
+### 23.3 No select(): busy-poll with a deadline
+A TCP op drives `Interface::poll` in a loop until the socket reaches the wanted
+state or an uptime deadline passes. DMA fills the RX ring independent of the IRQ,
+so polling needs no interrupt — which sidesteps oxbow's one-thread-per-process
+inability to wait on the endpoint and the NIC at once. smoltcp does its own ARP
+and routing (default route = the DHCP gateway), so it resolves peers itself.
+
+### 23.4 The protocol (same shape as UDP §21)
+| tag | invoked on | request | reply |
+|-----|-----------|---------|-------|
+| `TAG_TCP_CONNECT` | NET_CTL cap | `data[0]`=dst IPv4 (BE u32), `data[1]`=port | `data[0]`=status, **`handles[0]`=badged TCP-socket cap** |
+| `TAG_TCP_SEND` | socket cap | `data[0]`=len, bytes@8 (≤48) | `data[0]`=status |
+| `TAG_TCP_RECV` | socket cap | — | `data[0]`=len (0=closed), bytes@8 (≤56) |
+| `TAG_TCP_CLOSE` | socket cap | — | `data[0]`=status |
+
+`CONNECT` blocks server-side through the three-way handshake, then mints a badged
+socket cap (badge = socket id) the same way UDP `BIND` and fs `OPEN` do. The
+socket table slot is now a `Sock::Udp(port)` or `Sock::Tcp(SocketHandle)`.
+
+### 23.5 Demonstrated
+`http <ip>` (shell): connect to `<ip>:80`, send `GET / HTTP/1.0`, print the
+response. In QEMU, `http 1.1.1.1` reaches Cloudflare through SLIRP NAT and prints
+a real `HTTP/1.1` response. Per-connection socket buffers still leak into the
+bump heap (no free), so a real `dealloc`/slab is the natural follow-up; a
+shared-frame socket buffer would also lift the 48/56-byte inline payload cap.

@@ -216,6 +216,75 @@ fn dns_cmd(name: &[u8]) {
     }
 }
 
+/// Parse a dotted-quad IPv4 address.
+fn parse_ip(s: &[u8]) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut idx = 0usize;
+    let mut val: u32 = 0;
+    let mut have = false;
+    for &c in s {
+        if c == b'.' {
+            if !have || idx >= 3 {
+                return None;
+            }
+            octets[idx] = val as u8;
+            idx += 1;
+            val = 0;
+            have = false;
+        } else if c.is_ascii_digit() {
+            val = val * 10 + (c - b'0') as u32;
+            if val > 255 {
+                return None;
+            }
+            have = true;
+        } else {
+            return None;
+        }
+    }
+    if !have || idx != 3 {
+        return None;
+    }
+    octets[3] = val as u8;
+    Some(octets)
+}
+
+/// `http <ip>`: open a TCP connection to <ip>:80 over the net server's socket
+/// capability API (smoltcp does the TCP), send a minimal HTTP/1.0 GET, and print
+/// the response. We hold only BOOT_NET_EP; `tcp::connect` mints us a socket cap.
+fn http_cmd(args: &[u8]) {
+    let (host, _) = split_cmd(args);
+    let Some(ip) = parse_ip(host) else {
+        tw(b"http: usage: http <a.b.c.d>\n");
+        return;
+    };
+    let Some(sock) = rt::tcp::connect(BOOT_NET_EP, ip, 80) else {
+        tw(b"http: connect failed (refused/timeout)\n");
+        return;
+    };
+    tw(b"http: connected, GET /\n");
+    if !rt::tcp::send(sock, b"GET / HTTP/1.0\r\n\r\n") {
+        tw(b"http: send failed\n");
+        rt::tcp::close(sock);
+        return;
+    }
+    let mut buf = [0u8; 64];
+    let mut total = 0usize;
+    for _ in 0..8 {
+        let n = rt::tcp::recv(sock, &mut buf);
+        if n == 0 {
+            break;
+        }
+        tw(&buf[..n]);
+        total += n;
+    }
+    if total == 0 {
+        tw(b"http: no response\n");
+    } else {
+        tw(b"\n");
+    }
+    rt::tcp::close(sock);
+}
+
 /// `run pong`: launch the pong↔beta demo pair, wiring an endpoint between them
 /// (beta gets the recv side, pong the send side) and delegating the tick to pong.
 /// Proves multi-handle grant-at-spawn and child↔child IPC.
@@ -486,6 +555,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
         b"cp" => spawn_with(BOOT_IMG_CP, *cwd, rest, sp),
         b"cd" => cd(rest, cwd),
         b"dns" => dns_cmd(rest),
+        b"http" => http_cmd(rest),
         b"badgetest" => badgetest(sp),
         b"help" => {
             tw(b"oxbow shell:  (ls cat mkdir touch are spawned programs)\n");
@@ -499,6 +569,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
             tw(b"  cp <src> <dst>  copy a file\n");
             tw(b"  cd <dir> | /    change directory (builtin)\n");
             tw(b"  dns <host>      resolve a hostname via the net UDP socket API\n");
+            tw(b"  http <ip>       TCP GET / from <ip>:80 via the net socket API\n");
             tw(b"  run hello/pong  spawn a demo program\n");
             tw(b"  badgetest       exercise badged-endpoint mint rules\n");
             tw(b"  help            this list\n");
