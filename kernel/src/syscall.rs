@@ -586,6 +586,18 @@ fn sys_reply(reply: u64, msg_ptr: u64) -> SyscallRet {
         if m.data_len as usize > MSG_DATA_WORDS || m.handle_count as usize > MSG_HANDLES {
             return Err(SysError::Msg);
         }
+        // §3.4 also governs reply-carried handles: each needs R_GRANT in the
+        // replier's table (lets a server hand a freshly-minted cap back in OPEN).
+        if m.handle_count > 0 {
+            proc::with_current(|p| -> SysResult {
+                for &h in &m.handles[..m.handle_count as usize] {
+                    if p.get(h)?.rights & R_GRANT == 0 {
+                        return Err(SysError::Rights);
+                    }
+                }
+                Ok(())
+            })?;
+        }
         m.badge = 0; // a reply always delivers badge 0 (§14): badges are forward-only
         Ok((idx, m))
     })();

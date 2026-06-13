@@ -1,0 +1,2 @@
+ls and cat are shell builtins.
+The filesystem is a userspace server.

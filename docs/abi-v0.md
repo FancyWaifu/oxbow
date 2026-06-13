@@ -559,3 +559,59 @@ each badged cap plus one through the unbadged endpoint with a sender-written
 
 Plus the mint negative paths: re-badge denied, badge-0 denied, amplify denied,
 non-endpoint denied.
+
+---
+
+## 15. Filesystem (v1-ramfs)
+
+A userspace in-memory filesystem server (`servers/fs`), reached entirely through
+capabilities — there is NO kernel-resident namespace (laws L1/L3). Read-only in
+this arc (`ls`/`cat`); write is a follow-on.
+
+### 15.1 Directories are capabilities
+You open a file *relative to a directory capability you already hold*. The shell
+is born holding the **root directory capability** at `BOOT_FS_ROOT = 12`: a
+BADGED endpoint to the fs server with `badge = FS_ROOT (1)` and `R_SEND|R_GRANT`.
+There is no path you can name without first holding a directory cap. Holding a
+dir cap = authority over that subtree and nothing above it (OPEN rejects `/`,
+`..`, `.` — confinement).
+
+### 15.2 Each open file/dir is a badged capability; the server is stateless
+A badge carries the node id (§14, kernel-stamped, unforgeable), so every request
+arrives identifying its node — the server just indexes `nodes[badge]`. There is
+**no open-file table, no fids, no per-client state, no seek state**. OPEN mints a
+fresh badged cap (`badge = resolved child node id`) via `sys_mint` and returns it
+in the reply (reply-carried handle transfer — see below); the FS closes its own
+copy after the transfer. CLOSE is just the client closing its handle.
+
+### 15.3 Reply-carried capabilities (general IPC change)
+`sys_reply` now transfers handles like the forward path (§3.4): each handle in a
+reply needs `R_GRANT` in the replier's table, and the kernel installs it in the
+caller's table (rewriting the index). This is what lets OPEN hand a freshly-minted
+file cap back to the client. A reply still delivers `badge = 0` (§14); the
+*transferred handle* carries its own badge (the node id).
+
+### 15.4 Protocol (tag-multiplexed on the fs endpoint, dispatch on `m.badge`)
+- **`TAG_FS_OPEN`** (call through a dir cap): request `data` = NUL-terminated
+  name. Reply: `data[0]` = status (0 ok / 1 not-found), `data[1]` = kind
+  (`FS_DIR`/`FS_FILE`), `data[2]` = size, `handles[0]` = minted node cap.
+- **`TAG_FS_READ`** (call through a file cap): `data[0]` = byte offset. Reply:
+  `data[0]` = count (0 = EOF), `data[1..]` = up to 56 bytes. Clients loop.
+- **`TAG_FS_READDIR`** (call through a dir cap): `data[0]` = cursor. Reply:
+  `data[0]` = 1 if an entry follows (else 0 = end), `data[1]` = kind,
+  `data[2..]` = entry name. Clients loop.
+
+### 15.5 The tree + the tar initrd
+The fs holds a static node pool (`{kind, name, parent, content}`); ROOT = node 1.
+A **USTAR tar** archive is delivered as a Limine module (`initrd`); the kernel
+maps its frames **read-only (NX)** into the fs address space at `FS_INITRD =
+0x1000_0000` at boot. The fs parses the USTAR headers (stopping at the zero
+end-block) and creates a file node per top-level regular file, with content
+pointing **directly into the mapped archive** (no copy — read-only ramfs). The
+archive is built at compile time from `servers/fs/initrd/`.
+
+### 15.6 Deferred
+Write (`WRITE`/`CREATE`/`MKDIR`, file growth from the fs Memory budget),
+subdirectory traversal / multi-component path walk, zero-copy frame transfer for
+bulk read/write, spawned coreutils (receiving an open-file cap), `STAT`, refcount
+on CLOSE, a real on-disk filesystem behind the same VFS interface.

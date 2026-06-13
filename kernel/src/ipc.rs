@@ -26,6 +26,8 @@ use crate::{println, proc, usermem};
 pub const EP0: u8 = 0;
 /// The TTY endpoint (kbd/shell → tty).
 pub const EP1: u8 = 1;
+/// The filesystem endpoint (shell/clients → fs); badged per open file (§15).
+pub const EP2: u8 = 2;
 const EP_POOL: usize = 8;
 const REPLY_POOL: usize = 8;
 
@@ -208,8 +210,9 @@ pub fn init() {
     let mut eps = ENDPOINTS.lock();
     eps[EP0 as usize].in_use = true;
     eps[EP1 as usize].in_use = true;
+    eps[EP2 as usize].in_use = true;
     drop(eps);
-    println!("[ipc] EP0 + EP1 created");
+    println!("[ipc] EP0 + EP1 + EP2 created");
 }
 
 /// Mint a fresh endpoint from the pool (for `sys_ep_create`); returns its pool
@@ -401,10 +404,27 @@ pub fn recv(ep_idx: u8, msg_uptr: u64) -> (u64, u64) {
 /// consuming the Reply. Never blocks.
 pub fn do_reply(reply_idx: usize, reply: &MsgBuf) {
     let caller = reply_caller(reply_idx);
+    unsafe { (*slot(caller)).staging = *reply };
+    // Transfer any handles in the reply from the replier's table into the
+    // caller's, rewriting the staged indices (the reply path mirrors §3.4 — a
+    // server returns a freshly-minted cap in OPEN this way). R_GRANT was already
+    // validated in sys_reply. If the caller's table is full, it wakes E_NOSLOTS.
+    let transfer = if reply.handle_count > 0 {
+        transfer_into(thread::current_proc(), thread::process_of(caller), caller)
+    } else {
+        Ok(())
+    };
     unsafe {
-        (*slot(caller)).staging = *reply;
-        (*slot(caller)).copy_out = true;
-        (*slot(caller)).ret_rax = 0;
+        match transfer {
+            Ok(()) => {
+                (*slot(caller)).copy_out = true;
+                (*slot(caller)).ret_rax = 0;
+            }
+            Err(e) => {
+                (*slot(caller)).copy_out = false; // caller couldn't hold the caps
+                (*slot(caller)).ret_rax = e as u64;
+            }
+        }
         (*slot(caller)).ret_rdx = HANDLE_NULL as u64;
     }
     free_reply(reply_idx);

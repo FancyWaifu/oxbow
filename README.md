@@ -137,14 +137,26 @@ preserved by attenuation + transfer), forward-only (replies deliver 0). This is
 the foundation for the filesystem: each open file becomes a badged capability to
 the one FS endpoint. See `docs/abi-v0.md` §14.
 
+**v1 arc 11 — a userspace filesystem (ramfs): complete.** `ls` and `cat` from the
+shell, served by `servers/fs` — reached *entirely* through capabilities, no
+kernel-resident namespace. **Directories are capabilities**: you open a file
+relative to a directory cap you hold (the shell gets the root dir cap at boot;
+`/` and `..` are rejected — confinement). **Each open file is a badged
+capability** (§14) whose badge is the node id, so the server is *stateless* —
+every request indexes `nodes[badge]`. OPEN mints a fresh file cap and returns it
+in the reply (this arc taught the kernel's reply path to **carry capabilities**).
+The tree is seeded from a **USTAR tar initrd** mapped read-only into the fs
+address space at boot; file content points straight into the mapped archive
+(zero-copy). See `docs/abi-v0.md` §15.
+
 ### Next — toward a fuller userspace
 
-A **filesystem** (VFS naming server + ramdisk, with each open file a badged
-capability) → coreutils → a **libc/POSIX shim**. POSIX and the Unix feel live in
-*userspace* over the capability kernel (the Redox model) — the kernel stays
-capability-pure. Plus, eventually: frame reclamation + budget refund, the
-orphaned selftest rework, untyped/retype + `sys_unmap`, SMP, and the `aarch64`
-port.
+**Write** (`echo >`, `mkdir`, file growth from the fs budget) and **subdirectory
+walk** → spawned **coreutils** (each receiving an open-file capability) → a
+**libc/POSIX shim**. POSIX and the Unix feel live in *userspace* over the
+capability kernel (the Redox model) — the kernel stays capability-pure. Plus,
+eventually: frame reclamation + budget refund, the orphaned selftest rework,
+untyped/retype + `sys_unmap`, SMP, and the `aarch64` port.
 
 ## Building & running
 

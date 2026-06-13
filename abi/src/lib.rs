@@ -233,6 +233,30 @@ pub const BOOT_IMG_PONG: Handle = 9;
 pub const BOOT_IMG_BETA: Handle = 10;
 pub const BOOT_IMG_BADGE: Handle = 11; // §14 badged-endpoint demo server
 
+// --- Filesystem (§15) ------------------------------------------------------
+/// The shell's root-directory capability: a BADGED endpoint to the fs server,
+/// badge = FS_ROOT. Open files relative to it (directories are capabilities).
+pub const BOOT_FS_ROOT: Handle = 12;
+/// The root directory's node id (the badge the kernel stamps on BOOT_FS_ROOT).
+pub const FS_ROOT: u64 = 1;
+/// Fixed vaddr where the kernel maps the tar initrd (read-only) into the fs
+/// server's address space at boot; the fs parses USTAR from here.
+pub const FS_INITRD: u64 = 0x1000_0000;
+/// Node kinds, reported by OPEN/READDIR.
+pub const FS_DIR: u64 = 1;
+pub const FS_FILE: u64 = 2;
+/// FS request tags (sent through a dir/file capability; the badge = the node).
+/// OPEN(dir): `data` = the name bytes (NUL-terminated). Reply: `data[0]` = status
+/// (0 ok / 1 not-found), `data[1]` = kind, `data[2]` = size, `handles[0]` = a
+/// freshly-minted badged capability to the resolved node.
+pub const TAG_FS_OPEN: u64 = u32::from_le_bytes(*b"FSOP") as u64;
+/// READ(file): `data[0]` = byte offset. Reply: `data[0]` = count (0 = EOF),
+/// `data[1..]` = up to 56 bytes of content.
+pub const TAG_FS_READ: u64 = u32::from_le_bytes(*b"FSRD") as u64;
+/// READDIR(dir): `data[0]` = cursor index. Reply: `data[0]` = 1 if an entry is
+/// present (else 0 = end), `data[1]` = kind, `data[2..]` = the entry name.
+pub const TAG_FS_READDIR: u64 = u32::from_le_bytes(*b"FSDR") as u64;
+
 /// `sys_spawn` grant convention: the handles in the spawn MsgBuf land in the
 /// child's table at these slots, in order (HANDLE_NULL entries are skipped).
 /// Slot 3 is always the child's fresh Memory budget, so it is not in this list.

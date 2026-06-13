@@ -7,9 +7,9 @@
 #![no_main]
 
 use oxbow_abi::{
-    Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_IMG_BADGE, BOOT_IMG_BETA, BOOT_IMG_HELLO,
-    BOOT_IMG_PONG, BOOT_MEM, BOOT_TICK, BOOT_TTY, HANDLE_NULL, R_GRANT, R_RECV, R_SEND, R_WAIT,
-    R_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
+    Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA,
+    BOOT_IMG_HELLO, BOOT_IMG_PONG, BOOT_MEM, BOOT_TICK, BOOT_TTY, HANDLE_NULL, R_GRANT, R_RECV,
+    R_SEND, R_WAIT, R_WRITE, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -199,6 +199,67 @@ fn badgetest(sp: &Spawner) {
     let _ = rt::sys_close(b42);
 }
 
+/// `ls`: list the root directory by looping READDIR through the root-dir cap.
+fn ls() {
+    let mut i = 0u64;
+    loop {
+        let mut m = MsgBuf::new(TAG_FS_READDIR);
+        m.data[0] = i;
+        m.data_len = 1;
+        if rt::sys_call(BOOT_FS_ROOT, &mut m).is_err() || m.data[0] == 0 {
+            break;
+        }
+        // name is in data[2..] (byte offset 16)
+        let bytes = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(16), 48) };
+        let n = bytes.iter().position(|&b| b == 0).unwrap_or(0);
+        tw(&bytes[..n]);
+        tw(b"\n");
+        i += 1;
+    }
+}
+
+/// `cat <name>`: OPEN the file relative to root, then loop READ through the file
+/// capability the server minted, printing chunks until EOF.
+fn cat(name: &[u8]) {
+    if name.is_empty() {
+        tw(b"cat: usage: cat <file>\n");
+        return;
+    }
+    // OPEN: pack the name into the request data.
+    let mut m = MsgBuf::new(TAG_FS_OPEN);
+    let n = core::cmp::min(name.len(), 56);
+    let dst = m.data.as_mut_ptr() as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(name.as_ptr(), dst, n);
+        *dst.add(n) = 0;
+    }
+    m.data_len = ((n + 1 + 7) / 8) as u32;
+    if rt::sys_call(BOOT_FS_ROOT, &mut m).is_err() || m.data[0] != 0 {
+        tw(b"cat: ");
+        tw(name);
+        tw(b": not found\n");
+        return;
+    }
+    let file_cap = m.handles[0]; // the minted file cap, now in our table
+    let mut off = 0u64;
+    loop {
+        let mut rm = MsgBuf::new(TAG_FS_READ);
+        rm.data[0] = off;
+        rm.data_len = 1;
+        if rt::sys_call(file_cap, &mut rm).is_err() {
+            break;
+        }
+        let count = rm.data[0] as usize;
+        if count == 0 {
+            break;
+        }
+        let bytes = unsafe { core::slice::from_raw_parts((rm.data.as_ptr() as *const u8).add(8), count) };
+        tw(bytes);
+        off += count as u64;
+    }
+    let _ = rt::sys_close(file_cap);
+}
+
 fn run(line: &[u8], sp: &Spawner) {
     let (cmd, rest) = split_cmd(line);
     match cmd {
@@ -216,10 +277,14 @@ fn run(line: &[u8], sp: &Spawner) {
                 _ => tw(b"run: no such program\n"),
             }
         }
+        b"ls" => ls(),
+        b"cat" => cat(rest),
         b"badgetest" => badgetest(sp),
         b"help" => {
             tw(b"oxbow shell builtins:\n");
             tw(b"  echo <text>     print text\n");
+            tw(b"  ls              list the filesystem root\n");
+            tw(b"  cat <file>      print a file\n");
             tw(b"  run hello       spawn the hello program\n");
             tw(b"  run pong        spawn the pong<->beta IPC demo\n");
             tw(b"  badgetest       exercise badged-endpoint mint rules\n");

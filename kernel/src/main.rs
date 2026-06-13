@@ -174,11 +174,24 @@ fn kmain_stage2() -> ! {
     let mods = resp.modules();
     println!("[mod] {} module(s) loaded", mods.len());
 
+    // The tar initrd (mapped into the fs server's AS below). Captured as (phys
+    // base, size); module load addresses are page-aligned (Limine).
+    let mut initrd: Option<(u64, u64)> = None;
+
     for file in mods.iter() {
         let bytes: &'static [u8] =
             unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) };
         let cmd = file.string().to_bytes(); // the module_cmdline = the program name
         let name = core::str::from_utf8(cmd).unwrap_or("?");
+
+        // The filesystem initrd: not a program — remember where it is so we can
+        // map it into the fs server's address space when we spawn it.
+        if cmd == b"initrd" {
+            let phys = file.addr() as u64 - mm::hhdm_offset();
+            initrd = Some((phys, file.size()));
+            println!("[mod] initrd: {} bytes @ phys {:#x}", file.size(), phys);
+            continue;
+        }
 
         // Demo / on-demand programs are NOT boot-spawned: they are registered as
         // spawnable Image capabilities and launched later from the shell. This is
@@ -305,6 +318,51 @@ fn kmain_stage2() -> ! {
                         );
                     }
                 }
+                // The root-directory capability: a BADGED endpoint to the fs
+                // server (badge = FS_ROOT). The badge is the unforgeable node id;
+                // opening a file relative to it yields a fresh badged file cap.
+                p.install(
+                    oxbow_abi::BOOT_FS_ROOT,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Endpoint(ipc::EP2),
+                        rights: oxbow_abi::R_SEND | oxbow_abi::R_GRANT,
+                        badge: oxbow_abi::FS_ROOT,
+                    },
+                );
+            });
+        }
+        // The fs server owns the filesystem endpoint UNBADGED, with full rights:
+        // R_RECV to serve, R_SEND+R_ATTENUATE to mint badged file caps, R_GRANT to
+        // hand them back in OPEN replies. It is the root of filesystem authority.
+        if cmd == b"fs" {
+            // Map the tar initrd read-only (NX) into the fs address space at the
+            // fixed vaddr the server parses from. The fs holds no Memory/IoPort
+            // cap over it — it's a plain read-only mapping the kernel grants once.
+            if let Some((phys, size)) = initrd {
+                let pages = (size + 0xfff) / 0x1000;
+                for i in 0..pages {
+                    mm::vm::map_user_4k_in(
+                        as_i,
+                        oxbow_abi::FS_INITRD + i * 0x1000,
+                        phys + i * 0x1000,
+                        false,
+                        false,
+                    );
+                }
+                println!("[fs] initrd mapped: {} pages @ {:#x}", pages, oxbow_abi::FS_INITRD);
+            }
+            proc::with_proc_mut(pid, |p| {
+                p.install(
+                    oxbow_abi::BOOT_EP,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Endpoint(ipc::EP2),
+                        rights: oxbow_abi::R_SEND
+                            | oxbow_abi::R_RECV
+                            | oxbow_abi::R_GRANT
+                            | oxbow_abi::R_ATTENUATE,
+                        badge: 0,
+                    },
+                );
             });
         }
         // The serial driver gets the COM1 IRQ line + the 16550 RX ports as
