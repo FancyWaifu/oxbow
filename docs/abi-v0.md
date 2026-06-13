@@ -1015,3 +1015,37 @@ but a shared-frame socket buffer is needed for bigger datagrams. The server is
 single-client-at-a-time (a blocked `RECVFROM` holds the reply). DHCP (to lease
 10.0.2.15 rather than assert it) and smoltcp-backed TCP sockets over this same
 capability shape are the next arcs.
+
+## 22. DHCP — leasing an address (v1-dhcp)
+
+The net server no longer *asserts* 10.0.2.15; it **leases** an address from the
+SLIRP DHCP server at boot via the standard DORA handshake, then uses the leased
+IP as the source for every socket.
+
+### 22.1 Why it lives inside net (not the socket API)
+A DHCP message is the 236-byte BOOTP header + options (~300 bytes) — far past the
+64-byte inline socket payload (§21). So DHCP runs *inside* the net server over
+its own stack (`eth`/`ipv4`/`udp` + a new `dhcp` module), exactly as the internal
+ARP/DNS demos did, using full 2 KiB NIC buffers. It is the server's own business
+(acquiring its identity), not a client capability.
+
+### 22.2 The handshake
+`dhcp_acquire` runs DISCOVER → OFFER → REQUEST → ACK:
+- **DISCOVER** (broadcast, UDP 68→67, IP 0.0.0.0→255.255.255.255, BOOTP broadcast
+  flag set so the reply is broadcast back — we have no IP to unicast to yet).
+- **OFFER** parsed for `yiaddr` + the server identifier (option 54).
+- **REQUEST** echoes the offered IP (option 50) + server id.
+- **ACK** confirms the lease; net adopts `yiaddr` as `Nic.our_ip` and reads the
+  router (option 3), DNS (option 6), and subnet mask (option 1) from it.
+
+`Nic.our_ip` (previously the `OUR_IP` constant) is `0.0.0.0` until the lease, then
+the leased address; ARP replies, ICMP echo, and every `SENDTO` source-address use
+it. If DHCP doesn't answer within a bounded number of frames, net falls back to
+the well-known SLIRP lease (10.0.2.15) so boot never wedges.
+
+### 22.3 Demonstrated
+`[net] DHCP lease: IP 10.0.2.15  gw 10.0.2.2  dns 10.0.2.3` at boot, after which
+`dns example.com` resolves with the leased IP as the UDP source. Lease renewal
+(T1/T2 timers) and honoring the lease time are deferred — the SLIRP lease is
+effectively permanent for a VM session. smoltcp-backed TCP sockets over the §21
+capability shape remain the next arc.

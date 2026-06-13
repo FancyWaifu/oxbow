@@ -1,18 +1,19 @@
-//! net — the oxbow network stack (resident boot module).
+//! net — the oxbow network stack + UDP socket server (resident boot module).
 //!
-//! Layer 1 (PCI/MMIO + DMA rings + IRQ) was the e1000 arc (§19). This arc adds
-//! the protocol layers from scratch — Ethernet (eth), ARP (arp), IPv4 (ipv4),
-//! ICMP (icmp), and UDP (udp), plus a tiny DNS client (dns) — and proves them
-//! against QEMU's SLIRP services: it ARP-resolves the gateway, sends a real DNS
-//! query over UDP/IPv4 and prints the resolved address, and pings the gateway
-//! over ICMP. The NIC plumbing lives in `Nic`; the higher layers are pure byte
-//! shuffling over its `tx` / `recv_blocking`.
+//! The NIC plumbing (PCI/MMIO + DMA rings + IRQ, §19) lives in `Nic`; the
+//! protocol layers (eth/arp/ipv4/icmp/udp, §20) are pure byte-shuffling over its
+//! `tx` / `recv_blocking`. At boot net leases an address via DHCP (§22, the
+//! `dhcp` module), ARP-resolves the gateway, then serves the UDP **socket
+//! capability** API (§21): clients bind sockets (each a fresh badged endpoint)
+//! and send/recv datagrams through them. NIC I/O happens synchronously inside
+//! request handling, sidestepping the single-thread-per-process select problem.
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
 mod arp;
+mod dhcp;
 mod eth;
 mod icmp;
 mod ipv4;
@@ -56,8 +57,8 @@ fn send_udp(
     payload: &[u8],
 ) {
     let mac = arp_resolve(nic, cache, route(dst_ip));
-    let seg = udp::segment(OUR_IP, dst_ip, src_port, dst_port, payload);
-    let ip = ipv4::packet(OUR_IP, dst_ip, ipv4::PROTO_UDP, &seg);
+    let seg = udp::segment(nic.our_ip, dst_ip, src_port, dst_port, payload);
+    let ip = ipv4::packet(nic.our_ip, dst_ip, ipv4::PROTO_UDP, &seg);
     nic.tx(&eth::frame(mac, nic.mac, ETHERTYPE_IPV4, &ip));
 }
 
@@ -91,8 +92,57 @@ fn w(s: &[u8]) {
     let _ = rt::sys_console_write(BOOT_CONSOLE, s.as_ptr(), s.len());
 }
 
-// Our addressing (the SLIRP default network: gateway .2, DNS forwarder .3).
-const OUR_IP: [u8; 4] = [10, 0, 2, 15];
+/// Broadcast a DHCP message (UDP 68->67 from 0.0.0.0 to 255.255.255.255).
+fn dhcp_send(nic: &mut Nic, payload: &[u8]) {
+    let seg = udp::segment([0; 4], [255; 4], 68, 67, payload);
+    let ip = ipv4::packet([0; 4], [255; 4], ipv4::PROTO_UDP, &seg);
+    nic.tx(&eth::frame(eth::BROADCAST, nic.mac, ETHERTYPE_IPV4, &ip));
+}
+
+/// Wait for a DHCP reply of `want_type` matching `xid` (servicing background
+/// traffic). Bounded so a non-answering network can't wedge boot forever.
+fn dhcp_recv(nic: &mut Nic, cache: &mut arp::Cache, xid: u32, want_type: u8) -> Option<dhcp::Reply> {
+    let mut buf = [0u8; BUF];
+    for _ in 0..32 {
+        let n = nic.recv_blocking(&mut buf);
+        handle_background(nic, cache, &buf[..n]);
+        let Some((_, _, et, off)) = eth::parse(&buf[..n]) else { continue };
+        if et != ETHERTYPE_IPV4 {
+            continue;
+        }
+        let Some(ip) = ipv4::parse(&buf[off..n]) else { continue };
+        if ip.proto != ipv4::PROTO_UDP {
+            continue;
+        }
+        let uoff = off + ip.payload_off;
+        let Some(u) = udp::parse(&buf[uoff..n]) else { continue };
+        if u.dst_port != 68 {
+            continue;
+        }
+        if let Some(r) = dhcp::parse(&buf[uoff + u.payload_off..n]) {
+            if r.xid == xid && r.msg_type == want_type {
+                return Some(r);
+            }
+        }
+    }
+    None
+}
+
+/// Run the DHCP DORA handshake: DISCOVER -> OFFER -> REQUEST -> ACK.
+fn dhcp_acquire(nic: &mut Nic, cache: &mut arp::Cache) -> Option<dhcp::Reply> {
+    let xid = 0x6F78_626F; // "oxbo"
+    let mac = nic.mac;
+    dhcp_send(nic, &dhcp::message(xid, &mac, dhcp::DISCOVER, None, None));
+    let offer = dhcp_recv(nic, cache, xid, dhcp::OFFER)?;
+    dhcp_send(
+        nic,
+        &dhcp::message(xid, &mac, dhcp::REQUEST, Some(offer.yiaddr), Some(offer.server_id)),
+    );
+    dhcp_recv(nic, cache, xid, dhcp::ACK)
+}
+
+// The SLIRP gateway (also our DHCP server + router). Our own IP is leased via
+// DHCP at boot into `Nic.our_ip` rather than asserted.
 const GW_IP: [u8; 4] = [10, 0, 2, 2];
 
 // --- e1000 register offsets (bytes into BAR0) ------------------------------
@@ -182,6 +232,7 @@ fn dma_page(slot: &mut u64) -> (u64, u64) {
 /// The NIC: descriptor rings, packet buffers, and the bound IRQ notification.
 struct Nic {
     mac: [u8; 6],
+    our_ip: [u8; 4], // leased via DHCP at boot (0.0.0.0 until then)
     notif: oxbow_abi::Handle,
     rx_ring_v: u64,
     rx_buf_v: [u64; RX_DESCS],
@@ -263,8 +314,8 @@ fn handle_background(nic: &mut Nic, cache: &mut arp::Cache, frame: &[u8]) {
     if et == ETHERTYPE_ARP {
         if let Some(a) = arp::parse(&frame[off..]) {
             cache.insert(a.spa, a.sha);
-            if a.op == arp::OP_REQUEST && a.tpa == OUR_IP {
-                let pkt = arp::packet(arp::OP_REPLY, nic.mac, OUR_IP, a.sha, a.spa);
+            if a.op == arp::OP_REQUEST && a.tpa == nic.our_ip {
+                let pkt = arp::packet(arp::OP_REPLY, nic.mac, nic.our_ip, a.sha, a.spa);
                 let f = eth::frame(a.sha, nic.mac, ETHERTYPE_ARP, &pkt);
                 nic.tx(&f);
             }
@@ -272,11 +323,11 @@ fn handle_background(nic: &mut Nic, cache: &mut arp::Cache, frame: &[u8]) {
     } else if et == ETHERTYPE_IPV4 {
         if let Some(ip) = ipv4::parse(&frame[off..]) {
             cache.insert(ip.src, src_mac);
-            if ip.proto == ipv4::PROTO_ICMP && ip.dst == OUR_IP {
+            if ip.proto == ipv4::PROTO_ICMP && ip.dst == nic.our_ip {
                 if let Some(e) = icmp::parse(&frame[off + ip.payload_off..]) {
                     if e.typ == icmp::ECHO_REQUEST {
                         let msg = icmp::echo(icmp::ECHO_REPLY, e.id, e.seq, &[]);
-                        let pkt = ipv4::packet(OUR_IP, ip.src, ipv4::PROTO_ICMP, &msg);
+                        let pkt = ipv4::packet(nic.our_ip, ip.src, ipv4::PROTO_ICMP, &msg);
                         let f = eth::frame(src_mac, nic.mac, ETHERTYPE_IPV4, &pkt);
                         nic.tx(&f);
                     }
@@ -291,7 +342,7 @@ fn arp_resolve(nic: &mut Nic, cache: &mut arp::Cache, target: [u8; 4]) -> [u8; 6
     if let Some(mac) = cache.lookup(target) {
         return mac;
     }
-    let pkt = arp::packet(arp::OP_REQUEST, nic.mac, OUR_IP, [0; 6], target);
+    let pkt = arp::packet(arp::OP_REQUEST, nic.mac, nic.our_ip, [0; 6], target);
     let req = eth::frame(eth::BROADCAST, nic.mac, ETHERTYPE_ARP, &pkt);
     nic.tx(&req);
     let mut buf = [0u8; BUF];
@@ -406,6 +457,7 @@ pub extern "C" fn oxbow_main() -> ! {
 
     let mut nic = Nic {
         mac,
+        our_ip: [0; 4], // until DHCP leases one
         notif,
         rx_ring_v,
         rx_buf_v,
@@ -417,7 +469,26 @@ pub extern "C" fn oxbow_main() -> ! {
     };
     let mut cache = arp::Cache::new();
 
-    // 5. Prove the NIC + stack work: ARP-resolve the gateway (populates cache).
+    // 5. DHCP: lease an address from the SLIRP DHCP server (DORA) instead of
+    //    asserting one. Falls back to the well-known SLIRP lease if it fails.
+    match dhcp_acquire(&mut nic, &mut cache) {
+        Some(l) => {
+            nic.our_ip = l.yiaddr;
+            w(format!(
+                "[net] DHCP lease: IP {}.{}.{}.{}  gw {}.{}.{}.{}  dns {}.{}.{}.{}\n",
+                l.yiaddr[0], l.yiaddr[1], l.yiaddr[2], l.yiaddr[3],
+                l.router[0], l.router[1], l.router[2], l.router[3],
+                l.dns[0], l.dns[1], l.dns[2], l.dns[3]
+            )
+            .as_bytes());
+        }
+        None => {
+            nic.our_ip = [10, 0, 2, 15];
+            w(b"[net] DHCP failed; using static 10.0.2.15\n");
+        }
+    }
+
+    // Prove routing works: ARP-resolve the gateway (populates the cache).
     let gw = arp_resolve(&mut nic, &mut cache, GW_IP);
     w(format!(
         "[net] ARP: 10.0.2.2 is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
