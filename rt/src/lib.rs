@@ -14,7 +14,7 @@ use oxbow_abi::{
     Handle, MsgBuf, SysError, SysResult, BOOT_CONSOLE, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE,
     SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK,
     SYS_IRQ_BIND, SYS_MAP, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT, SYS_RECV, SYS_REPLY,
-    SYS_SEND, SYS_EP_CREATE, SYS_SPAWN,
+    SYS_SEND, SYS_EP_CREATE, SYS_MINT, SYS_SPAWN,
 };
 
 // --- The server provides this; _start calls it ---------------------------
@@ -130,6 +130,14 @@ pub fn sys_reply(reply: Handle, msg: *const MsgBuf) -> SysResult {
 
 pub fn sys_attenuate(src: Handle, new_rights: u32) -> SysResult<Handle> {
     let (rax, rdx) = unsafe { syscall2(SYS_ATTENUATE, src as u64, new_rights as u64) };
+    SysError::from_raw(rax).map(|_| rdx as Handle)
+}
+
+/// Mint a BADGED capability to the endpoint `src` (§14): the kernel delivers
+/// `badge` to whoever receives a message sent through the returned handle.
+/// `src` must be unbadged + held with R_ATTENUATE; `new_rights` ⊆ src; badge != 0.
+pub fn sys_mint(src: Handle, badge: u64, new_rights: u32) -> SysResult<Handle> {
+    let (rax, rdx) = unsafe { syscall3(SYS_MINT, src as u64, badge, new_rights as u64) };
     SysError::from_raw(rax).map(|_| rdx as Handle)
 }
 

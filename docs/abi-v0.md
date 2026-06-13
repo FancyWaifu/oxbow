@@ -496,3 +496,66 @@ budgets refund) + endpoint/notification pool free; passing Image handles to
 non-shell holders (a real init/launcher); a Process handle for kill/wait by the
 parent. The `--features selftest` Console-probe path on pong is orphaned by the
 move off boot-spawn and needs reworking into a spawnable test.
+
+---
+
+## 14. Badged endpoints (v1-badged-ep)
+
+The seL4 badge mechanism: a holder of an endpoint capability can mint additional
+capabilities to the **same** endpoint, each stamped with a server-chosen
+**badge**. When a message is sent through a badged cap, the kernel delivers the
+badge — unforgeably — to the receiver. This lets one server multiplex many
+unforgeable per-object/per-client capabilities on a **single** endpoint (no
+per-object endpoint objects, no wait-on-many primitive). It is the foundation for
+the filesystem: each open file will be a badged capability to the one FS endpoint.
+
+### 14.1 The badge field
+A badge is per-**capability** state (on the handle, like rights — law L2), not on
+the endpoint object: many handles to one endpoint pool slot carry different
+badges. `0` = unbadged (the default for every boot grant, `sys_ep_create`, and
+`MsgBuf::new`).
+
+`MsgBuf` gains a trailing `badge: u64` (struct is now 104 bytes, pinned by a
+compile-time assert). On delivery the kernel writes the **invoked cap's** badge
+into the receiver's MsgBuf, overwriting whatever the sender put there — so the
+sender cannot forge a badge. An unbadged send delivers `0`. A **reply always
+delivers `0`** (badges are forward-only: they identify the caller *to* the
+server, and a reply is already directed).
+
+### 14.2 `sys_mint(src, badge, new_rights) -> Handle` (20)
+Derives a badged capability to the endpoint `src`. Validation order
+(handle → type → rights → args, before side effects):
+- `src` resolves (`E_BAD_HANDLE`), is an Endpoint (`E_BAD_TYPE`).
+- `src` held with **`R_ATTENUATE`** (`E_RIGHTS`) — minting is a derivation, the
+  family `R_ATTENUATE` gates. (`R_GRANT` is orthogonal: it means "may ride in a
+  message", §3.4.)
+- **`src.badge == 0`** (`E_RIGHTS` otherwise) — **re-badging is forbidden**. This
+  immutability is the whole security property: a holder of a badge-7 cap cannot
+  manufacture a badge-42 cap to the same endpoint.
+- `new_rights ⊆ src.rights` (`E_RIGHTS`) — no amplification (law L5).
+- `badge != 0` (`E_MSG`) — `0` stays unambiguously "unbadged".
+- Returns a new handle: same `Endpoint(idx)`, `rights = new_rights`, the chosen
+  badge. Full `u64` badge range.
+
+### 14.3 Preservation
+A badge is set ONCE by `sys_mint` and never changed afterward:
+- **`sys_attenuate`** on a badged cap preserves the badge (drops rights only) —
+  so a read-only file handle is a badged cap with fewer rights.
+- **Message transfer** (§3.4) and **spawn grants** (§13) copy the whole
+  `HandleEntry`, badge included — a client can hand a badged cap onward unforged.
+
+### 14.4 Acceptance (the `badge` demo, `BOOT_IMG_BADGE = 11`)
+`badgetest` from the shell mints badges 7 and 42 off its endpoint, spawns the
+`badge` server (granted the recv side at slot 1), and sends one message through
+each badged cap plus one through the unbadged endpoint with a sender-written
+`badge = 1234`. The server reports the kernel-delivered badges:
+
+```
+[badge] got 7      (sender-first delivery)
+[badge] got 42     (receiver-first delivery — both orderings in one run)
+[badge] got 0      (forgery blocked: the kernel overwrote the sender's 1234)
+[badge] done
+```
+
+Plus the mint negative paths: re-badge denied, badge-0 denied, amplify denied,
+non-endpoint denied.

@@ -7,8 +7,9 @@
 #![no_main]
 
 use oxbow_abi::{
-    Handle, MsgBuf, BOOT_CONSOLE, BOOT_IMG_BETA, BOOT_IMG_HELLO, BOOT_IMG_PONG, BOOT_MEM, BOOT_TICK,
-    BOOT_TTY, HANDLE_NULL, R_GRANT, R_RECV, R_SEND, R_WAIT, TAG_TTY_READ, TAG_TTY_WRITE,
+    Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_IMG_BADGE, BOOT_IMG_BETA, BOOT_IMG_HELLO,
+    BOOT_IMG_PONG, BOOT_MEM, BOOT_TICK, BOOT_TTY, HANDLE_NULL, R_GRANT, R_RECV, R_SEND, R_WAIT,
+    R_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -134,6 +135,70 @@ fn run_pong(sp: &Spawner) {
     let _ = rt::sys_close(tick_w);
 }
 
+/// `badgetest`: exercise the §14 badged-endpoint mint rules from the shell.
+/// Phase 2 = the negative paths (the end-to-end delivery demo is added next).
+fn badgetest(sp: &Spawner) {
+    // Two distinct badges minted off our (unbadged, R_ATTENUATE-bearing) ep.
+    let b7 = rt::sys_mint(sp.ep, 7, R_SEND);
+    let b42 = rt::sys_mint(sp.ep, 42, R_SEND);
+    match (b7, b42) {
+        (Ok(_), Ok(_)) => tw(b"[sh] mint 7+42 ok\n"),
+        _ => tw(b"[sh] !! mint failed\n"),
+    }
+    // Re-badging an already-badged cap is forbidden (unforgeability).
+    if let Ok(b) = b7 {
+        match rt::sys_mint(b, 99, R_SEND) {
+            Err(SysError::Rights) => tw(b"[sh] re-badge denied ok\n"),
+            _ => tw(b"[sh] !! re-badge NOT denied\n"),
+        }
+    }
+    // Badge 0 is reserved for "unbadged".
+    match rt::sys_mint(sp.ep, 0, R_SEND) {
+        Err(SysError::Msg) => tw(b"[sh] badge 0 denied ok\n"),
+        _ => tw(b"[sh] !! badge 0 NOT denied\n"),
+    }
+    // Amplification (a right the source lacks) is refused (law L5).
+    match rt::sys_mint(sp.ep, 5, R_SEND | R_WRITE) {
+        Err(SysError::Rights) => tw(b"[sh] amplify denied ok\n"),
+        _ => tw(b"[sh] !! amplify NOT denied\n"),
+    }
+    // Minting a non-endpoint is a type error.
+    match rt::sys_mint(BOOT_MEM, 7, 0) {
+        Err(SysError::BadType) => tw(b"[sh] non-ep denied ok\n"),
+        _ => tw(b"[sh] !! non-ep NOT denied\n"),
+    }
+
+    // --- end-to-end: spawn the badge server and prove delivery + unforgeability.
+    let (b7, b42) = match (b7, b42) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return,
+    };
+    // The server receives on our endpoint; grant it the recv side at slot 1.
+    let recv_cap = match rt::sys_attenuate(sp.ep, R_RECV | R_GRANT) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let mut m = MsgBuf::new(0);
+    m.handle_count = 2;
+    m.handles[0] = recv_cap; // slot 1 = BOOT_EP (recv)
+    m.handles[1] = sp.stdout; // slot 2 = SPAWN_STDOUT
+    if rt::sys_spawn(BOOT_IMG_BADGE, BOOT_MEM, &m, sp.exit).is_ok() {
+        // Send through each badged cap → server should report 7 then 42.
+        let p = MsgBuf::new(0);
+        let _ = rt::sys_send(b7, &p);
+        let _ = rt::sys_send(b42, &p);
+        // Forgery attempt: write a badge into the message and send via the
+        // UNBADGED ep — the kernel overwrites it, so the server must report 0.
+        let mut forged = MsgBuf::new(0);
+        forged.badge = 1234;
+        let _ = rt::sys_send(sp.ep, &forged);
+        wait_exits(sp, 1);
+    }
+    let _ = rt::sys_close(recv_cap);
+    let _ = rt::sys_close(b7);
+    let _ = rt::sys_close(b42);
+}
+
 fn run(line: &[u8], sp: &Spawner) {
     let (cmd, rest) = split_cmd(line);
     match cmd {
@@ -151,11 +216,13 @@ fn run(line: &[u8], sp: &Spawner) {
                 _ => tw(b"run: no such program\n"),
             }
         }
+        b"badgetest" => badgetest(sp),
         b"help" => {
             tw(b"oxbow shell builtins:\n");
             tw(b"  echo <text>     print text\n");
             tw(b"  run hello       spawn the hello program\n");
             tw(b"  run pong        spawn the pong<->beta IPC demo\n");
+            tw(b"  badgetest       exercise badged-endpoint mint rules\n");
             tw(b"  help            this list\n");
         }
         _ => {

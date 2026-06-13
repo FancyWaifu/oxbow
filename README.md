@@ -126,13 +126,25 @@ tangles the echo with output; each command's echo lands grouped with its own
 prompt, and type-ahead edits (backspace) are invisible. A pure `servers/tty`
 change (no ABI/shell/driver change). See `docs/abi-v0.md` §12.5.
 
+**v1 arc 10 — badged endpoints: complete.** The seL4 badge mechanism: a holder
+of an endpoint capability can `sys_mint` additional capabilities to the *same*
+endpoint, each stamped with a server-chosen **badge** that the kernel delivers —
+**unforgeably** — to the receiver (it overwrites whatever the sender wrote). So a
+single-endpoint server can hand out many distinct, unforgeable per-object
+capabilities and tell them apart on one receive loop — no per-object endpoint
+objects, no wait-on-many primitive. Badges are immutable once set (no re-badging,
+preserved by attenuation + transfer), forward-only (replies deliver 0). This is
+the foundation for the filesystem: each open file becomes a badged capability to
+the one FS endpoint. See `docs/abi-v0.md` §14.
+
 ### Next — toward a fuller userspace
 
-A **filesystem** (VFS naming server + ramdisk) → coreutils → a **libc/POSIX
-shim**. POSIX and the Unix feel live in *userspace* over the capability kernel
-(the Redox model) — the kernel stays capability-pure. Plus, eventually: frame
-reclamation + budget refund, the orphaned selftest rework, untyped/retype +
-`sys_unmap`, SMP, and the `aarch64` port.
+A **filesystem** (VFS naming server + ramdisk, with each open file a badged
+capability) → coreutils → a **libc/POSIX shim**. POSIX and the Unix feel live in
+*userspace* over the capability kernel (the Redox model) — the kernel stays
+capability-pure. Plus, eventually: frame reclamation + budget refund, the
+orphaned selftest rework, untyped/retype + `sys_unmap`, SMP, and the `aarch64`
+port.
 
 ## Building & running
 

@@ -93,6 +93,9 @@ pub const SYS_IRQ_ACK: u64 = 17; // (irq)                  needs R_ACK
 pub const SYS_SPAWN: u64 = 18; // (image, mem, &MsgBuf, exit_notif) -> pid
 pub const SYS_EP_CREATE: u64 = 19; // () -> fresh Endpoint handle
 
+// Badged endpoints (§14).
+pub const SYS_MINT: u64 = 20; // (ep, badge, new_rights) -> badged Endpoint handle
+
 // ---------------------------------------------------------------------------
 // Error codes (§6) — returned in rax; values are stable forever (append-only)
 // ---------------------------------------------------------------------------
@@ -173,7 +176,16 @@ pub struct MsgBuf {
     /// Sender: handles to transfer (each needs `R_GRANT`).
     /// Receiver: kernel-written fresh indices.
     pub handles: [Handle; MSG_HANDLES],
+    /// Receiver: the badge of the capability the sender invoked, kernel-written
+    /// on every delivery (0 = unbadged; always 0 on a reply). Sender: ignored —
+    /// the kernel overwrites it with the invoked cap's badge, so it is
+    /// unforgeable. See §14 (badged endpoints).
+    pub badge: u64,
 }
+
+// MsgBuf is the cross-ABI wire struct; its size feeds `check_user`. Keep it
+// pinned so a layout drift can never silently desync kernel and userland.
+const _: () = assert!(core::mem::size_of::<MsgBuf>() == 104);
 
 impl MsgBuf {
     /// An empty message with the given tag and no payload or handles.
@@ -184,6 +196,7 @@ impl MsgBuf {
             handle_count: 0,
             data: [0; MSG_DATA_WORDS],
             handles: [HANDLE_NULL; MSG_HANDLES],
+            badge: 0,
         }
     }
 }
@@ -218,6 +231,7 @@ pub const BOOT_SERIAL_LSR: Handle = 6; // IoPort{0x3FD,1} — R_IN (line status)
 pub const BOOT_IMG_HELLO: Handle = 8;
 pub const BOOT_IMG_PONG: Handle = 9;
 pub const BOOT_IMG_BETA: Handle = 10;
+pub const BOOT_IMG_BADGE: Handle = 11; // §14 badged-endpoint demo server
 
 /// `sys_spawn` grant convention: the handles in the spawn MsgBuf land in the
 /// child's table at these slots, in order (HANDLE_NULL entries are skipped).

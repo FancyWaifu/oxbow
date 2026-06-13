@@ -178,6 +178,10 @@ fn copy_msg_to_user(uptr: u64, m: &MsgBuf) -> SysResult {
         for i in 0..hc {
             (&raw mut (*dst).handles[i]).write(m.handles[i]);
         }
+        // The badge of the cap the sender invoked, stamped by sys_ipc — delivered
+        // unforgeably to the receiver (§14). This is the single delivery path, so
+        // both rendezvous orderings get it.
+        (&raw mut (*dst).badge).write(m.badge);
     }
     Ok(())
 }
@@ -236,6 +240,7 @@ fn mint_reply(caller: usize, to_proc: usize) -> Result<(Handle, usize), SysError
         p.alloc_slot(HandleEntry {
             obj: ObjectRef::Reply(idx as u8),
             rights: 0,
+        badge: 0,
         })
     }) {
         Ok(h) => Ok((h, idx)),

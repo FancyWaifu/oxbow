@@ -55,4 +55,9 @@ impl ObjectRef {
 pub struct HandleEntry {
     pub obj: ObjectRef,
     pub rights: u32,
+    /// Endpoint badge (§14): a server-chosen label the kernel delivers to the
+    /// receiver. 0 = unbadged. Set ONCE by `sys_mint` on an unbadged source,
+    /// preserved by attenuation and message transfer, never otherwise changed —
+    /// that immutability is what makes a delivered badge unforgeable.
+    pub badge: u64,
 }

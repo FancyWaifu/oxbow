@@ -183,7 +183,7 @@ fn kmain_stage2() -> ! {
         // Demo / on-demand programs are NOT boot-spawned: they are registered as
         // spawnable Image capabilities and launched later from the shell. This is
         // what gives a clean boot straight to the prompt (no demo spam).
-        if matches!(cmd, b"pong" | b"beta" | b"hello") {
+        if matches!(cmd, b"pong" | b"beta" | b"hello" | b"badge") {
             image::register(cmd, bytes);
             println!("[mod] image '{}' registered ({} bytes)", name, bytes.len());
             continue;
@@ -214,6 +214,7 @@ fn kmain_stage2() -> ! {
                             | oxbow_abi::R_ACK
                             | oxbow_abi::R_GRANT
                             | oxbow_abi::R_ATTENUATE,
+                    badge: 0,
                     },
                 );
                 p.install(
@@ -221,6 +222,7 @@ fn kmain_stage2() -> ! {
                     object::HandleEntry {
                         obj: object::ObjectRef::IoPort { base: 0x60, len: 1 },
                         rights: io_rights,
+                    badge: 0,
                     },
                 );
                 p.install(
@@ -228,6 +230,7 @@ fn kmain_stage2() -> ! {
                     object::HandleEntry {
                         obj: object::ObjectRef::IoPort { base: 0x64, len: 1 },
                         rights: io_rights,
+                    badge: 0,
                     },
                 );
                 // The kbd driver sends characters to the TTY endpoint.
@@ -236,6 +239,7 @@ fn kmain_stage2() -> ! {
                     object::HandleEntry {
                         obj: object::ObjectRef::Endpoint(ipc::EP1),
                         rights: oxbow_abi::R_SEND,
+                    badge: 0,
                     },
                 );
             });
@@ -248,6 +252,7 @@ fn kmain_stage2() -> ! {
                     object::HandleEntry {
                         obj: object::ObjectRef::Endpoint(ipc::EP1),
                         rights: oxbow_abi::R_RECV,
+                    badge: 0,
                     },
                 )
             });
@@ -264,6 +269,7 @@ fn kmain_stage2() -> ! {
                     object::HandleEntry {
                         obj: object::ObjectRef::Endpoint(ipc::EP1),
                         rights: oxbow_abi::R_SEND | oxbow_abi::R_GRANT | oxbow_abi::R_ATTENUATE,
+                    badge: 0,
                     },
                 );
                 // Drop the console: the shell must not write hardware directly.
@@ -275,6 +281,7 @@ fn kmain_stage2() -> ! {
                     object::HandleEntry {
                         obj: object::ObjectRef::Notification(tick_idx),
                         rights: oxbow_abi::R_WAIT | oxbow_abi::R_GRANT | oxbow_abi::R_ATTENUATE,
+                    badge: 0,
                     },
                 );
                 // Spawnable program images (capabilities — the shell can only
@@ -285,6 +292,7 @@ fn kmain_stage2() -> ! {
                     (oxbow_abi::BOOT_IMG_HELLO, b"hello".as_slice()),
                     (oxbow_abi::BOOT_IMG_PONG, b"pong".as_slice()),
                     (oxbow_abi::BOOT_IMG_BETA, b"beta".as_slice()),
+                    (oxbow_abi::BOOT_IMG_BADGE, b"badge".as_slice()),
                 ] {
                     if let Some(idx) = image::find(iname) {
                         p.install(
@@ -292,6 +300,7 @@ fn kmain_stage2() -> ! {
                             object::HandleEntry {
                                 obj: object::ObjectRef::Image(idx),
                                 rights: spawn_rights,
+                            badge: 0,
                             },
                         );
                     }
@@ -308,6 +317,7 @@ fn kmain_stage2() -> ! {
                     object::HandleEntry {
                         obj: object::ObjectRef::Irq(4), // COM1 line
                         rights: oxbow_abi::R_BIND | oxbow_abi::R_ACK,
+                    badge: 0,
                     },
                 );
                 p.install(
@@ -315,6 +325,7 @@ fn kmain_stage2() -> ! {
                     object::HandleEntry {
                         obj: object::ObjectRef::IoPort { base: 0x3F8, len: 1 },
                         rights: oxbow_abi::R_IN,
+                    badge: 0,
                     },
                 );
                 p.install(
@@ -322,6 +333,7 @@ fn kmain_stage2() -> ! {
                     object::HandleEntry {
                         obj: object::ObjectRef::IoPort { base: 0x3FD, len: 1 },
                         rights: oxbow_abi::R_IN,
+                    badge: 0,
                     },
                 );
                 // The serial driver forwards received bytes to the TTY endpoint.
@@ -330,6 +342,7 @@ fn kmain_stage2() -> ! {
                     object::HandleEntry {
                         obj: object::ObjectRef::Endpoint(ipc::EP1),
                         rights: oxbow_abi::R_SEND,
+                    badge: 0,
                     },
                 );
             });

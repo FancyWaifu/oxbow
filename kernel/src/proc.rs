@@ -270,6 +270,7 @@ pub fn grant_standard(id: usize, budget: u64) {
             HandleEntry {
                 obj: ObjectRef::Console,
                 rights: R_WRITE | R_ATTENUATE | R_GRANT,
+            badge: 0,
             },
         );
         p.install(
@@ -277,6 +278,7 @@ pub fn grant_standard(id: usize, budget: u64) {
             HandleEntry {
                 obj: ObjectRef::Memory(mem_idx),
                 rights: R_MAP | R_GRANT | R_ATTENUATE,
+            badge: 0,
             },
         );
     }

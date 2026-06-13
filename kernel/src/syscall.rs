@@ -10,8 +10,8 @@ use oxbow_abi::{
     PROT_READ, PROT_WRITE, R_ATTENUATE, R_GRANT, R_MAP, R_RECV, R_SEND, R_SIGNAL, R_WAIT, R_WRITE,
     SPAWN_DEFAULT_BUDGET, SPAWN_SLOTS, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE,
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
-    SYS_EP_CREATE, SYS_MAP, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT, SYS_RECV, SYS_REPLY,
-    SYS_SEND, SYS_SPAWN, R_ACK, R_BIND, R_IN, R_OUT, R_SPAWN,
+    SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT, SYS_RECV,
+    SYS_REPLY, SYS_SEND, SYS_SPAWN, R_ACK, R_BIND, R_IN, R_OUT, R_SPAWN,
 };
 
 use crate::object::{HandleEntry, ObjType, ObjectRef};
@@ -86,6 +86,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_IRQ_ACK => sys_irq_ack(a1),
         SYS_SPAWN => sys_spawn(a1, a2, a3, a4),
         SYS_EP_CREATE => sys_ep_create(),
+        SYS_MINT => sys_mint(a1, a2, a3),
         SYS_CONSOLE_WRITE => sys_console_write(a1, a2, a3),
         SYS_ATTENUATE => sys_attenuate(a1, a2),
         SYS_CLOSE => SyscallRet::from_result(proc::with_current_mut(|p| p.close(a1 as Handle))),
@@ -113,10 +114,14 @@ fn sys_ipc(ep: u64, msg_ptr: u64, is_call: bool) -> SyscallRet {
             return Err(SysError::Fault);
         }
         usermem::check_user(msg_ptr, size_of::<MsgBuf>(), is_call)?;
-        let msg: MsgBuf = unsafe { core::ptr::read(msg_ptr as *const MsgBuf) };
+        let mut msg: MsgBuf = unsafe { core::ptr::read(msg_ptr as *const MsgBuf) };
         if msg.data_len as usize > MSG_DATA_WORDS || msg.handle_count as usize > MSG_HANDLES {
             return Err(SysError::Msg);
         }
+        // Stamp the invoked cap's badge, OVERWRITING whatever the sender wrote —
+        // this is what makes the delivered badge unforgeable (§14). Unbadged caps
+        // carry badge 0, so an ordinary send delivers 0.
+        msg.badge = entry.badge;
         // §3.4: every transferred handle needs R_GRANT in the sender's table.
         if msg.handle_count > 0 {
             proc::with_current(|p| -> SysResult {
@@ -202,6 +207,7 @@ fn sys_notif_create() -> SyscallRet {
                 p.alloc_slot(HandleEntry {
                     obj: ObjectRef::Notification(idx),
                     rights: R_SIGNAL | R_WAIT | R_GRANT | R_ATTENUATE,
+                badge: 0,
                 })
             });
             match r {
@@ -292,6 +298,7 @@ fn sys_ep_create() -> SyscallRet {
                 p.alloc_slot(HandleEntry {
                     obj: ObjectRef::Endpoint(idx),
                     rights: R_SEND | R_RECV | R_GRANT | R_ATTENUATE,
+                badge: 0,
                 })
             });
             match r {
@@ -428,6 +435,7 @@ fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> Sysca
             HandleEntry {
                 obj: ObjectRef::Memory(child_mem),
                 rights: R_MAP | R_GRANT | R_ATTENUATE,
+            badge: 0,
             },
         );
         for i in 0..prep.grant_count {
@@ -497,6 +505,7 @@ fn sys_frame_alloc(mem: u64) -> SyscallRet {
             p.alloc_slot(HandleEntry {
                 obj: ObjectRef::Frame(fidx),
                 rights: R_MAP | R_WRITE | R_GRANT | R_ATTENUATE,
+            badge: 0,
             })
         })
     })();
@@ -573,10 +582,11 @@ fn sys_reply(reply: u64, msg_ptr: u64) -> SyscallRet {
             return Err(SysError::Fault);
         }
         usermem::check_user(msg_ptr, size_of::<MsgBuf>(), false)?;
-        let m: MsgBuf = unsafe { core::ptr::read(msg_ptr as *const MsgBuf) };
+        let mut m: MsgBuf = unsafe { core::ptr::read(msg_ptr as *const MsgBuf) };
         if m.data_len as usize > MSG_DATA_WORDS || m.handle_count as usize > MSG_HANDLES {
             return Err(SysError::Msg);
         }
+        m.badge = 0; // a reply always delivers badge 0 (§14): badges are forward-only
         Ok((idx, m))
     })();
     match prepared {
@@ -606,6 +616,45 @@ fn sys_console_write(con: u64, buf: u64, len: u64) -> SyscallRet {
     SyscallRet::from_result(result)
 }
 
+/// `sys_mint(src, badge, new_rights)` — derive a BADGED capability to the same
+/// endpoint (§14). The badge is delivered, unforgeably, to whoever receives a
+/// message sent through the derived cap. Rules: `src` must be an unbadged
+/// Endpoint held with `R_ATTENUATE`; `new_rights` must be a subset (law L5);
+/// `badge != 0`. The source's badge being 0 is mandatory — re-badging is
+/// forbidden, which is exactly what makes a delivered badge unforgeable.
+fn sys_mint(src: u64, badge: u64, new_rights: u64) -> SyscallRet {
+    let new_rights = new_rights as u32;
+    proc::with_current_mut(|p| {
+        let entry = match p.get(src as Handle) {
+            Ok(e) => e,
+            Err(e) => return SyscallRet::err(e),
+        };
+        if entry.obj.ty() != ObjType::Endpoint {
+            return SyscallRet::err(SysError::BadType);
+        }
+        if entry.rights & R_ATTENUATE == 0 {
+            return SyscallRet::err(SysError::Rights);
+        }
+        if entry.badge != 0 {
+            return SyscallRet::err(SysError::Rights); // no re-badging (immutable)
+        }
+        if new_rights & entry.rights != new_rights {
+            return SyscallRet::err(SysError::Rights); // no amplification (L5)
+        }
+        if badge == 0 {
+            return SyscallRet::err(SysError::Msg); // 0 stays "unbadged"
+        }
+        match p.alloc_slot(HandleEntry {
+            obj: entry.obj,
+            rights: new_rights,
+            badge,
+        }) {
+            Ok(h) => SyscallRet::ok_handle(h),
+            Err(e) => SyscallRet::err(e),
+        }
+    })
+}
+
 /// `sys_attenuate(src, new_rights)` — derive a strictly-weaker handle (law L5).
 fn sys_attenuate(src: u64, new_rights: u64) -> SyscallRet {
     let new_rights = new_rights as u32;
@@ -628,6 +677,7 @@ fn sys_attenuate(src: u64, new_rights: u64) -> SyscallRet {
         match p.alloc_slot(HandleEntry {
             obj: entry.obj,
             rights: new_rights,
+            badge: entry.badge, // attenuation preserves the badge (§14)
         }) {
             Ok(h) => SyscallRet::ok_handle(h),
             Err(e) => SyscallRet::err(e),
