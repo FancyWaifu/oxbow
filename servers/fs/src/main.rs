@@ -27,11 +27,14 @@ use oxbow_rt as rt;
 const MAX_NODES: usize = 16;
 const READ_CHUNK: usize = 56; // 7 u64 of data[1..8]
 
-/// Mutable file storage, mapped from the fs Memory budget. A bump allocator
-/// hands out a fixed `FILE_CAP` region per file (no realloc/free in v1).
+/// Mutable file storage, mapped from the fs Memory budget. The arena hands out
+/// fixed `BLOCK` regions; a file is a list of up to `MAX_BLOCKS` blocks, so it
+/// can GROW past one block (up to `MAX_BLOCKS * BLOCK`).
 const ARENA: usize = 0x2000_0000;
-const ARENA_SIZE: usize = 64 * 1024;
-const FILE_CAP: usize = 1024;
+const ARENA_SIZE: usize = 128 * 1024;
+const BLOCK: usize = 1024;
+const MAX_BLOCKS: usize = 16; // 16 KiB max file
+const TOTAL_BLOCKS: usize = ARENA_SIZE / BLOCK;
 
 #[derive(Clone, Copy)]
 struct Node {
@@ -39,9 +42,9 @@ struct Node {
     name: [u8; 24],
     name_len: usize,
     parent: u16,
-    off: usize, // arena byte offset (files only)
-    len: usize, // current size
-    cap: usize, // allocated capacity in the arena
+    blocks: [usize; MAX_BLOCKS], // arena offsets of this file's blocks
+    nblocks: usize,
+    len: usize, // current size in bytes
 }
 
 const FREE: Node = Node {
@@ -49,9 +52,9 @@ const FREE: Node = Node {
     name: [0; 24],
     name_len: 0,
     parent: 0,
-    off: 0,
+    blocks: [0; MAX_BLOCKS],
+    nblocks: 0,
     len: 0,
-    cap: 0,
 };
 
 fn w(s: &[u8]) {
@@ -63,43 +66,51 @@ fn mk(name: &[u8], parent: u16, kind: u64) -> Node {
     let mut nb = [0u8; 24];
     let n = core::cmp::min(name.len(), 24);
     nb[..n].copy_from_slice(&name[..n]);
-    Node { kind, name: nb, name_len: n, parent, off: 0, len: 0, cap: 0 }
+    Node { kind, name: nb, name_len: n, parent, blocks: [0; MAX_BLOCKS], nblocks: 0, len: 0 }
 }
 
-/// The file-storage arena: a bump pointer plus a free list. Every file region is
-/// exactly `FILE_CAP`, so the free list is uniform — `alloc` pops a reclaimed
-/// region (from a removed file) before extending the bump pointer. This is what
-/// keeps repeated create/rm cycles from leaking the arena.
+/// The file-storage arena: a bump pointer plus a free list of fixed `BLOCK`
+/// regions. `alloc` pops a reclaimed block before extending the bump pointer, so
+/// repeated create/rm cycles (and shrinking files) don't leak the arena.
 struct Arena {
     used: usize,
-    free: [usize; MAX_NODES],
+    free: [usize; TOTAL_BLOCKS],
     free_n: usize,
 }
 
 impl Arena {
     const fn new() -> Self {
-        Arena { used: 0, free: [0; MAX_NODES], free_n: 0 }
+        Arena { used: 0, free: [0; TOTAL_BLOCKS], free_n: 0 }
     }
-    /// Allocate one `FILE_CAP` region; `None` if the arena is full.
+    /// Allocate one `BLOCK` region; `None` if the arena is full.
     fn alloc(&mut self) -> Option<usize> {
         if self.free_n > 0 {
             self.free_n -= 1;
             return Some(self.free[self.free_n]);
         }
-        if self.used + FILE_CAP > ARENA_SIZE {
+        if self.used + BLOCK > ARENA_SIZE {
             return None;
         }
         let off = self.used;
-        self.used += FILE_CAP;
+        self.used += BLOCK;
         Some(off)
     }
-    /// Return a region to the free list (on file removal).
+    /// Return a block to the free list.
     fn free(&mut self, off: usize) {
         if self.free_n < self.free.len() {
             self.free[self.free_n] = off;
             self.free_n += 1;
         }
     }
+}
+
+/// Free all of a file node's blocks back to the arena (on remove or truncate).
+fn free_blocks(node: &mut Node, arena: &mut Arena) {
+    for i in 0..node.nblocks {
+        arena.free(node.blocks[i]);
+    }
+    node.nblocks = 0;
+    node.len = 0;
 }
 
 /// A name is a single path component: reject empties, anything with '/', and '..'
@@ -187,18 +198,31 @@ fn build_tree(nodes: &mut [Node], arena: &mut Arena) {
         let typeflag = unsafe { *hdr.add(156) };
         let is_file = typeflag == b'0' || typeflag == 0;
         if is_file && !nm.is_empty() && !nm.contains(&b'/') && next < nodes.len() {
-            if let Some(aoff) = arena.alloc() {
-                let clen = core::cmp::min(size, FILE_CAP);
-                unsafe {
-                    core::ptr::copy_nonoverlapping(hdr.add(512), (ARENA + aoff) as *mut u8, clen);
+            let clen = core::cmp::min(size, MAX_BLOCKS * BLOCK);
+            let mut nd = mk(nm, 1, FS_FILE);
+            // Spread the content across as many blocks as it needs.
+            let mut copied = 0usize;
+            while copied < clen {
+                match arena.alloc() {
+                    Some(b) => {
+                        let n = core::cmp::min(BLOCK, clen - copied);
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                hdr.add(512 + copied),
+                                (ARENA + b) as *mut u8,
+                                n,
+                            );
+                        }
+                        nd.blocks[nd.nblocks] = b;
+                        nd.nblocks += 1;
+                        copied += n;
+                    }
+                    None => break,
                 }
-                let mut nd = mk(nm, 1, FS_FILE);
-                nd.off = aoff;
-                nd.len = clen;
-                nd.cap = FILE_CAP;
-                nodes[next] = nd;
-                next += 1;
             }
+            nd.len = copied;
+            nodes[next] = nd;
+            next += 1;
         }
         off += 512 + ((size + 511) & !511); // header + content padded to 512
     }
@@ -265,19 +289,26 @@ pub extern "C" fn oxbow_main() -> ! {
                 let off = m.data[0] as usize;
                 if valid && nodes[node_id].kind == FS_FILE {
                     let nd = &nodes[node_id];
-                    let end = core::cmp::min(off + READ_CHUNK, nd.len);
-                    let count = end.saturating_sub(off);
-                    if count > 0 {
+                    let bi = off / BLOCK;
+                    let within = off % BLOCK;
+                    // A read never crosses a block boundary (READ_CHUNK < BLOCK);
+                    // the client loops for the next block.
+                    let avail = nd.len.saturating_sub(off);
+                    let count =
+                        core::cmp::min(READ_CHUNK, core::cmp::min(BLOCK - within, avail));
+                    if count > 0 && bi < nd.nblocks {
                         let dst = r.data.as_mut_ptr() as *mut u8;
                         unsafe {
                             core::ptr::copy_nonoverlapping(
-                                (ARENA + nd.off + off) as *const u8,
+                                (ARENA + nd.blocks[bi] + within) as *const u8,
                                 dst.add(8), // bytes into data[1..]
                                 count,
                             );
                         }
+                        r.data[0] = count as u64;
+                    } else {
+                        r.data[0] = 0;
                     }
-                    r.data[0] = count as u64;
                     r.data_len = 8;
                 } else {
                     r.data[0] = 0; // EOF / bad node
@@ -339,21 +370,16 @@ pub extern "C" fn oxbow_main() -> ! {
                     Some((par, base)) if name_ok(base) => {
                         match find_child(&nodes, par, base) {
                             Some(i) if nodes[i].kind == FS_FILE => {
-                                nodes[i].len = 0; // truncate existing
+                                free_blocks(&mut nodes[i], &mut arena); // truncate
                                 Some(i)
                             }
                             Some(_) => None, // exists but is a directory
                             None => match (1..MAX_NODES).find(|&i| nodes[i].kind == 0) {
-                                Some(i) => match arena.alloc() {
-                                    Some(aoff) => {
-                                        let mut nd = mk(base, par as u16, FS_FILE);
-                                        nd.off = aoff;
-                                        nd.cap = FILE_CAP;
-                                        nodes[i] = nd;
-                                        Some(i)
-                                    }
-                                    None => None,
-                                },
+                                Some(i) => {
+                                    // Empty file; WRITE allocates blocks on demand.
+                                    nodes[i] = mk(base, par as u16, FS_FILE);
+                                    Some(i)
+                                }
                                 None => None,
                             },
                         }
@@ -387,26 +413,45 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut r = MsgBuf::new(0);
                 let off = m.data[0] as usize;
                 let count = (m.data[1] as usize).min(48);
+                let mut written = 0usize;
                 if valid && nodes[node_id].kind == FS_FILE {
-                    let nd = &mut nodes[node_id];
-                    let avail = nd.cap.saturating_sub(off);
-                    let n = count.min(avail);
-                    if n > 0 {
+                    let src = unsafe { (m.data.as_ptr() as *const u8).add(16) };
+                    while written < count {
+                        let pos = off + written;
+                        let bi = pos / BLOCK;
+                        let within = pos % BLOCK;
+                        if bi >= MAX_BLOCKS {
+                            break; // file-size ceiling reached
+                        }
+                        // Grow: allocate blocks (zeroing any gap) up to `bi`.
+                        while nodes[node_id].nblocks <= bi {
+                            match arena.alloc() {
+                                Some(b) => {
+                                    let nb = nodes[node_id].nblocks;
+                                    nodes[node_id].blocks[nb] = b;
+                                    nodes[node_id].nblocks += 1;
+                                }
+                                None => break,
+                            }
+                        }
+                        if nodes[node_id].nblocks <= bi {
+                            break; // arena exhausted
+                        }
+                        let n = (count - written).min(BLOCK - within);
                         unsafe {
                             core::ptr::copy_nonoverlapping(
-                                (m.data.as_ptr() as *const u8).add(16), // data[2..]
-                                (ARENA + nd.off + off) as *mut u8,
+                                src.add(written),
+                                (ARENA + nodes[node_id].blocks[bi] + within) as *mut u8,
                                 n,
                             );
                         }
-                        if off + n > nd.len {
-                            nd.len = off + n;
-                        }
+                        written += n;
                     }
-                    r.data[0] = n as u64;
-                } else {
-                    r.data[0] = 0;
+                    if off + written > nodes[node_id].len {
+                        nodes[node_id].len = off + written;
+                    }
                 }
+                r.data[0] = written as u64;
                 r.data_len = 1;
                 let _ = rt::sys_reply(reply, &r);
             }
@@ -462,8 +507,8 @@ pub extern "C" fn oxbow_main() -> ! {
                                     0
                                 }
                             } else {
-                                // file: reclaim its arena region, then free the slot.
-                                arena.free(nodes[i].off);
+                                // file: reclaim all its blocks, then free the slot.
+                                free_blocks(&mut nodes[i], &mut arena);
                                 nodes[i].kind = 0;
                                 0
                             }

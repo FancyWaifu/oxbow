@@ -308,21 +308,44 @@ fn write_chunks(cap: Handle, bytes: &[u8], start: u64) -> u64 {
 
 /// `echo TEXT > FILE`: CREATE-or-truncate the file (relative to `dir`), write
 /// TEXT + newline.
-fn write_file(dir: Handle, name: &[u8], text: &[u8]) {
+fn write_file(dir: Handle, name: &[u8], text: &[u8], append: bool) {
     if name.is_empty() {
         tw(b"sh: redirect needs a file name\n");
         return;
     }
-    let mut m = MsgBuf::new(TAG_FS_CREATE);
-    pack_name(&mut m, name);
-    if rt::sys_call(dir, &mut m).is_err() || m.data[0] != 0 {
-        tw(b"sh: cannot create ");
-        tw(name);
-        tw(b"\n");
-        return;
-    }
-    let cap = m.handles[0];
-    let off = write_chunks(cap, text, 0);
+    // Append mode: OPEN the file and write at its current end. If it doesn't
+    // exist (or for '>'), CREATE-or-truncate and write at 0.
+    let (cap, start) = if append {
+        let mut o = MsgBuf::new(TAG_FS_OPEN);
+        pack_name(&mut o, name);
+        if rt::sys_call(dir, &mut o).is_ok()
+            && o.data[0] == 0
+            && o.data[1] == oxbow_abi::FS_FILE
+        {
+            (o.handles[0], o.data[2]) // existing file: append at its size
+        } else {
+            let mut c = MsgBuf::new(TAG_FS_CREATE);
+            pack_name(&mut c, name);
+            if rt::sys_call(dir, &mut c).is_err() || c.data[0] != 0 {
+                tw(b"sh: cannot create ");
+                tw(name);
+                tw(b"\n");
+                return;
+            }
+            (c.handles[0], 0)
+        }
+    } else {
+        let mut c = MsgBuf::new(TAG_FS_CREATE);
+        pack_name(&mut c, name);
+        if rt::sys_call(dir, &mut c).is_err() || c.data[0] != 0 {
+            tw(b"sh: cannot create ");
+            tw(name);
+            tw(b"\n");
+            return;
+        }
+        (c.handles[0], 0)
+    };
+    let off = write_chunks(cap, text, start);
     let _ = write_chunks(cap, b"\n", off);
     let _ = rt::sys_close(cap);
 }
@@ -362,13 +385,14 @@ fn cd(name: &[u8], cwd: &mut Handle) {
 }
 
 fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
-    // Output redirect: `echo TEXT > FILE` writes TEXT to the file instead of the
-    // tty (the first taste of the Unix shell feel).
+    // Output redirect: `echo TEXT > FILE` (truncate) or `>> FILE` (append).
     if let Some(gt) = line.iter().position(|&b| b == b'>') {
+        let append = gt + 1 < line.len() && line[gt + 1] == b'>';
+        let file_start = if append { gt + 2 } else { gt + 1 };
         let (cmd, text) = split_cmd(trim(&line[..gt]));
-        let (file, _) = split_cmd(trim(&line[gt + 1..]));
+        let (file, _) = split_cmd(trim(&line[file_start..]));
         if cmd == b"echo" {
-            write_file(*cwd, file, text);
+            write_file(*cwd, file, text, append);
         } else {
             tw(b"sh: only 'echo ... > file' redirect is supported\n");
         }
