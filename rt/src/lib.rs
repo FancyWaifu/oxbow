@@ -3,7 +3,13 @@
 //! Provides `_start` (the ELF entry), typed `syscall` stubs for the whole v0
 //! ABI, and a userland panic handler. A server crate links this, defines
 //! `oxbow_main() -> !`, and gets a working ring-3 runtime. See docs/abi-v0.md.
+//!
+//! It also provides the userland conveniences that make oxbow programs feel like
+//! ordinary code: a heap (so `alloc` — `Vec`, `String`, `format!` — works), and
+//! `print!`/`println!` to the program's stdout. See `heap` + `io` below + §17.
 #![no_std]
+
+extern crate alloc;
 
 use core::panic::PanicInfo;
 
@@ -11,11 +17,201 @@ use core::panic::PanicInfo;
 pub use oxbow_abi as abi;
 
 use oxbow_abi::{
-    Handle, MsgBuf, SysError, SysResult, BOOT_CONSOLE, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE,
-    SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK,
-    SYS_IRQ_BIND, SYS_MAP, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT, SYS_RECV, SYS_REPLY,
-    SYS_SEND, SYS_EP_CREATE, SYS_MINT, SYS_SPAWN,
+    Handle, MsgBuf, SysError, SysResult, BOOT_CONSOLE, BOOT_MEM, PROT_READ, PROT_WRITE,
+    SPAWN_STDOUT, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC,
+    SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND, SYS_MAP, SYS_NOTIF_CREATE,
+    SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT, SYS_RECV, SYS_REPLY, SYS_SEND, SYS_EP_CREATE, SYS_MINT,
+    SYS_SPAWN, TAG_TTY_WRITE,
 };
+
+// --- Heap (so `alloc` works) ----------------------------------------------
+// A bump allocator that lazily grows by `sys_map`ing pages from the program's
+// Memory budget (BOOT_MEM) on demand — programs that never allocate pay nothing.
+// `dealloc` is a no-op: spawned programs are short-lived, and the whole address
+// space (heap included) is reclaimed on exit, so a bump heap is exactly right.
+mod heap {
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    const HEAP_BASE: usize = 0x3000_0000;
+    const HEAP_LIMIT: usize = 0x3040_0000; // 4 MiB ceiling
+
+    pub struct Bump {
+        next: AtomicUsize,       // 0 until first use, then the bump pointer
+        mapped_end: AtomicUsize, // highest vaddr currently mapped
+    }
+
+    #[global_allocator]
+    static HEAP: Bump = Bump {
+        next: AtomicUsize::new(0),
+        mapped_end: AtomicUsize::new(0),
+    };
+
+    unsafe impl GlobalAlloc for Bump {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // Single-threaded program: Relaxed ordering is sufficient.
+            let mut next = self.next.load(Ordering::Relaxed);
+            if next == 0 {
+                next = HEAP_BASE;
+                self.mapped_end.store(HEAP_BASE, Ordering::Relaxed);
+            }
+            let align = layout.align().max(1);
+            let start = (next + align - 1) & !(align - 1);
+            let end = match start.checked_add(layout.size()) {
+                Some(e) if e <= HEAP_LIMIT => e,
+                _ => return core::ptr::null_mut(),
+            };
+            let mut mend = self.mapped_end.load(Ordering::Relaxed);
+            if end > mend {
+                let need = (end - mend + 0xfff) & !0xfff; // round up to whole pages
+                let r = crate::sys_map(
+                    super::BOOT_MEM,
+                    mend as u64,
+                    need as u64,
+                    super::PROT_READ | super::PROT_WRITE,
+                );
+                if r.is_err() {
+                    return core::ptr::null_mut();
+                }
+                mend += need;
+                self.mapped_end.store(mend, Ordering::Relaxed);
+            }
+            self.next.store(end, Ordering::Relaxed);
+            start as *mut u8
+        }
+        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+    }
+}
+
+// --- stdout: print!/println! ----------------------------------------------
+// A program's stdout is a tty endpoint at SPAWN_STDOUT (granted by its spawner).
+// `Stdout` implements `core::fmt::Write` over it, so `format_args!` and the
+// `print!`/`println!` macros below Just Work — no manual MsgBuf packing.
+
+/// Write raw bytes to stdout (the granted tty endpoint), chunked into the tty's
+/// <=63-byte TAG_TTY_WRITE messages.
+pub fn stdout_write(bytes: &[u8]) {
+    let mut off = 0;
+    while off < bytes.len() {
+        let n = core::cmp::min(63, bytes.len() - off);
+        let mut m = MsgBuf::new(TAG_TTY_WRITE);
+        let dst = m.data.as_mut_ptr() as *mut u8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes[off..].as_ptr(), dst, n);
+            *dst.add(n) = 0;
+        }
+        m.data_len = ((n + 1 + 7) / 8) as u32;
+        let _ = sys_send(SPAWN_STDOUT, &m);
+        off += n;
+    }
+}
+
+/// The stdout sink for `core::fmt`.
+pub struct Stdout;
+impl core::fmt::Write for Stdout {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        stdout_write(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// Backs `print!`/`println!`.
+pub fn _print(args: core::fmt::Arguments) {
+    use core::fmt::Write;
+    let _ = Stdout.write_fmt(args);
+}
+
+/// Print to stdout (no newline).
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => ($crate::_print(format_args!($($arg)*)));
+}
+
+/// Print to stdout with a trailing newline.
+#[macro_export]
+macro_rules! println {
+    () => ($crate::_print(format_args!("\n")));
+    ($($arg:tt)*) => ($crate::_print(format_args!("{}\n", format_args!($($arg)*))));
+}
+
+// --- File API -------------------------------------------------------------
+/// A small client for the fs protocol (§15), the ergonomic half of the "libc":
+/// open a path relative to a directory capability, read a whole file into a
+/// `Vec`, or iterate a directory.
+pub mod fs {
+    use crate::{sys_call, Handle};
+    use alloc::vec::Vec;
+    use oxbow_abi::{MsgBuf, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR};
+
+    /// A node returned by `open`: its capability, kind (`FS_FILE`/`FS_DIR`), size.
+    pub struct Node {
+        pub cap: Handle,
+        pub kind: u64,
+        pub size: usize,
+    }
+
+    fn pack(m: &mut MsgBuf, path: &[u8]) {
+        let n = core::cmp::min(path.len(), 56);
+        let dst = m.data.as_mut_ptr() as *mut u8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(path.as_ptr(), dst, n);
+            *dst.add(n) = 0;
+        }
+        m.data_len = ((n + 1 + 7) / 8) as u32;
+    }
+
+    /// Open `path` (may be multi-component) relative to directory cap `dir`.
+    pub fn open(dir: Handle, path: &[u8]) -> Option<Node> {
+        let mut m = MsgBuf::new(TAG_FS_OPEN);
+        pack(&mut m, path);
+        if sys_call(dir, &mut m).is_err() || m.data[0] != 0 {
+            return None;
+        }
+        Some(Node {
+            cap: m.handles[0],
+            kind: m.data[1],
+            size: m.data[2] as usize,
+        })
+    }
+
+    /// Read an entire file capability into a `Vec`.
+    pub fn read_all(file: Handle) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut off = 0u64;
+        loop {
+            let mut m = MsgBuf::new(TAG_FS_READ);
+            m.data[0] = off;
+            m.data_len = 1;
+            if sys_call(file, &mut m).is_err() {
+                break;
+            }
+            let count = m.data[0] as usize;
+            if count == 0 {
+                break;
+            }
+            let bytes =
+                unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), count) };
+            out.extend_from_slice(bytes);
+            off += count as u64;
+        }
+        out
+    }
+
+    /// Read the directory entry at `cursor` (name, kind), or `None` at the end.
+    pub fn readdir(dir: Handle, cursor: u64) -> Option<(Vec<u8>, u64)> {
+        let mut m = MsgBuf::new(TAG_FS_READDIR);
+        m.data[0] = cursor;
+        m.data_len = 1;
+        if sys_call(dir, &mut m).is_err() || m.data[0] == 0 {
+            return None;
+        }
+        let kind = m.data[1];
+        let bytes =
+            unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(16), 48) };
+        let n = bytes.iter().position(|&b| b == 0).unwrap_or(0);
+        Some((bytes[..n].to_vec(), kind))
+    }
+}
 
 // --- The server provides this; _start calls it ---------------------------
 extern "C" {

@@ -770,3 +770,33 @@ escape above the directory capability it was invoked through (confinement is
 preserved). Empty components (leading/trailing/double `/`) are tolerated. The
 shell gains `ls <path>` (opens the directory, hands its cap to a spawned `ls`);
 `cat`/`cd`/`echo >`/`mkdir`/`touch`/`rm`/`mv` already pass the path through.
+
+---
+
+## 17. Userland runtime ("libc") (v1-libc)
+
+`oxbow-rt` grew from raw syscall stubs into a small libc, so programs read like
+ordinary Rust instead of hand-packing MsgBufs.
+
+### 17.1 Heap (`alloc`)
+A bump allocator backed by the program's Memory budget, registered as the global
+allocator — so `extern crate alloc` works (`Vec`, `String`, `Box`, `format!`).
+It maps pages **lazily** from `BOOT_MEM` on first allocation (a program that never
+allocates pays nothing) and grows page-by-page up to a 4 MiB ceiling. `dealloc`
+is a no-op: spawned programs are short-lived and the whole address space is
+reclaimed on exit (§16), so a bump heap is exactly right.
+
+### 17.2 stdout: `print!` / `println!`
+A `Stdout` sink implements `core::fmt::Write` over the program's stdout endpoint
+(`SPAWN_STDOUT`, chunked into TAG_TTY_WRITE messages), backing `print!`/`println!`
+— so `println!("squares {:?}", v)` Just Works.
+
+### 17.3 File API (`rt::fs`)
+A thin client for the fs protocol (§15): `open(dir, path) -> Node {cap, kind,
+size}`, `read_all(file) -> Vec<u8>`, `readdir(dir, cursor) -> Option<(name,
+kind)>`. The coreutils are rewritten against it — `cat` is `read_all` +
+`stdout_write`; `ls` is a `readdir` loop with `println!`.
+
+### 17.4 Deferred
+A buffered/line-disciplined stdin, real `errno`, a heap free-list (the bump heap
+suffices for short-lived programs), `mmap`/`sbrk`-style growth controls.

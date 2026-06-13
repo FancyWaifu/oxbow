@@ -1,44 +1,17 @@
-//! cat — a spawnable coreutil. It holds NO filesystem authority of its own: the
-//! shell resolves the name, opens the file, and grants the resulting file
-//! capability at slot 1 (BOOT_EP). cat just READs that one capability and writes
-//! the bytes to its stdout (a tty endpoint at slot 2). Least privilege in the
-//! flesh — cat can touch exactly one file, read-only, and nothing else.
+//! cat — written against the oxbow-rt "libc". The shell resolves the name and
+//! hands cat the FILE capability at BOOT_EP (slot 1); cat reads the whole file
+//! into a Vec and writes it to stdout. Compare the old hand-packed READ loop.
 #![no_std]
 #![no_main]
 
-use oxbow_abi::{MsgBuf, BOOT_EP, SPAWN_STDOUT, TAG_FS_READ, TAG_TTY_WRITE};
-use oxbow_rt as rt;
+extern crate alloc;
 
-/// Write a short (<63 byte) chunk to stdout (the granted tty endpoint).
-fn tw(s: &[u8]) {
-    let mut m = MsgBuf::new(TAG_TTY_WRITE);
-    let n = core::cmp::min(s.len(), 63);
-    let dst = m.data.as_mut_ptr() as *mut u8;
-    unsafe {
-        core::ptr::copy_nonoverlapping(s.as_ptr(), dst, n);
-        *dst.add(n) = 0;
-    }
-    m.data_len = ((n + 1 + 7) / 8) as u32;
-    let _ = rt::sys_send(SPAWN_STDOUT, &m);
-}
+use oxbow_abi::BOOT_EP;
+use oxbow_rt as rt;
 
 #[no_mangle]
 pub extern "C" fn oxbow_main() -> ! {
-    let mut off = 0u64;
-    loop {
-        let mut m = MsgBuf::new(TAG_FS_READ);
-        m.data[0] = off;
-        m.data_len = 1;
-        if rt::sys_call(BOOT_EP, &mut m).is_err() {
-            break;
-        }
-        let count = m.data[0] as usize;
-        if count == 0 {
-            break; // EOF
-        }
-        let bytes = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), count) };
-        tw(bytes);
-        off += count as u64;
-    }
+    let data = rt::fs::read_all(BOOT_EP);
+    rt::stdout_write(&data);
     rt::sys_exit(0)
 }

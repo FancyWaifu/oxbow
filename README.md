@@ -195,10 +195,19 @@ permanently consumed budget) — now a shell can spawn and reap commands
 indefinitely (verified by 70 back-to-back cycles with no exhaustion). See
 `docs/abi-v0.md` §16.
 
+**v1 arc 19 — a userland runtime ("libc"): complete.** `oxbow-rt` grew from raw
+syscall stubs into a small libc, so programs read like ordinary Rust. A bump
+**heap** backed by the program's Memory budget (mapped lazily, no-op `dealloc`
+since the address space is reclaimed on exit) makes `alloc` work — `Vec`,
+`String`, `format!`. `print!`/`println!` write to the program's stdout. A file
+API (`rt::fs::open`/`read_all`/`readdir`) wraps the fs protocol. The coreutils
+were rewritten against it — `cat` is `read_all` + `stdout_write`, `ls` a
+`readdir` loop with `println!`, `hello` uses `Vec`/`format!`. See §17.
+
 ### Next — toward a fuller userspace
 
-File growth/realloc → multi-component path walk + cross-directory `mv` →
-Frame-object refcounting → a real **argv vector** → a **libc/POSIX shim**. POSIX and the Unix feel live in *userspace*
+File growth/realloc → a real **argv vector** → buffered **stdin** + a `read`
+builtin → pipes (`a | b`) → richer coreutils. The substrate is now a real libc. POSIX and the Unix feel live in *userspace*
 over the capability kernel (the Redox model) — the kernel stays capability-pure.
 Plus, eventually: frame reclamation + budget refund, the orphaned selftest rework,
 untyped/retype + `sys_unmap`, SMP, and the `aarch64` port.
