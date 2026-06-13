@@ -20,7 +20,7 @@
 use oxbow_abi::{
     MsgBuf, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, FS_DIR, FS_FILE, FS_INITRD, PROT_READ, PROT_WRITE,
     R_GRANT, R_SEND, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR,
-    TAG_FS_WRITE,
+    TAG_FS_RENAME, TAG_FS_UNLINK, TAG_FS_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -361,6 +361,85 @@ pub extern "C" fn oxbow_main() -> ! {
                     false
                 };
                 r.data[0] = if ok { 0 } else { 1 };
+                r.data_len = 1;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            TAG_FS_UNLINK => {
+                // Remove a file, or an EMPTY directory, under the dir.
+                let bytes = unsafe { core::slice::from_raw_parts(m.data.as_ptr() as *const u8, 64) };
+                let nlen = bytes.iter().position(|&b| b == 0).unwrap_or(0);
+                let name = &bytes[..nlen];
+                let mut r = MsgBuf::new(0);
+                let status = if valid && nodes[node_id].kind == FS_DIR && name_ok(name) {
+                    match (1..MAX_NODES).find(|&i| {
+                        let nd = &nodes[i];
+                        nd.kind != 0 && nd.parent as usize == node_id && &nd.name[..nd.name_len] == name
+                    }) {
+                        Some(i) => {
+                            if nodes[i].kind == FS_DIR {
+                                let has_children = (1..MAX_NODES)
+                                    .any(|j| nodes[j].kind != 0 && nodes[j].parent as usize == i);
+                                if has_children {
+                                    2 // directory not empty
+                                } else {
+                                    nodes[i].kind = 0;
+                                    0
+                                }
+                            } else {
+                                // file: free the node slot (arena bytes leak — v1)
+                                nodes[i].kind = 0;
+                                0
+                            }
+                        }
+                        None => 1, // not found
+                    }
+                } else {
+                    1
+                };
+                r.data[0] = status;
+                r.data_len = 1;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            TAG_FS_RENAME => {
+                // data = old name NUL, then new name NUL.
+                let bytes = unsafe { core::slice::from_raw_parts(m.data.as_ptr() as *const u8, 64) };
+                let oldlen = bytes.iter().position(|&b| b == 0).unwrap_or(0);
+                let old = &bytes[..oldlen];
+                let nstart = oldlen + 1;
+                let new = if nstart < 64 {
+                    let rest = &bytes[nstart..];
+                    let nl = rest.iter().position(|&b| b == 0).unwrap_or(0);
+                    &rest[..nl]
+                } else {
+                    &bytes[0..0]
+                };
+                let mut r = MsgBuf::new(0);
+                let status = if valid
+                    && nodes[node_id].kind == FS_DIR
+                    && name_ok(old)
+                    && name_ok(new)
+                    && !(1..MAX_NODES).any(|i| {
+                        let nd = &nodes[i];
+                        nd.kind != 0 && nd.parent as usize == node_id && &nd.name[..nd.name_len] == new
+                    }) {
+                    match (1..MAX_NODES).find(|&i| {
+                        let nd = &nodes[i];
+                        nd.kind != 0 && nd.parent as usize == node_id && &nd.name[..nd.name_len] == old
+                    }) {
+                        Some(i) => {
+                            let mut nb = [0u8; 24];
+                            let k = core::cmp::min(new.len(), 24);
+                            nb[..k].copy_from_slice(&new[..k]);
+                            nodes[i].name = nb;
+                            nodes[i].name_len = k;
+                            0
+                        }
+                        None => 1,
+                    }
+                } else {
+                    1
+                };
+                r.data[0] = status;
                 r.data_len = 1;
                 let _ = rt::sys_reply(reply, &r);
             }

@@ -178,10 +178,18 @@ deliberate: read commands (`cat`/`ls`) take a *capability* the shell pre-resolve
 argv plus the directory cap. argv names a target *within* authority already
 granted — it never widens it. See `docs/abi-v0.md` §13.7.
 
+**v1 arc 15 — rm and mv: complete.** The first *destructive* filesystem
+operations. `rm <name>` (UNLINK) removes a file or an empty directory; `mv <old>
+<new>` (RENAME) renames a child within the current directory. Both are spawned
+coreutils holding the cwd capability + a name via argv, so confinement applies to
+destruction too — `rm`/`mv` can only affect children of the directory they were
+handed, never anything above it. See `docs/abi-v0.md` §15.9.
+
 ### Next — toward a fuller userspace
 
-A real **argv vector** (multiple arguments) → file growth/realloc +
-multi-component path walk → `rm`/`mv` + an unlink FS op → a **libc/POSIX shim**. POSIX and the Unix feel live in *userspace*
+File growth/realloc + arena reclamation (deleted-file bytes currently leak) →
+multi-component path walk + cross-directory `mv` → a real **argv vector** →
+a **libc/POSIX shim**. POSIX and the Unix feel live in *userspace*
 over the capability kernel (the Redox model) — the kernel stays capability-pure.
 Plus, eventually: frame reclamation + budget refund, the orphaned selftest rework,
 untyped/retype + `sys_unmap`, SMP, and the `aarch64` port.

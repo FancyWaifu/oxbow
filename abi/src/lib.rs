@@ -236,6 +236,8 @@ pub const BOOT_IMG_CAT: Handle = 13; // spawned coreutil: cat (gets a file cap)
 pub const BOOT_IMG_LS: Handle = 14; // spawned coreutil: ls (gets a dir cap)
 pub const BOOT_IMG_MKDIR: Handle = 15; // spawned coreutil: mkdir (dir cap + argv)
 pub const BOOT_IMG_TOUCH: Handle = 16; // spawned coreutil: touch (dir cap + argv)
+pub const BOOT_IMG_RM: Handle = 17; // spawned coreutil: rm (dir cap + argv)
+pub const BOOT_IMG_MV: Handle = 18; // spawned coreutil: mv (dir cap + argv)
 
 // --- Filesystem (§15) ------------------------------------------------------
 /// The shell's root-directory capability: a BADGED endpoint to the fs server,
@@ -268,6 +270,12 @@ pub const TAG_FS_CREATE: u64 = u32::from_le_bytes(*b"FSCR") as u64;
 pub const TAG_FS_WRITE: u64 = u32::from_le_bytes(*b"FSWR") as u64;
 /// MKDIR(dir): `data` = name. Reply: `data[0]` = status (0 ok / 1 fail).
 pub const TAG_FS_MKDIR: u64 = u32::from_le_bytes(*b"FSMD") as u64;
+/// UNLINK(dir): `data` = name. Removes a file or empty directory. Reply:
+/// `data[0]` = status (0 ok / 1 not-found / 2 directory-not-empty).
+pub const TAG_FS_UNLINK: u64 = u32::from_le_bytes(*b"FSRM") as u64;
+/// RENAME(dir): `data` = old name NUL then new name NUL. Renames a child within
+/// the directory. Reply: `data[0]` = status (0 ok / 1 fail).
+pub const TAG_FS_RENAME: u64 = u32::from_le_bytes(*b"FSMV") as u64;
 
 /// `sys_spawn` grant convention: the handles in the spawn MsgBuf land in the
 /// child's table at these slots, in order (HANDLE_NULL entries are skipped).

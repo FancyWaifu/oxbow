@@ -8,9 +8,9 @@
 
 use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA,
-    BOOT_IMG_CAT, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_MKDIR, BOOT_IMG_PONG, BOOT_IMG_TOUCH,
-    BOOT_MEM, BOOT_TICK, BOOT_TTY, HANDLE_NULL, R_GRANT, R_RECV, R_SEND, R_WAIT, R_WRITE,
-    TAG_FS_CREATE, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
+    BOOT_IMG_CAT, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_MKDIR, BOOT_IMG_MV, BOOT_IMG_PONG,
+    BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_TICK, BOOT_TTY, HANDLE_NULL, R_GRANT, R_RECV,
+    R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -368,6 +368,8 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
         b"cat" => cat_cmd(*cwd, rest, sp),
         b"mkdir" => spawn_with(BOOT_IMG_MKDIR, *cwd, rest, sp),
         b"touch" => spawn_with(BOOT_IMG_TOUCH, *cwd, rest, sp),
+        b"rm" => spawn_with(BOOT_IMG_RM, *cwd, rest, sp),
+        b"mv" => spawn_with(BOOT_IMG_MV, *cwd, rest, sp),
         b"cd" => cd(rest, cwd),
         b"badgetest" => badgetest(sp),
         b"help" => {
@@ -377,6 +379,8 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
             tw(b"  cat <file>      print a file\n");
             tw(b"  mkdir <name>    make a directory\n");
             tw(b"  touch <name>    make an empty file\n");
+            tw(b"  rm <name>       remove a file or empty dir\n");
+            tw(b"  mv <old> <new>  rename within the directory\n");
             tw(b"  cd <dir> | /    change directory (builtin)\n");
             tw(b"  run hello/pong  spawn a demo program\n");
             tw(b"  badgetest       exercise badged-endpoint mint rules\n");

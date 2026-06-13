@@ -687,3 +687,24 @@ authority, only to name a target within authority already granted.
 
 (Deferred: multiple arguments / a real argv vector; argument parsing beyond a
 single token.)
+
+### 15.9 Remove and rename (v1-rm-mv)
+The first destructive filesystem operations, both spawned coreutils granted the
+current-directory capability + a name via argv (§13.7):
+
+- **`TAG_FS_UNLINK`** (`rm <name>`, dir cap): removes a file, or an *empty*
+  directory. Reply `data[0]` = status (0 ok / 1 not-found / 2 directory-not-empty).
+  Non-empty directories are refused (no `-r`).
+- **`TAG_FS_RENAME`** (`mv <old> <new>`, dir cap): `data` = old name NUL then new
+  name NUL; renames a child within the directory if `new` is free. `mv` splits
+  its single argv string into the two names. Reply `data[0]` = status.
+
+Both operate only on the children of the directory capability they hold —
+confinement applies to destructive ops too: `rm`/`mv` cannot touch anything
+outside the directory the shell handed them, and cannot escape via `..`.
+
+Limitation: `rm` frees the file's node slot but NOT its arena bytes (the storage
+arena is a bump allocator with no free), so deleted-file storage leaks until a
+future arena free-list / compaction arc — the same deferred-reclaim story as the
+frame allocator and Memory budgets. Cross-directory `mv` (two dir caps) is also
+deferred.
