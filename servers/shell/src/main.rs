@@ -9,7 +9,8 @@
 use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA,
     BOOT_IMG_HELLO, BOOT_IMG_PONG, BOOT_MEM, BOOT_TICK, BOOT_TTY, HANDLE_NULL, R_GRANT, R_RECV,
-    R_SEND, R_WAIT, R_WRITE, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_TTY_READ, TAG_TTY_WRITE,
+    R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR,
+    TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -199,34 +200,21 @@ fn badgetest(sp: &Spawner) {
     let _ = rt::sys_close(b42);
 }
 
-/// `ls`: list the root directory by looping READDIR through the root-dir cap.
-fn ls() {
-    let mut i = 0u64;
-    loop {
-        let mut m = MsgBuf::new(TAG_FS_READDIR);
-        m.data[0] = i;
-        m.data_len = 1;
-        if rt::sys_call(BOOT_FS_ROOT, &mut m).is_err() || m.data[0] == 0 {
-            break;
-        }
-        // name is in data[2..] (byte offset 16)
-        let bytes = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(16), 48) };
-        let n = bytes.iter().position(|&b| b == 0).unwrap_or(0);
-        tw(&bytes[..n]);
-        tw(b"\n");
-        i += 1;
+/// Strip leading and trailing spaces.
+fn trim(s: &[u8]) -> &[u8] {
+    let mut a = 0;
+    let mut b = s.len();
+    while a < b && s[a] == b' ' {
+        a += 1;
     }
+    while b > a && s[b - 1] == b' ' {
+        b -= 1;
+    }
+    &s[a..b]
 }
 
-/// `cat <name>`: OPEN the file relative to root, then loop READ through the file
-/// capability the server minted, printing chunks until EOF.
-fn cat(name: &[u8]) {
-    if name.is_empty() {
-        tw(b"cat: usage: cat <file>\n");
-        return;
-    }
-    // OPEN: pack the name into the request data.
-    let mut m = MsgBuf::new(TAG_FS_OPEN);
+/// Pack a NUL-terminated name into a request MsgBuf's data.
+fn pack_name(m: &mut MsgBuf, name: &[u8]) {
     let n = core::cmp::min(name.len(), 56);
     let dst = m.data.as_mut_ptr() as *mut u8;
     unsafe {
@@ -234,7 +222,135 @@ fn cat(name: &[u8]) {
         *dst.add(n) = 0;
     }
     m.data_len = ((n + 1 + 7) / 8) as u32;
-    if rt::sys_call(BOOT_FS_ROOT, &mut m).is_err() || m.data[0] != 0 {
+}
+
+/// WRITE `bytes` to the file `cap` starting at `start`, looping in <=48-byte
+/// chunks. Returns the next write offset.
+fn write_chunks(cap: Handle, bytes: &[u8], start: u64) -> u64 {
+    let mut off = start;
+    let mut i = 0;
+    while i < bytes.len() {
+        let n = core::cmp::min(48, bytes.len() - i);
+        let mut wm = MsgBuf::new(TAG_FS_WRITE);
+        wm.data[0] = off;
+        wm.data[1] = n as u64;
+        let dst = wm.data.as_mut_ptr() as *mut u8;
+        unsafe { core::ptr::copy_nonoverlapping(bytes[i..].as_ptr(), dst.add(16), n) };
+        wm.data_len = 8;
+        if rt::sys_call(cap, &mut wm).is_err() {
+            break;
+        }
+        let wrote = wm.data[0] as usize;
+        if wrote == 0 {
+            break; // out of space
+        }
+        off += wrote as u64;
+        i += wrote;
+    }
+    off
+}
+
+/// `echo TEXT > FILE`: CREATE-or-truncate the file (relative to `dir`), write
+/// TEXT + newline.
+fn write_file(dir: Handle, name: &[u8], text: &[u8]) {
+    if name.is_empty() {
+        tw(b"sh: redirect needs a file name\n");
+        return;
+    }
+    let mut m = MsgBuf::new(TAG_FS_CREATE);
+    pack_name(&mut m, name);
+    if rt::sys_call(dir, &mut m).is_err() || m.data[0] != 0 {
+        tw(b"sh: cannot create ");
+        tw(name);
+        tw(b"\n");
+        return;
+    }
+    let cap = m.handles[0];
+    let off = write_chunks(cap, text, 0);
+    let _ = write_chunks(cap, b"\n", off);
+    let _ = rt::sys_close(cap);
+}
+
+/// `mkdir <name>`: make a subdirectory under `dir`.
+fn mkdir(dir: Handle, name: &[u8]) {
+    if name.is_empty() {
+        tw(b"mkdir: usage: mkdir <name>\n");
+        return;
+    }
+    let mut m = MsgBuf::new(TAG_FS_MKDIR);
+    pack_name(&mut m, name);
+    if rt::sys_call(dir, &mut m).is_err() || m.data[0] != 0 {
+        tw(b"mkdir: cannot create ");
+        tw(name);
+        tw(b"\n");
+    }
+}
+
+/// `cd <name>` / `cd /`: change the current-directory capability. `cd` with no
+/// arg (or `/`) returns to the root; `cd <name>` opens a subdir relative to the
+/// current one. Confinement: there is no `cd ..` — you can't walk above a dir cap
+/// you hold; `cd /` works only because the shell still holds the root cap.
+fn cd(name: &[u8], cwd: &mut Handle) {
+    if name.is_empty() || name == b"/" {
+        if *cwd != BOOT_FS_ROOT {
+            let _ = rt::sys_close(*cwd);
+        }
+        *cwd = BOOT_FS_ROOT;
+        return;
+    }
+    let mut m = MsgBuf::new(TAG_FS_OPEN);
+    pack_name(&mut m, name);
+    if rt::sys_call(*cwd, &mut m).is_err() || m.data[0] != 0 {
+        tw(b"cd: ");
+        tw(name);
+        tw(b": no such directory\n");
+        return;
+    }
+    let cap = m.handles[0];
+    if m.data[1] != oxbow_abi::FS_DIR {
+        tw(b"cd: ");
+        tw(name);
+        tw(b": not a directory\n");
+        let _ = rt::sys_close(cap);
+        return;
+    }
+    if *cwd != BOOT_FS_ROOT {
+        let _ = rt::sys_close(*cwd);
+    }
+    *cwd = cap;
+}
+
+/// `ls`: list `dir` by looping READDIR through its capability.
+fn ls(dir: Handle) {
+    let mut i = 0u64;
+    loop {
+        let mut m = MsgBuf::new(TAG_FS_READDIR);
+        m.data[0] = i;
+        m.data_len = 1;
+        if rt::sys_call(dir, &mut m).is_err() || m.data[0] == 0 {
+            break;
+        }
+        let bytes = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(16), 48) };
+        let n = bytes.iter().position(|&b| b == 0).unwrap_or(0);
+        tw(&bytes[..n]);
+        if m.data[1] == oxbow_abi::FS_DIR {
+            tw(b"/"); // mark directories
+        }
+        tw(b"\n");
+        i += 1;
+    }
+}
+
+/// `cat <name>`: OPEN the file relative to `dir`, then loop READ through the file
+/// capability the server minted, printing chunks until EOF.
+fn cat(dir: Handle, name: &[u8]) {
+    if name.is_empty() {
+        tw(b"cat: usage: cat <file>\n");
+        return;
+    }
+    let mut m = MsgBuf::new(TAG_FS_OPEN);
+    pack_name(&mut m, name);
+    if rt::sys_call(dir, &mut m).is_err() || m.data[0] != 0 {
         tw(b"cat: ");
         tw(name);
         tw(b": not found\n");
@@ -260,7 +376,19 @@ fn cat(name: &[u8]) {
     let _ = rt::sys_close(file_cap);
 }
 
-fn run(line: &[u8], sp: &Spawner) {
+fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
+    // Output redirect: `echo TEXT > FILE` writes TEXT to the file instead of the
+    // tty (the first taste of the Unix shell feel).
+    if let Some(gt) = line.iter().position(|&b| b == b'>') {
+        let (cmd, text) = split_cmd(trim(&line[..gt]));
+        let (file, _) = split_cmd(trim(&line[gt + 1..]));
+        if cmd == b"echo" {
+            write_file(*cwd, file, text);
+        } else {
+            tw(b"sh: only 'echo ... > file' redirect is supported\n");
+        }
+        return;
+    }
     let (cmd, rest) = split_cmd(line);
     match cmd {
         b"" => {}
@@ -277,14 +405,18 @@ fn run(line: &[u8], sp: &Spawner) {
                 _ => tw(b"run: no such program\n"),
             }
         }
-        b"ls" => ls(),
-        b"cat" => cat(rest),
+        b"ls" => ls(*cwd),
+        b"cat" => cat(*cwd, rest),
+        b"mkdir" => mkdir(*cwd, rest),
+        b"cd" => cd(rest, cwd),
         b"badgetest" => badgetest(sp),
         b"help" => {
             tw(b"oxbow shell builtins:\n");
-            tw(b"  echo <text>     print text\n");
-            tw(b"  ls              list the filesystem root\n");
+            tw(b"  echo <text>     print text (echo .. > f redirects to a file)\n");
+            tw(b"  ls              list the current directory\n");
             tw(b"  cat <file>      print a file\n");
+            tw(b"  mkdir <name>    make a directory\n");
+            tw(b"  cd <dir> | /    change directory\n");
             tw(b"  run hello       spawn the hello program\n");
             tw(b"  run pong        spawn the pong<->beta IPC demo\n");
             tw(b"  badgetest       exercise badged-endpoint mint rules\n");
@@ -317,10 +449,12 @@ pub extern "C" fn oxbow_main() -> ! {
         exit: rt::sys_notif_create().unwrap_or(HANDLE_NULL),
         ep: rt::sys_ep_create().unwrap_or(HANDLE_NULL),
     };
+    // The current-directory capability (starts at the filesystem root).
+    let mut cwd: Handle = BOOT_FS_ROOT;
     let mut line = [0u8; 64];
     loop {
         tw(PROMPT);
         let n = read_line(&mut line);
-        run(&line[..n], &sp);
+        run(&line[..n], &sp, &mut cwd);
     }
 }

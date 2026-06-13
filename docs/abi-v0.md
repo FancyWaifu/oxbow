@@ -615,3 +615,31 @@ Write (`WRITE`/`CREATE`/`MKDIR`, file growth from the fs Memory budget),
 subdirectory traversal / multi-component path walk, zero-copy frame transfer for
 bulk read/write, spawned coreutils (receiving an open-file cap), `STAT`, refcount
 on CLOSE, a real on-disk filesystem behind the same VFS interface.
+
+### 15.7 Write, directories, current-directory (v1-fs-write)
+The filesystem is now read-write. File bytes live in an **arena** the fs server
+`sys_map`s from its *own Memory budget* (law L6 — even the filesystem funds its
+storage from a capability it holds); the seed tar files are copied in at boot, so
+every file is uniformly writable. Each file node is `{arena offset, len, cap}`
+with a fixed per-file capacity (1 KiB in v1; growth/realloc deferred).
+
+New protocol ops (tag-multiplexed on the fs endpoint, dispatch on `m.badge`):
+- **`TAG_FS_CREATE`** (call through a dir cap): `data` = name. Create-or-truncate
+  a file under the directory; reply `data[0]` = status, `handles[0]` = a badged
+  cap to the file. `>` redirect uses this.
+- **`TAG_FS_WRITE`** (call through a file cap): `data[0]` = offset, `data[1]` =
+  count, `data[2..]` = up to 48 bytes. Reply `data[0]` = count written (0 = full).
+  Clients loop for longer writes.
+- **`TAG_FS_MKDIR`** (call through a dir cap): `data` = name → a child directory.
+
+The shell gains `echo TEXT > FILE` (CREATE + WRITE loop), `mkdir`, and `cd`. `cd`
+swaps the shell's **current-directory capability** (starts at root; `cd <name>`
+opens a subdir cap, `cd /` returns to root). There is no `cd ..` — you cannot
+walk above a directory capability you hold (confinement); `cd /` works only
+because the shell still holds the root cap. Files created in a subdirectory are
+not resolvable from a parent's cap, so the capability tree *is* the access-control
+boundary.
+
+§15.6's deferred list still stands minus write/mkdir/cd, which are now done; file
+growth/realloc, multi-component path walk, zero-copy frame bulk transfer, spawned
+coreutils, rm/unlink, and an on-disk FS remain deferred.

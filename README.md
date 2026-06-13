@@ -149,13 +149,22 @@ The tree is seeded from a **USTAR tar initrd** mapped read-only into the fs
 address space at boot; file content points straight into the mapped archive
 (zero-copy). See `docs/abi-v0.md` §15.
 
+**v1 arc 12 — a read-write filesystem: complete.** `echo TEXT > file`, `mkdir`,
+and `cd` from the shell. File bytes live in an arena the fs server `sys_map`s from
+its *own Memory budget* (even the filesystem funds its storage from a capability —
+law L6); seed files are copied in so every file is writable. New ops `CREATE`,
+`WRITE`, `MKDIR`. The shell tracks a **current-directory capability**: `cd <dir>`
+opens a subdir cap, `cd /` returns to root — and there is no `cd ..` (you can't
+walk above a directory cap you hold; the capability tree *is* the access boundary,
+so a subdir's files are invisible from its parent). See `docs/abi-v0.md` §15.7.
+
 ### Next — toward a fuller userspace
 
-**Write** (`echo >`, `mkdir`, file growth from the fs budget) and **subdirectory
-walk** → spawned **coreutils** (each receiving an open-file capability) → a
-**libc/POSIX shim**. POSIX and the Unix feel live in *userspace* over the
-capability kernel (the Redox model) — the kernel stays capability-pure. Plus,
-eventually: frame reclamation + budget refund, the orphaned selftest rework,
+Spawned **coreutils** (each receiving an open-file capability — the first real
+cap-passing between unrelated processes) → file growth/realloc + multi-component
+path walk → a **libc/POSIX shim**. POSIX and the Unix feel live in *userspace*
+over the capability kernel (the Redox model) — the kernel stays capability-pure.
+Plus, eventually: frame reclamation + budget refund, the orphaned selftest rework,
 untyped/retype + `sys_unmap`, SMP, and the `aarch64` port.
 
 ## Building & running

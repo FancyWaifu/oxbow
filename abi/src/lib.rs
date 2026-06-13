@@ -256,6 +256,14 @@ pub const TAG_FS_READ: u64 = u32::from_le_bytes(*b"FSRD") as u64;
 /// READDIR(dir): `data[0]` = cursor index. Reply: `data[0]` = 1 if an entry is
 /// present (else 0 = end), `data[1]` = kind, `data[2..]` = the entry name.
 pub const TAG_FS_READDIR: u64 = u32::from_le_bytes(*b"FSDR") as u64;
+/// CREATE(dir): `data` = name. Create-or-truncate a file. Reply: `data[0]` =
+/// status (0 ok / 1 fail), `handles[0]` = a badged capability to the file.
+pub const TAG_FS_CREATE: u64 = u32::from_le_bytes(*b"FSCR") as u64;
+/// WRITE(file): `data[0]` = offset, `data[1]` = count, `data[2..]` = up to 48
+/// bytes. Reply: `data[0]` = count actually written (0 = no space).
+pub const TAG_FS_WRITE: u64 = u32::from_le_bytes(*b"FSWR") as u64;
+/// MKDIR(dir): `data` = name. Reply: `data[0]` = status (0 ok / 1 fail).
+pub const TAG_FS_MKDIR: u64 = u32::from_le_bytes(*b"FSMD") as u64;
 
 /// `sys_spawn` grant convention: the handles in the spawn MsgBuf land in the
 /// child's table at these slots, in order (HANDLE_NULL entries are skipped).
