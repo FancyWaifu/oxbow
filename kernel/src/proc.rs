@@ -186,8 +186,10 @@ pub fn kill(id: usize) {
 
 /// Top of the user stack (exclusive). Canonical lower-half.
 const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
-/// 64 KiB stack.
-const USER_STACK_PAGES: u64 = 16;
+/// 512 KiB stack. The DRIFT crypto (curve25519 scalar mult + BLAKE2b) is very
+/// stack-hungry in a debug build (it overflowed 64 KiB), so give every process
+/// generous headroom — frames come from the pmm, not the process budget.
+const USER_STACK_PAGES: u64 = 128;
 
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;

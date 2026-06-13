@@ -35,6 +35,23 @@ struct KStack([u8; KSTACK_SIZE]);
 
 static mut KSTACKS: [KStack; MAX_THREADS] = [const { KStack([0; KSTACK_SIZE]) }; MAX_THREADS];
 
+/// Per-thread x87/SSE save area (FXSAVE layout), 16-byte aligned. A thread that
+/// uses SSE (the DRIFT crypto) keeps its XMM/MXCSR here across context switches.
+#[repr(align(16))]
+#[allow(dead_code)] // backing buffer; only its address is taken (fxsave/fxrstor)
+struct FxArea([u8; crate::arch::FXSAVE_SIZE]);
+
+static mut FX_AREAS: [FxArea; MAX_THREADS] =
+    [const { FxArea([0; crate::arch::FXSAVE_SIZE]) }; MAX_THREADS];
+/// A clean post-`fninit` save area, captured once at boot and copied into every
+/// thread's area at init and on slot reuse (so a fresh thread starts with valid,
+/// zeroed FPU state instead of whatever the previous occupant left).
+static mut FX_TEMPLATE: FxArea = FxArea([0; crate::arch::FXSAVE_SIZE]);
+
+fn fx_area_ptr(slot: usize) -> *mut u8 {
+    unsafe { addr_of_mut!(FX_AREAS[slot]) as *mut u8 }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Free,
@@ -109,6 +126,19 @@ pub fn process_of(tid: usize) -> usize {
 pub fn init() {
     set_state(IDLE, State::Running);
     unsafe { *addr_of_mut!(CURRENT) = IDLE };
+    // SSE was enabled + `fninit`'d in arch::init; snapshot that clean FPU state
+    // as the template and seed every thread's save area with it, so a thread's
+    // first FXRSTOR loads valid state rather than zeros.
+    unsafe {
+        crate::arch::fxsave(addr_of_mut!(FX_TEMPLATE) as *mut u8);
+        for s in 0..MAX_THREADS {
+            core::ptr::copy_nonoverlapping(
+                addr_of!(FX_TEMPLATE) as *const u8,
+                fx_area_ptr(s),
+                crate::arch::FXSAVE_SIZE,
+            );
+        }
+    }
 }
 
 /// Build a fake initial stack frame so the first switch into this thread
@@ -145,6 +175,12 @@ fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64) -> usize {
                     proc,
                     cr3,
                 };
+                // Fresh (or reused) slot: reset its FPU state to the clean template.
+                core::ptr::copy_nonoverlapping(
+                    addr_of!(FX_TEMPLATE) as *const u8,
+                    fx_area_ptr(slot),
+                    crate::arch::FXSAVE_SIZE,
+                );
             }
             return slot;
         }
@@ -193,6 +229,13 @@ fn switch_to(next: usize) {
     if next_cr3 != 0 && next_cr3 != crate::arch::current_cr3() {
         announce_first_cr3(proc_of(next));
         crate::arch::load_cr3(next_cr3);
+    }
+    // Swap FPU/SSE state: save the outgoing thread's XMM, load the incoming
+    // thread's. The kernel is soft-float and never touches XMM between here and
+    // the actual switch, so the incoming state survives into ring 3.
+    unsafe {
+        crate::arch::fxsave(fx_area_ptr(prev));
+        crate::arch::fxrstor(fx_area_ptr(next));
     }
     context_switch(ctx_slot(prev), ctx_rsp(next));
 }

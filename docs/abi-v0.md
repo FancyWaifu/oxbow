@@ -1114,3 +1114,43 @@ host, the ASUS router's web UI, and the public internet (1.1.1.1) through the
 router's NAT — all over the busy-polled smoltcp path. Per-connection socket buffers still leak into the
 bump heap (no free), so a real `dealloc`/slab is the natural follow-up; a
 shared-frame socket buffer would also lift the 48/56-byte inline payload cap.
+
+## 24. SSE / FPU support + DRIFT crypto (v1-sse)
+
+To run DRIFT — Bryson's encrypted, identity-based transport — oxbow needs its
+handshake crypto (X25519, BLAKE2b, ChaCha20-Poly1305). Those crates use SIMD that
+won't even *compile* for `x86_64-unknown-none`, which ships SSE disabled (so
+kernels can skip FPU-state management). `poly1305` has no soft path; the real fix
+is to give oxbow SSE.
+
+### 24.1 Enabling SSE (kernel)
+`arch::enable_sse()` (in `arch::init`): CR0 clears EM + sets MP; CR4 sets OSFXSR
++ OSXMMEXCPT; `fninit` brings the unit to a known state. The kernel stays
+soft-float (emits no SSE itself) — this only arms the hardware for ring 3.
+
+### 24.2 Per-thread FPU state (FXSAVE/FXRSTOR)
+Each TCB gets a 512-byte, 16-byte-aligned FXSAVE area. `switch_to` does
+`fxsave(prev)` / `fxrstor(next)` (raw `fxsave64`/`fxrstor64`, so the soft-float
+kernel needs no `fxsr` codegen feature) around the GPR context switch, so an
+SSE-using thread's XMM/MXCSR survive preemption. Areas are seeded at boot from a
+clean post-`fninit` template and reset on slot reuse. The kernel never touches
+XMM, so the incoming state survives the (XMM-free) switch into ring 3.
+
+### 24.3 Building SSE userland
+A program that uses SIMD crypto is built with `-C target-feature=-soft-float,
++sse,+sse2` (disabling soft-float is required — it contradicts +sse2) plus the
+non-SIMD `curve25519_dalek_backend="serial"`. Only such programs opt in; the
+kernel and the existing soft-float servers are unchanged. (Disabling soft-float
+via `-Ctarget-feature` is deprecated on current nightly — a custom target spec is
+the clean long-term home.)
+
+### 24.4 The `drift` program
+`servers/drift` (spawnable image, `BOOT_IMG_DRIFT`; shell builtin `drift`) is the
+start of the DRIFT client. This first cut is a crypto self-test proving the stack
+runs on oxbow: an X25519 Diffie-Hellman agreement, a BLAKE2b session-key
+derivation (the `drift-session-v2` shape), and a ChaCha20-Poly1305 round-trip —
+all green in ring 3. The user stack grew to 512 KiB (`USER_STACK_PAGES = 128`):
+debug-build curve25519 scalar multiplication overflowed 64 KiB.
+
+The DRIFT handshake (HELLO/HELLO_ACK) over the TCP socket capability API (§23),
+talking to a real bridge, is the next arc.

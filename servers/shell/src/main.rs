@@ -9,7 +9,7 @@
 use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA, BOOT_NET_EP,
     BOOT_IMG_CAT, BOOT_IMG_CP, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_MKDIR, BOOT_IMG_MV, BOOT_IMG_PONG,
-    BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_TICK, BOOT_TTY, HANDLE_NULL, R_GRANT, R_RECV,
+    BOOT_IMG_DRIFT, BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_TICK, BOOT_TTY, HANDLE_NULL, R_GRANT, R_RECV,
     R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
@@ -569,6 +569,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
         b"cd" => cd(rest, cwd),
         b"dns" => dns_cmd(rest),
         b"http" => http_cmd(rest),
+        b"drift" => spawn_with(BOOT_IMG_DRIFT, HANDLE_NULL, rest, sp),
         b"badgetest" => badgetest(sp),
         b"help" => {
             tw(b"oxbow shell:  (ls cat mkdir touch are spawned programs)\n");
@@ -583,6 +584,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
             tw(b"  cd <dir> | /    change directory (builtin)\n");
             tw(b"  dns <host>      resolve a hostname via the net UDP socket API\n");
             tw(b"  http <ip>       TCP GET / from <ip>:80 via the net socket API\n");
+            tw(b"  drift           DRIFT crypto self-test (X25519/ChaCha20, needs SSE)\n");
             tw(b"  run hello/pong  spawn a demo program\n");
             tw(b"  badgetest       exercise badged-endpoint mint rules\n");
             tw(b"  help            this list\n");

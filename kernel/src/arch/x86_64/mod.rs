@@ -11,7 +11,7 @@ pub mod syscall;
 use core::arch::asm;
 use core::sync::atomic::Ordering;
 
-pub use context::{context_switch, thread_trampoline};
+pub use context::{context_switch, fxrstor, fxsave, thread_trampoline, FXSAVE_SIZE};
 pub use serial::{write_bytes as console_write_bytes, _print};
 pub use syscall::enter_user;
 
@@ -56,6 +56,29 @@ pub fn init() {
     gdt::init();
     idt::init();
     syscall::init();
+    enable_sse();
+}
+
+/// Enable SSE so userland may run SIMD code (the crypto in the DRIFT client
+/// needs it — `x86_64-unknown-none` ships SSE-off so kernels can skip FPU-state
+/// management, but we opt back in and save/restore the state per thread).
+///
+/// CR0: clear EM (no x87 emulation) + set MP; CR4: set OSFXSR (FXSAVE/FXRSTOR +
+/// SSE enabled) + OSXMMEXCPT (SIMD float exceptions raise #XF, not #UD). Then
+/// `fninit` brings the x87/MMX/SSE unit to a known state. The kernel itself is
+/// built soft-float, so it emits no SSE — this only arms the hardware for ring 3.
+pub fn enable_sse() {
+    use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
+    unsafe {
+        let mut cr0 = Cr0::read();
+        cr0.remove(Cr0Flags::EMULATE_COPROCESSOR);
+        cr0.insert(Cr0Flags::MONITOR_COPROCESSOR);
+        Cr0::write(cr0);
+        let mut cr4 = Cr4::read();
+        cr4.insert(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE);
+        Cr4::write(cr4);
+        asm!("fninit", options(nostack, nomem));
+    }
 }
 
 /// Trigger a breakpoint exception — used once to prove the IDT entry/return path.

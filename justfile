@@ -36,6 +36,10 @@ build-server:
     RUSTFLAGS="-C relocation-model=static" cargo build -p rm
     RUSTFLAGS="-C relocation-model=static" cargo build -p mv
     RUSTFLAGS="-C relocation-model=static" cargo build -p cp
+    # drift speaks DRIFT's crypto (X25519/ChaCha20-Poly1305) — SIMD that needs
+    # hardware SSE. Build it with soft-float off + SSE on (the kernel enabled the
+    # FPU + does per-thread FXSAVE), and the non-SIMD curve25519 backend.
+    RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2 --cfg curve25519_dalek_backend="serial"' cargo build -p drift
 
 # Same, but with the ABI negative-path selftests compiled in.
 build-server-selftest:
@@ -74,6 +78,7 @@ _iso:
     cp target/x86_64-unknown-none/debug/rm iso_root/boot/rm.elf
     cp target/x86_64-unknown-none/debug/mv iso_root/boot/mv.elf
     cp target/x86_64-unknown-none/debug/cp iso_root/boot/cp.elf
+    cp target/x86_64-unknown-none/debug/drift iso_root/boot/drift.elf
     COPYFILE_DISABLE=1 tar --format=ustar -cf iso_root/boot/initrd.tar -C servers/fs/initrd .
     cp limine.conf iso_root/boot/limine/
     cp {{LIMINE_DIR}}/limine-bios.sys {{LIMINE_DIR}}/limine-bios-cd.bin {{LIMINE_DIR}}/limine-uefi-cd.bin iso_root/boot/limine/

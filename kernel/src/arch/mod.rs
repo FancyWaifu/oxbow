@@ -9,7 +9,7 @@ mod x86_64;
 #[allow(unused_imports)] // exit_qemu/QemuExit are for the future test harness
 pub use x86_64::{
     breakpoint, console_write_bytes, context_switch, current_cr3, disable_interrupts,
-    enable_interrupts, enter_user, exit_qemu, halt, init, io_in, io_out, load_cr3, pic_unmask,
-    set_kernel_stack, switch_address_space, thread_trampoline, ticks, timer_disable, timer_init,
-    wait_for_interrupt, QemuExit, _print,
+    enable_interrupts, enter_user, exit_qemu, fxrstor, fxsave, halt, init, io_in, io_out, load_cr3,
+    pic_unmask, set_kernel_stack, switch_address_space, thread_trampoline, ticks, timer_disable,
+    timer_init, wait_for_interrupt, FXSAVE_SIZE, QemuExit, _print,
 };

@@ -213,7 +213,7 @@ fn kmain_stage2() -> ! {
         // what gives a clean boot straight to the prompt (no demo spam).
         if matches!(
             cmd,
-            b"pong" | b"beta" | b"hello" | b"badge" | b"cat" | b"ls" | b"mkdir" | b"touch" | b"rm" | b"mv" | b"cp"
+            b"pong" | b"beta" | b"hello" | b"badge" | b"cat" | b"ls" | b"mkdir" | b"touch" | b"rm" | b"mv" | b"cp" | b"drift"
         ) {
             image::register(cmd, bytes);
             println!("[mod] image '{}' registered ({} bytes)", name, bytes.len());
@@ -331,6 +331,7 @@ fn kmain_stage2() -> ! {
                     (oxbow_abi::BOOT_IMG_RM, b"rm".as_slice()),
                     (oxbow_abi::BOOT_IMG_MV, b"mv".as_slice()),
                     (oxbow_abi::BOOT_IMG_CP, b"cp".as_slice()),
+                    (oxbow_abi::BOOT_IMG_DRIFT, b"drift".as_slice()),
                 ] {
                     if let Some(idx) = image::find(iname) {
                         p.install(
