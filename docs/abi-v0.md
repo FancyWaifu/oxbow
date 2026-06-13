@@ -962,3 +962,56 @@ The driver runs three real exchanges at boot, then serves the network forever:
 Addressing is the SLIRP default (us 10.0.2.15, gateway .2, DNS .3); DHCP and a
 proper socket *capability* API (a separate server handing out bound-port caps),
 plus smoltcp for TCP, are the next arcs.
+
+## 21. Socket capability API (v1-socket)
+
+The network analogue of "directories are capabilities" (§15): **sockets are
+capabilities**. A client that holds only a network *control* capability can bind
+a UDP socket and send/receive datagrams — the net server mints it a fresh badged
+endpoint per socket, and the badge makes the server near-stateless, exactly
+mirroring the fs file-cap model. No client touches the NIC, the protocol stack,
+or any port it was not given.
+
+### 21.1 The endpoints
+A fourth kernel endpoint, `EP3`, is the network endpoint. Two capabilities name it:
+- **net server** holds it as `BOOT_EP`, UNBADGED, with `R_SEND|R_RECV|R_GRANT|
+  R_ATTENUATE` — the root of network authority (serve requests, mint socket caps,
+  grant them back). Installed whether or not a NIC was found, so a client fails
+  cleanly instead of blocking forever.
+- **shell** (and any future client) holds it as `BOOT_NET_EP`, BADGED with
+  `NET_CTL`, `R_SEND|R_GRANT` — the control channel. This is the net analogue of
+  the shell's `BOOT_FS_ROOT`.
+
+### 21.2 The protocol (all via `sys_call`)
+| tag | invoked on | request | reply |
+|-----|-----------|---------|-------|
+| `TAG_UDP_BIND` ("UBND") | NET_CTL cap | `data[0]`=port (0=ephemeral) | `data[0]`=status, `data[1]`=bound port, **`handles[0]`=fresh badged socket cap** |
+| `TAG_UDP_SENDTO` ("USND") | socket cap | `data[0]`=dst IPv4 (BE u32), `data[1]`=dst port, `data[2]`=len, bytes@24 (≤40) | `data[0]`=status |
+| `TAG_UDP_RECVFROM` ("URCV") | socket cap | — | `data[0]`=len, payload@8 (≤56) |
+
+On `BIND` the server allocates a socket-table slot and `sys_mint`s a new badged
+endpoint (badge = socket id = slot+1, rights `R_SEND|R_GRANT`), returns it in the
+reply, and closes its own copy — the kernel transfers the cap to the client. On
+`SENDTO`/`RECVFROM` the kernel stamps the socket id into `m.badge`, so the server
+reads it to find the bound port; a forged badge is impossible (the kernel
+overwrites the sender's value with the invoking cap's badge). The whole DNS
+exchange in `dns example.com` rides this: the shell builds the query
+(`rt::dns`), the socket carries the raw UDP payload (`rt::udp`), and net never
+sees a hostname — just a datagram on a bound port.
+
+### 21.3 Server shape
+The net server stops auto-running demos; after NIC bring-up + a gateway ARP
+("net ready") it serves `BOOT_EP` forever. NIC I/O happens *synchronously inside
+request handling* — `SENDTO` ARP-resolves + transmits, `RECVFROM` blocks on the
+NIC (servicing background ARP/ping) until a datagram for the bound port arrives.
+This sidesteps oxbow's single-thread-per-process model (no select() over the
+endpoint and the IRQ at once); the RX ring buffers packets that arrive between
+requests. `recv_blocking` now re-arms IRQ11 *before* parking, since the server
+may drain the ring without ever waiting.
+
+### 21.4 Limits / next
+Payloads are inline in the 64-byte MsgBuf (send ≤40, recv ≤56) — enough for DNS,
+but a shared-frame socket buffer is needed for bigger datagrams. The server is
+single-client-at-a-time (a blocked `RECVFROM` holds the reply). DHCP (to lease
+10.0.2.15 rather than assert it) and smoltcp-backed TCP sockets over this same
+capability shape are the next arcs.

@@ -300,6 +300,22 @@ pub const TAG_FS_UNLINK: u64 = u32::from_le_bytes(*b"FSRM") as u64;
 /// the directory. Reply: `data[0]` = status (0 ok / 1 fail).
 pub const TAG_FS_RENAME: u64 = u32::from_le_bytes(*b"FSMV") as u64;
 
+// --- Socket capability API (§21) -------------------------------------------
+/// A client's control capability to the net server: a BADGED endpoint with the
+/// NET_CTL badge. `udp_bind` on it mints a fresh badged UDP-socket capability.
+pub const BOOT_NET_EP: Handle = 20;
+/// The control-channel badge (distinct from any socket id, which are 1..=N).
+pub const NET_CTL: u64 = 0x00C0_FFEE;
+/// Bind a UDP socket: request on the NET_CTL cap, data[0]=port (0=ephemeral).
+/// Reply: data[0]=status, data[1]=bound port, handles[0]=badged socket cap.
+pub const TAG_UDP_BIND: u64 = u32::from_le_bytes(*b"UBND") as u64;
+/// Send a datagram on a socket cap: data[0]=dst IPv4 (big-endian u32),
+/// data[1]=dst port, data[2]=len, bytes from offset 24. Reply: data[0]=status.
+pub const TAG_UDP_SENDTO: u64 = u32::from_le_bytes(*b"USND") as u64;
+/// Receive a datagram on a socket cap (blocks server-side until one arrives for
+/// the bound port). Reply: data[0]=len, payload bytes from offset 8 (<=56).
+pub const TAG_UDP_RECVFROM: u64 = u32::from_le_bytes(*b"URCV") as u64;
+
 /// `sys_spawn` grant convention: the handles in the spawn MsgBuf land in the
 /// child's table at these slots, in order (HANDLE_NULL entries are skipped).
 /// Slot 3 is always the child's fresh Memory budget, so it is not in this list.

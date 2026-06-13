@@ -354,6 +354,17 @@ fn kmain_stage2() -> ! {
                         badge: oxbow_abi::FS_ROOT,
                     },
                 );
+                // The network control capability: a BADGED endpoint to the net
+                // server (badge = NET_CTL). `udp_bind` on it mints a fresh badged
+                // UDP-socket cap — the network analogue of BOOT_FS_ROOT.
+                p.install(
+                    oxbow_abi::BOOT_NET_EP,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Endpoint(ipc::EP3),
+                        rights: oxbow_abi::R_SEND | oxbow_abi::R_GRANT,
+                        badge: oxbow_abi::NET_CTL,
+                    },
+                );
             });
         }
         // The fs server owns the filesystem endpoint UNBADGED, with full rights:
@@ -455,6 +466,24 @@ fn kmain_stage2() -> ! {
                     );
                 });
             }
+            // The net server owns the network endpoint UNBADGED with full rights
+            // (the root of network authority): R_RECV to serve socket requests,
+            // R_SEND+R_ATTENUATE to mint badged socket caps, R_GRANT to hand them
+            // back in bind replies. Installed even without a NIC so clients fail
+            // cleanly rather than block forever.
+            proc::with_proc_mut(pid, |p| {
+                p.install(
+                    oxbow_abi::BOOT_EP,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Endpoint(ipc::EP3),
+                        rights: oxbow_abi::R_SEND
+                            | oxbow_abi::R_RECV
+                            | oxbow_abi::R_GRANT
+                            | oxbow_abi::R_ATTENUATE,
+                        badge: 0,
+                    },
+                );
+            });
         }
         let tcb = thread::spawn_user(pid, as_i, entry, user_rsp);
         println!("[user] {} scheduled as tcb {} (ring 3, IF=1)", name, tcb);

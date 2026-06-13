@@ -526,3 +526,113 @@ fn panic(_info: &PanicInfo) -> ! {
     let _ = sys_console_write(BOOT_CONSOLE, msg.as_ptr(), msg.len());
     sys_exit(101)
 }
+
+/// UDP socket client over the net server's capability API (§21). `bind` on the
+/// NET_CTL control cap returns a fresh badged socket cap; `sendto`/`recvfrom`
+/// ride that cap (badge = socket id) so the server stays near-stateless.
+pub mod udp {
+    use crate::{sys_call, Handle};
+    use oxbow_abi::{MsgBuf, TAG_UDP_BIND, TAG_UDP_RECVFROM, TAG_UDP_SENDTO};
+
+    /// Bind a UDP socket via the control cap `ctl`; returns `(socket cap, port)`.
+    /// `port` 0 asks the server for an ephemeral port.
+    pub fn bind(ctl: Handle, port: u16) -> Option<(Handle, u16)> {
+        let mut m = MsgBuf::new(TAG_UDP_BIND);
+        m.data[0] = port as u64;
+        m.data_len = 1;
+        if sys_call(ctl, &mut m).is_err() || m.data[0] != 0 {
+            return None;
+        }
+        Some((m.handles[0], m.data[1] as u16))
+    }
+
+    /// Send `payload` (<=40 bytes inline) to `ip:dport` on socket cap `sock`.
+    pub fn sendto(sock: Handle, ip: [u8; 4], dport: u16, payload: &[u8]) -> bool {
+        let n = payload.len().min(40);
+        let mut m = MsgBuf::new(TAG_UDP_SENDTO);
+        m.data[0] = u32::from_be_bytes(ip) as u64;
+        m.data[1] = dport as u64;
+        m.data[2] = n as u64;
+        let dst = m.data.as_mut_ptr() as *mut u8;
+        unsafe { core::ptr::copy_nonoverlapping(payload.as_ptr(), dst.add(24), n) };
+        m.data_len = 8;
+        sys_call(sock, &mut m).is_ok() && m.data[0] == 0
+    }
+
+    /// Receive a datagram on `sock` into `out` (blocks); returns payload length.
+    pub fn recvfrom(sock: Handle, out: &mut [u8]) -> usize {
+        let mut m = MsgBuf::new(TAG_UDP_RECVFROM);
+        if sys_call(sock, &mut m).is_err() {
+            return 0;
+        }
+        let n = (m.data[0] as usize).min(out.len()).min(56);
+        let src = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), n) };
+        out[..n].copy_from_slice(src);
+        n
+    }
+}
+
+/// Minimal DNS A-record client: build a recursive query, parse the first answer.
+pub mod dns {
+    use alloc::vec::Vec;
+
+    /// Build a standard recursive A-record query for `name` (e.g. "example.com").
+    pub fn query(id: u16, name: &str) -> Vec<u8> {
+        let mut q = Vec::new();
+        q.extend_from_slice(&id.to_be_bytes());
+        q.extend_from_slice(&0x0100u16.to_be_bytes()); // recursion desired
+        q.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+        q.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+        q.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+        q.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+        for label in name.split('.') {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.push(0);
+        q.extend_from_slice(&1u16.to_be_bytes()); // QTYPE = A
+        q.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+        q
+    }
+
+    fn skip_name(p: &[u8], mut off: usize) -> Option<usize> {
+        loop {
+            let b = *p.get(off)?;
+            if b & 0xC0 == 0xC0 {
+                return Some(off + 2);
+            }
+            if b == 0 {
+                return Some(off + 1);
+            }
+            off += 1 + b as usize;
+        }
+    }
+
+    /// Parse the first A (IPv4) answer out of a DNS response.
+    pub fn first_a(resp: &[u8]) -> Option<[u8; 4]> {
+        if resp.len() < 12 {
+            return None;
+        }
+        let qd = u16::from_be_bytes([resp[4], resp[5]]);
+        let an = u16::from_be_bytes([resp[6], resp[7]]);
+        let mut off = 12;
+        for _ in 0..qd {
+            off = skip_name(resp, off)?;
+            off += 4;
+        }
+        for _ in 0..an {
+            off = skip_name(resp, off)?;
+            if off + 10 > resp.len() {
+                return None;
+            }
+            let typ = u16::from_be_bytes([resp[off], resp[off + 1]]);
+            let rdlen = u16::from_be_bytes([resp[off + 8], resp[off + 9]]) as usize;
+            off += 10;
+            if typ == 1 && rdlen == 4 && off + 4 <= resp.len() {
+                return Some([resp[off], resp[off + 1], resp[off + 2], resp[off + 3]]);
+            }
+            off += rdlen;
+        }
+        None
+    }
+}

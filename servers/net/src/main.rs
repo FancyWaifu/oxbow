@@ -13,18 +13,79 @@
 extern crate alloc;
 
 mod arp;
-mod dns;
 mod eth;
 mod icmp;
 mod ipv4;
 mod udp;
 
 use alloc::format;
+use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 use eth::{ETHERTYPE_ARP, ETHERTYPE_IPV4};
-use oxbow_abi::{BOOT_CONSOLE, BOOT_MEM, BOOT_NET_IRQ, BOOT_PCI, NET_DMA, NET_MMIO};
+use oxbow_abi::{
+    MsgBuf, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_NET_IRQ, BOOT_PCI, NET_DMA, NET_MMIO, R_GRANT,
+    R_SEND, TAG_UDP_BIND, TAG_UDP_RECVFROM, TAG_UDP_SENDTO,
+};
 use oxbow_rt as rt;
+
+const MAX_SOCKETS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct Socket {
+    in_use: bool,
+    port: u16,
+}
+
+/// Choose the next-hop MAC target: a 10.0.2.0/24 host is on-link, else the gateway.
+fn route(ip: [u8; 4]) -> [u8; 4] {
+    if ip[0] == 10 && ip[1] == 0 && ip[2] == 2 {
+        ip
+    } else {
+        GW_IP
+    }
+}
+
+/// Send a UDP datagram (resolving the next-hop MAC, building IPv4 + Ethernet).
+fn send_udp(
+    nic: &mut Nic,
+    cache: &mut arp::Cache,
+    src_port: u16,
+    dst_ip: [u8; 4],
+    dst_port: u16,
+    payload: &[u8],
+) {
+    let mac = arp_resolve(nic, cache, route(dst_ip));
+    let seg = udp::segment(OUR_IP, dst_ip, src_port, dst_port, payload);
+    let ip = ipv4::packet(OUR_IP, dst_ip, ipv4::PROTO_UDP, &seg);
+    nic.tx(&eth::frame(mac, nic.mac, ETHERTYPE_IPV4, &ip));
+}
+
+/// Block (serving background traffic) until a UDP datagram for `port` arrives;
+/// copy its payload into `out` and return the length.
+fn recv_udp_for(nic: &mut Nic, cache: &mut arp::Cache, port: u16, out: &mut [u8]) -> usize {
+    let mut buf = [0u8; BUF];
+    loop {
+        let n = nic.recv_blocking(&mut buf);
+        handle_background(nic, cache, &buf[..n]);
+        let Some((_, _, et, off)) = eth::parse(&buf[..n]) else { continue };
+        if et != ETHERTYPE_IPV4 {
+            continue;
+        }
+        let Some(ip) = ipv4::parse(&buf[off..n]) else { continue };
+        if ip.proto != ipv4::PROTO_UDP {
+            continue;
+        }
+        let uoff = off + ip.payload_off;
+        let Some(u) = udp::parse(&buf[uoff..n]) else { continue };
+        if u.dst_port == port {
+            let p = &buf[uoff + u.payload_off..n];
+            let len = p.len().min(out.len());
+            out[..len].copy_from_slice(&p[..len]);
+            return len;
+        }
+    }
+}
 
 fn w(s: &[u8]) {
     let _ = rt::sys_console_write(BOOT_CONSOLE, s.as_ptr(), s.len());
@@ -33,7 +94,6 @@ fn w(s: &[u8]) {
 // Our addressing (the SLIRP default network: gateway .2, DNS forwarder .3).
 const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 const GW_IP: [u8; 4] = [10, 0, 2, 2];
-const DNS_IP: [u8; 4] = [10, 0, 2, 3];
 
 // --- e1000 register offsets (bytes into BAR0) ------------------------------
 const CTRL: usize = 0x0000;
@@ -182,12 +242,14 @@ impl Nic {
                 self.rx_cur = (self.rx_cur + 1) % RX_DESCS;
                 return n;
             }
-            // Ring empty: park until the NIC raises IRQ11, then re-arm.
-            let _ = rt::sys_notif_wait(self.notif);
+            // Ring empty: re-arm the line FIRST (we may have drained the ring
+            // without ever parking, leaving IRQ11 masked from its last fire),
+            // then park until the NIC raises it again.
             unsafe {
                 let _ = reg(ICR); // reading ICR deasserts the level-triggered line
             }
             let _ = rt::sys_irq_ack(BOOT_NET_IRQ);
+            let _ = rt::sys_notif_wait(self.notif);
         }
     }
 }
@@ -238,35 +300,6 @@ fn arp_resolve(nic: &mut Nic, cache: &mut arp::Cache, target: [u8; 4]) -> [u8; 6
         handle_background(nic, cache, &buf[..n]);
         if let Some(mac) = cache.lookup(target) {
             return mac;
-        }
-    }
-}
-
-/// Send a DNS A-query for `name` to the SLIRP forwarder and return the answer.
-fn dns_query(nic: &mut Nic, cache: &mut arp::Cache, name: &str) -> Option<[u8; 4]> {
-    let dns_mac = arp_resolve(nic, cache, DNS_IP);
-    let sport: u16 = 0xC000;
-    let q = dns::query(0x1234, name);
-    let seg = udp::segment(OUR_IP, DNS_IP, sport, 53, &q);
-    let ip = ipv4::packet(OUR_IP, DNS_IP, ipv4::PROTO_UDP, &seg);
-    nic.tx(&eth::frame(dns_mac, nic.mac, ETHERTYPE_IPV4, &ip));
-
-    let mut buf = [0u8; BUF];
-    loop {
-        let n = nic.recv_blocking(&mut buf);
-        handle_background(nic, cache, &buf[..n]);
-        let Some((_, _, et, off)) = eth::parse(&buf[..n]) else { continue };
-        if et != ETHERTYPE_IPV4 {
-            continue;
-        }
-        let Some(ip) = ipv4::parse(&buf[off..n]) else { continue };
-        if ip.proto != ipv4::PROTO_UDP {
-            continue;
-        }
-        let uoff = off + ip.payload_off;
-        let Some(u) = udp::parse(&buf[uoff..n]) else { continue };
-        if u.dst_port == sport {
-            return dns::first_a(&buf[uoff + u.payload_off..n]);
         }
     }
 }
@@ -384,53 +417,98 @@ pub extern "C" fn oxbow_main() -> ! {
     };
     let mut cache = arp::Cache::new();
 
-    // 5. Demos against SLIRP: ARP, then a real DNS-over-UDP lookup, then ping.
+    // 5. Prove the NIC + stack work: ARP-resolve the gateway (populates cache).
     let gw = arp_resolve(&mut nic, &mut cache, GW_IP);
     w(format!(
         "[net] ARP: 10.0.2.2 is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
         gw[0], gw[1], gw[2], gw[3], gw[4], gw[5]
     )
     .as_bytes());
+    w(b"[net] ready (UDP socket service on the network endpoint)\n");
 
-    match dns_query(&mut nic, &mut cache, "example.com") {
-        Some(ip) => w(format!(
-            "[net] DNS: example.com -> {}.{}.{}.{}  (UDP/IPv4 over the stack)\n",
-            ip[0], ip[1], ip[2], ip[3]
-        )
-        .as_bytes()),
-        None => w(b"[net] DNS: no A record\n"),
-    }
-
-    // ICMP echo to the gateway (best-effort: SLIRP ICMP depends on host policy).
-    let gw_mac = arp_resolve(&mut nic, &mut cache, GW_IP);
-    let echo = icmp::echo(icmp::ECHO_REQUEST, 0x1234, 1, b"oxbow-ping");
-    let ip = ipv4::packet(OUR_IP, GW_IP, ipv4::PROTO_ICMP, &echo);
-    nic.tx(&eth::frame(gw_mac, nic.mac, ETHERTYPE_IPV4, &ip));
-    w(b"[net] ICMP echo -> 10.0.2.2 (ping sent)\n");
-    w(b"[net] ready (Ethernet/ARP/IPv4/ICMP/UDP)\n");
-
-    // 6. Steady state: serve the network forever — cache ARP, answer ARP/ping
-    //    for us, and report ICMP echo replies + other inbound traffic.
-    let mut buf = [0u8; BUF];
+    // 6. Serve the socket capability API: clients bind UDP sockets (each a fresh
+    //    badged endpoint, badge = socket id) and send/recv datagrams through
+    //    them. The badge makes the server stateless beyond a tiny port table.
+    let mut sockets = [Socket { in_use: false, port: 0 }; MAX_SOCKETS];
     loop {
-        let n = nic.recv_blocking(&mut buf);
-        handle_background(&mut nic, &mut cache, &buf[..n]);
-        if let Some((_, src, et, off)) = eth::parse(&buf[..n]) {
-            if et == ETHERTYPE_IPV4 {
-                if let Some(ip) = ipv4::parse(&buf[off..n]) {
-                    if ip.proto == ipv4::PROTO_ICMP && ip.dst == OUR_IP {
-                        if let Some(e) = icmp::parse(&buf[off + ip.payload_off..n]) {
-                            if e.typ == icmp::ECHO_REPLY {
-                                w(format!(
-                                    "[net] ICMP echo reply from {}.{}.{}.{} seq {} via {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
-                                    ip.src[0], ip.src[1], ip.src[2], ip.src[3], e.seq,
-                                    src[0], src[1], src[2], src[3], src[4], src[5]
-                                )
-                                .as_bytes());
+        let mut m = MsgBuf::new(0);
+        let reply = match rt::sys_recv(BOOT_EP, &mut m) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let mut r = MsgBuf::new(0);
+        match m.tag {
+            // Control channel (badge = NET_CTL): allocate a socket + mint its cap.
+            TAG_UDP_BIND => {
+                let req_port = m.data[0] as u16;
+                match sockets.iter().position(|s| !s.in_use) {
+                    Some(idx) => {
+                        let port = if req_port == 0 { 0xC000 + idx as u16 } else { req_port };
+                        sockets[idx] = Socket { in_use: true, port };
+                        match rt::sys_mint(BOOT_EP, (idx + 1) as u64, R_SEND | R_GRANT) {
+                            Ok(cap) => {
+                                r.data[0] = 0;
+                                r.data[1] = port as u64;
+                                r.data_len = 2;
+                                r.handle_count = 1;
+                                r.handles[0] = cap;
+                                let _ = rt::sys_reply(reply, &r);
+                                let _ = rt::sys_close(cap);
+                            }
+                            Err(_) => {
+                                r.data[0] = 1;
+                                r.data_len = 1;
+                                let _ = rt::sys_reply(reply, &r);
                             }
                         }
                     }
+                    None => {
+                        r.data[0] = 1; // no free socket
+                        r.data_len = 1;
+                        let _ = rt::sys_reply(reply, &r);
+                    }
                 }
+            }
+            // Socket channel (badge = socket id): send a datagram.
+            TAG_UDP_SENDTO => {
+                let sid = m.badge as usize;
+                if sid >= 1 && sid <= MAX_SOCKETS && sockets[sid - 1].in_use {
+                    let dst_ip = (m.data[0] as u32).to_be_bytes();
+                    let dport = m.data[1] as u16;
+                    let len = (m.data[2] as usize).min(40);
+                    let bytes =
+                        unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(24), len) };
+                    let payload: Vec<u8> = bytes.to_vec();
+                    let src_port = sockets[sid - 1].port;
+                    send_udp(&mut nic, &mut cache, src_port, dst_ip, dport, &payload);
+                    r.data[0] = 0;
+                } else {
+                    r.data[0] = 1;
+                }
+                r.data_len = 1;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            // Socket channel: receive a datagram (blocks until one arrives).
+            TAG_UDP_RECVFROM => {
+                let sid = m.badge as usize;
+                if sid >= 1 && sid <= MAX_SOCKETS && sockets[sid - 1].in_use {
+                    let port = sockets[sid - 1].port;
+                    let mut out = [0u8; 56];
+                    let n = recv_udp_for(&mut nic, &mut cache, port, &mut out);
+                    r.data[0] = n as u64;
+                    let dst = r.data.as_mut_ptr() as *mut u8;
+                    unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), dst.add(8), n) };
+                    r.data_len = 8;
+                } else {
+                    r.data[0] = 0;
+                    r.data_len = 1;
+                }
+                let _ = rt::sys_reply(reply, &r);
+            }
+            _ => {
+                r.data[0] = 1;
+                r.data_len = 1;
+                let _ = rt::sys_reply(reply, &r);
             }
         }
     }

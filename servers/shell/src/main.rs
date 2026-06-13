@@ -7,7 +7,7 @@
 #![no_main]
 
 use oxbow_abi::{
-    Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA,
+    Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA, BOOT_NET_EP,
     BOOT_IMG_CAT, BOOT_IMG_CP, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_MKDIR, BOOT_IMG_MV, BOOT_IMG_PONG,
     BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_TICK, BOOT_TTY, HANDLE_NULL, R_GRANT, R_RECV,
     R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
@@ -151,6 +151,69 @@ fn cat_cmd(dir: Handle, name: &[u8], sp: &Spawner) {
     let file_cap = m.handles[0];
     spawn_with(BOOT_IMG_CAT, file_cap, b"", sp); // cat reads the file cap, prints, exits
     let _ = rt::sys_close(file_cap); // cat holds its own copy
+}
+
+/// Write a byte as decimal ASCII to the tty (for printing IP octets).
+fn tw_dec(n: u8) {
+    let mut b = [0u8; 3];
+    let mut i = 3;
+    let mut v = n;
+    loop {
+        i -= 1;
+        b[i] = b'0' + v % 10;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    tw(&b[i..]);
+}
+
+/// `dns <hostname>`: resolve a name over the net server's UDP socket capability
+/// API. We hold only BOOT_NET_EP (the NET_CTL control cap); `udp::bind` mints us
+/// a socket cap, and the whole DNS exchange rides it — net never sees a name,
+/// just a UDP datagram on a bound port. This crosses the shell↔net process
+/// boundary entirely through capabilities.
+fn dns_cmd(name: &[u8]) {
+    if name.is_empty() {
+        tw(b"dns: usage: dns <hostname>\n");
+        return;
+    }
+    let Ok(name_str) = core::str::from_utf8(name) else {
+        tw(b"dns: bad name\n");
+        return;
+    };
+    let Some((sock, _port)) = rt::udp::bind(BOOT_NET_EP, 0) else {
+        tw(b"dns: bind failed (no net server?)\n");
+        return;
+    };
+    let q = rt::dns::query(0x1234, name_str);
+    if !rt::udp::sendto(sock, [10, 0, 2, 3], 53, &q) {
+        tw(b"dns: send failed\n");
+        let _ = rt::sys_close(sock);
+        return;
+    }
+    let mut buf = [0u8; 64];
+    let n = rt::udp::recvfrom(sock, &mut buf);
+    let _ = rt::sys_close(sock);
+    match rt::dns::first_a(&buf[..n]) {
+        Some(ip) => {
+            tw(name);
+            tw(b" -> ");
+            tw_dec(ip[0]);
+            tw(b".");
+            tw_dec(ip[1]);
+            tw(b".");
+            tw_dec(ip[2]);
+            tw(b".");
+            tw_dec(ip[3]);
+            tw(b"\n");
+        }
+        None => {
+            tw(name);
+            tw(b": no A record\n");
+        }
+    }
 }
 
 /// `run pong`: launch the pong↔beta demo pair, wiring an endpoint between them
@@ -422,6 +485,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
         b"mv" => spawn_with(BOOT_IMG_MV, *cwd, rest, sp),
         b"cp" => spawn_with(BOOT_IMG_CP, *cwd, rest, sp),
         b"cd" => cd(rest, cwd),
+        b"dns" => dns_cmd(rest),
         b"badgetest" => badgetest(sp),
         b"help" => {
             tw(b"oxbow shell:  (ls cat mkdir touch are spawned programs)\n");
@@ -434,6 +498,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
             tw(b"  mv <old> <new>  rename within the directory\n");
             tw(b"  cp <src> <dst>  copy a file\n");
             tw(b"  cd <dir> | /    change directory (builtin)\n");
+            tw(b"  dns <host>      resolve a hostname via the net UDP socket API\n");
             tw(b"  run hello/pong  spawn a demo program\n");
             tw(b"  badgetest       exercise badged-endpoint mint rules\n");
             tw(b"  help            this list\n");

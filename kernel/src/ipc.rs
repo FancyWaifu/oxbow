@@ -28,6 +28,8 @@ pub const EP0: u8 = 0;
 pub const EP1: u8 = 1;
 /// The filesystem endpoint (shell/clients → fs); badged per open file (§15).
 pub const EP2: u8 = 2;
+/// The network endpoint (clients → net); badged per socket / NET_CTL (§21).
+pub const EP3: u8 = 3;
 const EP_POOL: usize = 8;
 const REPLY_POOL: usize = 8;
 
@@ -211,8 +213,9 @@ pub fn init() {
     eps[EP0 as usize].in_use = true;
     eps[EP1 as usize].in_use = true;
     eps[EP2 as usize].in_use = true;
+    eps[EP3 as usize].in_use = true;
     drop(eps);
-    println!("[ipc] EP0 + EP1 + EP2 created");
+    println!("[ipc] EP0 + EP1 + EP2 + EP3 created");
 }
 
 /// Mint a fresh endpoint from the pool (for `sys_ep_create`); returns its pool
