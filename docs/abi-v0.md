@@ -800,3 +800,14 @@ kind)>`. The coreutils are rewritten against it — `cat` is `read_all` +
 ### 17.4 Deferred
 A buffered/line-disciplined stdin, real `errno`, a heap free-list (the bump heap
 suffices for short-lived programs), `mmap`/`sbrk`-style growth controls.
+
+### 15.11 File growth (v1-file-growth)
+A file is no longer a single fixed region — it is a list of up to `MAX_BLOCKS`
+(16) arena BLOCKs, so it grows past one block (up to 16 KiB) as it is written.
+WRITE allocates blocks on demand (spanning block boundaries); READ serves one
+block per call (the client loops); truncate (CREATE on an existing file) and
+remove return all the file's blocks to the arena free list (uniform BLOCK
+regions, so arc-16 reclamation still holds). The shell gains `>>` (append):
+`echo X >> f` opens the file and writes at its current end (creating it if
+absent), so a multi-block file can be built a line at a time. The arena grew to
+128 KiB (TOTAL_BLOCKS = 128) for larger working sets.
