@@ -252,12 +252,25 @@ fn parse_ip(s: &[u8]) -> Option<[u8; 4]> {
 /// capability API (smoltcp does the TCP), send a minimal HTTP/1.0 GET, and print
 /// the response. We hold only BOOT_NET_EP; `tcp::connect` mints us a socket cap.
 fn http_cmd(args: &[u8]) {
-    let (host, _) = split_cmd(args);
+    let (host, rest) = split_cmd(args);
     let Some(ip) = parse_ip(host) else {
-        tw(b"http: usage: http <a.b.c.d>\n");
+        tw(b"http: usage: http <a.b.c.d> [port]\n");
         return;
     };
-    let Some(sock) = rt::tcp::connect(BOOT_NET_EP, ip, 80) else {
+    let (port_tok, _) = split_cmd(rest);
+    let mut port: u16 = 80;
+    if !port_tok.is_empty() {
+        let mut v: u32 = 0;
+        for &c in port_tok {
+            if c.is_ascii_digit() {
+                v = v * 10 + (c - b'0') as u32;
+            }
+        }
+        if v > 0 && v <= 65535 {
+            port = v as u16;
+        }
+    }
+    let Some(sock) = rt::tcp::connect(BOOT_NET_EP, ip, port) else {
         tw(b"http: connect failed (refused/timeout)\n");
         return;
     };

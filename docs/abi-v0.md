@@ -1093,6 +1093,9 @@ socket table slot is now a `Sock::Udp(port)` or `Sock::Tcp(SocketHandle)`.
 ### 23.5 Demonstrated
 `http <ip>` (shell): connect to `<ip>:80`, send `GET / HTTP/1.0`, print the
 response. In QEMU, `http 1.1.1.1` reaches Cloudflare through SLIRP NAT and prints
-a real `HTTP/1.1` response. Per-connection socket buffers still leak into the
+a real `HTTP/1.1` response. **On real hardware** (a Proxmox KVM VM, e1000 on a
+LAN bridge), the same build leases a real DHCP address and `http` reaches a LAN
+host, the ASUS router's web UI, and the public internet (1.1.1.1) through the
+router's NAT — all over the busy-polled smoltcp path. Per-connection socket buffers still leak into the
 bump heap (no free), so a real `dealloc`/slab is the natural follow-up; a
 shared-frame socket buffer would also lift the 48/56-byte inline payload cap.
