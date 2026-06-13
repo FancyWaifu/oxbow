@@ -779,12 +779,27 @@ shell gains `ls <path>` (opens the directory, hands its cap to a spawned `ls`);
 ordinary Rust instead of hand-packing MsgBufs.
 
 ### 17.1 Heap (`alloc`)
-A bump allocator backed by the program's Memory budget, registered as the global
-allocator — so `extern crate alloc` works (`Vec`, `String`, `Box`, `format!`).
-It maps pages **lazily** from `BOOT_MEM` on first allocation (a program that never
-allocates pays nothing) and grows page-by-page up to a 4 MiB ceiling. `dealloc`
-is a no-op: spawned programs are short-lived and the whole address space is
-reclaimed on exit (§16), so a bump heap is exactly right.
+A segregated free-list (slab) allocator backed by the program's Memory budget,
+registered as the global allocator — so `extern crate alloc` works (`Vec`,
+`String`, `Box`, `format!`). Each request rounds up to a power-of-two size class;
+a per-class intrusive free list recycles `dealloc`s, and fresh blocks are carved
+from a bump region that **lazily** `sys_map`s pages from `BOOT_MEM` (a program
+that never allocates pays nothing). Every block in a class is class-sized and
+class-aligned, so a freed block satisfies any later same-class request — no
+coalescing needed; same-size reuse is exactly what a long-lived server wants.
+
+This replaced the original no-op-`dealloc` bump heap: a short-lived spawned
+coreutil didn't care, but the resident **net** server churns same-size
+allocations (each smoltcp TCP connection needs 4 KiB socket buffers, §23) and a
+non-freeing heap exhausted its budget after a handful of connections. With the
+slab, the second connection onward reuses the first's freed buffers — the heap
+stops growing (verified: page-maps per `http` go `[3, 0, 0, 0, …]`).
+
+### 17.1a Console newlines (CR+LF)
+The kernel serial console translates an output `\n` into `\r\n` (both the
+`println!` path and `sys_console_write`). A bare line feed only drops the cursor
+a row on a real serial terminal / the Proxmox xterm.js console, so successive
+lines would stairstep diagonally; CR+LF returns the cursor to column 0.
 
 ### 17.2 stdout: `print!` / `println!`
 A `Stdout` sink implements `core::fmt::Write` over the program's stdout endpoint

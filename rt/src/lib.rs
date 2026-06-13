@@ -25,61 +25,100 @@ use oxbow_abi::{
 };
 
 // --- Heap (so `alloc` works) ----------------------------------------------
-// A bump allocator that lazily grows by `sys_map`ing pages from the program's
-// Memory budget (BOOT_MEM) on demand — programs that never allocate pay nothing.
-// `dealloc` is a no-op: spawned programs are short-lived, and the whole address
-// space (heap included) is reclaimed on exit, so a bump heap is exactly right.
+// A segregated free-list (slab) allocator. Each request rounds up to a
+// power-of-two size class; a per-class free list recycles deallocations, so a
+// long-lived server that churns same-size allocations (e.g. the net server
+// opening/closing TCP connections, each smoltcp socket needing 4 KiB buffers)
+// reuses freed blocks instead of growing without bound. Fresh blocks are carved
+// from a bump region that lazily `sys_map`s pages from the Memory budget
+// (BOOT_MEM) — programs that never allocate still pay nothing.
+//
+// Within a class, every block is class-sized and class-aligned, so a freed block
+// satisfies any later request mapped to that class. No coalescing across classes:
+// same-size reuse is exactly what the workload needs, and the heap is bounded by
+// the process budget regardless. Single-threaded (one thread per server), so the
+// load/store pairs need no CAS — atomics are only here to satisfy `Sync`.
 mod heap {
     use core::alloc::{GlobalAlloc, Layout};
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     const HEAP_BASE: usize = 0x3000_0000;
-    const HEAP_LIMIT: usize = 0x3040_0000; // 4 MiB ceiling
+    const HEAP_LIMIT: usize = 0x3400_0000; // 64 MiB ceiling (real cap is the budget)
+    const MIN_BUCKET: u32 = 4; // smallest class = 16 bytes (holds the free-list link)
+    const NBUCKETS: usize = 40; // up to 2^39; the free-list link lives in the block
 
-    pub struct Bump {
-        next: AtomicUsize,       // 0 until first use, then the bump pointer
+    /// Power-of-two size class index for a layout: `ceil_log2(max(size, align))`,
+    /// floored at MIN_BUCKET. `class = 1 << bucket >= size` and `>= align`.
+    fn bucket_of(layout: Layout) -> usize {
+        let need = layout.size().max(layout.align()).max(1);
+        let b = usize::BITS - (need - 1).leading_zeros();
+        b.max(MIN_BUCKET) as usize
+    }
+
+    pub struct Slab {
+        bump: AtomicUsize,       // next un-carved address (0 until first use)
         mapped_end: AtomicUsize, // highest vaddr currently mapped
+        free: [AtomicUsize; NBUCKETS], // per-class free-list heads (0 = empty)
     }
 
     #[global_allocator]
-    static HEAP: Bump = Bump {
-        next: AtomicUsize::new(0),
+    static HEAP: Slab = Slab {
+        bump: AtomicUsize::new(0),
         mapped_end: AtomicUsize::new(0),
+        free: [const { AtomicUsize::new(0) }; NBUCKETS],
     };
 
-    unsafe impl GlobalAlloc for Bump {
+    unsafe impl GlobalAlloc for Slab {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            // Single-threaded program: Relaxed ordering is sufficient.
-            let mut next = self.next.load(Ordering::Relaxed);
+            let bucket = bucket_of(layout);
+            let class = 1usize << bucket;
+
+            // 1. Reuse a freed block of this class (pop the intrusive free list).
+            let head = self.free[bucket].load(Ordering::Relaxed);
+            if head != 0 {
+                let next = *(head as *const usize);
+                self.free[bucket].store(next, Ordering::Relaxed);
+                return head as *mut u8;
+            }
+
+            // 2. Carve a fresh class-sized, class-aligned block from the bump.
+            let mut next = self.bump.load(Ordering::Relaxed);
             if next == 0 {
                 next = HEAP_BASE;
                 self.mapped_end.store(HEAP_BASE, Ordering::Relaxed);
             }
-            let align = layout.align().max(1);
-            let start = (next + align - 1) & !(align - 1);
-            let end = match start.checked_add(layout.size()) {
+            let start = (next + class - 1) & !(class - 1);
+            let end = match start.checked_add(class) {
                 Some(e) if e <= HEAP_LIMIT => e,
                 _ => return core::ptr::null_mut(),
             };
             let mut mend = self.mapped_end.load(Ordering::Relaxed);
             if end > mend {
-                let need = (end - mend + 0xfff) & !0xfff; // round up to whole pages
-                let r = crate::sys_map(
+                let need = (end - mend + 0xfff) & !0xfff; // whole pages
+                if crate::sys_map(
                     super::BOOT_MEM,
                     mend as u64,
                     need as u64,
                     super::PROT_READ | super::PROT_WRITE,
-                );
-                if r.is_err() {
+                )
+                .is_err()
+                {
                     return core::ptr::null_mut();
                 }
                 mend += need;
                 self.mapped_end.store(mend, Ordering::Relaxed);
             }
-            self.next.store(end, Ordering::Relaxed);
+            self.bump.store(end, Ordering::Relaxed);
             start as *mut u8
         }
-        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // Push onto this class's free list: stash the old head in the block.
+            let bucket = bucket_of(layout);
+            let head = self.free[bucket].load(Ordering::Relaxed);
+            *(ptr as *mut usize) = head;
+            self.free[bucket].store(ptr as usize, Ordering::Relaxed);
+        }
     }
 }
 

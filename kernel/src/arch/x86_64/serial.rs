@@ -24,18 +24,41 @@ pub fn init() {
     }
 }
 
+/// Send one byte, translating a line feed into CR+LF. A serial terminal (and
+/// the Proxmox xterm.js console) treats a bare `\n` as line-feed only — the
+/// cursor drops a row but keeps its column, so successive lines stairstep
+/// diagonally. Emitting `\r\n` returns the cursor to column 0 first. (`send`
+/// itself only special-cases backspace, so the translation lives here.)
+fn send_crlf(port: &mut SerialPort, b: u8) {
+    if b == b'\n' {
+        port.send(b'\r');
+    }
+    port.send(b);
+}
+
+/// A `core::fmt::Write` adapter over the locked UART that applies `send_crlf`.
+struct CrlfWriter<'a>(spin::MutexGuard<'a, SerialPort>);
+impl fmt::Write for CrlfWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for &b in s.as_bytes() {
+            send_crlf(&mut self.0, b);
+        }
+        Ok(())
+    }
+}
+
 /// Backing function for the `print!`/`println!` macros.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
     // `.ok()` — there is nowhere useful to report a serial write error to.
-    SERIAL1.lock().write_fmt(args).ok();
+    CrlfWriter(SERIAL1.lock()).write_fmt(args).ok();
 }
 
 /// Write raw bytes to the console (backs the `sys_console_write` syscall).
 pub fn write_bytes(bytes: &[u8]) {
     let mut port = SERIAL1.lock();
     for &b in bytes {
-        port.send(b);
+        send_crlf(&mut port, b);
     }
 }
