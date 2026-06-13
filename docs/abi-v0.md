@@ -708,3 +708,48 @@ arena is a bump allocator with no free), so deleted-file storage leaks until a
 future arena free-list / compaction arc — the same deferred-reclaim story as the
 frame allocator and Memory budgets. Cross-directory `mv` (two dir caps) is also
 deferred.
+
+---
+
+## 16. Memory reclamation (v1-reclaim)
+
+Earlier arcs deferred all reclamation: the frame allocator, Memory budgets, and
+the fs arena were one-way. That capped a session at ~20 spawned commands (each
+permanently consumed ~400 KiB of the shell's budget) and let `rm`'d file storage
+leak. This arc closes the loop at every layer.
+
+### 16.1 Physical frames
+`pmm` gains an **intrusive free list**: a freed frame stores the next-free
+physical address in its own first 8 bytes, so `free_frame` is O(1) and needs no
+side table. `alloc_frame` pops a reclaimed frame before extending the bump
+pointer.
+
+### 16.2 Address-space teardown
+`vm::free_user_pml4` walks the LOWER half (user, PML4 entries 0..256) of a dead
+process's tables and frees every leaf data frame plus the intermediate
+page-table frames, then the PML4 — returning it all to `pmm`. The upper half
+(the shared kernel image + HHDM) is never touched. **Shared frames** (Frame
+objects / zero-copy shmem, identified via the Frame pool) are *skipped* so a
+peer's teardown can't double-free a frame the other still maps.
+
+Timing: an address space is freed **on slot reuse** (`proc::create` reclaiming a
+`Dead` slot), never on the dying thread itself — at exit the dying process's
+PML4 is still the live CR3. By reuse time the owner has long switched away, so
+the free is safe. (A dead slot never reused before shutdown simply isn't freed.)
+
+### 16.3 Budget refund
+A spawn records the spawner's Memory budget + the cost it paid; on the child's
+death `proc::kill` **credits that cost back** to the spawner. So a shell that
+spawns and reaps commands forever never exhausts its budget — verified by 70
+back-to-back spawn cycles with no exhaustion.
+
+### 16.4 Filesystem arena
+The fs storage arena gains a free list (uniform `FILE_CAP` regions): `rm` returns
+a removed file's region, and `CREATE` reuses it before extending. Repeated
+create/rm cycles no longer leak the arena.
+
+### 16.5 Still deferred
+Frame-object refcounting (shared shmem frames leak — skipped, not freed); freeing
+a `Dead` slot's frames at exit rather than at reuse (a reaper); file growth /
+realloc. These are bounded leaks on rare paths, not the unbounded per-command
+leak this arc removed.

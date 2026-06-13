@@ -56,12 +56,22 @@ pub fn grant(budget: u64) -> Option<u8> {
     None
 }
 
-/// Release a Memory budget slot (on process exit). The bytes are NOT refunded —
-/// `pmm` is a bump allocator with no frame reclamation, so the frames really are
-/// gone; only the pool slot is freed for reuse.
-#[allow(dead_code)] // used by proc::kill (Phase 3)
+/// Release a Memory budget slot (on process exit) — frees the pool slot.
 pub fn release(idx: u8) {
     MEMORY.lock()[idx as usize].in_use = false;
+}
+
+/// Refund `bytes` to Memory budget `idx` (a spawner is credited the cost of a
+/// child when that child dies and its frames are reclaimed).
+pub fn credit(idx: u8, bytes: u64) {
+    MEMORY.lock()[idx as usize].remaining += bytes;
+}
+
+/// Is `phys` a frame backing a live Frame object (zero-copy shared memory)? Such
+/// frames must NOT be auto-freed on address-space teardown — a peer may still map
+/// them. (Frame lifetime / refcounting is deferred.)
+pub fn is_shared_frame(phys: u64) -> bool {
+    FRAMES.lock().iter().any(|f| f.in_use && f.phys == phys)
 }
 
 /// Remaining budget on Memory `idx`.

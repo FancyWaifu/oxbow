@@ -16,6 +16,10 @@ struct Bump {
     next: u64,
     /// One past the end of the region.
     end: u64,
+    /// Head of the intrusive free list (0 = empty). A freed frame stores the
+    /// physical address of the next free frame in its first 8 bytes, so the free
+    /// list needs no side table and scales to all of RAM.
+    free_head: u64,
 }
 
 static BUMP: Mutex<Option<Bump>> = Mutex::new(None);
@@ -42,21 +46,31 @@ pub fn init(memmap: &MemoryMapResponse) -> (u64, u32) {
     *BUMP.lock() = Some(Bump {
         next: best_base,
         end: best_base + best_len,
+        free_head: 0,
     });
 
     (total, count)
 }
 
-/// Allocate one zeroed physical frame; `None` when the region is exhausted.
+/// Allocate one zeroed physical frame; `None` when memory is exhausted. Reuses a
+/// freed frame (popped from the intrusive free list) before extending the bump.
 pub fn alloc_frame() -> Option<u64> {
     let mut guard = BUMP.lock();
     let bump = guard.as_mut()?;
 
-    if bump.next + FRAME_SIZE > bump.end {
-        return None;
-    }
-    let frame = bump.next;
-    bump.next += FRAME_SIZE;
+    let frame = if bump.free_head != 0 {
+        let f = bump.free_head;
+        // The next-free pointer lives in the frame's first 8 bytes.
+        bump.free_head = unsafe { *(crate::mm::phys_to_virt(f) as *const u64) };
+        f
+    } else {
+        if bump.next + FRAME_SIZE > bump.end {
+            return None;
+        }
+        let f = bump.next;
+        bump.next += FRAME_SIZE;
+        f
+    };
     drop(guard); // don't hold the lock across the zeroing write
 
     // Zero through the HHDM so the frame is safe to use as a page table.
@@ -64,4 +78,14 @@ pub fn alloc_frame() -> Option<u64> {
         core::ptr::write_bytes(crate::mm::phys_to_virt(frame) as *mut u8, 0, FRAME_SIZE as usize);
     }
     Some(frame)
+}
+
+/// Return a frame to the free list (push). The frame's first 8 bytes are
+/// overwritten with the old list head — safe, the frame is no longer in use.
+pub fn free_frame(frame: u64) {
+    let mut guard = BUMP.lock();
+    if let Some(bump) = guard.as_mut() {
+        unsafe { *(crate::mm::phys_to_virt(frame) as *mut u64) = bump.free_head };
+        bump.free_head = frame;
+    }
 }

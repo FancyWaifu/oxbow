@@ -37,6 +37,9 @@ pub struct Process {
     exit_notif: Option<u8>,
     /// This process's own Memory budget pool index, released on exit.
     mem_idx: Option<u8>,
+    /// The spawner's Memory budget index + the cost it paid — refunded on exit.
+    parent_mem: Option<u8>,
+    spawn_cost: u64,
 }
 
 static PROCESSES: Mutex<[Process; MAX_PROCS]> = Mutex::new([Process::new(); MAX_PROCS]);
@@ -49,6 +52,8 @@ impl Process {
             handles: [None; HANDLE_TABLE_SIZE],
             exit_notif: None,
             mem_idx: None,
+            parent_mem: None,
+            spawn_cost: 0,
         }
     }
 
@@ -135,29 +140,44 @@ pub fn with_proc_mut<R>(id: usize, f: impl FnOnce(&mut Process) -> R) -> R {
     f(&mut procs[id])
 }
 
-/// Record a spawned child's exit notification + own Memory budget so `kill` can
-/// signal the parent and reclaim the budget slot when the child dies.
-pub fn set_lifecycle(id: usize, exit_notif: Option<u8>, mem_idx: u8) {
+/// Record a spawned child's lifecycle: exit notification, its own Memory budget,
+/// and the spawner's budget + the cost it paid (refunded when the child dies).
+pub fn set_lifecycle(id: usize, exit_notif: Option<u8>, mem_idx: u8, parent_mem: u8, cost: u64) {
     let mut procs = PROCESSES.lock();
     procs[id].exit_notif = exit_notif;
     procs[id].mem_idx = Some(mem_idx);
+    procs[id].parent_mem = Some(parent_mem);
+    procs[id].spawn_cost = cost;
 }
 
 /// Mark a process dead and drop its handles (on a ring-3 fault or `sys_exit`).
 /// Any pending Reply it held is abandoned — the blocked caller wakes `E_GONE`.
-/// Releases the process's Memory budget slot and signals its exit notification
-/// (if any) so a waiting parent wakes. The slot becomes reusable (`Dead`).
+/// Releases the child's Memory slot, REFUNDS the spawner's budget by the cost it
+/// paid, and signals the exit notification. The address space is NOT freed here
+/// (it may be the live CR3 — the dying thread is still running on it); its frames
+/// are reclaimed when the slot is reused (`create`). The slot becomes `Dead`.
 pub fn kill(id: usize) {
-    let (exit_notif, mem_idx) = {
+    let (exit_notif, mem_idx, parent_mem, cost) = {
         let mut procs = PROCESSES.lock();
         procs[id].for_each_reply(|idx| ipc::reply_abandon(idx as usize));
         procs[id].close_all();
         procs[id].state = PState::Dead;
-        (procs[id].exit_notif.take(), procs[id].mem_idx.take())
+        (
+            procs[id].exit_notif.take(),
+            procs[id].mem_idx.take(),
+            procs[id].parent_mem.take(),
+            procs[id].spawn_cost,
+        )
     };
-    // Outside the PROCESSES lock (lock rule): reclaim the budget, wake the parent.
+    // Outside the PROCESSES lock (lock rule): reclaim the budget slot, refund the
+    // spawner, wake the parent.
     if let Some(mi) = mem_idx {
         mm::mem::release(mi);
+    }
+    if let (Some(pm), c) = (parent_mem, cost) {
+        if c > 0 {
+            mm::mem::credit(pm, c);
+        }
     }
     if let Some(en) = exit_notif {
         crate::notif::signal(en);
@@ -239,16 +259,25 @@ fn load_into(img: &Image, pml4_phys: u64) -> (u64, u64) {
 /// — the caller installs the boot set (`grant_standard` + per-name device caps)
 /// or the spawn set (the §13 convention). `E_NOMEM` if the pool is full.
 pub fn create(img: &Image, pml4_phys: u64, name: &str) -> Result<(usize, u64, u64), SysError> {
-    let id = {
+    let (id, dead_pml4) = {
         let mut procs = PROCESSES.lock();
         let id = (0..MAX_PROCS)
             .find(|&i| matches!(procs[i].state, PState::Free | PState::Dead))
             .ok_or(SysError::NoMem)?;
+        // If we're reusing a Dead slot, its old address space is no longer live
+        // (the owner switched away on exit) — reclaim its frames below.
+        let dead_pml4 = (procs[id].state == PState::Dead).then_some(procs[id].pml4_phys);
+        procs[id] = Process::new(); // clear all stale state (handles, lifecycle)
         procs[id].state = PState::Alive;
         procs[id].pml4_phys = pml4_phys;
-        procs[id].handles = [None; HANDLE_TABLE_SIZE]; // clear any stale (Dead reuse)
-        id
+        (id, dead_pml4)
     };
+
+    // Free the previous tenant's address space (frames + page tables) now that the
+    // PROCESSES lock is dropped and that AS is provably not the live CR3.
+    if let Some(old) = dead_pml4 {
+        mm::vm::free_user_pml4(old);
+    }
 
     let (entry, user_rsp) = load_into(img, pml4_phys);
     println!("[proc] {} = proc {} (as pml4={:#x})", name, id, pml4_phys);

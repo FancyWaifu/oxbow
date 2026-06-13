@@ -454,7 +454,9 @@ fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> Sysca
             }
         }
     });
-    proc::set_lifecycle(cid, prep.exit_idx, child_mem);
+    // Record the lifecycle: the spawner (prep.midx) is refunded prep.cost when
+    // this child dies and its frames are reclaimed (slot reuse).
+    proc::set_lifecycle(cid, prep.exit_idx, child_mem, prep.midx, prep.cost);
     // Map the argv page (read-only) into the child at SPAWN_ARGV and write the
     // argument string there. Always mapped (empty string if no arg) so any child
     // can read it safely. Charged via the +1 page in `cost`.

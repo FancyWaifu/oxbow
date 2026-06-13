@@ -154,6 +154,61 @@ pub fn new_user_pml4() -> u64 {
     frame
 }
 
+/// Free every frame reachable from the LOWER half (user, entries 0..256) of the
+/// address space rooted at `pml4_phys`: the leaf data frames and the intermediate
+/// page-table frames, then the PML4 itself. The upper half (256..512) is the
+/// SHARED kernel image + HHDM and is never touched. Shared user frames (Frame
+/// objects, zero-copy shmem) are skipped so they aren't double-freed by a peer's
+/// teardown — they leak until a future Frame-refcount arc.
+///
+/// MUST NOT run while this address space is the live CR3 — call it only after the
+/// owning thread has switched away (we free on slot reuse, never on the dying
+/// thread itself).
+pub fn free_user_pml4(pml4_phys: u64) {
+    unsafe {
+        let l4 = &*(super::phys_to_virt(pml4_phys) as *const PageTable);
+        for i in 0..256 {
+            let e4 = &l4[i];
+            if !e4.flags().contains(Flags::PRESENT) {
+                continue;
+            }
+            let l3p = e4.addr().as_u64();
+            let l3 = &*(super::phys_to_virt(l3p) as *const PageTable);
+            for j in 0..512 {
+                let e3 = &l3[j];
+                if !e3.flags().contains(Flags::PRESENT) || e3.flags().contains(Flags::HUGE_PAGE) {
+                    continue;
+                }
+                let l2p = e3.addr().as_u64();
+                let l2 = &*(super::phys_to_virt(l2p) as *const PageTable);
+                for k in 0..512 {
+                    let e2 = &l2[k];
+                    if !e2.flags().contains(Flags::PRESENT) || e2.flags().contains(Flags::HUGE_PAGE)
+                    {
+                        continue;
+                    }
+                    let l1p = e2.addr().as_u64();
+                    let l1 = &*(super::phys_to_virt(l1p) as *const PageTable);
+                    for m in 0..512 {
+                        let e1 = &l1[m];
+                        if !e1.flags().contains(Flags::PRESENT) {
+                            continue;
+                        }
+                        let leaf = e1.addr().as_u64();
+                        if !super::mem::is_shared_frame(leaf) {
+                            pmm::free_frame(leaf);
+                        }
+                    }
+                    pmm::free_frame(l1p); // the PT
+                }
+                pmm::free_frame(l2p); // the PD
+            }
+            pmm::free_frame(l3p); // the PDPT
+        }
+    }
+    pmm::free_frame(pml4_phys);
+}
+
 /// Boot self-test (canary for the share-copy): create a second address space,
 /// switch CR3 into it, execute kernel code + read through the HHDM under it,
 /// then switch back. Must run with IF=0 (no timer yet). Stays as a permanent

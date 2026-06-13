@@ -185,11 +185,20 @@ coreutils holding the cwd capability + a name via argv, so confinement applies t
 destruction too — `rm`/`mv` can only affect children of the directory they were
 handed, never anything above it. See `docs/abi-v0.md` §15.9.
 
+**v1 arc 16 — memory reclamation: complete.** Every allocation layer now frees.
+The frame allocator gains an intrusive free list; a dead process's address space
+is walked and its frames + page tables returned to the allocator (skipping
+shared shmem frames so peers aren't double-freed); the spawner's budget is
+refunded the cost of a child when it dies; and the fs storage arena reclaims
+removed files. Before this, a session was capped at ~20 spawned commands (each
+permanently consumed budget) — now a shell can spawn and reap commands
+indefinitely (verified by 70 back-to-back cycles with no exhaustion). See
+`docs/abi-v0.md` §16.
+
 ### Next — toward a fuller userspace
 
-File growth/realloc + arena reclamation (deleted-file bytes currently leak) →
-multi-component path walk + cross-directory `mv` → a real **argv vector** →
-a **libc/POSIX shim**. POSIX and the Unix feel live in *userspace*
+File growth/realloc → multi-component path walk + cross-directory `mv` →
+Frame-object refcounting → a real **argv vector** → a **libc/POSIX shim**. POSIX and the Unix feel live in *userspace*
 over the capability kernel (the Redox model) — the kernel stays capability-pure.
 Plus, eventually: frame reclamation + budget refund, the orphaned selftest rework,
 untyped/retype + `sys_unmap`, SMP, and the `aarch64` port.

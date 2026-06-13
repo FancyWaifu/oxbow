@@ -66,14 +66,40 @@ fn mk(name: &[u8], parent: u16, kind: u64) -> Node {
     Node { kind, name: nb, name_len: n, parent, off: 0, len: 0, cap: 0 }
 }
 
-/// Bump-allocate `cap` bytes from the arena; `None` if it would overflow.
-fn arena_alloc(used: &mut usize, cap: usize) -> Option<usize> {
-    if *used + cap > ARENA_SIZE {
-        return None;
+/// The file-storage arena: a bump pointer plus a free list. Every file region is
+/// exactly `FILE_CAP`, so the free list is uniform — `alloc` pops a reclaimed
+/// region (from a removed file) before extending the bump pointer. This is what
+/// keeps repeated create/rm cycles from leaking the arena.
+struct Arena {
+    used: usize,
+    free: [usize; MAX_NODES],
+    free_n: usize,
+}
+
+impl Arena {
+    const fn new() -> Self {
+        Arena { used: 0, free: [0; MAX_NODES], free_n: 0 }
     }
-    let off = *used;
-    *used += cap;
-    Some(off)
+    /// Allocate one `FILE_CAP` region; `None` if the arena is full.
+    fn alloc(&mut self) -> Option<usize> {
+        if self.free_n > 0 {
+            self.free_n -= 1;
+            return Some(self.free[self.free_n]);
+        }
+        if self.used + FILE_CAP > ARENA_SIZE {
+            return None;
+        }
+        let off = self.used;
+        self.used += FILE_CAP;
+        Some(off)
+    }
+    /// Return a region to the free list (on file removal).
+    fn free(&mut self, off: usize) {
+        if self.free_n < self.free.len() {
+            self.free[self.free_n] = off;
+            self.free_n += 1;
+        }
+    }
 }
 
 /// A name is a single path component: reject empties, anything with '/', and '..'
@@ -99,7 +125,7 @@ fn parse_octal(b: &[u8]) -> usize {
 
 /// Build the node tree from the USTAR initrd at FS_INITRD, copying each top-level
 /// regular file's bytes into a fresh arena region (so it is writable).
-fn build_tree(nodes: &mut [Node], used: &mut usize) {
+fn build_tree(nodes: &mut [Node], arena: &mut Arena) {
     nodes[1] = mk(b"", 0, FS_DIR);
     let base = FS_INITRD as *const u8;
     let mut off = 0usize;
@@ -119,7 +145,7 @@ fn build_tree(nodes: &mut [Node], used: &mut usize) {
         let typeflag = unsafe { *hdr.add(156) };
         let is_file = typeflag == b'0' || typeflag == 0;
         if is_file && !nm.is_empty() && !nm.contains(&b'/') && next < nodes.len() {
-            if let Some(aoff) = arena_alloc(used, FILE_CAP) {
+            if let Some(aoff) = arena.alloc() {
                 let clen = core::cmp::min(size, FILE_CAP);
                 unsafe {
                     core::ptr::copy_nonoverlapping(hdr.add(512), (ARENA + aoff) as *mut u8, clen);
@@ -140,9 +166,9 @@ fn build_tree(nodes: &mut [Node], used: &mut usize) {
 pub extern "C" fn oxbow_main() -> ! {
     // Map the file-storage arena from our Memory budget (read+write).
     let _ = rt::sys_map(BOOT_MEM, ARENA as u64, ARENA_SIZE as u64, PROT_READ | PROT_WRITE);
-    let mut used = 0usize;
+    let mut arena = Arena::new();
     let mut nodes = [FREE; MAX_NODES];
-    build_tree(&mut nodes, &mut used);
+    build_tree(&mut nodes, &mut arena);
 
     w(b"[fs] ready\n");
 
@@ -274,7 +300,7 @@ pub extern "C" fn oxbow_main() -> ! {
                             Some(i)
                         }
                         None => match (1..MAX_NODES).find(|&i| nodes[i].kind == 0) {
-                            Some(i) => match arena_alloc(&mut used, FILE_CAP) {
+                            Some(i) => match arena.alloc() {
                                 Some(aoff) => {
                                     let mut nd = mk(name, node_id as u16, FS_FILE);
                                     nd.off = aoff;
@@ -386,7 +412,8 @@ pub extern "C" fn oxbow_main() -> ! {
                                     0
                                 }
                             } else {
-                                // file: free the node slot (arena bytes leak — v1)
+                                // file: reclaim its arena region, then free the slot.
+                                arena.free(nodes[i].off);
                                 nodes[i].kind = 0;
                                 0
                             }
