@@ -753,3 +753,14 @@ Frame-object refcounting (shared shmem frames leak — skipped, not freed); free
 a `Dead` slot's frames at exit rather than at reuse (a reaper); file growth /
 realloc. These are bounded leaks on rare paths, not the unbounded per-command
 leak this arc removed.
+
+### 15.10 Multi-component paths (v1-paths)
+The fs now resolves `/`-separated paths, not just single names. OPEN walks the
+full path from the invoked directory; CREATE/MKDIR/UNLINK resolve the parent path
+and operate on the last component; RENAME resolves the source and destination
+parents independently, so `mv a/x b/y` moves a node ACROSS directories (re-parents
+it). Resolution descends only — `.` and `..` are rejected, so a path can never
+escape above the directory capability it was invoked through (confinement is
+preserved). Empty components (leading/trailing/double `/`) are tolerated. The
+shell gains `ls <path>` (opens the directory, hands its cap to a spawned `ls`);
+`cat`/`cd`/`echo >`/`mkdir`/`touch`/`rm`/`mv` already pass the path through.

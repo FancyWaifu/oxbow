@@ -108,6 +108,48 @@ fn name_ok(name: &[u8]) -> bool {
     !name.is_empty() && !name.contains(&b'/') && name != b".." && name != b"."
 }
 
+/// Find a child of `parent` named `name` (single component), or None.
+fn find_child(nodes: &[Node], parent: usize, name: &[u8]) -> Option<usize> {
+    (1..MAX_NODES).find(|&i| {
+        let nd = &nodes[i];
+        nd.kind != 0 && nd.parent as usize == parent && &nd.name[..nd.name_len] == name
+    })
+}
+
+/// Resolve a (possibly multi-component) path from `start`, returning the final
+/// node. Descends only: '/' separates components, '.' and '..' are rejected, so a
+/// path can never escape above the directory capability it was invoked through
+/// (confinement). Empty components (leading/trailing/double slash) are tolerated.
+fn walk(nodes: &[Node], start: usize, path: &[u8]) -> Option<usize> {
+    let mut node = start;
+    for comp in path.split(|&b| b == b'/') {
+        if comp.is_empty() {
+            continue;
+        }
+        if !name_ok(comp) || nodes[node].kind != FS_DIR {
+            return None;
+        }
+        node = find_child(nodes, node, comp)?;
+    }
+    Some(node)
+}
+
+/// Resolve all but the LAST component of `path` from `start`, returning
+/// (parent directory node, last component). The last component is not looked up
+/// (it may not exist yet — for create/mkdir). Parent must exist and be a dir.
+fn walk_parent<'a>(nodes: &[Node], start: usize, path: &'a [u8]) -> Option<(usize, &'a [u8])> {
+    match path.iter().rposition(|&b| b == b'/') {
+        None => Some((start, path)),
+        Some(i) => {
+            let parent = walk(nodes, start, &path[..i])?;
+            if nodes[parent].kind != FS_DIR {
+                return None;
+            }
+            Some((parent, &path[i + 1..]))
+        }
+    }
+}
+
 /// Parse a USTAR octal numeric field (leading spaces, octal digits, then space/NUL).
 fn parse_octal(b: &[u8]) -> usize {
     let mut v = 0usize;
@@ -187,11 +229,9 @@ pub extern "C" fn oxbow_main() -> ! {
                 let nlen = bytes.iter().position(|&b| b == 0).unwrap_or(0);
                 let name = &bytes[..nlen];
                 let mut r = MsgBuf::new(0);
-                let found = if valid && nodes[node_id].kind == FS_DIR && name_ok(name) {
-                    (1..MAX_NODES).find(|&i| {
-                        let nd = &nodes[i];
-                        nd.kind != 0 && nd.parent as usize == node_id && &nd.name[..nd.name_len] == name
-                    })
+                // `name` may be a multi-component path (a/b/c); walk it.
+                let found = if valid && nodes[node_id].kind == FS_DIR {
+                    walk(&nodes, node_id, name)
                 } else {
                     None
                 };
@@ -289,32 +329,36 @@ pub extern "C" fn oxbow_main() -> ! {
                 let nlen = bytes.iter().position(|&b| b == 0).unwrap_or(0);
                 let name = &bytes[..nlen];
                 let mut r = MsgBuf::new(0);
-                let child = if valid && nodes[node_id].kind == FS_DIR && name_ok(name) {
-                    let existing = (1..MAX_NODES).find(|&i| {
-                        let nd = &nodes[i];
-                        nd.kind == FS_FILE && nd.parent as usize == node_id && &nd.name[..nd.name_len] == name
-                    });
-                    match existing {
-                        Some(i) => {
-                            nodes[i].len = 0; // truncate
-                            Some(i)
-                        }
-                        None => match (1..MAX_NODES).find(|&i| nodes[i].kind == 0) {
-                            Some(i) => match arena.alloc() {
-                                Some(aoff) => {
-                                    let mut nd = mk(name, node_id as u16, FS_FILE);
-                                    nd.off = aoff;
-                                    nd.cap = FILE_CAP;
-                                    nodes[i] = nd;
-                                    Some(i)
-                                }
-                                None => None,
-                            },
-                            None => None,
-                        },
-                    }
+                // Resolve the parent path; create `base` (the last component) in it.
+                let target = if valid && nodes[node_id].kind == FS_DIR {
+                    walk_parent(&nodes, node_id, name)
                 } else {
                     None
+                };
+                let child = match target {
+                    Some((par, base)) if name_ok(base) => {
+                        match find_child(&nodes, par, base) {
+                            Some(i) if nodes[i].kind == FS_FILE => {
+                                nodes[i].len = 0; // truncate existing
+                                Some(i)
+                            }
+                            Some(_) => None, // exists but is a directory
+                            None => match (1..MAX_NODES).find(|&i| nodes[i].kind == 0) {
+                                Some(i) => match arena.alloc() {
+                                    Some(aoff) => {
+                                        let mut nd = mk(base, par as u16, FS_FILE);
+                                        nd.off = aoff;
+                                        nd.cap = FILE_CAP;
+                                        nodes[i] = nd;
+                                        Some(i)
+                                    }
+                                    None => None,
+                                },
+                                None => None,
+                            },
+                        }
+                    }
+                    _ => None,
                 };
                 match child {
                     Some(i) => match rt::sys_mint(BOOT_EP, i as u64, R_SEND | R_GRANT) {
@@ -371,20 +415,24 @@ pub extern "C" fn oxbow_main() -> ! {
                 let nlen = bytes.iter().position(|&b| b == 0).unwrap_or(0);
                 let name = &bytes[..nlen];
                 let mut r = MsgBuf::new(0);
-                let dup = (1..MAX_NODES).any(|i| {
-                    let nd = &nodes[i];
-                    nd.kind != 0 && nd.parent as usize == node_id && &nd.name[..nd.name_len] == name
-                });
-                let ok = if valid && nodes[node_id].kind == FS_DIR && name_ok(name) && !dup {
-                    match (1..MAX_NODES).find(|&i| nodes[i].kind == 0) {
-                        Some(i) => {
-                            nodes[i] = mk(name, node_id as u16, FS_DIR);
-                            true
-                        }
-                        None => false,
-                    }
+                let target = if valid && nodes[node_id].kind == FS_DIR {
+                    walk_parent(&nodes, node_id, name)
                 } else {
-                    false
+                    None
+                };
+                let ok = match target {
+                    Some((par, base))
+                        if name_ok(base) && find_child(&nodes, par, base).is_none() =>
+                    {
+                        match (1..MAX_NODES).find(|&i| nodes[i].kind == 0) {
+                            Some(i) => {
+                                nodes[i] = mk(base, par as u16, FS_DIR);
+                                true
+                            }
+                            None => false,
+                        }
+                    }
+                    _ => false,
                 };
                 r.data[0] = if ok { 0 } else { 1 };
                 r.data_len = 1;
@@ -396,11 +444,13 @@ pub extern "C" fn oxbow_main() -> ! {
                 let nlen = bytes.iter().position(|&b| b == 0).unwrap_or(0);
                 let name = &bytes[..nlen];
                 let mut r = MsgBuf::new(0);
-                let status = if valid && nodes[node_id].kind == FS_DIR && name_ok(name) {
-                    match (1..MAX_NODES).find(|&i| {
-                        let nd = &nodes[i];
-                        nd.kind != 0 && nd.parent as usize == node_id && &nd.name[..nd.name_len] == name
-                    }) {
+                let target = if valid && nodes[node_id].kind == FS_DIR {
+                    walk_parent(&nodes, node_id, name)
+                } else {
+                    None
+                };
+                let status = if let Some((par, base)) = target.filter(|(_, b)| name_ok(b)) {
+                    match find_child(&nodes, par, base) {
                         Some(i) => {
                             if nodes[i].kind == FS_DIR {
                                 let has_children = (1..MAX_NODES)
@@ -441,30 +491,38 @@ pub extern "C" fn oxbow_main() -> ! {
                     &bytes[0..0]
                 };
                 let mut r = MsgBuf::new(0);
-                let status = if valid
-                    && nodes[node_id].kind == FS_DIR
-                    && name_ok(old)
-                    && name_ok(new)
-                    && !(1..MAX_NODES).any(|i| {
-                        let nd = &nodes[i];
-                        nd.kind != 0 && nd.parent as usize == node_id && &nd.name[..nd.name_len] == new
-                    }) {
-                    match (1..MAX_NODES).find(|&i| {
-                        let nd = &nodes[i];
-                        nd.kind != 0 && nd.parent as usize == node_id && &nd.name[..nd.name_len] == old
-                    }) {
-                        Some(i) => {
-                            let mut nb = [0u8; 24];
-                            let k = core::cmp::min(new.len(), 24);
-                            nb[..k].copy_from_slice(&new[..k]);
-                            nodes[i].name = nb;
-                            nodes[i].name_len = k;
-                            0
-                        }
-                        None => 1,
-                    }
+                // Resolve src and dst parents independently — supports moving a
+                // node across directories (mv a/x b/y), all within the dir cap.
+                let src = if valid && nodes[node_id].kind == FS_DIR {
+                    walk_parent(&nodes, node_id, old)
                 } else {
-                    1
+                    None
+                };
+                let dst = if valid && nodes[node_id].kind == FS_DIR {
+                    walk_parent(&nodes, node_id, new)
+                } else {
+                    None
+                };
+                let status = match (src, dst) {
+                    (Some((spar, sbase)), Some((dpar, dbase)))
+                        if name_ok(sbase)
+                            && name_ok(dbase)
+                            && find_child(&nodes, dpar, dbase).is_none() =>
+                    {
+                        match find_child(&nodes, spar, sbase) {
+                            Some(i) => {
+                                let mut nb = [0u8; 24];
+                                let k = core::cmp::min(dbase.len(), 24);
+                                nb[..k].copy_from_slice(&dbase[..k]);
+                                nodes[i].name = nb;
+                                nodes[i].name_len = k;
+                                nodes[i].parent = dpar as u16; // re-parent (cross-dir)
+                                0
+                            }
+                            None => 1,
+                        }
+                    }
+                    _ => 1,
                 };
                 r.data[0] = status;
                 r.data_len = 1;

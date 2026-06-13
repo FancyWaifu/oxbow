@@ -106,6 +106,32 @@ fn spawn_with(image: Handle, cap0: Handle, arg: &[u8], sp: &Spawner) {
     }
 }
 
+/// `ls [path]`: with no arg, list `dir`; with a path, OPEN it (must be a
+/// directory) and hand that capability to a spawned `ls`.
+fn ls_cmd(dir: Handle, path: &[u8], sp: &Spawner) {
+    if path.is_empty() {
+        spawn_with(BOOT_IMG_LS, dir, b"", sp);
+        return;
+    }
+    let mut m = MsgBuf::new(TAG_FS_OPEN);
+    pack_name(&mut m, path);
+    if rt::sys_call(dir, &mut m).is_err() || m.data[0] != 0 {
+        tw(b"ls: ");
+        tw(path);
+        tw(b": no such directory\n");
+        return;
+    }
+    let cap = m.handles[0];
+    if m.data[1] != oxbow_abi::FS_DIR {
+        tw(b"ls: ");
+        tw(path);
+        tw(b": not a directory\n");
+    } else {
+        spawn_with(BOOT_IMG_LS, cap, b"", sp);
+    }
+    let _ = rt::sys_close(cap);
+}
+
 /// `cat <name>`: resolve the name relative to `dir` (the shell holds the dir cap),
 /// then hand the resulting FILE capability to a freshly-spawned `cat` program —
 /// which reads exactly that one file and nothing else.
@@ -364,7 +390,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle) {
                 _ => tw(b"run: no such program\n"),
             }
         }
-        b"ls" => spawn_with(BOOT_IMG_LS, *cwd, b"", sp),
+        b"ls" => ls_cmd(*cwd, rest, sp),
         b"cat" => cat_cmd(*cwd, rest, sp),
         b"mkdir" => spawn_with(BOOT_IMG_MKDIR, *cwd, rest, sp),
         b"touch" => spawn_with(BOOT_IMG_TOUCH, *cwd, rest, sp),
