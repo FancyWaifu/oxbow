@@ -117,15 +117,22 @@ spawned children (the full PONG regression — IPC, zero-copy shmem, E_GONE, tic
 sys_map — on demand). A program can only launch images it was *granted* (zero
 ambient authority; spawn-by-handle). See `docs/abi-v0.md` §13.
 
+**v1 arc 9 — cooked-mode line discipline: complete.** The tty now synchronizes
+echo with the reader: keystrokes echo live while the shell waits in `READ`, but
+buffer **un-echoed** while the shell is busy (running a command, emitting its
+output + prompt) and flush at the next `READ`, after the prompt. So pasting a
+whole command — or typing the next one before the previous finishes — no longer
+tangles the echo with output; each command's echo lands grouped with its own
+prompt, and type-ahead edits (backspace) are invisible. A pure `servers/tty`
+change (no ABI/shell/driver change). See `docs/abi-v0.md` §12.5.
+
 ### Next — toward a fuller userspace
 
 A **filesystem** (VFS naming server + ramdisk) → coreutils → a **libc/POSIX
 shim**. POSIX and the Unix feel live in *userspace* over the capability kernel
-(the Redox model) — the kernel stays capability-pure. A nearer-term polish item:
-**cooked-mode echo synchronization** in the tty (see §12.5) for clean
-paste/type-ahead. Plus, eventually: frame reclamation + budget refund, the
-orphaned selftest rework, untyped/retype + `sys_unmap`, SMP, and the `aarch64`
-port.
+(the Redox model) — the kernel stays capability-pure. Plus, eventually: frame
+reclamation + budget refund, the orphaned selftest rework, untyped/retype +
+`sys_unmap`, SMP, and the `aarch64` port.
 
 ## Building & running
 

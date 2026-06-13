@@ -333,9 +333,10 @@ handle, not a global; least privilege is enforced by *not minting* the cap.)
 ### 11.2 Messages (one endpoint, tag-multiplexed)
 A single blocking `recv` loop in the tty can't select across senders, so the
 sender's intent rides in the message **tag**:
-- **`TAG_TTY_CHAR`** (kbd, one-way `send`): `data[0]` = one byte (set-1 ASCII,
-  `0x08` = backspace). Runs line discipline: printable → buffer + echo;
-  backspace → rub-out (`\x08 \x08`); CR/LF → terminate the line.
+- **`TAG_TTY_CHAR`** (kbd/serial, one-way `send`): `data[0]` = one byte. Runs the
+  line discipline: printable → buffer (echo live iff a reader waits, else defer —
+  see §12.5); backspace (`0x08` or `0x7F`) → rub-out `\x08 \x08` if the char was
+  on screen, else silent; CR/LF → terminate the line.
 - **`TAG_TTY_READ`** (shell, `call`): "give me the next complete line." If one is
   queued, the tty replies immediately with `TAG_TTY_LINE`; otherwise it **stashes
   the Reply handle** and replies when the next line completes. Completed lines
@@ -349,12 +350,11 @@ sender's intent rides in the message **tag**:
 empty line is a no-op; anything else → `oxbow: <cmd>: command not found`. The
 prompt is `oxbow$ `, written via `TAG_TTY_WRITE` before each `READ`.
 
-### 11.4 Known limitation
-Under aggressive **type-ahead** (keys posted to the endpoint before the shell's
-prompt-write message arrives) the keystroke echo can precede the prompt for that
-line — inherent to async input with a single ordered endpoint. At interactive
-speed the prompt always leads. Cooked-mode prompt/echo synchronization is
-deferred.
+### 11.4 Echo ordering
+Keystroke echo is synchronized with the reader so it never precedes the prompt or
+tangles with shell output, even under paste / type-ahead — see §12.5 (cooked-mode
+echo synchronization). The only residual edge is a paste of more than the
+4-deep line FIFO while the shell is busy (excess lines dropped).
 
 ---
 
@@ -401,20 +401,30 @@ The serial driver is a dumb byte pipe — no translation. Terminals send **DEL
 already handled. The tty's existing echo is the sole echo source (QEMU's stdio
 chardev is in raw mode; tcp has no echo) — no double echo.
 
-### 12.5 Known limitation — type-ahead / paste echo interleaving
-Echo is driven per-character by the tty the instant a `TAG_TTY_CHAR` arrives,
-while shell output and the prompt arrive as separate `TAG_TTY_WRITE` messages
-from a *different* sender. When input is typed (or pasted) faster than the shell
-consumes a line — i.e. while the shell is still emitting the previous command's
-output/prompt — the two async message streams interleave at the endpoint, so the
-echoed characters can tangle with that output on screen. Correctness is
-unaffected (every command still parses and runs; the machine never faults), but
-the *display* is messy under burst input. The clean fix is cooked-mode echo
-synchronization: the tty would withhold echo while no reader is waiting (the
-shell is busy) and flush it when the next `READ` is posted, after the prompt.
-That is a line-discipline enhancement (it applies to the PS/2 path too), tracked
-for a future arc. At human interactive speed — type, see the prompt, type the
-next command — echo is clean.
+### 12.5 Cooked-mode echo synchronization (v1-cooked-tty)
+Echo is synchronized with the reader so paste / type-ahead never tangles with the
+shell's output. The tty tracks an `echoed` cursor into the edit buffer
+(`edit[..echoed]` is on screen, `edit[echoed..elen]` is pending-echo) and gates
+echo on whether a reader is waiting (`pending != HANDLE_NULL`):
+- **A reader is waiting (normal interactive):** printable keystrokes echo live, as
+  typed — unchanged behavior.
+- **The shell is busy** (running a command, emitting output + the next prompt):
+  keystrokes buffer **un-echoed**. Backspace edits the buffer silently (a char
+  that was never shown is removed without a rub-out). A line completed in this
+  window queues in the done FIFO un-echoed.
+- **On the next `READ`:** the shell's prompt `TAG_TTY_WRITE` has already printed
+  (the kernel endpoint is FIFO-ordered, and the shell sends the prompt *before*
+  the READ), so the tty now flushes the echo — the in-progress line's pending
+  tail on a stash, or a queued completed line at the moment it is popped. Each
+  command's echo therefore lands grouped with its own prompt.
+
+Invariant: a line resting in the done FIFO across loop iterations is always
+un-echoed (it completed with no reader), so it is echoed exactly once, at
+delivery. Children writing via `TAG_TTY_WRITE` while the shell blocks elsewhere
+(e.g. `run pong`) pass through untouched, and type-ahead during such a command
+buffers and flushes cleanly when the shell returns to `READ`. The only residual
+edge is a paste of more than `DONE_CAP` (4) complete lines while busy: excess
+lines are dropped with `[tty] !line dropped`, as before.
 
 ---
 

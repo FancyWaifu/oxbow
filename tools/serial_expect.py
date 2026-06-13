@@ -117,6 +117,23 @@ def main():
     # 3) unknown command
     exchange(b"nope", b"nope: command not found")
 
+    # --- cooked-mode echo (v1-cooked-tty): paste/type-ahead must NOT garble ---
+    # These deliberately do NOT pace per character — eliminating the §12.5 race is
+    # the point. A single contiguous-substring match is the strong check: with
+    # cooked-mode echo every byte appears exactly once, in order.
+    c.read_until(PROMPT, 8)
+    # 4) two commands pasted at ONE prompt (the classic interleave case)
+    c.send(b"echo a\recho b\r")
+    if not c.read_until(b"echo a\na\noxbow$ echo b\nb\noxbow$ ", 8):
+        fails.append("paste of two commands garbled")
+    # 5) type-ahead DURING a long command buffers, then flushes clean afterwards
+    c.send(b"run pong\r")
+    time.sleep(0.3)
+    c.send(b"echo after\r")  # lands mid-run (shell busy)
+    c.read_until(b"round 3 -> E_GONE ok", 12)
+    if not c.read_until(b"oxbow$ echo after\nafter\noxbow$ ", 10):
+        fails.append("type-ahead during long command garbled")
+
     print("----- transcript -----")
     sys.stdout.write(c.buf.decode("latin1"))
     print("\n----- results -----")
@@ -124,7 +141,7 @@ def main():
         for f in fails:
             print(f"  FAIL: {f}")
         return 1
-    print("  ALL PASS: echo, DEL-editing, unknown-command driven over serial")
+    print("  ALL PASS: echo, DEL-editing, unknown-command, paste + type-ahead")
     return 0
 
 
