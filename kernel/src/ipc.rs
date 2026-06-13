@@ -15,7 +15,6 @@
 //! contention-free; the only hazard is a lock held across a switch.
 use core::mem::size_of;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicBool, Ordering};
 use oxbow_abi::{Handle, MsgBuf, SysError, SysResult, HANDLE_NULL, MSG_DATA_WORDS, MSG_HANDLES};
 use spin::Mutex;
 
@@ -198,15 +197,6 @@ fn resume_epilogue(me: usize) -> (u64, u64) {
     }
 }
 
-// --- One-shot rendezvous-path announcements (proof both orderings happen) --
-fn announce(done: &AtomicBool, msg: &str) {
-    if !done.swap(true, Ordering::Relaxed) {
-        println!("[ipc] rendezvous: {}", msg);
-    }
-}
-static SENDER_FIRST: AtomicBool = AtomicBool::new(false);
-static RECEIVER_FIRST: AtomicBool = AtomicBool::new(false);
-
 // --- Boot -----------------------------------------------------------------
 
 /// Create EP0 (user↔user PONG) and EP1 (the TTY endpoint).
@@ -266,7 +256,6 @@ pub fn send_or_call(ep_idx: u8, msg: &MsgBuf, msg_uptr: u64, is_call: bool) -> (
     if let Some(r) = ep.recv_waiter.take() {
         // ---- receiver-first: a receiver is blocked waiting for us ----
         drop(eps);
-        announce(&RECEIVER_FIRST, "receiver-first");
         // Deposit our message into the receiver's staging, then move any granted
         // handles into the receiver's table (rewriting the staged indices).
         unsafe { (*slot(r)).staging = *msg };
@@ -328,7 +317,6 @@ pub fn recv(ep_idx: u8, msg_uptr: u64) -> (u64, u64) {
 
         if let Some(s) = ep.send_q.pop() {
             // ---- sender-first: a sender is queued ----
-            announce(&SENDER_FIRST, "sender-first");
             let is_call = unsafe { (*slot(s)).is_call };
             // Move any granted handles from the sender's table into ours, rewriting
             // the staged indices to our table's (we are the running receiver).

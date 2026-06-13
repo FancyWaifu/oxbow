@@ -58,7 +58,8 @@ pub extern "C" fn oxbow_main() -> ! {
 
         match m.tag {
             TAG_TTY_CHAR if m.data_len >= 1 => match m.data[0] as u8 {
-                0x08 => {
+                // PS/2 backspace is 0x08; serial terminals send DEL (0x7F).
+                0x08 | 0x7F => {
                     if elen > 0 {
                         elen -= 1;
                         w(b"\x08 \x08");

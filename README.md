@@ -92,13 +92,28 @@ output flows through the tty — least privilege enforced by not minting the cap
 The headline works end-to-end at the keyboard: **`oxbow$ echo hi` → `hi`**. See
 `docs/abi-v0.md` §11.
 
+**v1 arc 7 — a serial console: complete.** A sixth userspace process
+(`servers/serial`) makes COM1 a real *input* device, so you can type at the
+shell directly over the serial line — `just run` is fully interactive in your
+terminal, BSD-serial-console style, no graphical window needed. It is the §10
+IRQ/driver pattern applied to the 16550 UART, with a twist: the device is
+**shared with the kernel** (which owns config + the TX path), split by direction
+and enforced by capabilities — the driver is granted RBR/LSR as **`R_IN`-only**
+I/O-port caps, so it can physically only *read* the UART; a write faults
+`E_RIGHTS`. Each received byte is forwarded to the tty as `TAG_TTY_CHAR`, joining
+keyboard input in the one line discipline (DEL and 0x08 both rub out). See
+`docs/abi-v0.md` §12. (Headless test: COM1 on a TCP socket, driven by
+`tools/serial_expect.py`.)
+
 ### Next — toward a fuller userspace
 
-**Process spawning** (a shell that launches programs) → a **filesystem** (VFS
-naming server + ramdisk) → coreutils → a **libc/POSIX shim**. POSIX and the Unix
-feel live in *userspace* over the capability kernel (the Redox model) — the
-kernel stays capability-pure. Plus, eventually: untyped/retype + `sys_unmap`,
-SMP, and the `aarch64` port.
+**Process spawning** (a shell that launches programs; also lets the boot drop
+straight into a clean shell instead of running the pong/beta demo) → a
+**filesystem** (VFS naming server + ramdisk) → coreutils → a **libc/POSIX shim**.
+POSIX and the Unix feel live in *userspace* over the capability kernel (the Redox
+model) — the kernel stays capability-pure. A nearer-term polish item: **cooked-
+mode echo synchronization** in the tty (see §12.5) for clean paste/type-ahead.
+Plus, eventually: untyped/retype + `sys_unmap`, SMP, and the `aarch64` port.
 
 ## Building & running
 

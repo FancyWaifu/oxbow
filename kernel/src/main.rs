@@ -180,7 +180,8 @@ fn kmain_stage2() -> ! {
             1 => "beta",
             2 => "kbd",
             3 => "tty",
-            _ => "shell",
+            4 => "shell",
+            _ => "serial",
         };
         println!("[mod] module {} ({}): {} bytes", i, name, bytes.len());
         let img = elf::Image::validate(bytes);
@@ -275,6 +276,42 @@ fn kmain_stage2() -> ! {
                 );
                 // Drop the console: the shell must not write hardware directly.
                 let _ = p.close(oxbow_abi::BOOT_CONSOLE);
+            });
+        }
+        // Module 5 (serial driver) gets the COM1 IRQ line + the 16550 RX ports as
+        // capabilities. The ports are R_IN ONLY — the kernel keeps exclusive
+        // ownership of every UART config/TX register, so the driver can only read.
+        if i == 5 {
+            proc::with_proc_mut(pid, |p| {
+                p.install(
+                    oxbow_abi::BOOT_SERIAL_IRQ,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Irq(4), // COM1 line
+                        rights: oxbow_abi::R_BIND | oxbow_abi::R_ACK,
+                    },
+                );
+                p.install(
+                    oxbow_abi::BOOT_SERIAL_RBR,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::IoPort { base: 0x3F8, len: 1 },
+                        rights: oxbow_abi::R_IN,
+                    },
+                );
+                p.install(
+                    oxbow_abi::BOOT_SERIAL_LSR,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::IoPort { base: 0x3FD, len: 1 },
+                        rights: oxbow_abi::R_IN,
+                    },
+                );
+                // The serial driver forwards received bytes to the TTY endpoint.
+                p.install(
+                    oxbow_abi::BOOT_TTY,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Endpoint(ipc::EP1),
+                        rights: oxbow_abi::R_SEND,
+                    },
+                );
             });
         }
         let tcb = thread::spawn_user(pid, as_i, entry, user_rsp);

@@ -200,6 +200,12 @@ pub const BOOT_KBD_DATA: Handle = 5; // IoPort{0x60,1}
 pub const BOOT_KBD_STATUS: Handle = 6; // IoPort{0x64,1}
 /// The TTY endpoint: kbd/shell hold R_SEND, tty holds R_RECV (slot 7).
 pub const BOOT_TTY: Handle = 7;
+/// Serial driver (module 5) boot handles: the COM1 IRQ line + 16550 RX ports.
+/// The driver only ever READS, so the port caps are granted R_IN with no R_OUT;
+/// the kernel keeps exclusive ownership of every UART config/TX register.
+pub const BOOT_SERIAL_IRQ: Handle = 4; // IrqLine(4) — R_BIND|R_ACK
+pub const BOOT_SERIAL_RBR: Handle = 5; // IoPort{0x3F8,1} — R_IN (RBR, read side)
+pub const BOOT_SERIAL_LSR: Handle = 6; // IoPort{0x3FD,1} — R_IN (line status)
 
 /// "PING" — request tag for the v0 roundtrip.
 pub const TAG_PING: u64 = 0x474E4950;

@@ -355,3 +355,63 @@ prompt-write message arrives) the keystroke echo can precede the prompt for that
 line — inherent to async input with a single ordered endpoint. At interactive
 speed the prompt always leads. Cooked-mode prompt/echo synchronization is
 deferred.
+
+---
+
+## 12. Serial console (v1-serial-console)
+
+A userspace driver makes COM1 a real input device, so you can type at the shell
+directly over the serial line (`just run`) — not just the PS/2 keyboard. It is
+the §10 IRQ/driver pattern applied to the 16550 UART, with one twist: the device
+is **shared with the kernel**, split by direction and enforced by capabilities.
+
+### 12.1 Register ownership (kernel vs driver)
+- **Kernel owns all config + the TX path.** `init()` (the `uart_16550` crate)
+  programs LCR/divisor/MCR and leaves `IER=0x01` (RX-data interrupt enabled) and
+  `MCR=0x0b` (OUT2 set — gates the IRQ onto the PIC). The kernel then retunes the
+  FIFO to `FCR=0x07` (RX trigger level **1 byte**), so one keystroke raises IRQ4
+  deterministically. Output stays polled THR writes under the `SERIAL1` lock.
+  **The kernel must not re-init the UART after boot** (that would re-arm IER).
+- **Driver owns the RX path, read-only.** It is granted `IoPort{0x3F8,1}` (RBR)
+  and `IoPort{0x3FD,1}` (LSR) with **`R_IN` only — no `R_OUT`**. A driver write
+  to any UART register is an `E_RIGHTS` fault: the capability *is* the ownership
+  boundary. The driver writes **zero** UART registers; everything it needs is
+  already configured by the kernel.
+
+### 12.2 Boot handles (module 5, `servers/serial`)
+- **`BOOT_SERIAL_IRQ = 4`** — `Irq(4)`, rights `R_BIND | R_ACK` (no GRANT/ATTEN).
+- **`BOOT_SERIAL_RBR = 5`** — `IoPort{0x3F8,1}`, rights `R_IN`.
+- **`BOOT_SERIAL_LSR = 6`** — `IoPort{0x3FD,1}`, rights `R_IN`.
+- **`BOOT_TTY = 7`** — `Endpoint(EP1)`, rights `R_SEND` (forwards keystrokes).
+
+(Handle slots are per-process, so reusing 4/5/6 here — as the kbd driver also
+does — is not a collision; each process has its own table.)
+
+### 12.3 Drain discipline
+On IRQ4 the kernel handler masks line 4, EOIs, and signals the bound
+notification. The driver then drains: `while LSR(0x3FD) bit0 (DR) set { read
+RBR(0x3F8); forward as TAG_TTY_CHAR }`, then `sys_irq_ack` (unmask). With only
+IER bit0 enabled, draining the RX FIFO below the trigger deasserts the
+interrupt — **no IIR read is required**. drain-before-ack as in §10.3.
+
+### 12.4 Line discipline note
+The serial driver is a dumb byte pipe — no translation. Terminals send **DEL
+(0x7F)** for Backspace (vs the PS/2 path's 0x08), so the tty line discipline
+(§11.2) treats **both 0x08 and 0x7F** as backspace. Enter arrives as CR (0x0D),
+already handled. The tty's existing echo is the sole echo source (QEMU's stdio
+chardev is in raw mode; tcp has no echo) — no double echo.
+
+### 12.5 Known limitation — type-ahead / paste echo interleaving
+Echo is driven per-character by the tty the instant a `TAG_TTY_CHAR` arrives,
+while shell output and the prompt arrive as separate `TAG_TTY_WRITE` messages
+from a *different* sender. When input is typed (or pasted) faster than the shell
+consumes a line — i.e. while the shell is still emitting the previous command's
+output/prompt — the two async message streams interleave at the endpoint, so the
+echoed characters can tangle with that output on screen. Correctness is
+unaffected (every command still parses and runs; the machine never faults), but
+the *display* is messy under burst input. The clean fix is cooked-mode echo
+synchronization: the tty would withhold echo while no reader is waiting (the
+shell is busy) and flush it when the next `READ` is posted, after the prompt.
+That is a line-discipline enhancement (it applies to the PS/2 path too), tracked
+for a future arc. At human interactive speed — type, see the prompt, type the
+next command — echo is clean.

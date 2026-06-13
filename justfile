@@ -24,6 +24,7 @@ build-server:
     RUSTFLAGS="-C relocation-model=static" cargo build -p kbd
     RUSTFLAGS="-C relocation-model=static" cargo build -p tty
     RUSTFLAGS="-C relocation-model=static" cargo build -p shell
+    RUSTFLAGS="-C relocation-model=static" cargo build -p serial
 
 # Same, but with the ABI negative-path selftests compiled in.
 build-server-selftest:
@@ -50,6 +51,7 @@ _iso:
     cp target/x86_64-unknown-none/debug/kbd iso_root/boot/kbd.elf
     cp target/x86_64-unknown-none/debug/tty iso_root/boot/tty.elf
     cp target/x86_64-unknown-none/debug/shell iso_root/boot/shell.elf
+    cp target/x86_64-unknown-none/debug/serial iso_root/boot/serial.elf
     cp limine.conf iso_root/boot/limine/
     cp {{LIMINE_DIR}}/limine-bios.sys {{LIMINE_DIR}}/limine-bios-cd.bin {{LIMINE_DIR}}/limine-uefi-cd.bin iso_root/boot/limine/
     cp {{LIMINE_DIR}}/BOOTX64.EFI {{LIMINE_DIR}}/BOOTIA32.EFI iso_root/EFI/BOOT/
@@ -79,6 +81,20 @@ run-faulttest: build build-server-faulttest _iso
 # Boot the isolation demo: same vaddr / different bytes, hostile beta dies alone.
 run-isolation: build build-server-isolation _iso
     qemu-system-x86_64 {{qemu_flags}}
+
+# Boot WITH a graphical window so you can type at the shell. The i8042 keyboard
+# needs a display to capture keystrokes; kernel output still streams to serial on
+# this terminal. Type in the QEMU window, watch results here. (Quit: close the
+# window, or Ctrl-A X in this terminal.)
+run-tty: iso
+    qemu-system-x86_64 -M q35 -m 256M -cdrom {{ISO}} -boot d -serial stdio -display cocoa -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04
+
+# Headless serial-console test target: COM1 routed to a TCP socket so a harness
+# can both TYPE (write) and READ on one stream. server=on,wait=on makes QEMU
+# block at startup until the harness connects, so no boot output is lost.
+# (By design this hangs until a client connects — that's the point.)
+run-serial-tcp PORT="45454": iso
+    qemu-system-x86_64 -M q35 -m 256M -cdrom {{ISO}} -boot d -serial tcp:127.0.0.1:{{PORT}},server=on,wait=on -display none -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04
 
 # Boot stopped, waiting for a debugger:  (in another shell) gdb -ex 'target remote :1234'
 gdb: iso

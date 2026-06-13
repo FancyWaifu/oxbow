@@ -38,10 +38,11 @@ pub fn init() {
         // Hardware IRQ vectors (PIC remapped base 0x20).
         idt[TIMER_VECTOR].set_handler_fn(timer); // IRQ0 — scheduler tick
         idt[0x21].set_handler_fn(keyboard); // IRQ1 — i8042 keyboard (bindable)
+        idt[0x24].set_handler_fn(serial_com1); // IRQ4 — 16550 COM1 RX (bindable)
         idt[0x27].set_handler_fn(spurious_master); // IRQ7 spurious: no EOI
         idt[0x2F].set_handler_fn(spurious_slave); // IRQ15 spurious: EOI master
         for v in 0x22u8..=0x2E {
-            if v != 0x27 {
+            if v != 0x24 && v != 0x27 {
                 idt[v].set_handler_fn(unexpected_irq);
             }
         }
@@ -55,7 +56,6 @@ pub fn init() {
 
 /// Count of times the timer has preempted ring 3 (user), for the Phase-5
 /// checkpoint message.
-static USER_PREEMPTS: AtomicU64 = AtomicU64::new(0);
 
 extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
     let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -69,11 +69,10 @@ extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
         crate::notif::fire_tick();
     }
 
-    // Were we interrupting ring 3? (RPL bits of the saved CS.) Announce the
-    // first few user preemptions as the Phase-5 proof that ring 3 is preemptible.
-    if frame.code_segment.0 & 3 == 3 && USER_PREEMPTS.fetch_add(1, Ordering::Relaxed) < 3 {
-        println!("[sched] preempt user @ tick {}", tick);
-    }
+    // (Ring-3 preemptibility was proven in the threads arc; the per-preempt
+    // trace print is retired — it would otherwise corrupt the serial console,
+    // which the shell now shares with kernel output.)
+    let _ = frame;
     crate::thread::preempt();
 }
 
@@ -84,6 +83,14 @@ extern "x86-interrupt" fn keyboard(_frame: InterruptStackFrame) {
     pic::mask(1);
     pic::eoi(1);
     crate::irq::fire(1);
+}
+
+extern "x86-interrupt" fn serial_com1(_frame: InterruptStackFrame) {
+    // IRQ4 — COM1 RX. Same discipline as the keyboard: mask, EOI in-kernel, then
+    // signal the bound notification. The user serial driver drains RBR and acks.
+    pic::mask(4);
+    pic::eoi(4);
+    crate::irq::fire(4);
 }
 
 extern "x86-interrupt" fn spurious_master(_frame: InterruptStackFrame) {
