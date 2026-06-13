@@ -11,7 +11,8 @@ use oxbow_abi::{
     SPAWN_DEFAULT_BUDGET, SPAWN_SLOTS, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE,
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
-    SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE, SYS_RECV, SYS_REPLY, SYS_SEND, SYS_SPAWN, R_ACK,
+    SYS_DMA_ALLOC, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE, SYS_RECV, SYS_REPLY, SYS_SEND,
+    SYS_SPAWN, R_ACK,
     R_BIND, R_IN, R_OUT, R_SPAWN,
 };
 
@@ -91,6 +92,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_PCI_READ => sys_pci_read(a1, a2),
         SYS_PCI_WRITE => sys_pci_write(a1, a2, a3),
         SYS_PCI_BAR_MAP => sys_pci_bar_map(a1, a2, a3),
+        SYS_DMA_ALLOC => sys_dma_alloc(a1, a2),
         SYS_CONSOLE_WRITE => sys_console_write(a1, a2, a3),
         SYS_ATTENUATE => sys_attenuate(a1, a2),
         SYS_CLOSE => SyscallRet::from_result(proc::with_current_mut(|p| p.close(a1 as Handle))),
@@ -756,6 +758,38 @@ fn sys_pci_bar_map(dev: u64, bar: u64, vaddr: u64) -> SyscallRet {
         }
         Ok(())
     })())
+}
+
+/// `sys_dma_alloc(mem, vaddr) -> phys` — allocate one frame, map it writable
+/// (cacheable) into the caller's AS at `vaddr`, and return its physical address
+/// in rdx. A bus-mastering driver needs known physical addresses to program a
+/// device's ring-base registers and descriptor buffer pointers. Paid from the
+/// Memory budget (R_MAP). The frame is an ordinary lower-half mapping, so AS
+/// teardown (§16) reclaims it like any other; no IOMMU exists in v0, so a driver
+/// holding a bus-master device cap could already DMA anywhere — exposing the
+/// physical address of its own frames adds no authority it lacked.
+fn sys_dma_alloc(mem: u64, vaddr: u64) -> SyscallRet {
+    let result = (|| -> SysResult<u64> {
+        let entry = proc::with_current(|p| p.lookup(mem as Handle, ObjType::Memory, R_MAP))?;
+        let ObjectRef::Memory(midx) = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        if vaddr & 0xfff != 0 || vaddr >= LOWER_HALF_END {
+            return Err(SysError::Fault);
+        }
+        if !mm::mem::debit(midx, 4096) {
+            return Err(SysError::NoMem);
+        }
+        let phys = mm::pmm::alloc_frame().ok_or(SysError::NoMem)?;
+        let pml4 = mm::vm::current_pml4();
+        mm::vm::probe_user_range(pml4, vaddr, 1).map_err(|_| SysError::Fault)?;
+        mm::vm::map_user_4k_live(pml4, vaddr, phys, true);
+        Ok(phys)
+    })();
+    match result {
+        Ok(phys) => SyscallRet { rax: 0, rdx: phys },
+        Err(e) => SyscallRet::err(e),
+    }
 }
 
 /// `sys_attenuate(src, new_rights)` — derive a strictly-weaker handle (law L5).

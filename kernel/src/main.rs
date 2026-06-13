@@ -169,8 +169,8 @@ fn kmain_stage2() -> ! {
         Some(d) => {
             let (base, size) = d.bar_region(0);
             println!(
-                "[pci] NIC {:04x}:{:04x} at {:02x}:{:02x}.{} — BAR0 {:#x} ({} KiB)",
-                d.vendor, d.device, d.bus, d.dev, d.func, base, size / 1024
+                "[pci] NIC {:04x}:{:04x} at {:02x}:{:02x}.{} — BAR0 {:#x} ({} KiB) IRQ {}",
+                d.vendor, d.device, d.bus, d.dev, d.func, base, size / 1024, d.irq_line()
             );
         }
         None => println!("[pci] no network controller found"),
@@ -440,6 +440,16 @@ fn kmain_stage2() -> ! {
                         object::HandleEntry {
                             obj: object::ObjectRef::PciDevice(d.bdf()),
                             rights: oxbow_abi::R_IN | oxbow_abi::R_OUT | oxbow_abi::R_MAP,
+                            badge: 0,
+                        },
+                    );
+                    // ...and a capability to that NIC's interrupt line, so it can
+                    // bind the IRQ to a notification and ack it (mask/unmask).
+                    p.install(
+                        oxbow_abi::BOOT_NET_IRQ,
+                        object::HandleEntry {
+                            obj: object::ObjectRef::Irq(d.irq_line()),
+                            rights: oxbow_abi::R_BIND | oxbow_abi::R_ACK,
                             badge: 0,
                         },
                     );

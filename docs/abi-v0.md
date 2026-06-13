@@ -874,3 +874,54 @@ registers to.
 This establishes the substrate; the following arcs build the e1000 TX/RX
 descriptor rings + IRQ on top, then Ethernet/ARP/IPv4/UDP, then smoltcp for TCP
 and a socket capability API — all as userland servers over this mechanism.
+
+## 19. e1000 NIC driver — rings, DMA, IRQ (v1-e1000)
+
+Building on the PCI/MMIO capability (§18), `net` becomes a real driver: it owns
+DMA descriptor rings, brings the e1000 up, and receives packets through an
+interrupt. The arc is proven end to end — the driver hand-builds one ARP request,
+transmits it, and receives the QEMU SLIRP gateway's ARP reply *via the NIC's
+interrupt* — so TX, RX, and IRQ all work over the capability model.
+
+### 19.1 DMA memory: `SYS_DMA_ALLOC` (24)
+`sys_dma_alloc(mem, vaddr) -> phys` allocates one frame from the caller's Memory
+budget (R_MAP), maps it writable+cacheable at `vaddr`, and **returns its physical
+address**. A bus-mastering driver must know physical addresses to program a
+device's ring-base registers and per-descriptor buffer pointers — virtual
+addresses are meaningless to the device's DMA engine. The frame is an ordinary
+lower-half mapping, so §16 reclamation frees it on AS teardown like any other. No
+new authority is exposed: with no IOMMU in v0, a driver holding a bus-master
+device cap can already DMA anywhere; revealing the physical address of *its own*
+frames adds nothing. (Lesson learned the hard way: a TX descriptor pointing at a
+*virtual* buffer address transmits whatever physical memory happens to live
+there — garbage the gateway silently drops.)
+
+### 19.2 The NIC interrupt: `BOOT_NET_IRQ`
+The kernel enumerates the NIC's interrupt line from PCI config space (offset
+0x3C — QEMU/SeaBIOS routes the e1000 to legacy PIC IRQ 11) and grants `net` an
+`Irq(line)` capability (`BOOT_NET_IRQ`, rights `R_BIND | R_ACK`) alongside its
+PciDevice cap. The driver `sys_irq_bind`s it to a Notification and `sys_irq_ack`s
+to arm the line. IRQ 11 is a *slave-PIC* line, so the kernel's `pic::unmask` now
+also unmasks the master's cascade input (IRQ2) — the first slave-line driver in
+the system. A dedicated IDT handler (vector 0x2B) follows the standard
+mask-on-fire / EOI-in-kernel discipline; the driver reads the device ICR (which
+deasserts the level-triggered INTx) before acking. PCI INTx is level-triggered,
+which the mask-on-fire rule handles without change.
+
+### 19.3 e1000 bring-up (driver)
+`servers/net` now: enables bus-mastering, maps BAR0, pulses `CTRL.RST`, sets link
+up (`CTRL.SLU`), clears the multicast table, and builds two rings in DMA memory —
+RX (8 descriptors, 2048-byte buffers, `RCTL = EN|UPE|MPE|BAM|SECRC`) and TX
+(`TCTL = EN|PSP|CT|COLD`, standard TIPG). RX head/tail bracket the descriptors
+hardware may fill; TX hands a descriptor to the device by writing the buffer's
+*physical* address + `EOP|IFCS|RS` and bumping `TDT`. Receive is interrupt-driven:
+park on the notification, read ICR, drain every descriptor whose `STA.DD` is set,
+recycle it (clear status, advance `RDT`), then ack. Descriptor memory is
+cacheable with a `SeqCst` fence before each tail bump — sufficient on x86's
+coherent PCI bus (QEMU).
+
+### 19.4 Demonstrated
+`[net] ARP reply: 10.0.2.2 is at 52:55:0a:00:02:02` — the gateway's MAC, learned
+by transmitting a broadcast ARP request and receiving the unicast reply through
+IRQ 11. Next arcs layer proper Ethernet/ARP/IPv4/UDP (from scratch) and then
+smoltcp for TCP, plus a socket capability API — all userland over this driver.

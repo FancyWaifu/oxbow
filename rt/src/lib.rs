@@ -452,6 +452,13 @@ pub fn sys_pci_bar_map(pcidev: Handle, bar: u32, vaddr: u64) -> SysResult {
     SysError::from_raw(rax)
 }
 
+/// Allocate one DMA frame from the `mem` budget, map it writable at `vaddr`, and
+/// return its physical address (§19) — for a driver's ring/buffer pointers.
+pub fn sys_dma_alloc(mem: Handle, vaddr: u64) -> SysResult<u64> {
+    let (rax, rdx) = unsafe { syscall2(oxbow_abi::SYS_DMA_ALLOC, mem as u64, vaddr) };
+    SysError::from_raw(rax).map(|_| rdx)
+}
+
 /// This program's argument string (the kernel mapped it at SPAWN_ARGV on spawn).
 /// Empty if spawned without an argument.
 pub fn argv() -> &'static [u8] {

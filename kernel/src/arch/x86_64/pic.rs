@@ -61,12 +61,18 @@ pub fn mask_all() {
     }
 }
 
-/// Unmask (enable) one IRQ line. v1 arc 1 uses only IRQ0 (master).
+/// Unmask (enable) one IRQ line. A slave line (8-15) only reaches the CPU if the
+/// master's cascade input (IRQ2) is also unmasked, so unmask it too — the first
+/// slave-line driver (the e1000 NIC on IRQ11) needs this.
 pub fn unmask(irq: u8) {
     unsafe {
         let (port, line) = if irq < 8 {
             (PIC1_DATA, irq)
         } else {
+            // Unmask the cascade (master IRQ2) so slave interrupts propagate.
+            let mut m = Port::<u8>::new(PIC1_DATA);
+            let cur = m.read();
+            m.write(cur & !(1 << 2));
             (PIC2_DATA, irq - 8)
         };
         let mut p = Port::<u8>::new(port);

@@ -40,9 +40,10 @@ pub fn init() {
         idt[0x21].set_handler_fn(keyboard); // IRQ1 — i8042 keyboard (bindable)
         idt[0x24].set_handler_fn(serial_com1); // IRQ4 — 16550 COM1 RX (bindable)
         idt[0x27].set_handler_fn(spurious_master); // IRQ7 spurious: no EOI
+        idt[0x2B].set_handler_fn(net_irq); // IRQ11 — e1000 NIC, PCI INTx (bindable)
         idt[0x2F].set_handler_fn(spurious_slave); // IRQ15 spurious: EOI master
         for v in 0x22u8..=0x2E {
-            if v != 0x24 && v != 0x27 {
+            if v != 0x24 && v != 0x27 && v != 0x2B {
                 idt[v].set_handler_fn(unexpected_irq);
             }
         }
@@ -91,6 +92,16 @@ extern "x86-interrupt" fn serial_com1(_frame: InterruptStackFrame) {
     pic::mask(4);
     pic::eoi(4);
     crate::irq::fire(4);
+}
+
+extern "x86-interrupt" fn net_irq(_frame: InterruptStackFrame) {
+    // IRQ11 — the e1000 NIC's PCI INTx line (level-triggered). Same discipline:
+    // mask the line, EOI in-kernel (slave + master cascade), then signal the
+    // bound notification. The net driver reads the device's ICR (which deasserts
+    // the line), drains the RX ring, and acks (unmask) for the next interrupt.
+    pic::mask(11);
+    pic::eoi(11);
+    crate::irq::fire(11);
 }
 
 extern "x86-interrupt" fn spurious_master(_frame: InterruptStackFrame) {

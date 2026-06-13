@@ -101,6 +101,12 @@ pub const SYS_PCI_READ: u64 = 21; // (pcidev, offset) -> u32   needs R_IN
 pub const SYS_PCI_WRITE: u64 = 22; // (pcidev, offset, value)  needs R_OUT
 pub const SYS_PCI_BAR_MAP: u64 = 23; // (pcidev, bar, vaddr)   needs R_MAP; maps BAR MMIO
 
+// DMA memory (§19). Allocate one frame, map it writable+cacheable into the
+// caller's AS at `vaddr`, and RETURN its physical address (in rdx) — a driver
+// needs known physical addresses to program a device's ring-base registers and
+// descriptor buffer pointers. Paid from the caller's Memory budget (R_MAP).
+pub const SYS_DMA_ALLOC: u64 = 24; // (mem, vaddr) -> phys      needs R_MAP
+
 // ---------------------------------------------------------------------------
 // Error codes (§6) — returned in rax; values are stable forever (append-only)
 // ---------------------------------------------------------------------------
@@ -250,6 +256,11 @@ pub const BOOT_IMG_CP: Handle = 19; // spawned coreutil: cp (dir cap + argv)
 pub const BOOT_PCI: Handle = 8;
 /// Fixed vaddr where the net driver maps the NIC's MMIO BAR0.
 pub const NET_MMIO: u64 = 0x4000_0000;
+/// The net driver's IrqLine capability for the NIC's interrupt (R_BIND|R_ACK).
+pub const BOOT_NET_IRQ: Handle = 9;
+/// Fixed vaddr base where the net driver maps its first DMA page (rings +
+/// packet buffers map at NET_DMA + n*0x1000).
+pub const NET_DMA: u64 = 0x4010_0000;
 
 // --- Filesystem (§15) ------------------------------------------------------
 /// The shell's root-directory capability: a BADGED endpoint to the fs server,

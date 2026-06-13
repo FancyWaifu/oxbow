@@ -57,6 +57,12 @@ impl Device {
         config_read(self.bus, self.dev, self.func, 0x10 + i * 4)
     }
 
+    /// The interrupt line (config 0x3C, low byte): the legacy PIC IRQ the
+    /// firmware routed this function's INTx# pin to. QEMU/SeaBIOS programs it.
+    pub fn irq_line(&self) -> u8 {
+        config_read(self.bus, self.dev, self.func, 0x3C) as u8
+    }
+
     /// Probe BAR `i`'s size by writing all-ones and reading the mask back, then
     /// restoring it. Returns `(phys_base, size)` for a memory BAR, or (0,0).
     pub fn bar_region(&self, i: u8) -> (u64, u64) {
