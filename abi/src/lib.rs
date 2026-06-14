@@ -151,6 +151,15 @@ pub const PLEDGE_CAP: u64 = 1 << 4; // attenuate
 pub const PLEDGE_IO: u64 = 1 << 5; // io_in/out, pci_*, irq_*
 pub const PLEDGE_NOTIF: u64 = 1 << 6; // notif_create/signal/wait
 
+/// immutable (§38) — OpenBSD mimmutable(2): permanently lock the protection of a
+/// mapped range. After this, sys_map or sys_protect touching any page in the
+/// range is refused (E_RIGHTS) — even a W^X-LEGAL flip like RW->RX. A runtime
+/// maps its code, sets it RX, marks it immutable, and now nothing (not even the
+/// process itself, post-exploit) can make it writable or remap it. Hardens W^X
+/// (L4) from "never W and X at once" to "this text can never change again".
+/// Gated on the Memory cap (R_MAP), like map/protect. One-way: no un-immutable.
+pub const SYS_IMMUTABLE: u64 = 30; // (mem, vaddr, len) -> 0 / E_NOMEM (table full)
+
 // ---------------------------------------------------------------------------
 // Error codes (§6) — returned in rax; values are stable forever (append-only)
 // ---------------------------------------------------------------------------

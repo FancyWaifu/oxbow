@@ -617,6 +617,14 @@ pub fn sys_pledge(promises: u64) -> SysResult {
     SysError::from_raw(rax)
 }
 
+/// Permanently lock the protection of a mapped range (mimmutable). After this,
+/// sys_map/sys_protect touching the range is refused. Needs the Memory cap.
+pub fn sys_immutable(mem: Handle, vaddr: u64, len: u64) -> SysResult {
+    let (rax, _) =
+        unsafe { syscall3(oxbow_abi::SYS_IMMUTABLE, mem as u64, vaddr, len) };
+    SysError::from_raw(rax)
+}
+
 pub fn sys_exit(code: u64) -> ! {
     unsafe {
         syscall1(SYS_EXIT, code);

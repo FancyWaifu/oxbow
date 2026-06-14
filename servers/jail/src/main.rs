@@ -145,7 +145,8 @@ pub extern "C" fn oxbow_main() -> ! {
     // then try to flip it to writable+executable. The kernel forbids W|X.
     total += 1;
     let scratch = 0x3000_0000u64;
-    if rt::sys_map(BOOT_MEM, scratch, 4096, PROT_READ | PROT_WRITE).is_ok() {
+    let scratch_ok = rt::sys_map(BOOT_MEM, scratch, 4096, PROT_READ | PROT_WRITE).is_ok();
+    if scratch_ok {
         unsafe { core::ptr::write_volatile(scratch as *mut u8, 0xC3) }; // a 'ret'
         held += match rt::sys_protect(BOOT_MEM, scratch, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) {
             Err(e) => report(b"[L4] make my code page W+X         ", true, errname(e)),
@@ -153,6 +154,20 @@ pub extern "C" fn oxbow_main() -> ! {
         };
     } else {
         held += report(b"[L4] make my code page W+X (no mem)", true, b"E_NOMEM");
+    }
+
+    // [H] mimmutable hardening: lock the scratch page immutable, then try a flip
+    // that W^X WOULD permit (RW->RX). Immutability forbids it — the text can never
+    // change again, even via a legal transition.
+    total += 1;
+    if scratch_ok {
+        let _ = rt::sys_immutable(BOOT_MEM, scratch, 4096);
+        held += match rt::sys_protect(BOOT_MEM, scratch, 4096, PROT_READ | PROT_EXEC) {
+            Err(e) => report(b"[H ] re-protect an immutable page   ", true, errname(e)),
+            Ok(_) => report(b"[H ] re-protect an immutable page   ", false, b""),
+        };
+    } else {
+        held += report(b"[H ] immutable page (no mem)        ", true, b"E_NOMEM");
     }
 
     // L3 — no global namespace + capability confinement. We were handed a cap to

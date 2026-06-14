@@ -12,9 +12,9 @@ use oxbow_abi::{
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
     SYS_DMA_ALLOC, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE, SYS_PROTECT, SYS_RECV, SYS_REPLY,
-    SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_UPTIME_MS, PROT_EXEC,
-    R_ACK, R_BIND, R_IN, R_OUT, R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM, PLEDGE_SPAWN,
-    PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
+    SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_UPTIME_MS,
+    PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT, R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM,
+    PLEDGE_SPAWN, PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
 };
 
 use crate::object::{HandleEntry, ObjType, ObjectRef};
@@ -104,6 +104,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_SPAWN_BYTES => sys_spawn_bytes(a1, a2, a3, a4, a5),
         SYS_GETENTROPY => sys_getentropy(a1, a2),
         SYS_PLEDGE => sys_pledge(a1),
+        SYS_IMMUTABLE => sys_immutable(a1, a2, a3),
         SYS_EP_CREATE => sys_ep_create(),
         SYS_MINT => sys_mint(a1, a2, a3),
         SYS_PCI_READ => sys_pci_read(a1, a2),
@@ -898,10 +899,37 @@ fn sys_protect(mem: u64, vaddr: u64, len: u64, prot: u64) -> SyscallRet {
             return Err(SysError::Msg); // must be readable; W^X forbids W|X (L4)
         }
         let pages = (len + 0xfff) / 0x1000;
+        // mimmutable (§38): refuse to re-protect a range locked immutable, even a
+        // W^X-legal flip.
+        let end = vaddr + pages * 0x1000;
+        if proc::with_current(|p| p.is_immutable(vaddr, end)) {
+            return Err(SysError::Rights);
+        }
         let pml4 = mm::vm::current_pml4();
         mm::vm::protect_user_range(pml4, vaddr, pages, writable, executable)
             .map_err(|_| SysError::Fault)?;
         Ok(())
+    })())
+}
+
+/// `sys_immutable(mem, vaddr, len)` — permanently lock the protection of a mapped
+/// range (mimmutable, §38). Gated on the Memory cap (R_MAP), like protect.
+fn sys_immutable(mem: u64, vaddr: u64, len: u64) -> SyscallRet {
+    SyscallRet::from_result((|| -> SysResult {
+        let entry = proc::with_current(|p| p.lookup(mem as Handle, ObjType::Memory, R_MAP))?;
+        if !matches!(entry.obj, ObjectRef::Memory(_)) {
+            return Err(SysError::BadType);
+        }
+        if vaddr & 0xfff != 0 || vaddr >= LOWER_HALF_END {
+            return Err(SysError::Fault);
+        }
+        let pages = (len + 0xfff) / 0x1000;
+        let end = vaddr + pages * 0x1000;
+        if proc::with_current_mut(|p| p.immutable_add(vaddr, end)) {
+            Ok(())
+        } else {
+            Err(SysError::NoMem) // immutable-range table full
+        }
     })())
 }
 
@@ -930,7 +958,9 @@ fn pledge_class(nr: u64) -> u64 {
         SYS_EXIT | SYS_PLEDGE | SYS_CLOSE => 0,
         SYS_CONSOLE_WRITE | SYS_GETENTROPY | SYS_UPTIME_MS => PLEDGE_STDIO,
         SYS_SEND | SYS_RECV | SYS_CALL | SYS_REPLY | SYS_EP_CREATE | SYS_MINT => PLEDGE_IPC,
-        SYS_MAP | SYS_PROTECT | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC => PLEDGE_MEM,
+        SYS_MAP | SYS_PROTECT | SYS_IMMUTABLE | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC => {
+            PLEDGE_MEM
+        }
         SYS_SPAWN | SYS_SPAWN_BYTES => PLEDGE_SPAWN,
         SYS_ATTENUATE => PLEDGE_CAP,
         SYS_IO_IN | SYS_IO_OUT | SYS_PCI_READ | SYS_PCI_WRITE | SYS_PCI_BAR_MAP | SYS_IRQ_BIND

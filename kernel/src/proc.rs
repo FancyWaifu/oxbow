@@ -43,7 +43,14 @@ pub struct Process {
     /// Permitted syscall-class bitmask (pledge, §37). u64::MAX = unpledged (all
     /// classes). `sys_pledge` only ever intersects it, so authority is monotone.
     pledge: u64,
+    /// Immutable address ranges (mimmutable, §38): [start, end) pairs whose
+    /// protection can never change again. Fixed pool; `imm_count` are live.
+    imm: [(u64, u64); MAX_IMM],
+    imm_count: usize,
 }
+
+/// Max immutable ranges per process (a runtime locks text + maybe rodata/got).
+const MAX_IMM: usize = 8;
 
 static PROCESSES: Mutex<[Process; MAX_PROCS]> = Mutex::new([Process::new(); MAX_PROCS]);
 
@@ -58,6 +65,8 @@ impl Process {
             parent_mem: None,
             spawn_cost: 0,
             pledge: u64::MAX, // unpledged: every syscall class permitted
+            imm: [(0, 0); MAX_IMM],
+            imm_count: 0,
         }
     }
 
@@ -70,6 +79,22 @@ impl Process {
     /// Narrow the pledge to the intersection with `mask` (drop authority only).
     pub fn pledge_narrow(&mut self, mask: u64) {
         self.pledge &= mask;
+    }
+
+    /// Mark [start, end) immutable. Returns false if the range table is full.
+    pub fn immutable_add(&mut self, start: u64, end: u64) -> bool {
+        if self.imm_count >= MAX_IMM {
+            return false;
+        }
+        self.imm[self.imm_count] = (start, end);
+        self.imm_count += 1;
+        true
+    }
+
+    /// True if [start, end) overlaps any immutable range (so a map/protect over
+    /// it must be refused).
+    pub fn is_immutable(&self, start: u64, end: u64) -> bool {
+        self.imm[..self.imm_count].iter().any(|&(s, e)| start < e && s < end)
     }
 
     /// Install a well-known handle at a fixed slot (boot-time setup only).
