@@ -47,7 +47,7 @@ build-server:
     # (the kernel enabled SSE at boot) so the float ABI matches across the
     # Rust↔C boundary (pow/floor args, printf %f varargs).
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p oxlua
-    RUSTFLAGS="-C relocation-model=static" cargo build -p oxpy
+    RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p oxpy
 
 # Same, but with the ABI negative-path selftests compiled in.
 build-server-selftest:

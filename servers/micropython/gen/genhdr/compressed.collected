@@ -40,6 +40,8 @@
 
 *x must be assignment target
 
+0.0 to a complex power
+
 3-arg pow() not supported
 
 I/O operation on closed file
@@ -90,9 +92,17 @@ can't assign to expression
 
 can't assign to expression
 
+can't convert %s to complex
+
+can't convert %s to float
+
 can't convert %s to int
 
 can't convert '%q' object to %q implicitly
+
+can't convert NaN to int
+
+can't convert inf to int
 
 can't create '%q' instances
 
@@ -112,13 +122,19 @@ can't switch from automatic field numbering to manual field specification
 
 can't switch from manual field specification to automatic field numbering
 
+can't truncate-divide a complex number
+
 chr() arg not in range(256)
 
-decimal numbers not supported
+complex divide by zero
 
 default 'except' must be last
 
 dict update sequence has wrong length
+
+divide by zero
+
+divide by zero
 
 divide by zero
 
@@ -137,6 +153,8 @@ expecting key:value for dict
 extra keyword arguments given
 
 extra positional arguments given
+
+float too big
 
 format needs a dict
 
@@ -204,6 +222,8 @@ invalid syntax
 
 invalid syntax for integer with base %d
 
+invalid syntax for number
+
 issubclass() arg 1 must be a class
 
 issubclass() arg 2 must be a class or a tuple of classes
@@ -215,6 +235,8 @@ keyword argument(s) not implemented - use normal args instead
 local variable referenced before assignment
 
 long int not supported in this build
+
+math domain error
 
 memory allocation failed, allocating %u bytes
 
@@ -233,8 +255,6 @@ name too long
 need more than %d values to unpack
 
 need more than %d values to unpack
-
-negative power with no float support
 
 negative shift count
 

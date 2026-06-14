@@ -160,6 +160,8 @@ Q(__class__)
 
 Q(__class__)
 
+Q(__complex__)
+
 Q(__contains__)
 
 Q(__contains__)
@@ -191,6 +193,8 @@ Q(__file__)
 Q(__file__)
 
 Q(__file__)
+
+Q(__float__)
 
 Q(__ge__)
 
@@ -241,6 +245,8 @@ Q(__main__)
 Q(__main__)
 
 Q(__module__)
+
+Q(__name__)
 
 Q(__name__)
 
@@ -366,6 +372,8 @@ Q(_star_)
 
 Q(abs)
 
+Q(acos)
+
 Q(add)
 
 Q(all)
@@ -387,6 +395,12 @@ Q(array)
 Q(array)
 
 Q(array)
+
+Q(asin)
+
+Q(atan)
+
+Q(atan2)
 
 Q(bin)
 
@@ -418,6 +432,8 @@ Q(calcsize)
 
 Q(callable)
 
+Q(ceil)
+
 Q(chr)
 
 Q(classmethod)
@@ -444,15 +460,23 @@ Q(collections)
 
 Q(collections)
 
-Q(const)
+Q(complex)
+
+Q(complex)
 
 Q(const)
 
-Q(copy)
+Q(const)
 
 Q(copy)
 
 Q(copy)
+
+Q(copy)
+
+Q(copysign)
+
+Q(cos)
 
 Q(count)
 
@@ -463,6 +487,8 @@ Q(count)
 Q(decode)
 
 Q(default)
+
+Q(degrees)
 
 Q(delattr)
 
@@ -488,6 +514,8 @@ Q(divmod)
 
 Q(doc)
 
+Q(e)
+
 Q(enable)
 
 Q(encode)
@@ -508,9 +536,13 @@ Q(exec)
 
 Q(exit)
 
+Q(exp)
+
 Q(extend)
 
 Q(extend)
+
+Q(fabs)
 
 Q(filter)
 
@@ -518,9 +550,19 @@ Q(filter)
 
 Q(find)
 
+Q(float)
+
+Q(float)
+
+Q(floor)
+
 Q(flush)
 
+Q(fmod)
+
 Q(format)
+
+Q(frexp)
 
 Q(from_bytes)
 
@@ -572,6 +614,8 @@ Q(hex)
 
 Q(id)
 
+Q(imag)
+
 Q(implementation)
 
 Q(index)
@@ -602,9 +646,15 @@ Q(isdisjoint)
 
 Q(isenabled)
 
+Q(isfinite)
+
+Q(isinf)
+
 Q(isinstance)
 
 Q(islower)
+
+Q(isnan)
 
 Q(isspace)
 
@@ -642,6 +692,8 @@ Q(keys)
 
 Q(keys)
 
+Q(ldexp)
+
 Q(len)
 
 Q(list)
@@ -656,6 +708,8 @@ Q(little)
 
 Q(locals)
 
+Q(log)
+
 Q(lower)
 
 Q(lstrip)
@@ -663,6 +717,10 @@ Q(lstrip)
 Q(map)
 
 Q(map)
+
+Q(math)
+
+Q(math)
 
 Q(max)
 
@@ -679,6 +737,8 @@ Q(micropython)
 Q(micropython)
 
 Q(min)
+
+Q(modf)
 
 Q(module)
 
@@ -712,6 +772,8 @@ Q(path)
 
 Q(pend_throw)
 
+Q(pi)
+
 Q(pop)
 
 Q(pop)
@@ -722,6 +784,8 @@ Q(popitem)
 
 Q(pow)
 
+Q(pow)
+
 Q(print)
 
 Q(print_exception)
@@ -729,6 +793,8 @@ Q(print_exception)
 Q(property)
 
 Q(property)
+
+Q(radians)
 
 Q(range)
 
@@ -741,6 +807,8 @@ Q(read)
 Q(readinto)
 
 Q(readline)
+
+Q(real)
 
 Q(remove)
 
@@ -786,6 +854,8 @@ Q(setdefault)
 
 Q(setter)
 
+Q(sin)
+
 Q(slice)
 
 Q(slice)
@@ -795,6 +865,8 @@ Q(sort)
 Q(sorted)
 
 Q(split)
+
+Q(sqrt)
 
 Q(start)
 
@@ -840,6 +912,8 @@ Q(sys)
 
 Q(sys)
 
+Q(tan)
+
 Q(tell)
 
 Q(threshold)
@@ -849,6 +923,8 @@ Q(throw)
 Q(throw)
 
 Q(to_bytes)
+
+Q(trunc)
 
 Q(tuple)
 

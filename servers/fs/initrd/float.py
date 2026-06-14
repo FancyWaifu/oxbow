@@ -1,0 +1,12 @@
+import math
+print("float on oxbow:")
+print("  3 / 2 =", 3 / 2)
+print("  2 ** 0.5 =", 2 ** 0.5)
+print("  math.pi =", math.pi)
+print("  math.sqrt(2) =", math.sqrt(2))
+print("  math.sin(math.pi/6) =", round(math.sin(math.pi / 6), 6))
+print("  math.cos(0) =", math.cos(0))
+print("  math.log(math.e) =", round(math.log(math.e), 6))
+print("  math.atan2(1, 1) =", round(math.atan2(1, 1), 6))
+total = sum(1 / n for n in range(1, 1001))
+print("  sum(1/n, n=1..1000) =", round(total, 6))

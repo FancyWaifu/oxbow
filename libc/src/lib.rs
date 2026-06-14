@@ -1755,6 +1755,170 @@ pub extern "C" fn pow(x: f64, y: f64) -> f64 {
     exp(y * log(x))
 }
 
+// --- Elementary transcendentals (libm). Series/range-reduction based, accurate
+// to ~1e-12 — enough for an interpreter's math module (MicroPython, QuickJS). ---
+const PI: f64 = 3.141592653589793;
+const LN10: f64 = 2.302585092994046;
+const LN2: f64 = 0.6931471805599453;
+
+#[no_mangle]
+pub extern "C" fn copysign(x: f64, y: f64) -> f64 {
+    let a = fabs(x);
+    if y < 0.0 || (y == 0.0 && 1.0 / y < 0.0) { -a } else { a }
+}
+#[no_mangle]
+pub extern "C" fn trunc(x: f64) -> f64 {
+    if !(fabs(x) < 9.007199254740992e15) { return x; }
+    (x as i64) as f64
+}
+#[no_mangle]
+pub extern "C" fn round(x: f64) -> f64 {
+    if x < 0.0 { ceil(x - 0.5) } else { floor(x + 0.5) }
+}
+#[no_mangle]
+pub unsafe extern "C" fn modf(x: f64, iptr: *mut f64) -> f64 {
+    let ip = trunc(x);
+    if !iptr.is_null() { *iptr = ip; }
+    x - ip
+}
+#[no_mangle]
+pub extern "C" fn log10(x: f64) -> f64 { log(x) / LN10 }
+#[no_mangle]
+pub extern "C" fn log2(x: f64) -> f64 { log(x) / LN2 }
+#[no_mangle]
+pub extern "C" fn expm1(x: f64) -> f64 { exp(x) - 1.0 }
+
+/// sin via reduction to [-pi, pi] then Taylor (15 terms → ~1e-15 over the range).
+#[no_mangle]
+pub extern "C" fn sin(x: f64) -> f64 {
+    if x != x || fabs(x) == f64::INFINITY { return f64::NAN; }
+    let twopi = 2.0 * PI;
+    let r = x - twopi * round(x / twopi); // r in [-pi, pi]
+    let r2 = r * r;
+    let mut term = r;
+    let mut sum = r;
+    let mut n = 1.0f64;
+    for _ in 0..15 {
+        term *= -r2 / ((2.0 * n) * (2.0 * n + 1.0));
+        sum += term;
+        n += 1.0;
+    }
+    sum
+}
+#[no_mangle]
+pub extern "C" fn cos(x: f64) -> f64 {
+    sin(x + PI / 2.0)
+}
+#[no_mangle]
+pub extern "C" fn tan(x: f64) -> f64 {
+    sin(x) / cos(x)
+}
+
+/// atan via |x|>1 reduction (pi/2 - atan(1/x)) and a half-range identity so the
+/// final series argument stays small.
+#[no_mangle]
+pub extern "C" fn atan(x: f64) -> f64 {
+    if x != x { return x; }
+    if x < 0.0 { return -atan(-x); }
+    if x > 1.0 { return PI / 2.0 - atan(1.0 / x); }
+    // For x in (tan(pi/12), 1], reduce: atan(x) = pi/6 + atan((sqrt3 x -1)/(sqrt3 + x)).
+    let sqrt3 = 1.7320508075688772;
+    let mut add = 0.0;
+    let mut v = x;
+    if x > 0.2679491924311227 {
+        add = PI / 6.0;
+        v = (sqrt3 * x - 1.0) / (sqrt3 + x);
+    }
+    // series: v - v^3/3 + v^5/5 - ... (|v| <= tan(pi/12) ~ 0.27 → fast)
+    let v2 = v * v;
+    let mut term = v;
+    let mut sum = v;
+    let mut k = 1i32;
+    for _ in 0..20 {
+        term *= -v2;
+        sum += term / (2 * k + 1) as f64;
+        k += 1;
+    }
+    add + sum
+}
+#[no_mangle]
+pub extern "C" fn atan2(y: f64, x: f64) -> f64 {
+    if x > 0.0 {
+        atan(y / x)
+    } else if x < 0.0 {
+        if y >= 0.0 { atan(y / x) + PI } else { atan(y / x) - PI }
+    } else if y > 0.0 {
+        PI / 2.0
+    } else if y < 0.0 {
+        -PI / 2.0
+    } else {
+        0.0
+    }
+}
+#[no_mangle]
+pub extern "C" fn asin(x: f64) -> f64 {
+    if x < -1.0 || x > 1.0 { return f64::NAN; }
+    if x == 1.0 { return PI / 2.0; }
+    if x == -1.0 { return -PI / 2.0; }
+    atan(x / sqrt(1.0 - x * x))
+}
+#[no_mangle]
+pub extern "C" fn acos(x: f64) -> f64 {
+    PI / 2.0 - asin(x)
+}
+#[no_mangle]
+pub extern "C" fn sinh(x: f64) -> f64 {
+    let e = exp(x);
+    (e - 1.0 / e) * 0.5
+}
+#[no_mangle]
+pub extern "C" fn cosh(x: f64) -> f64 {
+    let e = exp(x);
+    (e + 1.0 / e) * 0.5
+}
+#[no_mangle]
+pub extern "C" fn tanh(x: f64) -> f64 {
+    if x > 20.0 { return 1.0; }
+    if x < -20.0 { return -1.0; }
+    let e = exp(2.0 * x);
+    (e - 1.0) / (e + 1.0)
+}
+#[no_mangle]
+pub extern "C" fn asinh(x: f64) -> f64 {
+    log(x + sqrt(x * x + 1.0))
+}
+#[no_mangle]
+pub extern "C" fn acosh(x: f64) -> f64 {
+    log(x + sqrt(x * x - 1.0))
+}
+#[no_mangle]
+pub extern "C" fn atanh(x: f64) -> f64 {
+    0.5 * log((1.0 + x) / (1.0 - x))
+}
+#[no_mangle]
+pub extern "C" fn cbrt(x: f64) -> f64 {
+    if x == 0.0 { return 0.0; }
+    let s = if x < 0.0 { -1.0 } else { 1.0 };
+    s * exp(log(fabs(x)) / 3.0)
+}
+#[no_mangle]
+pub extern "C" fn hypot(x: f64, y: f64) -> f64 {
+    sqrt(x * x + y * y)
+}
+/// Round to nearest integer (ties away from zero).
+#[no_mangle]
+pub extern "C" fn nearbyint(x: f64) -> f64 {
+    if x >= 0.0 {
+        floor(x + 0.5)
+    } else {
+        ceil(x - 0.5)
+    }
+}
+#[no_mangle]
+pub extern "C" fn rint(x: f64) -> f64 {
+    nearbyint(x)
+}
+
 // --- <locale.h>: oxbow is "C" locale only (Lua reads the decimal point). -------
 #[repr(C)]
 pub struct Lconv {

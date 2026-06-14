@@ -1,3 +1,5 @@
+can't convert %s to float
+can't convert %s to complex
 object '%s' isn't a tuple or list
 requested length %d but object has length %d
 %q indices must be integers, not %s

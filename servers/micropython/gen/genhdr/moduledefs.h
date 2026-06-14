@@ -28,6 +28,10 @@ extern const struct _mp_obj_module_t mp_module_gc;
 #undef MODULE_DEF_GC
 #define MODULE_DEF_GC { MP_ROM_QSTR(MP_QSTR_gc), MP_ROM_PTR(&mp_module_gc) },
 
+extern const struct _mp_obj_module_t mp_module_math;
+#undef MODULE_DEF_MATH
+#define MODULE_DEF_MATH { MP_ROM_QSTR(MP_QSTR_math), MP_ROM_PTR(&mp_module_math) },
+
 extern const struct _mp_obj_module_t mp_module_micropython;
 #undef MODULE_DEF_MICROPYTHON
 #define MODULE_DEF_MICROPYTHON { MP_ROM_QSTR(MP_QSTR_micropython), MP_ROM_PTR(&mp_module_micropython) },
@@ -40,6 +44,7 @@ extern const struct _mp_obj_module_t mp_module_sys;
 #define MICROPY_REGISTERED_MODULES \
     MODULE_DEF_BUILTINS \
     MODULE_DEF_GC \
+    MODULE_DEF_MATH \
     MODULE_DEF_MICROPYTHON \
     MODULE_DEF_SYS \
     MODULE_DEF___MAIN__ \
