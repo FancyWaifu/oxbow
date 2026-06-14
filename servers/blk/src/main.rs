@@ -16,8 +16,9 @@
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 use oxbow_abi::{
-    MsgBuf, BLK_CHUNK, BLK_DMA, BLK_MMIO, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_PCI, TAG_BLK_FLUSH,
-    TAG_BLK_READ, TAG_BLK_WRITE,
+    MsgBuf, BLK_CHUNK, BLK_DMA, BLK_MMIO, BLK_SHARED, BLK_XFER_SECTORS, BOOT_CONSOLE, BOOT_EP,
+    BOOT_MEM, BOOT_PCI, PROT_READ, PROT_WRITE, TAG_BLK_ATTACH, TAG_BLK_FLUSH, TAG_BLK_READ,
+    TAG_BLK_READN, TAG_BLK_WRITE, TAG_BLK_WRITEN,
 };
 use oxbow_rt as rt;
 
@@ -282,7 +283,11 @@ pub extern "C" fn oxbow_main() -> ! {
         None => w(b"[blk] no disk - degraded (requests fail)\n"),
     }
 
-    // Service loop: stream sector bytes for the fs server through the cache.
+    // `shared` is the vaddr of the client's transfer frame (TAG_BLK_ATTACH),
+    // mapped here once for fast whole-sector copies (bulk READN/WRITEN).
+    let mut shared: Option<usize> = None;
+
+    // Service loop: byte-stream sector ops (legacy) + bulk shared-frame transfers.
     loop {
         let mut m = MsgBuf::new(0);
         let reply = match rt::sys_recv(BOOT_EP, &mut m) {
@@ -291,6 +296,71 @@ pub extern "C" fn oxbow_main() -> ! {
         };
         let mut r = MsgBuf::new(0);
         match m.tag {
+            TAG_BLK_ATTACH => {
+                // Map the client's shared transfer frame (handles[0]) read+write.
+                let mut status = 1u64;
+                if m.handle_count >= 1 {
+                    if rt::sys_frame_map(m.handles[0], BLK_SHARED, PROT_READ | PROT_WRITE).is_ok() {
+                        shared = Some(BLK_SHARED as usize);
+                        status = 0;
+                    }
+                }
+                r.data[0] = status;
+                r.data_len = 1;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            TAG_BLK_READN => {
+                let sector = m.data[0];
+                let n = (m.data[1]).min(BLK_XFER_SECTORS);
+                let mut status = 1u64;
+                if let (Some(sh), Some(c)) = (shared, cache.as_mut()) {
+                    let _ = unsafe { c.flush() }; // coherency vs the byte-stream cache
+                    status = 0;
+                    for i in 0..n {
+                        if unsafe { c.dev.op(sector + i, false) } != 0 {
+                            status = 1;
+                            break;
+                        }
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                c.dev.data_ptr(),
+                                (sh + i as usize * SECTOR) as *mut u8,
+                                SECTOR,
+                            );
+                        }
+                    }
+                    c.cached = NO_SECTOR; // dev.op clobbered the cache buffer
+                }
+                r.data[0] = status;
+                r.data_len = 1;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            TAG_BLK_WRITEN => {
+                let sector = m.data[0];
+                let n = (m.data[1]).min(BLK_XFER_SECTORS);
+                let mut status = 1u64;
+                if let (Some(sh), Some(c)) = (shared, cache.as_mut()) {
+                    let _ = unsafe { c.flush() };
+                    status = 0;
+                    for i in 0..n {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                (sh + i as usize * SECTOR) as *const u8,
+                                c.dev.data_ptr(),
+                                SECTOR,
+                            );
+                        }
+                        if unsafe { c.dev.op(sector + i, true) } != 0 {
+                            status = 1;
+                            break;
+                        }
+                    }
+                    c.cached = NO_SECTOR;
+                }
+                r.data[0] = status;
+                r.data_len = 1;
+                let _ = rt::sys_reply(reply, &r);
+            }
             TAG_BLK_READ => {
                 let sector = m.data[0];
                 let off = (m.data[1] as usize).min(SECTOR);

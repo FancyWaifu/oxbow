@@ -21,8 +21,9 @@ extern crate oxbow_libc as _;
 
 use core::ffi::{c_int, c_void};
 use oxbow_abi::{
-    Handle, MsgBuf, BLK_CHUNK, BOOT_BLK_EP, BOOT_CONSOLE, BOOT_EP, FS_DIR, FS_FILE, FS_INITRD,
-    FS_ROOT, R_GRANT, R_SEND, TAG_BLK_FLUSH, TAG_BLK_READ, TAG_BLK_WRITE, TAG_FS_CREATE,
+    Handle, MsgBuf, BLK_CHUNK, BLK_XFER_SECTORS, BOOT_BLK_EP, BOOT_CONSOLE, BOOT_EP, BOOT_MEM,
+    FS_DIR, FS_FILE, FS_INITRD, FS_ROOT, PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_BLK_ATTACH,
+    TAG_BLK_FLUSH, TAG_BLK_READ, TAG_BLK_READN, TAG_BLK_WRITE, TAG_BLK_WRITEN, TAG_FS_CREATE,
     TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_FS_RENAME, TAG_FS_SYNC,
     TAG_FS_UNLINK, TAG_FS_WRITE,
 };
@@ -30,6 +31,24 @@ use oxbow_rt as rt;
 
 const SECTOR: usize = 512;
 const READ_CHUNK: usize = 56;
+/// Where fsd maps the shared block-transfer frame (above the rt heap window).
+const FSD_XFER: usize = 0x3F00_0000;
+static mut SHARED_OK: bool = false;
+
+/// Allocate a transfer frame, map it, and hand it to the block service so reads
+/// and writes move whole sectors in one IPC instead of ~13 byte-stream messages.
+fn blk_attach() {
+    if let Ok(frame) = rt::sys_frame_alloc(BOOT_MEM) {
+        if rt::sys_frame_map(frame, FSD_XFER as u64, PROT_READ | PROT_WRITE).is_ok() {
+            let mut m = MsgBuf::new(TAG_BLK_ATTACH);
+            m.handle_count = 1;
+            m.handles[0] = frame;
+            if rt::sys_call(BOOT_BLK_EP, &mut m).is_ok() && m.data[0] == 0 {
+                unsafe { SHARED_OK = true };
+            }
+        }
+    }
+}
 
 fn w(s: &[u8]) {
     let _ = rt::sys_console_write(BOOT_CONSOLE, s.as_ptr(), s.len());
@@ -116,6 +135,29 @@ pub extern "C" fn ox_close(_b: *mut c_void) -> c_int {
 }
 #[no_mangle]
 pub extern "C" fn ox_bread(_b: *mut c_void, buf: *mut u8, blk_id: u64, blk_cnt: u32) -> c_int {
+    if unsafe { SHARED_OK } {
+        let total = blk_cnt as u64;
+        let mut done = 0u64;
+        while done < total {
+            let chunk = (total - done).min(BLK_XFER_SECTORS);
+            let mut m = MsgBuf::new(TAG_BLK_READN);
+            m.data[0] = blk_id + done;
+            m.data[1] = chunk;
+            m.data_len = 2;
+            if rt::sys_call(BOOT_BLK_EP, &mut m).is_err() || m.data[0] != 0 {
+                return -5;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    FSD_XFER as *const u8,
+                    buf.add(done as usize * SECTOR),
+                    chunk as usize * SECTOR,
+                );
+            }
+            done += chunk;
+        }
+        return 0;
+    }
     for i in 0..blk_cnt as u64 {
         let dst = unsafe { core::slice::from_raw_parts_mut(buf.add(i as usize * SECTOR), SECTOR) };
         if !read_sector(blk_id + i, dst) {
@@ -126,6 +168,29 @@ pub extern "C" fn ox_bread(_b: *mut c_void, buf: *mut u8, blk_id: u64, blk_cnt: 
 }
 #[no_mangle]
 pub extern "C" fn ox_bwrite(_b: *mut c_void, buf: *const u8, blk_id: u64, blk_cnt: u32) -> c_int {
+    if unsafe { SHARED_OK } {
+        let total = blk_cnt as u64;
+        let mut done = 0u64;
+        while done < total {
+            let chunk = (total - done).min(BLK_XFER_SECTORS);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    buf.add(done as usize * SECTOR),
+                    FSD_XFER as *mut u8,
+                    chunk as usize * SECTOR,
+                );
+            }
+            let mut m = MsgBuf::new(TAG_BLK_WRITEN);
+            m.data[0] = blk_id + done;
+            m.data[1] = chunk;
+            m.data_len = 2;
+            if rt::sys_call(BOOT_BLK_EP, &mut m).is_err() || m.data[0] != 0 {
+                return -5;
+            }
+            done += chunk;
+        }
+        return 0;
+    }
     for i in 0..blk_cnt as u64 {
         let src = unsafe { core::slice::from_raw_parts(buf.add(i as usize * SECTOR), SECTOR) };
         if !write_sector(blk_id + i, src) {
@@ -330,11 +395,9 @@ fn seed_from_initrd() {
         let typeflag = unsafe { *hdr.add(156) };
         let is_dir = typeflag == b'5' || trailing;
         let is_file = !is_dir && (typeflag == b'0' || typeflag == 0);
-        // Skip the bundled source tree: it is megabytes, and copying it to ext2
-        // over the byte-stream block protocol would make first boot crawl. The FHS
-        // skeleton, sample programs, and /bin (exec-from-fs) are what matter.
-        let skip = nm.starts_with(b"usr/src");
-        if !skip && !nm.is_empty() && nm.len() < PLEN {
+        // The full tree (incl. the megabyte source under /usr/src) is now seeded —
+        // the shared-memory block transfer makes it fast enough.
+        if !nm.is_empty() && nm.len() < PLEN {
             ensure_dirs(nm);
             let mut full = [0u8; 256];
             full[..4].copy_from_slice(b"/mp/");
@@ -384,6 +447,12 @@ fn reply_status(reply: Handle, status: u64) {
 #[no_mangle]
 pub extern "C" fn oxbow_main() -> ! {
     w(b"[fsd] ext2 filesystem server starting\n");
+    blk_attach();
+    if unsafe { SHARED_OK } {
+        w(b"[fsd] shared-memory block transfer attached\n");
+    } else {
+        w(b"[fsd] WARN: bulk attach failed, using slow byte-stream\n");
+    }
     unsafe {
         let bd = oxblk_get();
         ext4_device_register(bd, b"ox\0".as_ptr());

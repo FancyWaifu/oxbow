@@ -346,6 +346,25 @@ pub const TAG_BLK_WRITE: u64 = u32::from_le_bytes(*b"BKWR") as u64;
 /// FLUSH: commit the cached dirty sector to disk. Reply: data[0]=status (0 ok).
 pub const TAG_BLK_FLUSH: u64 = u32::from_le_bytes(*b"BKFL") as u64;
 
+// --- Bulk (shared-memory) block transfer -----------------------------------
+// The byte-stream READ/WRITE above moves <=40 bytes per IPC — ~13 round-trips
+// per 512-byte sector, far too slow for a filesystem. A client instead shares a
+// page-sized Frame with the block service: blk memcpys whole sectors between
+// that shared page and its DMA buffer, so a multi-sector transfer is ONE IPC.
+/// Sectors per shared-frame transfer (a 4 KiB frame = 8 x 512-byte sectors).
+pub const BLK_XFER_SECTORS: u64 = 8;
+/// Where the block service maps the client's shared transfer frame.
+pub const BLK_SHARED: u64 = 0x4040_0000;
+/// ATTACH: handles[0] = a writable Frame cap; the block service maps it as the
+/// shared transfer buffer. Reply: data[0]=status (0 ok).
+pub const TAG_BLK_ATTACH: u64 = u32::from_le_bytes(*b"BKAT") as u64;
+/// READN: read data[1] sectors starting at LBA data[0] from disk INTO the shared
+/// frame (sector i at frame offset i*512). Reply: data[0]=status.
+pub const TAG_BLK_READN: u64 = u32::from_le_bytes(*b"BKRN") as u64;
+/// WRITEN: write data[1] sectors starting at LBA data[0] FROM the shared frame to
+/// disk. Reply: data[0]=status.
+pub const TAG_BLK_WRITEN: u64 = u32::from_le_bytes(*b"BKWN") as u64;
+
 // --- Filesystem (§15) ------------------------------------------------------
 /// The shell's root-directory capability: a BADGED endpoint to the fs server,
 /// badge = FS_ROOT. Open files relative to it (directories are capabilities).
