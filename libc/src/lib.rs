@@ -14,7 +14,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::ffi::VaList;
 use core::ptr::addr_of_mut;
-use oxbow_abi::{Handle, MsgBuf, BOOT_EP, BOOT_MEM, FS_FILE, TAG_FS_READ};
+use oxbow_abi::{Handle, MsgBuf, BOOT_EP, BOOT_MEM, FS_FILE, TAG_FS_READ, TAG_FS_WRITE};
 use oxbow_rt as rt;
 
 extern "C" {
@@ -59,7 +59,46 @@ fn build_argv() -> (i32, *const *const u8) {
 unsafe fn out_fd(fd: i32, s: &[u8]) {
     if fd == 1 || fd == 2 {
         rt::stdout_write(s);
+    } else if fd >= 3 {
+        fs_write_fd(fd, s);
     }
+}
+
+/// Write `s` to an open file fd (>=3) via the 48-byte FS_WRITE protocol, looping
+/// at the fd's offset; the fs grows the file block by block. Returns bytes
+/// written. This is the single file-output sink — `write`, `fwrite`, `fputc`,
+/// `fputs`, and the printf family (via `out_fd`) all funnel through it.
+unsafe fn fs_write_fd(fd: i32, s: &[u8]) -> usize {
+    if fd < 3 || fd as usize >= MAX_FD {
+        return 0;
+    }
+    let slot = &mut (*addr_of_mut!(FDS))[fd as usize];
+    if !slot.used {
+        return 0;
+    }
+    let mut i = 0usize;
+    while i < s.len() {
+        let n = core::cmp::min(48, s.len() - i);
+        let mut m = MsgBuf::new(TAG_FS_WRITE);
+        m.data[0] = slot.off;
+        m.data[1] = n as u64;
+        let dst = m.data.as_mut_ptr() as *mut u8;
+        core::ptr::copy_nonoverlapping(s[i..].as_ptr(), dst.add(16), n);
+        m.data_len = 8;
+        if rt::sys_call(slot.handle, &mut m).is_err() {
+            break;
+        }
+        let wrote = m.data[0] as usize;
+        if wrote == 0 {
+            break; // file-size ceiling or arena exhausted
+        }
+        slot.off += wrote as u64;
+        if slot.off > slot.size {
+            slot.size = slot.off;
+        }
+        i += wrote;
+    }
+    i
 }
 
 // ===========================================================================
@@ -70,10 +109,19 @@ unsafe fn out_fd(fd: i32, s: &[u8]) {
 struct FdSlot {
     handle: Handle,
     off: u64,
+    /// High-water mark of bytes in the file — tracks growth so `lseek(SEEK_END)`
+    /// and `ftell` work on a file we are writing.
+    size: u64,
     used: bool,
 }
 const MAX_FD: usize = 32;
-static mut FDS: [FdSlot; MAX_FD] = [FdSlot { handle: 0, off: 0, used: false }; MAX_FD];
+static mut FDS: [FdSlot; MAX_FD] = [FdSlot { handle: 0, off: 0, size: 0, used: false }; MAX_FD];
+
+// <fcntl.h> open flags (must match libc/include/fcntl.h).
+const O_WRONLY: i32 = 1;
+const O_RDWR: i32 = 2;
+const O_CREAT: i32 = 0o100;
+const O_TRUNC: i32 = 0o1000;
 
 unsafe fn cstr_len(s: *const u8) -> usize {
     if s.is_null() {
@@ -99,30 +147,38 @@ unsafe fn fs_read(cap: Handle, off: u64, out: &mut [u8]) -> usize {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn open(path: *const u8, _flags: i32) -> i32 {
+pub unsafe extern "C" fn open(path: *const u8, flags: i32) -> i32 {
     let n = cstr_len(path);
     if n == 0 {
         return -1;
     }
     let p = core::slice::from_raw_parts(path, n);
-    match rt::fs::open(BOOT_EP, p) {
-        Some(node) if node.kind == FS_FILE => {
-            for i in 3..MAX_FD {
-                let slot = &mut (*addr_of_mut!(FDS))[i];
-                if !slot.used {
-                    *slot = FdSlot { handle: node.cap, off: 0, used: true };
-                    return i as i32;
-                }
+    // Resolve to a (file cap, initial size). O_CREAT/O_TRUNC route through the
+    // fs CREATE op (create-or-truncate); a plain read goes through OPEN.
+    let (cap, size) = if flags & (O_CREAT | O_TRUNC) != 0 {
+        match rt::fs::create(BOOT_EP, p) {
+            Some(c) => (c, 0u64),
+            None => return -1,
+        }
+    } else {
+        match rt::fs::open(BOOT_EP, p) {
+            Some(node) if node.kind == FS_FILE => (node.cap, node.size as u64),
+            Some(node) => {
+                let _ = rt::sys_close(node.cap);
+                return -1;
             }
-            let _ = rt::sys_close(node.cap);
-            -1
+            None => return -1,
         }
-        Some(node) => {
-            let _ = rt::sys_close(node.cap);
-            -1
+    };
+    for i in 3..MAX_FD {
+        let slot = &mut (*addr_of_mut!(FDS))[i];
+        if !slot.used {
+            *slot = FdSlot { handle: cap, off: 0, size, used: true };
+            return i as i32;
         }
-        None => -1,
     }
+    let _ = rt::sys_close(cap);
+    -1
 }
 
 #[no_mangle]
@@ -149,9 +205,13 @@ pub unsafe extern "C" fn write(fd: i32, buf: *const u8, len: usize) -> isize {
     }
     if fd == 1 || fd == 2 {
         out_fd(fd, core::slice::from_raw_parts(buf, len));
-        len as isize
-    } else {
+        return len as isize;
+    }
+    let w = fs_write_fd(fd, core::slice::from_raw_parts(buf, len));
+    if w == 0 && len > 0 {
         -1
+    } else {
+        w as isize
     }
 }
 
@@ -168,7 +228,9 @@ pub unsafe extern "C" fn close(fd: i32) -> i32 {
     0
 }
 
-/// `lseek` — only SEEK_SET (0) on a read-only file fd (sets the read offset).
+/// `lseek` — SEEK_SET/CUR/END on a file fd. SEEK_END uses the tracked size
+/// high-water mark, so tcc's "seek to end, ftell, seek back to 0 to patch the
+/// ELF header" pattern works on a file we are writing.
 #[no_mangle]
 pub unsafe extern "C" fn lseek(fd: i32, off: i64, whence: i32) -> i64 {
     if fd < 3 || fd as usize >= MAX_FD {
@@ -178,11 +240,17 @@ pub unsafe extern "C" fn lseek(fd: i32, off: i64, whence: i32) -> i64 {
     if !slot.used {
         return -1;
     }
-    match whence {
-        0 => slot.off = off as u64,           // SEEK_SET
-        1 => slot.off = slot.off + off as u64, // SEEK_CUR
+    let base = match whence {
+        0 => 0i64,                // SEEK_SET
+        1 => slot.off as i64,     // SEEK_CUR
+        2 => slot.size as i64,    // SEEK_END
         _ => return -1,
+    };
+    let target = base + off;
+    if target < 0 {
+        return -1;
     }
+    slot.off = target as u64;
     slot.off as i64
 }
 
@@ -209,10 +277,36 @@ const MAX_FILES: usize = 16;
 static mut FILES: [FILE; MAX_FILES] = [FILE { fd: -1, eof: 0 }; MAX_FILES];
 
 #[no_mangle]
-pub unsafe extern "C" fn fopen(path: *const u8, _mode: *const u8) -> *mut FILE {
-    let fd = open(path, 0);
+pub unsafe extern "C" fn fopen(path: *const u8, mode: *const u8) -> *mut FILE {
+    // Map the mode string to open flags. "r"=read, "w"=create+truncate+write,
+    // "a"=append, and a '+' anywhere means read+write. ('b' is ignored — oxbow
+    // makes no text/binary distinction.)
+    let mut flags = 0i32;
+    let mut append = false;
+    if !mode.is_null() {
+        match *mode {
+            b'w' => flags = O_WRONLY | O_CREAT | O_TRUNC,
+            b'a' => {
+                flags = O_WRONLY | O_CREAT;
+                append = true;
+            }
+            _ => flags = 0, // 'r' / default = read-only
+        }
+        let mut i = 1usize;
+        while *mode.add(i) != 0 {
+            if *mode.add(i) == b'+' {
+                flags = (flags & !O_WRONLY) | O_RDWR;
+            }
+            i += 1;
+        }
+    }
+    let fd = open(path, flags);
     if fd < 0 {
         return core::ptr::null_mut();
+    }
+    // Append mode: start the offset at end-of-file.
+    if append {
+        lseek(fd, 0, 2);
     }
     for i in 0..MAX_FILES {
         let f = &mut (*addr_of_mut!(FILES))[i];

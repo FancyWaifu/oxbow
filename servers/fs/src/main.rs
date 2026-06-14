@@ -30,11 +30,17 @@ const READ_CHUNK: usize = 56; // 7 u64 of data[1..8]
 
 /// Mutable file storage, mapped from the fs Memory budget. The arena hands out
 /// fixed `BLOCK` regions; a file is a list of up to `MAX_BLOCKS` blocks, so it
-/// can GROW past one block (up to `MAX_BLOCKS * BLOCK`).
+/// can GROW past one block (up to `MAX_BLOCKS * BLOCK`). Sized for real output:
+/// an 8 MiB arena of page-sized blocks, up to 512 KiB per file — enough to hold
+/// a compiled binary, the prerequisite for tcc emitting an output file (arc 2 of
+/// self-hosting). The fs server is granted a matching budget at boot (§main).
+/// (MAX_BLOCKS is bounded by the fs's 512 KiB stack, where the `nodes` array
+/// lives: 256 nodes * (MAX_BLOCKS*8 + header) must stay well under it. Lifting
+/// the ceiling further means moving `nodes` to static storage.)
 const ARENA: usize = 0x2000_0000;
-const ARENA_SIZE: usize = 128 * 1024;
-const BLOCK: usize = 1024;
-const MAX_BLOCKS: usize = 16; // 16 KiB max file
+const ARENA_SIZE: usize = 8 * 1024 * 1024;
+const BLOCK: usize = 4096;
+const MAX_BLOCKS: usize = 128; // 512 KiB max file
 const TOTAL_BLOCKS: usize = ARENA_SIZE / BLOCK;
 
 #[derive(Clone, Copy)]

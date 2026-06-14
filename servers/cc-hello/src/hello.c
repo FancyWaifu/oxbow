@@ -17,6 +17,10 @@ extern FILE *stdout;
 int toupper(int);
 unsigned long strlen(const char *);
 
+long ftell(FILE *);
+int fseek(FILE *, long, int);
+unsigned long fread(void *, unsigned long, unsigned long, FILE *);
+
 void *mmap(void *, unsigned long, int, int, int, long);
 int mprotect(void *, unsigned long, int);
 #define PROT_READ 1
@@ -43,8 +47,42 @@ static void jit_demo(void) {
     printf("  JIT: wrote code, flipped RW->RX, ran it -> %d (W^X transition!)\n", f());
 }
 
+/* Writable file output — what tcc needs to emit a binary. Create a file, write
+ * past the old 16 KiB single-file ceiling (proving multi-block growth), use
+ * fseek/ftell to size it, then reopen and read it all back. */
+static void write_demo(void) {
+    const char *path = "/tmp/cc-out.txt";
+    FILE *w = fopen(path, "w");
+    if (!w) { puts("  WRITE: fopen(\"w\") failed"); return; }
+    int lines = 400;
+    for (int i = 0; i < lines; i++)
+        fprintf(w, "%4d: the quick brown fox jumps over the lazy dog\n", i);
+    fseek(w, 0, 2); /* SEEK_END */
+    long sz = ftell(w);
+    fclose(w);
+    printf("  WRITE: wrote %d lines = %ld bytes to %s\n", lines, sz, path);
+    if (sz > 16384)
+        puts("  WRITE: file exceeds the old 16 KiB ceiling (multi-block growth!)");
+
+    FILE *r = fopen(path, "r");
+    if (!r) { puts("  WRITE: reopen failed"); return; }
+    char buf[256];
+    long bytes = 0;
+    int nl = 0;
+    unsigned long got;
+    while ((got = fread(buf, 1, sizeof buf, r)) > 0) {
+        bytes += (long)got;
+        for (unsigned long k = 0; k < got; k++)
+            if (buf[k] == '\n') nl++;
+    }
+    fclose(r);
+    printf("  WRITE: read back %ld bytes, %d lines (roundtrip %s)\n",
+           bytes, nl, (bytes == sz && nl == lines) ? "OK" : "MISMATCH");
+}
+
 int main(int argc, char **argv) {
     jit_demo();
+    write_demo();
 
     const char *path = (argc > 1) ? argv[1] : "etc/os-release";
 

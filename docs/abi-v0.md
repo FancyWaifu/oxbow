@@ -1469,3 +1469,35 @@ MB-scale file output, a static `libc.a` + crt0 for tcc to link, tcc's source +
 headers on the fs — all produce a *file*; exec-from-fs is what *runs* it. A
 follow-on optimization is a bulk FS_READ (the 56-byte/call loop costs ~2000 IPCs
 for a 115 KB binary; a shared-frame read collapses that).
+
+## 34. Writable file output (v1-writable-fs) — arc 2 of self-hosting
+
+A compiler has to write its output somewhere. Until now oxbow's writable storage
+was a 128 KiB arena of 1 KiB blocks capped at 16 KiB/file — fine for `echo > f`,
+useless for a binary. Arc 2 makes oxbow-libc able to *create, write, grow, seek,
+and read back* real files.
+
+### 34.1 Bigger filesystem
+The fs arena grew to **8 MiB** of **4 KiB** (page-sized) blocks, **512 KiB max
+file** (`MAX_BLOCKS=128`). The fs server is granted a matching **16 MiB** boot
+budget (it `sys_map`s the arena from it). The per-file size ceiling is bounded by
+the fs's 512 KiB stack, where the `nodes` table lives (256 nodes × (blocks array
++ header)); lifting it to multi-MB means moving `nodes` to static storage — a
+clean follow-on when tcc's own output needs it.
+
+### 34.2 libc writable I/O
+- `open(path, flags)` honors `O_CREAT`/`O_TRUNC` (route through fs CREATE =
+  create-or-truncate) vs a plain read (fs OPEN); the fd tracks a size high-water
+  mark for SEEK_END/ftell.
+- `write(fd>=3, …)`, and `fwrite`/`fputc`/`fputs`/`fprintf`/`printf` (via the
+  shared `out_fd` sink) funnel through `fs_write_fd` — the 48-byte FS_WRITE loop
+  that grows the file block by block at the fd's offset.
+- `lseek` gains SEEK_END (uses the tracked size); `fopen` parses the mode string
+  ("r"/"w"/"a", "+", "b") into flags; append seeks to end.
+
+### 34.3 Proven
+A C program (`cc-hello`) creates `/tmp/cc-out.txt`, writes 400 lines = 19 490
+bytes (past the old 16 KiB ceiling → multi-block growth), `fseek`/`ftell`s it,
+then reopens and `fread`s it all back — roundtrip OK. A *separate* process (the
+shell's `cat`) then reads the persisted file. open→write→grow→seek→read→persist
+is the file-I/O surface tcc needs to emit a binary (arc 3: link a standalone ELF).
