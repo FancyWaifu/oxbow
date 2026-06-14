@@ -9,15 +9,16 @@
 //!   slot 20 (NET_EP)   — the network endpoint.
 //! Everything else in its handle table is empty. It then runs a battery of escape
 //! attempts — each uses a real syscall expecting a denial — and prints a verdict
-//! table proving laws L1–L6 (docs/abi-v0.md §1) hold. As a finale it touches
-//! memory it does not own, faults, and dies ALONE: the machine survives and the
-//! shell prompt returns.
+//! table proving laws L1–L6 (docs/abi-v0.md §1) hold. As a finale it pledges away
+//! its memory-mapping rights (§37) and then tries to map anyway: the kernel kills
+//! it the instant it breaks its own promise — fail-closed, and ALONE, so the
+//! shell prompt returns and every server keeps running.
 #![no_std]
 #![no_main]
 
 use oxbow_abi::{
-    Handle, MsgBuf, SysError, BOOT_MEM, PROT_EXEC, PROT_READ, PROT_WRITE, R_ATTENUATE, R_RECV,
-    R_SEND, SPAWN_STDOUT, TAG_FS_CREATE, TAG_FS_OPEN, TAG_TTY_WRITE,
+    Handle, MsgBuf, SysError, BOOT_MEM, PLEDGE_IPC, PLEDGE_STDIO, PROT_EXEC, PROT_READ, PROT_WRITE,
+    R_ATTENUATE, R_RECV, R_SEND, SPAWN_STDOUT, TAG_FS_CREATE, TAG_FS_OPEN, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -207,15 +208,18 @@ pub extern "C" fn oxbow_main() -> ! {
         w(b" blocked - A SANDBOX LEAK EXISTS!\n");
     }
 
-    // Finale: fault isolation. Touch memory we don't own. The kernel kills only
-    // this process; the shell prompt returns and every server keeps running.
-    w(b"jail: finale - dereferencing an address I was never granted...\n");
-    // Give the tty a moment to flush the line before we fault (preemption lets it
-    // run during the spin).
+    // Finale: pledge (defense-in-depth + fail-closed). Voluntarily renounce the
+    // right to map memory (keep only stdio + ipc so we can still speak), then try
+    // to map anyway. The kernel kills us the instant we break our own promise —
+    // and only us: the shell prompt returns, every server keeps running.
+    w(b"jail: finale - I pledge away MEM (keep stdio+ipc)...\n");
+    let _ = rt::sys_pledge(PLEDGE_STDIO | PLEDGE_IPC);
+    w(b"jail: pledged. now I try to map memory anyway:\n");
+    // Let the tty flush before the pledge trips (preemption runs it during spin).
     for _ in 0..20_000_000u64 {
         core::hint::spin_loop();
     }
-    unsafe { core::ptr::write_volatile(0xDEAD_0000 as *mut u64, 0) };
+    let _ = rt::sys_map(BOOT_MEM, 0x4000_0000, 4096, PROT_READ | PROT_WRITE);
 
     w(b"jail: (this line should never appear)\n");
     rt::sys_exit(0)

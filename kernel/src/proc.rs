@@ -40,6 +40,9 @@ pub struct Process {
     /// The spawner's Memory budget index + the cost it paid — refunded on exit.
     parent_mem: Option<u8>,
     spawn_cost: u64,
+    /// Permitted syscall-class bitmask (pledge, §37). u64::MAX = unpledged (all
+    /// classes). `sys_pledge` only ever intersects it, so authority is monotone.
+    pledge: u64,
 }
 
 static PROCESSES: Mutex<[Process; MAX_PROCS]> = Mutex::new([Process::new(); MAX_PROCS]);
@@ -54,7 +57,19 @@ impl Process {
             mem_idx: None,
             parent_mem: None,
             spawn_cost: 0,
+            pledge: u64::MAX, // unpledged: every syscall class permitted
         }
+    }
+
+    /// True if this process may invoke a syscall of the given class (all bits of
+    /// `class` must be permitted). Class 0 (exit/pledge/close) is always allowed.
+    pub fn pledge_allows(&self, class: u64) -> bool {
+        self.pledge & class == class
+    }
+
+    /// Narrow the pledge to the intersection with `mask` (drop authority only).
+    pub fn pledge_narrow(&mut self, mask: u64) {
+        self.pledge &= mask;
     }
 
     /// Install a well-known handle at a fixed slot (boot-time setup only).

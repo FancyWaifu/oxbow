@@ -609,6 +609,14 @@ pub fn sys_getentropy(buf: &mut [u8]) -> SysResult {
     SysError::from_raw(rax)
 }
 
+/// Restrict this process to the given pledge promise classes (PLEDGE_* bits,
+/// intersected with the current set). After this, a syscall outside the permitted
+/// classes terminates the process. Always succeeds.
+pub fn sys_pledge(promises: u64) -> SysResult {
+    let (rax, _) = unsafe { syscall1(oxbow_abi::SYS_PLEDGE, promises) };
+    SysError::from_raw(rax)
+}
+
 pub fn sys_exit(code: u64) -> ! {
     unsafe {
         syscall1(SYS_EXIT, code);

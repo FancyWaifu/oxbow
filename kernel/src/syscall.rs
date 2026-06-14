@@ -12,8 +12,9 @@ use oxbow_abi::{
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
     SYS_DMA_ALLOC, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE, SYS_PROTECT, SYS_RECV, SYS_REPLY,
-    SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_UPTIME_MS, PROT_EXEC, R_ACK,
-    R_BIND, R_IN, R_OUT, R_SPAWN,
+    SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_UPTIME_MS, PROT_EXEC,
+    R_ACK, R_BIND, R_IN, R_OUT, R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM, PLEDGE_SPAWN,
+    PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
 };
 
 use crate::object::{HandleEntry, ObjType, ObjectRef};
@@ -71,6 +72,19 @@ pub extern "C" fn syscall_dispatch(
     _a6: u64,
     nr: u64,
 ) -> SyscallRet {
+    // Pledge enforcement (§37): if the process has restricted itself and this
+    // syscall's class is no longer permitted, fail closed — kill it now, before
+    // the handler runs. exit/pledge/close are class 0 (always allowed).
+    let class = pledge_class(nr);
+    if class != 0 && !proc::with_current(|p| p.pledge_allows(class)) {
+        crate::println!(
+            "[pledge] proc {} broke its pledge on syscall {} -- killing",
+            crate::thread::current_proc(),
+            nr
+        );
+        proc::kill(crate::thread::current_proc());
+        crate::thread::exit_current(); // diverges; the machine lives on
+    }
     match nr {
         SYS_SEND => sys_ipc(a1, a2, false),
         SYS_RECV => sys_recv(a1, a2),
@@ -89,6 +103,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_SPAWN => sys_spawn(a1, a2, a3, a4),
         SYS_SPAWN_BYTES => sys_spawn_bytes(a1, a2, a3, a4, a5),
         SYS_GETENTROPY => sys_getentropy(a1, a2),
+        SYS_PLEDGE => sys_pledge(a1),
         SYS_EP_CREATE => sys_ep_create(),
         SYS_MINT => sys_mint(a1, a2, a3),
         SYS_PCI_READ => sys_pci_read(a1, a2),
@@ -906,6 +921,30 @@ fn sys_getentropy(buf: u64, len: u64) -> SyscallRet {
         unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf as *mut u8, n) };
         Ok(())
     })())
+}
+
+/// The pledge class a syscall belongs to (0 = always permitted: exit, pledge,
+/// close). Used by the dispatcher to enforce a process's pledge (§37).
+fn pledge_class(nr: u64) -> u64 {
+    match nr {
+        SYS_EXIT | SYS_PLEDGE | SYS_CLOSE => 0,
+        SYS_CONSOLE_WRITE | SYS_GETENTROPY | SYS_UPTIME_MS => PLEDGE_STDIO,
+        SYS_SEND | SYS_RECV | SYS_CALL | SYS_REPLY | SYS_EP_CREATE | SYS_MINT => PLEDGE_IPC,
+        SYS_MAP | SYS_PROTECT | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC => PLEDGE_MEM,
+        SYS_SPAWN | SYS_SPAWN_BYTES => PLEDGE_SPAWN,
+        SYS_ATTENUATE => PLEDGE_CAP,
+        SYS_IO_IN | SYS_IO_OUT | SYS_PCI_READ | SYS_PCI_WRITE | SYS_PCI_BAR_MAP | SYS_IRQ_BIND
+        | SYS_IRQ_ACK => PLEDGE_IO,
+        SYS_NOTIF_CREATE | SYS_NOTIF_SIGNAL | SYS_NOTIF_WAIT => PLEDGE_NOTIF,
+        _ => 0, // unknown number: let the dispatch return E_NOSYS, don't kill
+    }
+}
+
+/// `sys_pledge(promises)` — intersect this process's permitted syscall classes
+/// with `promises` (drop authority only; §37). Always succeeds.
+fn sys_pledge(promises: u64) -> SyscallRet {
+    proc::with_current_mut(|p| p.pledge_narrow(promises));
+    SyscallRet::from_result(Ok(()))
 }
 
 /// `sys_attenuate(src, new_rights)` — derive a strictly-weaker handle (law L5).

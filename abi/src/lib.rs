@@ -131,6 +131,26 @@ pub const SYS_SPAWN_BYTES: u64 = 27; // (buf, len, mem, &MsgBuf, exit_notif) -> 
 /// arc4random and the stack-protector cookie.
 pub const SYS_GETENTROPY: u64 = 28; // (buf, len) -> 0 / E_MSG (len>256) / E_FAULT
 
+/// pledge (§37) — a process voluntarily restricts itself to a subset of syscall
+/// CLASSES (the OpenBSD pledge(2) model, adapted to oxbow's verbs). One-way: the
+/// new promise set is intersected with the current one, so authority can only be
+/// dropped, never regained. After pledging, calling a syscall outside the
+/// permitted classes is FAIL-CLOSED — the kernel kills the process immediately
+/// (no error return; an exploit that hijacks control flow trips the pledge and
+/// dies before it can do damage). Always-permitted regardless of pledge: exit,
+/// pledge itself, and close (releasing resources). Defense-in-depth ON TOP of
+/// capabilities: even with a handle, you cannot use a class you pledged away.
+pub const SYS_PLEDGE: u64 = 29; // (promises) -> 0
+
+/// Pledge promise classes (bitmask). Unpledged = all bits (u64::MAX).
+pub const PLEDGE_STDIO: u64 = 1 << 0; // console_write, getentropy, uptime
+pub const PLEDGE_IPC: u64 = 1 << 1; // send, recv, call, reply, ep_create, mint
+pub const PLEDGE_MEM: u64 = 1 << 2; // map, protect, frame_alloc/map, dma_alloc
+pub const PLEDGE_SPAWN: u64 = 1 << 3; // spawn, spawn_bytes
+pub const PLEDGE_CAP: u64 = 1 << 4; // attenuate
+pub const PLEDGE_IO: u64 = 1 << 5; // io_in/out, pci_*, irq_*
+pub const PLEDGE_NOTIF: u64 = 1 << 6; // notif_create/signal/wait
+
 // ---------------------------------------------------------------------------
 // Error codes (§6) — returned in rax; values are stable forever (append-only)
 // ---------------------------------------------------------------------------
