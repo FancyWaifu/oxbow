@@ -1661,3 +1661,39 @@ reads a `.py` file via libc and runs it. `port/oxhal.c` = stdout/stdin over fds.
 Config choice: `CORE_FEATURES` (sets/slicing/comprehensions/io) but not `EXTRA`
 (which pulls `sys.stdin`/`uctypes`/file objects needing a VFS port). Integer-only
 keeps the float ABI out of scope for this arc.
+
+## 39. QuickJS — JavaScript on oxbow (v1-quickjs)
+
+The third language, and the most complete: the QuickJS-ng engine runs ES2023
+JavaScript on oxbow, built-in test and `.js` files from the filesystem:
+```
+oxbow:/$ js /hello.js
+primes < 40: 2 3 5 7 11 13 17 ...          // generators
+destructure: 1 2 rest: [3,4,5]              // destructuring + spread
+map x+y: 3   unique: 1,2,3                  // Map, Set
+compose: 21  opt chain: 42 default          // closures, ?./??
+```
+Arrow functions, classes, template literals, regex, generators, destructuring,
+Map/Set, spread, optional chaining, `JSON`, `try/catch`, full `Math` — real
+modern JS. Single-threaded (no Workers/Atomics).
+
+### 39.1 The port (`servers/quickjs/`)
+Vendored QuickJS-ng 0.10 (`quickjs.c` + `cutils.c` + `libregexp.c` +
+`libunicode.c` + `xsum.c`), cross-compiled like the others. Self-contained (no
+generated files — version is hardcoded). `src/oxmain.c` creates a runtime +
+context, installs `print`/`console.log`, and evals a script (built-in test or a
+`.js` file via libc). `js`/`qjs` shell command, `BOOT_IMG_QJS=26`.
+
+### 39.2 libc/headers it forced (all reusable)
+- **`pthread.h`**: single-threaded no-op stubs (mutex lock/unlock are no-ops,
+  `pthread_once` runs the init, thread creation fails) — oxbow is single-threaded.
+- **`<stdint.h>`**: `int_fast*`/`int_least*` types.
+- **`<inttypes.h>`**: the full `PRI*`/`SCN*` format-macro set.
+- **`<fenv.h>`** (rounding-mode stubs), **`<time.h>`**: `struct timespec`,
+  `clock_gettime` (over `sys_uptime_ms`), `gmtime`/`mktime`/`*_r` stubs.
+- **libm**: `lrint`, `scalbn` (the elementary set from §38 covered the rest).
+- Build defines: `NO_TM_GMTOFF` (no `tm_gmtoff` field), `-Dalloca=__builtin_alloca`
+  (force the compiler builtin — a real `alloca` can't exist).
+
+Three languages now run on oxbow: **Lua, MicroPython, JavaScript** — plus C via
+tcc. Each reused the maturing libc; the surface keeps compounding.

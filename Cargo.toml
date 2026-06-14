@@ -29,6 +29,7 @@ members = [
     "servers/tcc",
     "servers/lua",
     "servers/micropython",
+    "servers/quickjs",
     # "tools/*",  # initrd packer, etc.
 ]
 # Servers are excluded from the default build because they need a DIFFERENT

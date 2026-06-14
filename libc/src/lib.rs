@@ -1437,6 +1437,49 @@ pub extern "C" fn time(_t: *mut i64) -> i64 {
 pub extern "C" fn clock() -> i64 {
     rt::sys_uptime_ms() as i64
 }
+#[repr(C)]
+pub struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+#[no_mangle]
+pub unsafe extern "C" fn clock_gettime(_clk: i32, ts: *mut Timespec) -> i32 {
+    if !ts.is_null() {
+        let ms = rt::sys_uptime_ms();
+        (*ts).tv_sec = (ms / 1000) as i64;
+        (*ts).tv_nsec = ((ms % 1000) * 1_000_000) as i64;
+    }
+    0
+}
+#[no_mangle]
+pub unsafe extern "C" fn gmtime(t: *const i64) -> *mut i32 {
+    localtime(t)
+}
+#[no_mangle]
+pub extern "C" fn mktime(_tm: *const i32) -> i64 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn lrint(x: f64) -> i64 {
+    nearbyint(x) as i64
+}
+#[no_mangle]
+pub extern "C" fn scalbn(x: f64, n: i32) -> f64 {
+    ldexp(x, n)
+}
+#[no_mangle]
+pub extern "C" fn difftime(a: i64, b: i64) -> f64 {
+    (a - b) as f64
+}
+#[no_mangle]
+pub unsafe extern "C" fn gmtime_r(t: *const i64, _res: *mut i32) -> *mut i32 {
+    localtime(t)
+}
+#[no_mangle]
+pub unsafe extern "C" fn localtime_r(t: *const i64, _res: *mut i32) -> *mut i32 {
+    localtime(t)
+}
+
 #[no_mangle]
 pub extern "C" fn gettimeofday(tv: *mut i64, _tz: *mut u8) -> i32 {
     if !tv.is_null() {
