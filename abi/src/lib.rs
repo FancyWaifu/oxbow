@@ -117,6 +117,13 @@ pub const SYS_UPTIME_MS: u64 = 25; // () -> u64 ms
 /// both — so a JIT writes code into an RW page then flips it to RX. Needs R_MAP.
 pub const SYS_PROTECT: u64 = 26; // (mem, vaddr, len, prot)
 
+/// exec-from-fs (§33): spawn a fresh process from an ELF image the caller
+/// supplies as bytes (e.g. read from a filesystem file), rather than from a
+/// boot-granted Image capability. Same MsgBuf grant/budget protocol as
+/// `sys_spawn`. The authority is "run what you can read and afford": the caller
+/// proved read access to the bytes (via a file cap) and pays with a Memory cap.
+pub const SYS_SPAWN_BYTES: u64 = 27; // (buf, len, mem, &MsgBuf, exit_notif) -> pid
+
 // ---------------------------------------------------------------------------
 // Error codes (§6) — returned in rax; values are stable forever (append-only)
 // ---------------------------------------------------------------------------

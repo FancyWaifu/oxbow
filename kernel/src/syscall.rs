@@ -12,7 +12,7 @@ use oxbow_abi::{
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
     SYS_DMA_ALLOC, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE, SYS_PROTECT, SYS_RECV, SYS_REPLY,
-    SYS_SEND, SYS_SPAWN, SYS_UPTIME_MS, PROT_EXEC, R_ACK,
+    SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_UPTIME_MS, PROT_EXEC, R_ACK,
     R_BIND, R_IN, R_OUT, R_SPAWN,
 };
 
@@ -67,7 +67,7 @@ pub extern "C" fn syscall_dispatch(
     a2: u64,
     a3: u64,
     a4: u64,
-    _a5: u64,
+    a5: u64,
     _a6: u64,
     nr: u64,
 ) -> SyscallRet {
@@ -87,6 +87,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_IRQ_BIND => sys_irq_bind(a1, a2),
         SYS_IRQ_ACK => sys_irq_ack(a1),
         SYS_SPAWN => sys_spawn(a1, a2, a3, a4),
+        SYS_SPAWN_BYTES => sys_spawn_bytes(a1, a2, a3, a4, a5),
         SYS_EP_CREATE => sys_ep_create(),
         SYS_MINT => sys_mint(a1, a2, a3),
         SYS_PCI_READ => sys_pci_read(a1, a2),
@@ -334,21 +335,28 @@ fn spawn_load_pages(img: &crate::elf::Image) -> u64 {
     pages
 }
 
-/// `sys_spawn(image, mem, &MsgBuf, exit_notif)` — load a spawnable Image into a
-/// fresh process, granting it the capabilities named in the spawn MsgBuf, and
-/// start it. The parent's Memory budget pays for the child's frames + budget
-/// (the seL4-honest model: spawning consumes the spawner's untyped). Returns the
-/// child pid in rdx (informational — no authority). See ABI §13.
-fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> SyscallRet {
+/// Shared spawn machinery for both `sys_spawn` (image from an Image capability)
+/// and `sys_spawn_bytes` (image from a caller-supplied buffer, i.e. exec-from-fs).
+/// The image is already validated; `img.bytes()` must stay valid for the whole
+/// call — guaranteed because the kernel is non-preemptible (IF=0, single CPU), so
+/// neither a registry blob nor a user buffer can change underneath us. The
+/// parent's Memory budget pays for the child's frames + budget (the seL4-honest
+/// model: spawning consumes the spawner's untyped). See ABI §13 / §33.
+fn spawn_common(
+    img: &crate::elf::Image,
+    mem_h: u64,
+    msg_ptr: u64,
+    exit_notif_h: u64,
+    label: &str,
+) -> SyscallRet {
     // 16 stack pages + a conservative page-table overhead (fresh PML4 + tables
     // for ≤2 mapped regions needs ≤7); mirrors proc::load_into's stack size.
     const STACK_PAGES: u64 = 16;
     const PT_OVERHEAD: u64 = 8;
 
-    // ---- Validate everything; no side effects (handle→type→rights, then the
-    // MsgBuf, then per-grant R_GRANT, then the image, then the budget bound). ----
+    // ---- Validate everything; no side effects (mem cap, exit notif, the MsgBuf,
+    // then per-grant R_GRANT, then the budget bound). ----
     struct Prep {
-        img_idx: u8,
         midx: u8,
         exit_idx: Option<u8>,
         grants: [Option<HandleEntry>; MSG_HANDLES],
@@ -359,10 +367,6 @@ fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> Sysca
         argv_len: usize,
     }
     let prep = (|| -> SysResult<Prep> {
-        let ie = proc::with_current(|p| p.lookup(image_h as Handle, ObjType::Image, R_SPAWN))?;
-        let ObjectRef::Image(img_idx) = ie.obj else {
-            return Err(SysError::BadType);
-        };
         let me = proc::with_current(|p| p.lookup(mem_h as Handle, ObjType::Memory, R_MAP))?;
         let ObjectRef::Memory(midx) = me.obj else {
             return Err(SysError::BadType);
@@ -409,11 +413,8 @@ fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> Sysca
             }
             Ok(())
         })?;
-        // Validate the image now (a bad image is an error, not a panic).
-        let bytes = crate::image::bytes(img_idx).ok_or(SysError::Msg)?;
-        let img = crate::elf::Image::try_validate(bytes)?;
         // +1 page for the argv page the kernel maps into the child (§13).
-        let cost = (spawn_load_pages(&img) + STACK_PAGES + PT_OVERHEAD + 1) * 4096 + child_budget;
+        let cost = (spawn_load_pages(img) + STACK_PAGES + PT_OVERHEAD + 1) * 4096 + child_budget;
         // Authority bound: the parent must be able to afford it. We CHECK rather
         // than debit here so a later slot-full failure costs nothing; the kernel
         // is non-preemptible (IF=0, single CPU), so nothing allocates between the
@@ -422,7 +423,6 @@ fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> Sysca
             return Err(SysError::NoMem);
         }
         Ok(Prep {
-            img_idx,
             midx,
             exit_idx,
             grants,
@@ -440,10 +440,8 @@ fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> Sysca
 
     // ---- Side effects. Create the child (claims a slot, loads the image), then
     // mint its budget, install its handles, debit the parent, and start it. ----
-    let bytes = crate::image::bytes(prep.img_idx).expect("spawn: image vanished");
-    let img = crate::elf::Image::try_validate(bytes).expect("spawn: image re-validate");
     let pml4 = mm::vm::new_user_pml4();
-    let (cid, entry, rsp) = match proc::create(&img, pml4, "spawned") {
+    let (cid, entry, rsp) = match proc::create(img, pml4, label) {
         Ok(t) => t,
         Err(e) => return SyscallRet::err(e), // pool full — nothing debited yet
     };
@@ -484,9 +482,59 @@ fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> Sysca
     let _ = mm::mem::debit(prep.midx, prep.cost);
     let tcb = crate::thread::spawn_user(cid, pml4, entry, rsp);
     if crate::verbose() {
-        println!("[spawn] pid {} (tcb {}) image#{} -{} KiB", cid, tcb, prep.img_idx, prep.cost / 1024);
+        println!("[spawn] pid {} (tcb {}) {} -{} KiB", cid, tcb, label, prep.cost / 1024);
     }
     SyscallRet::ok_handle(cid as Handle)
+}
+
+/// `sys_spawn(image, mem, &MsgBuf, exit_notif)` — load a spawnable Image into a
+/// fresh process, granting it the capabilities named in the spawn MsgBuf, and
+/// start it. Returns the child pid in rdx (informational — no authority). §13.
+fn sys_spawn(image_h: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> SyscallRet {
+    // Resolve the Image capability → registry bytes → validated image.
+    let bytes = match (|| -> SysResult<&'static [u8]> {
+        let ie = proc::with_current(|p| p.lookup(image_h as Handle, ObjType::Image, R_SPAWN))?;
+        let ObjectRef::Image(img_idx) = ie.obj else {
+            return Err(SysError::BadType);
+        };
+        crate::image::bytes(img_idx).ok_or(SysError::Msg)
+    })() {
+        Ok(b) => b,
+        Err(e) => return SyscallRet::err(e),
+    };
+    let img = match crate::elf::Image::try_validate(bytes) {
+        Ok(i) => i,
+        Err(e) => return SyscallRet::err(e),
+    };
+    spawn_common(&img, mem_h, msg_ptr, exit_notif_h, "spawned")
+}
+
+/// `sys_spawn_bytes(buf, len, mem, &MsgBuf, exit_notif)` — exec-from-fs (ABI §33).
+/// Spawn a fresh process from an ELF image the caller supplies as bytes (e.g.
+/// read from a filesystem file) rather than from a boot-granted Image cap. The
+/// capability story: the caller already proved read authority over the bytes (it
+/// read them through a file capability) and supplies a Memory cap to pay — so
+/// this is "run what you can read and afford", not ambient exec. The kernel
+/// validates the ELF header (bad bytes → error, never a panic). The buffer is
+/// read while the caller's address space is live; the kernel is non-preemptible,
+/// so it cannot change mid-call.
+fn sys_spawn_bytes(buf: u64, len: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u64) -> SyscallRet {
+    // Bound the image size defensively (an ELF this large is a bug, not a build).
+    const MAX_ELF: u64 = 64 * 1024 * 1024;
+    if len == 0 || len > MAX_ELF {
+        return SyscallRet::err(SysError::Msg);
+    }
+    if let Err(e) = usermem::check_user(buf, len as usize, false) {
+        return SyscallRet::err(e);
+    }
+    // SAFETY: check_user proved [buf, buf+len) is mapped + user-readable in the
+    // caller's live address space; non-preemptible so it stays valid + constant.
+    let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
+    let img = match crate::elf::Image::try_validate(bytes) {
+        Ok(i) => i,
+        Err(e) => return SyscallRet::err(e),
+    };
+    spawn_common(&img, mem_h, msg_ptr, exit_notif_h, "exec")
 }
 
 /// `sys_io_in(ioport, port)` — read a byte from a port authorized by an IoPort

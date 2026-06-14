@@ -93,6 +93,13 @@ _iso:
     mkdir -p build/initrd/usr/src/oxbow/servers
     for d in servers/*/src; do s=$(basename $(dirname $d)); mkdir -p build/initrd/usr/src/oxbow/servers/$s; cp -R $d build/initrd/usr/src/oxbow/servers/$s/; done
     cp Cargo.toml justfile limine.conf build/initrd/usr/src/oxbow/ 2>/dev/null || true
+    # exec-from-fs demo (§33): a STRIPPED copy of `hello` placed on the fs at
+    # /bin/hello, so `exec /bin/hello` loads + runs an ELF from disk. Stripping
+    # (with llvm-strip — Apple strip can't touch ELF) shrinks 3.4 MB -> ~115 KB so
+    # the shell's 56-byte FS_READ loop slurps it quickly.
+    mkdir -p build/initrd/bin
+    cp target/x86_64-unknown-none/debug/hello build/initrd/bin/hello
+    $(find $(rustc --print sysroot) -name llvm-strip | head -1) --strip-all build/initrd/bin/hello
     # Drop build artifacts + the (self-referential) initrd skeleton copy.
     find build/initrd/usr/src/oxbow -type d -name target -prune -exec rm -rf {} + 2>/dev/null || true
     rm -rf build/initrd/usr/src/oxbow/servers/fs/initrd

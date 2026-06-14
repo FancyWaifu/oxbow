@@ -219,6 +219,99 @@ fn cat_cmd(dir: Handle, name: &[u8], sp: &Spawner) {
     let _ = rt::sys_close(file_cap); // cat holds its own copy
 }
 
+/// Scratch buffer holding an ELF read off the filesystem for `exec` (§33). Sized
+/// for a stripped no_std binary with headroom; a larger image truncates safely
+/// (read_all stops at the buffer end and try_validate then rejects it).
+const ELF_BUF_CAP: usize = 256 * 1024;
+static mut ELF_BUF: [u8; ELF_BUF_CAP] = [0; ELF_BUF_CAP];
+
+/// Slurp an entire file capability into `buf` via the 56-byte FS_READ protocol,
+/// looping on the read offset until EOF. Returns the byte count read.
+unsafe fn read_all(cap: Handle, buf: &mut [u8]) -> usize {
+    let mut off = 0usize;
+    loop {
+        let mut m = MsgBuf::new(oxbow_abi::TAG_FS_READ);
+        m.data[0] = off as u64;
+        m.data_len = 1;
+        if rt::sys_call(cap, &mut m).is_err() {
+            break;
+        }
+        let count = core::cmp::min(m.data[0] as usize, 56);
+        if count == 0 || off + count > buf.len() {
+            break;
+        }
+        core::ptr::copy_nonoverlapping(
+            (m.data.as_ptr() as *const u8).add(8),
+            buf.as_mut_ptr().add(off),
+            count,
+        );
+        off += count;
+    }
+    off
+}
+
+/// `exec <path> [args]`: read the ELF at `path` from the filesystem into a
+/// buffer and launch it as a fresh process via exec-from-fs (ABI §33). Unlike
+/// `ls`/`cat`/`tcc` — which spawn fixed boot-granted images — this runs an
+/// ARBITRARY program loaded from disk: the foundation for running compiled
+/// binaries. The program is granted the cwd dir cap (slot 1) and stdout
+/// (slot 2), with the remaining tokens passed as its argv.
+fn exec_cmd(cwd: Handle, path: &Path, arg_line: &[u8], sp: &Spawner) {
+    let (pathname, rest) = split_cmd(arg_line);
+    if pathname.is_empty() {
+        tw(b"exec: usage: exec <path> [args]\n");
+        return;
+    }
+    // Resolve to an absolute path and OPEN it from the root cap (the shell holds
+    // root, so any absolute path resolves; the fs walks multi-component paths).
+    let mut target = *path;
+    target.apply(pathname);
+    let mut m = MsgBuf::new(TAG_FS_OPEN);
+    pack_name(&mut m, target.as_bytes());
+    if rt::sys_call(BOOT_FS_ROOT, &mut m).is_err() || m.data[0] != 0 {
+        tw(b"exec: ");
+        tw(pathname);
+        tw(b": not found\n");
+        return;
+    }
+    let file_cap = m.handles[0];
+    if m.data[1] != oxbow_abi::FS_FILE {
+        tw(b"exec: ");
+        tw(pathname);
+        tw(b": not a file\n");
+        let _ = rt::sys_close(file_cap);
+        return;
+    }
+    let len = unsafe {
+        let buf = core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(ELF_BUF) as *mut u8, ELF_BUF_CAP);
+        read_all(file_cap, buf)
+    };
+    let _ = rt::sys_close(file_cap);
+    if len == 0 {
+        tw(b"exec: empty or unreadable file\n");
+        return;
+    }
+    // Build the spawn MsgBuf: budget default, argv from `rest`, cwd at slot 1,
+    // stdout at slot 2 — then hand the ELF bytes to the kernel (exec-from-fs).
+    let mut sm = MsgBuf::new(0);
+    sm.data[0] = 0;
+    let n = core::cmp::min(rest.len(), 55);
+    let dst = sm.data.as_mut_ptr() as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(rest.as_ptr(), dst.add(8), n);
+        *dst.add(8 + n) = 0;
+    }
+    sm.data_len = 8;
+    sm.handle_count = 2;
+    sm.handles[0] = cwd;
+    sm.handles[1] = sp.stdout;
+    let elf = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(ELF_BUF) as *const u8, len) };
+    match rt::sys_spawn_bytes(elf, BOOT_MEM, &sm, sp.exit) {
+        Ok(_) => wait_exits(sp, 1),
+        Err(_) => tw(b"exec: not a valid program (spawn rejected)\n"),
+    }
+}
+
 /// Write a byte as decimal ASCII to the tty (for printing IP octets).
 fn tw_dec(n: u8) {
     let mut b = [0u8; 3];
@@ -646,6 +739,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"drift" => spawn_with(BOOT_IMG_DRIFT, HANDLE_NULL, rest, sp),
         b"cc-hello" => spawn_with(BOOT_IMG_CCHELLO, *cwd, rest, sp),
         b"tcc" => spawn_with_budget(BOOT_IMG_TCC, *cwd, rest, 48 * 1024 * 1024, sp),
+        b"exec" => exec_cmd(*cwd, path, rest, sp),
         b"badgetest" => badgetest(sp),
         b"help" => {
             tw(b"oxbow shell:  (ls cat mkdir touch are spawned programs)\n");
@@ -662,6 +756,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  http <ip>       TCP GET / from <ip>:80 via the net socket API\n");
             tw(b"  drift           DRIFT crypto self-test (X25519/ChaCha20, needs SSE)\n");
             tw(b"  run hello/pong  spawn a demo program\n");
+            tw(b"  exec <path>     load + run an ELF from the filesystem (exec-from-fs)\n");
             tw(b"  badgetest       exercise badged-endpoint mint rules\n");
             tw(b"  help            this list\n");
         }

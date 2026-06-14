@@ -1428,3 +1428,44 @@ ambient authority. The compiler is a normal capability process; the code it emit
 runs in pages it was granted, made executable only via a transition the kernel
 polices. Bootstrapping tcc to compile *itself* on oxbow (true self-hosting) is the
 horizon; the primitives are all in place.
+
+## 33. exec-from-fs — running an ELF from the filesystem (v1-exec-from-fs)
+
+Until now oxbow could only run the programs handed to it at boot: Limine loads a
+fixed set of ELF modules, the kernel mints an `Image` capability for each, and
+`sys_spawn` requires one. The runnable set was frozen at boot — fine for an
+appliance, fatal for a system that compiles new programs and wants to run them.
+
+`sys_spawn_bytes(buf, len, mem, &MsgBuf, exit_notif) -> pid` (SYS 27) lifts that
+limit. It spawns a fresh process from an ELF the caller supplies as **bytes**
+(e.g. read out of a filesystem file) instead of from a boot-granted Image cap.
+Everything downstream of "where do the bytes come from" is identical to
+`sys_spawn` — same MsgBuf grant slots, same budget model, same lifecycle — so the
+two share a `spawn_common(img, …)` helper; `sys_spawn` resolves bytes from the
+Image registry, `sys_spawn_bytes` from a user buffer.
+
+### 33.1 Capability story
+This is **not** an ambient "exec anything" power. The authority is *"run what you
+can read and afford"*:
+- the caller already proved read access to the bytes — it read them through a
+  **file capability** it holds (no file cap → no bytes);
+- it supplies a **Memory capability** to pay for the child's frames + budget.
+The kernel `check_user`-validates the buffer (mapped + user-readable in the live
+caller AS; non-preemptible so it can't change mid-call), then `try_validate`s the
+ELF header — bad bytes are an error, never a panic. Size is bounded at 64 MiB.
+
+### 33.2 Shell `exec`
+`exec <path> [args]` resolves `<path>` from the root cap, slurps the file via the
+56-byte FS_READ loop into a scratch buffer, and calls `sys_spawn_bytes`, granting
+the program the cwd dir cap (slot 1) + stdout (slot 2) with the rest as argv.
+Proven: a stripped `hello` staged at `/bin/hello` runs via `exec /bin/hello`
+(prints "hello, world" + its squares) — an arbitrary ELF, loaded from disk, run
+as a process. `exec` rejects non-ELF files and missing paths cleanly.
+
+### 33.3 Toward self-hosting
+This is the keystone primitive for self-hosting: a compiler that emits a binary
+is useless if the OS can't launch it. Remaining pieces on that path — writable
+MB-scale file output, a static `libc.a` + crt0 for tcc to link, tcc's source +
+headers on the fs — all produce a *file*; exec-from-fs is what *runs* it. A
+follow-on optimization is a bulk FS_READ (the 56-byte/call loop costs ~2000 IPCs
+for a 115 KB binary; a shared-frame read collapses that).

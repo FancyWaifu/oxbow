@@ -21,7 +21,7 @@ use oxbow_abi::{
     SPAWN_STDOUT, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC,
     SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND, SYS_MAP, SYS_NOTIF_CREATE,
     SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT, SYS_RECV, SYS_REPLY, SYS_SEND, SYS_EP_CREATE, SYS_MINT,
-    SYS_SPAWN, TAG_TTY_WRITE,
+    SYS_SPAWN, SYS_SPAWN_BYTES, TAG_TTY_WRITE,
 };
 
 // --- Heap (so `alloc` works) ----------------------------------------------
@@ -375,6 +375,22 @@ unsafe fn syscall4(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> (u64, u64) {
     (rax, rdx)
 }
 
+unsafe fn syscall5(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> (u64, u64) {
+    let (rax, rdx);
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") nr => rax,
+        in("rdi") a1,
+        in("rsi") a2,
+        inlateout("rdx") a3 => rdx,
+        in("r10") a4,
+        in("r8") a5,
+        lateout("rcx") _,
+        lateout("r11") _,
+    );
+    (rax, rdx)
+}
+
 // --- Typed ABI ------------------------------------------------------------
 
 pub fn sys_send(ep: Handle, msg: *const MsgBuf) -> SysResult {
@@ -458,6 +474,29 @@ pub fn sys_spawn(
 ) -> SysResult<u64> {
     let (rax, rdx) =
         unsafe { syscall4(SYS_SPAWN, image as u64, mem as u64, msg as u64, exit_notif as u64) };
+    SysError::from_raw(rax).map(|_| rdx)
+}
+
+/// exec-from-fs (§33): spawn a new process from an ELF image supplied as bytes
+/// (`elf`), rather than from a boot-granted Image cap. Same `mem`/`msg`/
+/// `exit_notif` protocol as [`sys_spawn`]. The kernel reads the bytes from the
+/// caller's address space and validates the ELF header. Returns the child pid.
+pub fn sys_spawn_bytes(
+    elf: &[u8],
+    mem: Handle,
+    msg: *const MsgBuf,
+    exit_notif: Handle,
+) -> SysResult<u64> {
+    let (rax, rdx) = unsafe {
+        syscall5(
+            SYS_SPAWN_BYTES,
+            elf.as_ptr() as u64,
+            elf.len() as u64,
+            mem as u64,
+            msg as u64,
+            exit_notif as u64,
+        )
+    };
     SysError::from_raw(rax).map(|_| rdx)
 }
 
