@@ -432,6 +432,30 @@ pub struct AddrInfo {
 /// Minimal getaddrinfo: resolves a numeric IPv4 `node` (DNS is a follow-up) and a
 /// numeric/empty `service` port, returning one addrinfo. malloc'd; freeaddrinfo
 /// releases it.
+/// Resolve a hostname to an IPv4 address over DNS: bind a UDP socket, send a
+/// standard A-record query to the DHCP-provided resolver (10.0.2.3 under QEMU
+/// slirp), and parse the first A answer. Returns the address as a network-order
+/// u32 (memory bytes [a,b,c,d]), or None.
+unsafe fn dns_resolve(name: *const u8) -> Option<u32> {
+    let n = cstr_len(name);
+    if n == 0 || n > 255 {
+        return None;
+    }
+    let s = core::slice::from_raw_parts(name, n);
+    let name_str = core::str::from_utf8(s).ok()?;
+    let (sock, _) = rt::udp::bind(BOOT_NET_EP, 0)?;
+    let q = rt::dns::query(0x1234, name_str);
+    if !rt::udp::sendto(sock, [10, 0, 2, 3], 53, &q) {
+        let _ = rt::sys_close(sock);
+        return None;
+    }
+    let mut buf = [0u8; 64];
+    let got = rt::udp::recvfrom(sock, &mut buf);
+    let _ = rt::sys_close(sock);
+    let a = rt::dns::first_a(&buf[..got])?; // [a,b,c,d]
+    Some(u32::from_ne_bytes(a)) // memory = [a,b,c,d] (network order)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn getaddrinfo(
     node: *const u8,
@@ -444,7 +468,11 @@ pub unsafe extern "C" fn getaddrinfo(
     }
     let mut ip: u32 = 0;
     if inet_pton(AF_INET, node, &mut ip) != 1 {
-        return -2; // not numeric — DNS not yet wired here
+        // Not a numeric IP — resolve the hostname over DNS.
+        match dns_resolve(node) {
+            Some(resolved) => ip = resolved,
+            None => return -2, // EAI_NONAME
+        }
     }
     let mut port: u16 = 0;
     if !service.is_null() {
