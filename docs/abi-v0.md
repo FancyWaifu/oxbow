@@ -1272,3 +1272,42 @@ exercising argv + FILE* stdio + ctype + string, all over capabilities.
 `FILE*` read buffering (fgetc is one fs IPC per byte), `snprintf`/`sprintf`,
 `getcwd`/`stat`/`opendir`, `env`; then porting **TinyCC** over this libc for
 on-device compilation.
+
+## 28. TinyCC port — feasibility + groundwork (v1-tcc-feasibility)
+
+Goal: TinyCC compiling + running C **on oxbow** (`tcc -run hello.c`). This is a
+multi-phase port; this section is the de-risk + the groundwork.
+
+### 28.1 Feasibility (proven)
+- TinyCC's x86_64 core (~25 k lines: tcc/libtcc/tccpp/tccgen/tccelf/tccrun/
+  tccasm/x86_64-gen/tccdbg) **compiles for `x86_64-unknown-none`** against a set
+  of freestanding C headers written for oxbow (`libc/include/`). `libtcc.c` and
+  7/9 core files compile clean; the last two need only a generated predefs file
+  and a `sys/ucontext.h` stub.
+- The link enumerates the **exact** libc functions tcc needs from us — a finite,
+  mostly-trivial set: `qsort`, `strpbrk`, `snprintf`/`vsnprintf`/`sprintf`,
+  `strtol`/`strtoull`, `fseek`/`ftell`, `strerror`, `getenv`/`realpath` (stubs),
+  `sem_*` (stubs, single-threaded), `setjmp`/`longjmp`, and `mmap`/`mprotect`.
+
+### 28.2 The keystone: the JIT exec model vs W^X
+`tcc -run` JITs code into memory and jumps to it: `mmap` RW, emit code,
+`mprotect` to RX, execute. oxbow enforces **W^X** (law L4) — no page is ever
+writable+executable simultaneously — but a *transition* RW→RX is exactly what tcc
+needs and is W^X-compliant. So the port needs a new oxbow capability:
+`sys_protect(frame/region, RX)` flipping an already-mapped writable page to
+read-execute (and the inverse), which `mmap`/`mprotect` in oxbow-libc wrap.
+
+### 28.3 Groundwork shipped here
+`libc/include/` — freestanding `stdio.h`, `stdlib.h`, `string.h`, `setjmp.h`,
+`ctype.h`, `errno.h`, `unistd.h`, `fcntl.h`, `sys/mman.h`, `sys/time.h`,
+`signal.h`, `assert.h`, `math.h`, `time.h`, `stdint`/`inttypes` (+ stubs for the
+threading/dl headers tcc references but won't use). These declare oxbow-libc and
+double as oxbow's future `/usr/include` so on-device tcc can compile real
+programs.
+
+### 28.4 Phased plan
+- **B** — implement the remaining libc functions + `setjmp`/`longjmp` (asm) +
+  generate `tccdefs_.h`; get tcc to fully compile + link into an oxbow ELF.
+- **C** — the `sys_protect` capability + `mmap`/`mprotect` in oxbow-libc.
+- **D** — `tcc -run hello.c` compiling + executing on oxbow; ship `/usr/include`.
+- **E** (optional) — tcc → ELF on the fs + exec-from-fs.
