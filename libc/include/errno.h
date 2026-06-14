@@ -48,4 +48,10 @@ extern int errno;
 #define ENAMETOOLONG 36
 #define ENETDOWN 100
 #define EHOSTDOWN 112
+#define ENXIO 6
+#define EFAULT 14
+#define EMLINK 31
+#define ENOTEMPTY 39
+#define ENODATA 61
+#define ENOATTR 61
 #endif

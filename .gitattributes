@@ -17,6 +17,7 @@ servers/lua/lua/**             linguist-vendored
 servers/micropython/mp/**      linguist-vendored
 servers/quickjs/qjs/**         linguist-vendored
 servers/curl/curl/**           linguist-vendored
+servers/fsext/lwext4/**         linguist-vendored
 
 # --- Build-time generated sources ---
 servers/micropython/gen/**     linguist-generated

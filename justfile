@@ -39,6 +39,7 @@ build-server:
     RUSTFLAGS="-C relocation-model=static" cargo build -p mv
     RUSTFLAGS="-C relocation-model=static" cargo build -p cp
     RUSTFLAGS="-C relocation-model=static" cargo build -p jail
+    RUSTFLAGS="-C relocation-model=static" cargo build -p fsext
     # drift speaks DRIFT's crypto (X25519/ChaCha20-Poly1305) — SIMD that needs
     # hardware SSE. Build it with soft-float off + SSE on (the kernel enabled the
     # FPU + does per-thread FXSAVE), and the non-SIMD curve25519 backend.
@@ -93,6 +94,8 @@ _iso:
     cp target/x86_64-unknown-none/debug/mv iso_root/boot/mv.elf
     cp target/x86_64-unknown-none/debug/cp iso_root/boot/cp.elf
     cp target/x86_64-unknown-none/debug/jail iso_root/boot/jail.elf
+    cp target/x86_64-unknown-none/debug/fstest iso_root/boot/fstest.elf
+    -strip -S iso_root/boot/fstest.elf
     cp target/x86_64-unknown-none/debug/drift iso_root/boot/drift.elf
     cp target/x86_64-unknown-none/debug/cc-hello iso_root/boot/cc-hello.elf
     cp target/x86_64-unknown-none/debug/tcc iso_root/boot/tcc.elf
