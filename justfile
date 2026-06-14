@@ -108,6 +108,13 @@ _iso:
     RUSTFLAGS="-C relocation-model=static" cargo build -p oxbow-libc --release
     mkdir -p build/initrd/lib
     cp target/x86_64-unknown-none/release/liboxbow_libc.a build/initrd/lib/c.a
+    # /usr/include (§36): oxbow-libc headers (stdio.h, string.h, …) at
+    # /usr/include + tcc's own builtin headers (stdarg.h, stddef.h, …) at
+    # /usr/lib/tcc/include. tcc's default sysinclude path is "{B}/include:
+    # /usr/include" with B=/usr/lib/tcc, so on-device `#include <stdio.h>` resolves.
+    mkdir -p build/initrd/usr/include build/initrd/usr/lib/tcc/include
+    cp -R libc/include/. build/initrd/usr/include/
+    cp servers/tcc/tinycc/include/*.h build/initrd/usr/lib/tcc/include/
     # Drop build artifacts + the (self-referential) initrd skeleton copy.
     find build/initrd/usr/src/oxbow -type d -name target -prune -exec rm -rf {} + 2>/dev/null || true
     rm -rf build/initrd/usr/src/oxbow/servers/fs/initrd

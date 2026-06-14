@@ -1561,3 +1561,27 @@ relocations, not the PIC/GOT forms tcc mishandles.
 prototypes). The 55-byte spawn argv forces short paths. Self-hosting *tcc itself*
 (tcc compiling its own source) needs those plus a larger budget — but the
 primitive — produce a standalone binary and run it — is proven.
+
+## 36. `/usr/include` — system headers on the filesystem (v1-usr-include)
+
+`cc` can now compile C that uses real `#include <...>` directives on the device:
+```
+oxbow:/$ cc /inc.c -o /ic        # /inc.c: #include <stdio.h>, <string.h>, <stdlib.h>
+oxbow:/$ exec /ic
+hello via #include <stdio.h> on oxbow! (len=38)
+  sum(1..100) = 5050, argc = 1
+```
+This needed no tcc change — only staging the headers where tcc already looks.
+tcc's default system include path is `{B}/include : /usr/include` with
+`{B} = CONFIG_TCCDIR = /usr/lib/tcc`. So:
+- **oxbow-libc headers** (`stdio.h`, `string.h`, `stdlib.h`, `stddef_shim.h`,
+  `sys/…`) are staged at **`/usr/include`** — the declarations for the functions
+  in `liboxbow_libc.a`.
+- **tcc's own freestanding headers** (`stdarg.h`, `stddef.h`, `stdbool.h`,
+  `float.h`, …) are staged at **`/usr/lib/tcc/include`** — these define the
+  compiler-intrinsic types (`va_list`, `size_t`) a libc header pulls in.
+
+A program's `#include <stdio.h>` resolves to `/usr/include/stdio.h`, which itself
+pulls `<stddef_shim.h>` (same dir) and `<stdarg.h>` (from `/usr/lib/tcc/include`)
+— the whole chain resolves on the device. With real includes + the standalone
+link (§35) + real argv (§13.7), oxbow compiles and runs non-trivial C from source.
