@@ -435,6 +435,18 @@ fn kmain_stage2() -> ! {
                         badge: 0,
                     },
                 );
+                // A SEND cap to the block service (EP4): the fs persists its
+                // writable files to disk through this, and restores them at boot.
+                // The only authority over storage the fs holds — it owns no PCI or
+                // DMA cap of its own.
+                p.install(
+                    oxbow_abi::BOOT_BLK_EP,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Endpoint(ipc::EP4),
+                        rights: oxbow_abi::R_SEND,
+                        badge: 0,
+                    },
+                );
             });
         }
         // The serial driver gets the COM1 IRQ line + the 16550 RX ports as
@@ -537,6 +549,20 @@ fn kmain_stage2() -> ! {
                     );
                 });
             }
+            // It also owns the block-service endpoint UNBADGED with full rights
+            // (the root of block authority): R_RECV to serve sector requests.
+            // Installed even without a disk so the fs server's calls fail cleanly
+            // (degraded loop) rather than block forever.
+            proc::with_proc_mut(pid, |p| {
+                p.install(
+                    oxbow_abi::BOOT_EP,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Endpoint(ipc::EP4),
+                        rights: oxbow_abi::R_SEND | oxbow_abi::R_RECV | oxbow_abi::R_GRANT,
+                        badge: 0,
+                    },
+                );
+            });
         }
         let tcb = thread::spawn_user(pid, as_i, entry, user_rsp);
         println!("[user] {} scheduled as tcb {} (ring 3, IF=1)", name, tcb);

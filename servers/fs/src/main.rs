@@ -18,9 +18,10 @@
 #![no_main]
 
 use oxbow_abi::{
-    MsgBuf, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, FS_DIR, FS_FILE, FS_INITRD, PROT_READ, PROT_WRITE,
-    R_GRANT, R_SEND, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR,
-    TAG_FS_RENAME, TAG_FS_UNLINK, TAG_FS_WRITE,
+    MsgBuf, BLK_CHUNK, BOOT_BLK_EP, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, FS_DIR, FS_FILE, FS_INITRD,
+    PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_BLK_FLUSH, TAG_BLK_READ, TAG_BLK_WRITE,
+    TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_FS_RENAME,
+    TAG_FS_SYNC, TAG_FS_UNLINK, TAG_FS_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -281,6 +282,331 @@ fn build_tree(nodes: &mut [Node]) {
 static mut NODES: [Node; MAX_NODES] = [FREE; MAX_NODES];
 static mut ARENA_STATE: Arena = Arena::new();
 
+// --- Persistence to the block service (§24) --------------------------------
+//
+// The fs is a ramfs, but its WRITABLE state survives reboots: on `sync` it
+// serializes every directory and arena-backed file to the disk through the block
+// service (BOOT_BLK_EP), and on boot it restores them after seeding the read-only
+// initrd tree. The on-disk image is a byte stream — a small superblock then one
+// record per entry — written sequentially from sector 0; the block service's
+// write-back cache turns the stream into whole-sector disk writes.
+//
+//   superblock: "OXBOWFS1" (8) | count: u64 LE (8)
+//   record:     kind: u8 | path_len: u16 LE | data_len: u32 LE | path | data
+//
+// Records are order-independent: restore auto-creates any missing ancestor dirs.
+const SECTOR: usize = 512;
+const FS_MAGIC: &[u8; 8] = b"OXBOWFS1";
+
+/// Sequential byte-stream writer over the block service. Advances a (sector,
+/// offset) cursor; the service buffers whole sectors and we FLUSH at the end.
+struct BlkW {
+    sector: u64,
+    off: usize,
+    err: bool,
+}
+impl BlkW {
+    fn new() -> Self {
+        BlkW { sector: 0, off: 0, err: false }
+    }
+    fn put(&mut self, bytes: &[u8]) {
+        let mut i = 0;
+        while i < bytes.len() && !self.err {
+            let n = BLK_CHUNK.min(SECTOR - self.off).min(bytes.len() - i);
+            let mut m = MsgBuf::new(TAG_BLK_WRITE);
+            m.data[0] = self.sector;
+            m.data[1] = self.off as u64;
+            m.data[2] = n as u64;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr().add(i),
+                    (m.data.as_mut_ptr() as *mut u8).add(24),
+                    n,
+                );
+            }
+            m.data_len = 8;
+            if rt::sys_call(BOOT_BLK_EP, &mut m).is_err() || m.data[0] as usize != n {
+                self.err = true;
+                break;
+            }
+            i += n;
+            self.off += n;
+            if self.off == SECTOR {
+                self.off = 0;
+                self.sector += 1;
+            }
+        }
+    }
+    fn finish(&mut self) -> bool {
+        let mut m = MsgBuf::new(TAG_BLK_FLUSH);
+        let _ = rt::sys_call(BOOT_BLK_EP, &mut m);
+        !self.err
+    }
+}
+
+/// Sequential byte-stream reader over the block service (mirror of BlkW).
+struct BlkR {
+    sector: u64,
+    off: usize,
+    err: bool,
+}
+impl BlkR {
+    fn new() -> Self {
+        BlkR { sector: 0, off: 0, err: false }
+    }
+    fn get(&mut self, out: &mut [u8]) {
+        let mut i = 0;
+        while i < out.len() && !self.err {
+            let want = BLK_CHUNK.min(SECTOR - self.off).min(out.len() - i);
+            let mut m = MsgBuf::new(TAG_BLK_READ);
+            m.data[0] = self.sector;
+            m.data[1] = self.off as u64;
+            m.data_len = 2;
+            if rt::sys_call(BOOT_BLK_EP, &mut m).is_err() {
+                self.err = true;
+                break;
+            }
+            let got = m.data[0] as usize;
+            if got == 0 {
+                self.err = true;
+                break;
+            }
+            let n = got.min(want);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (m.data.as_ptr() as *const u8).add(8),
+                    out.as_mut_ptr().add(i),
+                    n,
+                );
+            }
+            i += n;
+            self.off += n;
+            if self.off >= SECTOR {
+                self.off = 0;
+                self.sector += 1;
+            }
+        }
+    }
+    /// Read and discard `n` bytes (keep the stream aligned past an entry we can't
+    /// recreate).
+    fn skip(&mut self, mut n: usize) {
+        let mut tmp = [0u8; 64];
+        while n > 0 && !self.err {
+            let k = n.min(tmp.len());
+            self.get(&mut tmp[..k]);
+            n -= k;
+        }
+    }
+}
+
+/// Build the full root-relative path of node `id` into `buf`, returning its
+/// length. Root (node 1) has the empty path.
+fn full_path(nodes: &[Node], id: usize, buf: &mut [u8; 256]) -> usize {
+    let mut chain = [0usize; 64];
+    let mut n = 0;
+    let mut cur = id;
+    while cur != 1 && cur != 0 && n < chain.len() {
+        chain[n] = cur;
+        n += 1;
+        cur = nodes[cur].parent as usize;
+    }
+    let mut len = 0;
+    for k in (0..n).rev() {
+        let nd = &nodes[chain[k]];
+        if len > 0 && len < buf.len() {
+            buf[len] = b'/';
+            len += 1;
+        }
+        let nl = core::cmp::min(nd.name_len, buf.len() - len);
+        buf[len..len + nl].copy_from_slice(&nd.name[..nl]);
+        len += nl;
+    }
+    len
+}
+
+/// Write `src` into file node `id` at byte offset `off`, growing its arena blocks
+/// as needed (the WRITE handler's logic, factored for restore).
+fn file_write(nodes: &mut [Node], arena: &mut Arena, id: usize, off: usize, src: &[u8]) {
+    let mut written = 0usize;
+    while written < src.len() {
+        let pos = off + written;
+        let bi = pos / BLOCK;
+        let within = pos % BLOCK;
+        if bi >= MAX_BLOCKS {
+            break;
+        }
+        while nodes[id].nblocks <= bi {
+            match arena.alloc() {
+                Some(b) => {
+                    let nb = nodes[id].nblocks;
+                    nodes[id].blocks[nb] = b;
+                    nodes[id].nblocks += 1;
+                }
+                None => break,
+            }
+        }
+        if nodes[id].nblocks <= bi {
+            break;
+        }
+        let n = (src.len() - written).min(BLOCK - within);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr().add(written),
+                (ARENA + nodes[id].blocks[bi] + within) as *mut u8,
+                n,
+            );
+        }
+        written += n;
+    }
+    if off + written > nodes[id].len {
+        nodes[id].len = off + written;
+    }
+}
+
+/// Serialize every directory + writable file to the disk. Returns (ok, count).
+fn persist(nodes: &[Node]) -> (bool, usize) {
+    // A node is persisted if it's a non-root dir, or a writable (arena) file.
+    // Read-only initrd files (data != 0) come back from the initrd at boot.
+    let keep = |i: usize| -> bool {
+        let nd = &nodes[i];
+        (nd.kind == FS_DIR && i != 1) || (nd.kind == FS_FILE && nd.data == 0)
+    };
+    let count = (1..MAX_NODES).filter(|&i| keep(i)).count();
+
+    let mut bw = BlkW::new();
+    bw.put(FS_MAGIC);
+    bw.put(&(count as u64).to_le_bytes());
+    for i in 1..MAX_NODES {
+        if !keep(i) {
+            continue;
+        }
+        let nd = &nodes[i];
+        let mut pbuf = [0u8; 256];
+        let plen = full_path(nodes, i, &mut pbuf);
+        let dlen = if nd.kind == FS_FILE { nd.len } else { 0 };
+        bw.put(&[nd.kind as u8]);
+        bw.put(&(plen as u16).to_le_bytes());
+        bw.put(&(dlen as u32).to_le_bytes());
+        bw.put(&pbuf[..plen]);
+        // Stream the file's bytes straight from its arena blocks.
+        let mut done = 0usize;
+        while done < dlen && !bw.err {
+            let bi = done / BLOCK;
+            let within = done % BLOCK;
+            let n = (dlen - done).min(BLOCK - within);
+            let src = unsafe {
+                core::slice::from_raw_parts((ARENA + nd.blocks[bi] + within) as *const u8, n)
+            };
+            bw.put(src);
+            done += n;
+        }
+    }
+    (bw.finish(), count)
+}
+
+/// Restore the persisted tree from disk after the initrd seed. No-op (clean
+/// boot) if the superblock magic is absent — a fresh disk reads as zeros.
+fn restore(nodes: &mut [Node], arena: &mut Arena, next: &mut usize) {
+    let mut br = BlkR::new();
+    let mut magic = [0u8; 8];
+    br.get(&mut magic);
+    if br.err || &magic != FS_MAGIC {
+        return;
+    }
+    let mut cb = [0u8; 8];
+    br.get(&mut cb);
+    if br.err {
+        return;
+    }
+    let count = u64::from_le_bytes(cb) as usize;
+    let mut restored = 0usize;
+    for _ in 0..count {
+        let mut hk = [0u8; 1];
+        let mut hp = [0u8; 2];
+        let mut hd = [0u8; 4];
+        br.get(&mut hk);
+        br.get(&mut hp);
+        br.get(&mut hd);
+        if br.err {
+            break;
+        }
+        let kind = hk[0] as u64;
+        let plen = u16::from_le_bytes(hp) as usize;
+        let dlen = u32::from_le_bytes(hd) as usize;
+        let mut path = [0u8; 256];
+        if plen > path.len() {
+            break;
+        }
+        br.get(&mut path[..plen]);
+        if br.err {
+            break;
+        }
+        // Recreate, auto-creating any missing ancestor directories.
+        let target = resolve_parent(nodes, next, &path[..plen]);
+        let id = match target {
+            Some((par, base)) if name_ok(base) => {
+                if kind == FS_DIR {
+                    let _ = find_or_make_dir(nodes, next, par, base);
+                    None
+                } else {
+                    match find_child(nodes, par, base) {
+                        Some(i) if nodes[i].kind == FS_FILE && nodes[i].data == 0 => {
+                            free_blocks(&mut nodes[i], arena);
+                            Some(i)
+                        }
+                        Some(_) => None, // dir or read-only initrd file: don't clobber
+                        None => {
+                            if *next < MAX_NODES {
+                                nodes[*next] = mk(base, par as u16, FS_FILE);
+                                let id = *next;
+                                *next += 1;
+                                Some(id)
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                }
+            }
+            _ => None,
+        };
+        match id {
+            Some(id) => {
+                // Stream the file body from disk into the arena.
+                let mut done = 0usize;
+                let mut tmp = [0u8; 64];
+                while done < dlen && !br.err {
+                    let n = (dlen - done).min(tmp.len());
+                    br.get(&mut tmp[..n]);
+                    if br.err {
+                        break;
+                    }
+                    file_write(nodes, arena, id, done, &tmp[..n]);
+                    done += n;
+                }
+                restored += 1;
+            }
+            None => br.skip(dlen), // couldn't recreate; stay stream-aligned
+        }
+    }
+    if restored > 0 {
+        w(b"[fs] restored ");
+        let mut nb = [0u8; 20];
+        let mut x = restored;
+        let mut k = 20;
+        loop {
+            k -= 1;
+            nb[k] = b'0' + (x % 10) as u8;
+            x /= 10;
+            if x == 0 {
+                break;
+            }
+        }
+        w(&nb[k..]);
+        w(b" entries from disk\n");
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn oxbow_main() -> ! {
     // Map the file-storage arena from our Memory budget (read+write).
@@ -288,6 +614,11 @@ pub extern "C" fn oxbow_main() -> ! {
     let arena = unsafe { &mut *core::ptr::addr_of_mut!(ARENA_STATE) };
     let nodes = unsafe { &mut *core::ptr::addr_of_mut!(NODES) };
     build_tree(nodes);
+
+    // Overlay the persisted writable tree from disk (no-op on a fresh disk). The
+    // bump index `next` continues past the contiguous nodes the initrd seeded.
+    let mut next = (1..MAX_NODES).find(|&i| nodes[i].kind == 0).unwrap_or(MAX_NODES);
+    restore(nodes, arena, &mut next);
 
     w(b"[fs] ready\n");
 
@@ -633,6 +964,17 @@ pub extern "C" fn oxbow_main() -> ! {
                 };
                 r.data[0] = status;
                 r.data_len = 1;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            TAG_FS_SYNC => {
+                // Persist the whole writable tree to disk. Any cap reaching the fs
+                // can trigger it (it's idempotent and reveals nothing); the shell
+                // exposes it as `sync`.
+                let (ok, count) = persist(nodes);
+                let mut r = MsgBuf::new(0);
+                r.data[0] = if ok { 0 } else { 1 };
+                r.data[1] = count as u64;
+                r.data_len = 2;
                 let _ = rt::sys_reply(reply, &r);
             }
             _ => {

@@ -286,6 +286,27 @@ pub const NET_DMA: u64 = 0x4010_0000;
 pub const BLK_MMIO: u64 = 0x4020_0000;
 pub const BLK_DMA: u64 = 0x4030_0000;
 
+// --- Block service IPC (§24) ----------------------------------------------
+/// The block driver also serves a SECTOR read/write endpoint (the root of block
+/// authority, EP4). It owns this UNBADGED at `BOOT_EP` with R_RECV; the fs server
+/// holds a SEND cap to it at `BOOT_BLK_EP` and uses it to persist its writable
+/// files to disk. Sectors are 512 bytes; the service keeps a one-sector
+/// write-back cache, so reads/writes are byte-granular streams that the fs server
+/// drives sequentially. (No badge: there is a single disk and a single client.)
+pub const BOOT_BLK_EP: Handle = 28;
+/// The largest payload a block read/write message carries (bytes), bounded by the
+/// 64-byte MsgBuf: write puts sector+offset+count in data[0..3] then 48 bytes.
+pub const BLK_CHUNK: usize = 48;
+/// READ: data[0]=sector (LBA), data[1]=offset within sector (0..512). Reply:
+/// data[0]=count (bytes, 0 on error/EOF), payload bytes from offset 8.
+pub const TAG_BLK_READ: u64 = u32::from_le_bytes(*b"BKRD") as u64;
+/// WRITE: data[0]=sector, data[1]=offset, data[2]=count (<=BLK_CHUNK), payload
+/// bytes from offset 24. The service buffers into its cached sector (write-back).
+/// Reply: data[0]=count written (0 on error).
+pub const TAG_BLK_WRITE: u64 = u32::from_le_bytes(*b"BKWR") as u64;
+/// FLUSH: commit the cached dirty sector to disk. Reply: data[0]=status (0 ok).
+pub const TAG_BLK_FLUSH: u64 = u32::from_le_bytes(*b"BKFL") as u64;
+
 // --- Filesystem (§15) ------------------------------------------------------
 /// The shell's root-directory capability: a BADGED endpoint to the fs server,
 /// badge = FS_ROOT. Open files relative to it (directories are capabilities).
@@ -323,6 +344,10 @@ pub const TAG_FS_UNLINK: u64 = u32::from_le_bytes(*b"FSRM") as u64;
 /// RENAME(dir): `data` = old name NUL then new name NUL. Renames a child within
 /// the directory. Reply: `data[0]` = status (0 ok / 1 fail).
 pub const TAG_FS_RENAME: u64 = u32::from_le_bytes(*b"FSMV") as u64;
+/// SYNC(root): persist every writable file + directory to the block device, so
+/// the tree survives a reboot. Sent on the root dir cap. Reply: data[0]=status
+/// (0 ok), data[1]=entries written. The fs auto-restores from disk at boot.
+pub const TAG_FS_SYNC: u64 = u32::from_le_bytes(*b"FSSY") as u64;
 
 // --- Socket capability API (§21) -------------------------------------------
 /// A client's control capability to the net server: a BADGED endpoint with the

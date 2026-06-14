@@ -1,34 +1,28 @@
-//! blk — the virtio-blk (modern/MMIO) block driver. Owns the virtio-blk PCI
-//! device, negotiates features, sets up a single virtqueue in DMA memory, and
-//! reads/writes 512-byte sectors. Stage 1: a self-test (read sector 0, write a
-//! pattern to sector 1, read it back) proving the disk works; the block-service
-//! IPC + fs persistence layer comes next.
+//! blk — the virtio-blk (modern/MMIO) block driver + sector service.
+//!
+//! Owns the virtio-blk PCI device the kernel hands it, negotiates modern virtio,
+//! and drives a single virtqueue to read/write 512-byte sectors. On top of the
+//! raw device it serves a SECTOR read/write endpoint (EP4 / BOOT_EP): the fs
+//! server calls it to persist its writable files and restore them at boot.
+//!
+//! The service keeps a ONE-SECTOR write-back cache: reads/writes name a sector +
+//! byte offset, so a client streams arbitrary byte ranges and the driver only
+//! touches the disk when the cached sector changes (or on FLUSH). This keeps the
+//! 64-byte IPC message a natural unit (<=48 payload bytes) without a disk op per
+//! chunk. There is a single disk and a single client, so the endpoint is unbadged.
 #![no_std]
 #![no_main]
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
-use oxbow_abi::{BLK_DMA, BLK_MMIO, BOOT_CONSOLE, BOOT_MEM, BOOT_PCI};
+use oxbow_abi::{
+    MsgBuf, BLK_CHUNK, BLK_DMA, BLK_MMIO, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_PCI, TAG_BLK_FLUSH,
+    TAG_BLK_READ, TAG_BLK_WRITE,
+};
 use oxbow_rt as rt;
 
 fn w(s: &[u8]) {
     let _ = rt::sys_console_write(BOOT_CONSOLE, s.as_ptr(), s.len());
-}
-fn wn(label: &[u8], n: u64) {
-    w(label);
-    let mut b = [0u8; 20];
-    let mut i = 20;
-    let mut v = n;
-    loop {
-        i -= 1;
-        b[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
-    }
-    w(&b[i..]);
-    w(b"\n");
 }
 
 // --- MMIO register accessors --------------------------------------------------
@@ -86,21 +80,26 @@ const Q: u16 = 64;
 const AVAIL_OFF: usize = 1024;
 const USED_OFF: usize = 2048;
 
-struct Blk {
-    common: usize, // common cfg MMIO base
+const SECTOR: usize = 512;
+const NO_SECTOR: u64 = u64::MAX;
+
+struct Dev {
     notify: usize, // notify address for queue 0
-    qv: usize,     // queue page vaddr
-    rv: usize,     // request page vaddr
+    qv: usize,     // queue page vaddr (desc/avail/used rings)
+    rv: usize,     // request page vaddr (header @0, data @512, status @1024)
     rp: u64,       // request page phys
 }
 
-impl Blk {
-    /// Read (write=false) or write (write=true) one 512-byte sector. For a write,
-    /// `buf` is the data to write; for a read, the sector lands in `buf`. Returns
-    /// the virtio-blk status byte (0 = OK).
-    unsafe fn op(&self, sector: u64, write: bool, buf: &mut [u8; 512]) -> u8 {
+impl Dev {
+    /// The 512-byte sector data buffer (DMA), used as the write-back cache.
+    fn data_ptr(&self) -> *mut u8 {
+        (self.rv + 512) as *mut u8
+    }
+
+    /// Read (write=false) or write (write=true) the sector buffer at `rv+512` to
+    /// disk sector `sector`. Returns the virtio-blk status byte (0 = OK).
+    unsafe fn op(&self, sector: u64, write: bool) -> u8 {
         let hdr = self.rv;
-        let dbuf = self.rv + 512;
         let stat = self.rv + 1024;
         let hdr_p = self.rp;
         let dbuf_p = self.rp + 512;
@@ -110,12 +109,8 @@ impl Blk {
         w32(hdr, if write { 1 } else { 0 });
         w32(hdr + 4, 0);
         w64(hdr + 8, sector);
-        if write {
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), dbuf as *mut u8, 512);
-        }
 
         // Three descriptors at qv: header (RO) -> data -> status (device-write).
-        // desc i: addr(u64) len(u32) flags(u16) next(u16) = 16 bytes.
         w64(self.qv, hdr_p);
         w32(self.qv + 8, 16);
         w16(self.qv + 12, F_NEXT);
@@ -123,7 +118,7 @@ impl Blk {
 
         let dflags = F_NEXT | if write { 0 } else { F_WRITE };
         w64(self.qv + 16, dbuf_p);
-        w32(self.qv + 24, 512);
+        w32(self.qv + 24, SECTOR as u32);
         w16(self.qv + 28, dflags);
         w16(self.qv + 30, 2);
 
@@ -140,38 +135,68 @@ impl Blk {
         w16(avail + 2, aidx.wrapping_add(1));
         fence(Ordering::SeqCst);
 
-        // Notify the device of queue 0.
+        // Notify the device of queue 0, then poll the used ring for completion.
         w16(self.notify, 0);
-
-        // Poll the used ring for completion.
         let used = self.qv + USED_OFF;
         let start = r16(used + 2);
         let mut spins: u64 = 0;
         while r16(used + 2) == start {
             spins += 1;
-            if spins > 500_000_000 {
-                w(b"[blk] request timed out\n");
+            if spins > 1_000_000_000 {
                 return 0xff;
             }
         }
         fence(Ordering::SeqCst);
-        if !write {
-            core::ptr::copy_nonoverlapping(dbuf as *const u8, buf.as_mut_ptr(), 512);
-        }
         r8(stat)
+    }
+}
+
+/// One-sector write-back cache over the device.
+struct Cache {
+    dev: Dev,
+    cached: u64, // sector currently in the buffer, or NO_SECTOR
+    dirty: bool,
+}
+
+impl Cache {
+    /// Make `sector` the cached sector, flushing a dirty different one first and
+    /// reading the new one in (so partial writes preserve the rest). Returns false
+    /// on a disk error.
+    unsafe fn ensure(&mut self, sector: u64) -> bool {
+        if self.cached == sector {
+            return true;
+        }
+        if self.dirty && self.cached != NO_SECTOR && self.dev.op(self.cached, true) != 0 {
+            return false;
+        }
+        self.dirty = false;
+        if self.dev.op(sector, false) != 0 {
+            self.cached = NO_SECTOR;
+            return false;
+        }
+        self.cached = sector;
+        true
+    }
+
+    /// Commit the cached sector if dirty.
+    unsafe fn flush(&mut self) -> bool {
+        if self.dirty && self.cached != NO_SECTOR {
+            if self.dev.op(self.cached, true) != 0 {
+                return false;
+            }
+            self.dirty = false;
+        }
+        true
     }
 }
 
 #[no_mangle]
 pub extern "C" fn oxbow_main() -> ! {
-    // 1. Confirm the device; enable mem-space + bus master.
-    let id = cfg_dword(0x00);
     w(b"[blk] virtio-blk init\n");
     let cmd = cfg_dword(0x04);
     let _ = rt::sys_pci_write(BOOT_PCI, 0x04, cmd | 0x6);
-    let _ = id;
 
-    // 2. Walk the PCI capability list for the virtio common/notify/device caps.
+    // Walk the PCI capability list for the virtio common/notify caps.
     let mut cap = (cfg_byte(0x34) & 0xFC) as u32;
     let mut common_bar = 0u8;
     let mut common_off = 0u32;
@@ -179,6 +204,7 @@ pub extern "C" fn oxbow_main() -> ! {
     let mut notify_off = 0u32;
     let mut notify_mult = 0u32;
     let mut guard = 0;
+    let mut have_dev = cfg_dword(0x00) & 0xFFFF == 0x1af4;
     while cap != 0 && guard < 32 {
         guard += 1;
         let d0 = cfg_dword(cap);
@@ -204,95 +230,116 @@ pub extern "C" fn oxbow_main() -> ! {
         cap = (cap_next & 0xFC) as u32;
     }
     if common_bar != notify_bar {
-        w(b"[blk] caps span multiple BARs (unsupported)\n");
-        rt::sys_exit(1);
+        have_dev = false;
     }
 
-    // 3. Map the device BAR.
-    if rt::sys_pci_bar_map(BOOT_PCI, common_bar as u32, BLK_MMIO).is_err() {
-        w(b"[blk] BAR map FAILED\n");
-        rt::sys_exit(1);
-    }
-    let cc = BLK_MMIO as usize + common_off as usize;
-
-    // 4. Reset, negotiate (VIRTIO_F_VERSION_1, feature bit 32), set up queue 0.
-    let rp;
-    let blk;
-    unsafe {
-        w8(cc + DEVICE_STATUS, 0);
-        while r8(cc + DEVICE_STATUS) != 0 {}
-        w8(cc + DEVICE_STATUS, S_ACK);
-        w8(cc + DEVICE_STATUS, S_ACK | S_DRIVER);
-        // accept only VERSION_1 (feature 32 = bit 0 of the high feature word).
-        w32(cc + DRIVER_FEATURE_SELECT, 1);
-        w32(cc + DRIVER_FEATURE, 1);
-        w32(cc + DRIVER_FEATURE_SELECT, 0);
-        w32(cc + DRIVER_FEATURE, 0);
-        w8(cc + DEVICE_STATUS, S_ACK | S_DRIVER | S_FEATURES_OK);
-        if r8(cc + DEVICE_STATUS) & S_FEATURES_OK == 0 {
-            w(b"[blk] FEATURES_OK rejected\n");
-            rt::sys_exit(1);
-        }
-        w16(cc + QUEUE_SELECT, 0);
-        let maxq = r16(cc + QUEUE_SIZE);
-        let q = if maxq < Q { maxq } else { Q };
-        w16(cc + QUEUE_SIZE, q);
-
-        let qp = rt::sys_dma_alloc(BOOT_MEM, BLK_DMA).expect("[blk] dma q");
-        rp = rt::sys_dma_alloc(BOOT_MEM, BLK_DMA + 0x1000).expect("[blk] dma r");
-        w64(cc + QUEUE_DESC, qp);
-        w64(cc + QUEUE_DRIVER, qp + AVAIL_OFF as u64);
-        w64(cc + QUEUE_DEVICE, qp + USED_OFF as u64);
-        w16(cc + QUEUE_ENABLE, 1);
-        w8(cc + DEVICE_STATUS, S_ACK | S_DRIVER | S_FEATURES_OK | S_DRIVER_OK);
-
-        let qnoff = r16(cc + QUEUE_NOTIFY_OFF);
-        let notify = BLK_MMIO as usize + notify_off as usize + qnoff as usize * notify_mult as usize;
-
-        blk = Blk {
-            common: cc,
-            notify,
-            qv: BLK_DMA as usize,
-            rv: (BLK_DMA + 0x1000) as usize,
-            rp,
-        };
-    }
-    let _ = blk.common;
-    w(b"[blk] queue ready, running self-test\n");
-
-    // 5. Self-test: write a known pattern to sector 1, read it back, verify; and
-    //    read sector 0 (a freshly created image is zeros).
-    unsafe {
-        let mut buf = [0u8; 512];
-        // read sector 0
-        let st = blk.op(0, false, &mut buf);
-        wn(b"[blk] read sector 0 status=", st as u64);
-        wn(b"[blk]   sector0[0..4] sum=", buf[0..4].iter().map(|&b| b as u64).sum());
-
-        // write a pattern to sector 1
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = (i as u8) ^ 0x5a;
-        }
-        let st = blk.op(1, true, &mut buf);
-        wn(b"[blk] write sector 1 status=", st as u64);
-
-        // read it back into a fresh buffer + verify
-        let mut rd = [0u8; 512];
-        let st = blk.op(1, false, &mut rd);
-        wn(b"[blk] read-back status=", st as u64);
-        let mut ok = true;
-        for i in 0..512 {
-            if rd[i] != ((i as u8) ^ 0x5a) {
-                ok = false;
-                break;
+    // Map the BAR + bring the device up. Any failure drops to a degraded service
+    // that fails every request, so the fs server gets a clean error (and skips
+    // restore) instead of blocking on a never-ready disk.
+    let mut cache: Option<Cache> = None;
+    if have_dev && rt::sys_pci_bar_map(BOOT_PCI, common_bar as u32, BLK_MMIO).is_ok() {
+        let cc = BLK_MMIO as usize + common_off as usize;
+        unsafe {
+            w8(cc + DEVICE_STATUS, 0);
+            while r8(cc + DEVICE_STATUS) != 0 {}
+            w8(cc + DEVICE_STATUS, S_ACK);
+            w8(cc + DEVICE_STATUS, S_ACK | S_DRIVER);
+            // Accept only VIRTIO_F_VERSION_1 (feature bit 32).
+            w32(cc + DRIVER_FEATURE_SELECT, 1);
+            w32(cc + DRIVER_FEATURE, 1);
+            w32(cc + DRIVER_FEATURE_SELECT, 0);
+            w32(cc + DRIVER_FEATURE, 0);
+            w8(cc + DEVICE_STATUS, S_ACK | S_DRIVER | S_FEATURES_OK);
+            if r8(cc + DEVICE_STATUS) & S_FEATURES_OK != 0 {
+                w16(cc + QUEUE_SELECT, 0);
+                let maxq = r16(cc + QUEUE_SIZE);
+                let q = if maxq < Q { maxq } else { Q };
+                w16(cc + QUEUE_SIZE, q);
+                let qp = rt::sys_dma_alloc(BOOT_MEM, BLK_DMA).unwrap_or(0);
+                let rp = rt::sys_dma_alloc(BOOT_MEM, BLK_DMA + 0x1000).unwrap_or(0);
+                if qp != 0 && rp != 0 {
+                    w64(cc + QUEUE_DESC, qp);
+                    w64(cc + QUEUE_DRIVER, qp + AVAIL_OFF as u64);
+                    w64(cc + QUEUE_DEVICE, qp + USED_OFF as u64);
+                    w16(cc + QUEUE_ENABLE, 1);
+                    w8(cc + DEVICE_STATUS, S_ACK | S_DRIVER | S_FEATURES_OK | S_DRIVER_OK);
+                    let qnoff = r16(cc + QUEUE_NOTIFY_OFF);
+                    let notify = BLK_MMIO as usize
+                        + notify_off as usize
+                        + qnoff as usize * notify_mult as usize;
+                    cache = Some(Cache {
+                        dev: Dev { notify, qv: BLK_DMA as usize, rv: (BLK_DMA + 0x1000) as usize, rp },
+                        cached: NO_SECTOR,
+                        dirty: false,
+                    });
+                }
             }
         }
-        if ok {
-            w(b"[blk] SELF-TEST PASS: wrote + read back 512 bytes to disk!\n");
-        } else {
-            w(b"[blk] SELF-TEST FAIL: read-back mismatch\n");
-        }
     }
 
-    rt::sys_exit(0)
+    match &cache {
+        Some(_) => w(b"[blk] sector service ready\n"),
+        None => w(b"[blk] no disk - degraded (requests fail)\n"),
+    }
+
+    // Service loop: stream sector bytes for the fs server through the cache.
+    loop {
+        let mut m = MsgBuf::new(0);
+        let reply = match rt::sys_recv(BOOT_EP, &mut m) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let mut r = MsgBuf::new(0);
+        match m.tag {
+            TAG_BLK_READ => {
+                let sector = m.data[0];
+                let off = (m.data[1] as usize).min(SECTOR);
+                let mut count = (SECTOR - off).min(BLK_CHUNK);
+                let mut ok = false;
+                if let Some(c) = cache.as_mut() {
+                    if unsafe { c.ensure(sector) } {
+                        let src = unsafe { c.dev.data_ptr().add(off) };
+                        let dst = unsafe { (r.data.as_mut_ptr() as *mut u8).add(8) };
+                        unsafe { core::ptr::copy_nonoverlapping(src, dst, count) };
+                        ok = true;
+                    }
+                }
+                if !ok {
+                    count = 0;
+                }
+                r.data[0] = count as u64;
+                r.data_len = 8;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            TAG_BLK_WRITE => {
+                let sector = m.data[0];
+                let off = (m.data[1] as usize).min(SECTOR);
+                let count = (m.data[2] as usize).min(BLK_CHUNK).min(SECTOR - off);
+                let mut written = 0usize;
+                if let Some(c) = cache.as_mut() {
+                    if unsafe { c.ensure(sector) } {
+                        let src = unsafe { (m.data.as_ptr() as *const u8).add(24) };
+                        let dst = unsafe { c.dev.data_ptr().add(off) };
+                        unsafe { core::ptr::copy_nonoverlapping(src, dst, count) };
+                        c.dirty = true;
+                        written = count;
+                    }
+                }
+                r.data[0] = written as u64;
+                r.data_len = 1;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            TAG_BLK_FLUSH => {
+                let ok = cache.as_mut().map(|c| unsafe { c.flush() }).unwrap_or(false);
+                r.data[0] = if ok { 0 } else { 1 };
+                r.data_len = 1;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            _ => {
+                r.data[0] = 1;
+                r.data_len = 1;
+                let _ = rt::sys_reply(reply, &r);
+            }
+        }
+    }
 }

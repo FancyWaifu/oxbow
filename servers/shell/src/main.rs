@@ -372,6 +372,19 @@ fn tw_dec_u32(mut n: u32) {
     tw(&b[i..]);
 }
 
+/// `sync`: ask the fs to persist its writable tree to disk (TAG_FS_SYNC on the
+/// root dir cap). The tree is restored automatically at the next boot.
+fn sync_cmd() {
+    let mut m = MsgBuf::new(oxbow_abi::TAG_FS_SYNC);
+    if rt::sys_call(BOOT_FS_ROOT, &mut m).is_err() || m.data[0] != 0 {
+        tw(b"sync: failed (no disk?)\n");
+        return;
+    }
+    tw(b"sync: persisted ");
+    tw_dec_u32(m.data[1] as u32);
+    tw(b" entries to disk\n");
+}
+
 /// Write a byte as decimal ASCII to the tty (for printing IP octets).
 fn tw_dec(n: u8) {
     let mut b = [0u8; 3];
@@ -805,6 +818,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"js" | b"qjs" => spawn_with_budget(BOOT_IMG_QJS, *cwd, rest, 48 * 1024 * 1024, sp),
         b"curl" => spawn_with_budget(BOOT_IMG_CURL, *cwd, rest, 48 * 1024 * 1024, sp),
         b"exec" => exec_cmd(*cwd, path, rest, sp),
+        b"sync" => sync_cmd(),
         b"badgetest" => badgetest(sp),
         b"help" => {
             tw(b"oxbow shell:  (ls cat mkdir touch are spawned programs)\n");
@@ -827,6 +841,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  js [file.js]    run QuickJS JavaScript (built-in test, or a .js file)\n");
             tw(b"  curl <url>      fetch an http:// URL (no TLS)\n");
             tw(b"  exec <path>     load + run an ELF from the filesystem (exec-from-fs)\n");
+            tw(b"  sync            persist writable files to disk (restored at boot)\n");
             tw(b"  badgetest       exercise badged-endpoint mint rules\n");
             tw(b"  help            this list\n");
         }
