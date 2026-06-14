@@ -47,6 +47,7 @@ build-server:
     # (the kernel enabled SSE at boot) so the float ABI matches across the
     # Rust↔C boundary (pow/floor args, printf %f varargs).
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p oxlua
+    RUSTFLAGS="-C relocation-model=static" cargo build -p oxpy
 
 # Same, but with the ABI negative-path selftests compiled in.
 build-server-selftest:
@@ -91,6 +92,8 @@ _iso:
     -strip -S iso_root/boot/tcc.elf
     cp target/x86_64-unknown-none/debug/lua iso_root/boot/lua.elf
     -strip -S iso_root/boot/lua.elf
+    cp target/x86_64-unknown-none/debug/micropython iso_root/boot/micropython.elf
+    -strip -S iso_root/boot/micropython.elf
     # Stage the filesystem: the FHS skeleton (servers/fs/initrd) plus the live
     # oxbow source under /usr/src/oxbow so it is browsable on oxbow itself.
     rm -rf build/initrd

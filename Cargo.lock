@@ -440,6 +440,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxpy"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+]
+
+[[package]]
 name = "oxtcc"
 version = "0.0.0"
 dependencies = [

@@ -28,6 +28,7 @@ members = [
     "servers/cc-hello",
     "servers/tcc",
     "servers/lua",
+    "servers/micropython",
     # "tools/*",  # initrd packer, etc.
 ]
 # Servers are excluded from the default build because they need a DIFFERENT

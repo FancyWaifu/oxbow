@@ -1625,3 +1625,39 @@ Lua's clang-compiled C passes doubles in XMM (hardware SSE), but Rust's
 0.0000). Fix: build oxbow-libc for the Lua image with `-C target-feature=
 -soft-float,+sse,+sse2` (the kernel enables SSE at boot, as for drift) so the
 float ABI matches across the Rust↔C boundary. `MAX_IMAGES` bumped 14→16.
+
+## 38. MicroPython — real Python on oxbow (v1-micropython)
+
+The second language, and a far richer one. MicroPython 1.24 runs on oxbow,
+executing a built-in test and `.py` scripts from the filesystem:
+```
+oxbow:/$ py /hello.py
+primes < 40: [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]   # generators
+reversed: ['jumps', 'fox', 'brown', 'quick', 'the']          # slicing [::-1]
+lengths: {'quick': 5, ...}  unique letters: 19               # dict/set comprehensions
+vector sum: Vec(4, 6)   map+filter: [10, 12, 14]             # __add__, closures, lambda
+```
+Lists/dicts/sets, comprehensions, generators, slicing, classes with operator
+overloading, exceptions, closures — the full language (integer-only for now;
+float is a follow-up). Its own GC manages a 2 MiB heap.
+
+### 38.1 The port (`servers/micropython/`)
+Vendored MicroPython 1.24.1's **`minimal` port** (`py/` core + `shared/` +
+`extmod/`), cross-compiled like Lua/tcc. The build needs **generated `qstr`
+headers** (host Python scripts) — generated once via the upstream host build at
+`MICROPY_CONFIG_ROM_LEVEL_CORE_FEATURES` and vendored under `gen/genhdr/` (the
+host *link* failing is fine; only header generation matters). `port/oxmain.c`
+replaces the REPL main: a GC heap + `mp_init` + `do_str` (built-in test) or
+reads a `.py` file via libc and runs it. `port/oxhal.c` = stdout/stdin over fds.
+`open()` is a stub that raises (no VFS yet; `io.StringIO`/`BytesIO` work).
+
+### 38.2 libc headers it forced (all also help future C ports)
+- `<stdint.h>`: the limit macros (`UINT8_MAX`, `SIZE_MAX`, `INTPTR_MAX`, the
+  `*_C()` literal macros, `intmax_t`).
+- `<unistd.h>`: `SEEK_SET/CUR/END`, `STD{IN,OUT,ERR}_FILENO`.
+- `<errno.h>`: ~35 errno constants (was 7).
+- `<alloca.h>`: `alloca` → `__builtin_alloca`.
+
+Config choice: `CORE_FEATURES` (sets/slicing/comprehensions/io) but not `EXTRA`
+(which pulls `sys.stdin`/`uctypes`/file objects needing a VFS port). Integer-only
+keeps the float ABI out of scope for this arc.
