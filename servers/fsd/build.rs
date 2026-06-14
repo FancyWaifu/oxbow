@@ -51,7 +51,9 @@ fn main() {
             b.file(&path);
         }
     }
-    b.file("src/blockdev_glue.c");
-    println!("cargo:rerun-if-changed=src/blockdev_glue.c");
+    for f in ["src/blockdev_glue.c", "src/fs_ops.c"] {
+        b.file(f);
+        println!("cargo:rerun-if-changed={f}");
+    }
     b.compile("lwext4_fsd");
 }
