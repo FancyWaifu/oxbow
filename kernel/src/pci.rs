@@ -99,10 +99,13 @@ fn probe(bus: u8, dev: u8, func: u8) -> Option<Device> {
     })
 }
 
-/// Enumerate the PCI bus, logging each function, and return the first network
-/// controller (class 0x02) found — the NIC a future net driver will own.
-pub fn enumerate() -> Option<Device> {
+/// Enumerate the PCI bus, logging each function, and return (NIC, block device):
+/// the first network controller (class 0x02) and the first virtio-blk device
+/// (vendor 0x1af4, mass-storage class 0x01) — the hardware a net / block driver
+/// will own.
+pub fn enumerate() -> (Option<Device>, Option<Device>) {
     let mut nic = None;
+    let mut blk = None;
     for bus in 0u16..256 {
         for dev in 0u8..32 {
             for func in 0u8..8 {
@@ -114,6 +117,9 @@ pub fn enumerate() -> Option<Device> {
                     if d.class == 0x02 && nic.is_none() {
                         nic = Some(d);
                     }
+                    if d.vendor == 0x1af4 && d.class == 0x01 && blk.is_none() {
+                        blk = Some(d);
+                    }
                     // func 0 with no multi-function bit: skip funcs 1..8
                     if func == 0 && config_read(bus as u8, dev, 0, 0x0C) & 0x0080_0000 == 0 {
                         break;
@@ -122,5 +128,5 @@ pub fn enumerate() -> Option<Device> {
             }
         }
     }
-    nic
+    (nic, blk)
 }

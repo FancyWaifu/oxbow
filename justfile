@@ -5,9 +5,10 @@ KERNEL     := "target/x86_64-unknown-none/debug/oxbow-kernel"
 ISO        := "oxbow.iso"
 
 # QEMU flags shared by `run` and `gdb`. q35 machine, serial routed to stdio,
-# no display, and the isa-debug-exit device so a future test harness can exit
-# QEMU from inside the kernel.
-qemu_flags := "-M q35 -m 256M -cdrom " + ISO + " -boot d -serial stdio -display none -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04 -netdev user,id=net0 -device e1000,netdev=net0"
+# no display, the isa-debug-exit device so a future test harness can exit QEMU
+# from inside the kernel, and a legacy virtio-blk disk (oxbow-disk.img) for
+# persistent storage. Create the disk once with:  just disk
+qemu_flags := "-M q35 -m 256M -cdrom " + ISO + " -boot d -serial stdio -display none -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04 -netdev user,id=net0 -device e1000,netdev=net0 -drive file=oxbow-disk.img,if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0,disable-modern=on,disable-legacy=off"
 
 default: run
 
@@ -186,3 +187,7 @@ gdb: iso
 clean:
     cargo clean
     rm -rf iso_root {{ISO}}
+
+# Create the persistent-storage disk image (16 MiB raw) if it does not exist.
+disk:
+    [ -f oxbow-disk.img ] || dd if=/dev/zero of=oxbow-disk.img bs=1m count=16

@@ -173,7 +173,7 @@ fn kmain_stage2() -> ! {
 
     // Enumerate the PCI bus — the kernel is the root of hardware authority and
     // will hand a future net driver a capability to the NIC it finds here.
-    let nic = pci::enumerate();
+    let (nic, blk) = pci::enumerate();
     match nic {
         Some(d) => {
             let (base, size) = d.bar_region(0);
@@ -183,6 +183,17 @@ fn kmain_stage2() -> ! {
             );
         }
         None => println!("[pci] no network controller found"),
+    }
+    match blk {
+        Some(d) => {
+            let raw = d.bar(0);
+            let io_base = (raw & 0xFFFC) as u16; // legacy virtio: I/O-port BAR
+            println!(
+                "[pci] virtio-blk {:04x}:{:04x} at {:02x}:{:02x}.{} — I/O port {:#06x} IRQ {}",
+                d.vendor, d.device, d.bus, d.dev, d.func, io_base, d.irq_line()
+            );
+        }
+        None => println!("[pci] no virtio-blk device found"),
     }
 
     // The timer-driven tick notification (granted to module 0 as BOOT_TICK).
