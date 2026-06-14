@@ -19,8 +19,12 @@ fn main() {
     let host = std::env::var("HOST").unwrap();
     let llvm_ar = format!("{}/lib/rustlib/{}/bin/llvm-ar", sysroot.trim(), host);
 
+    // Default to clang (cross-compiles to x86_64 ELF with no extra install). To
+    // use a cross-gcc instead, set CC, e.g. `CC=x86_64-elf-gcc`.
+    let compiler = std::env::var("CC").unwrap_or_else(|_| "clang".to_string());
+
     cc::Build::new()
-        .compiler("clang")
+        .compiler(&compiler)
         .archiver(&llvm_ar)
         .file("src/hello.c")
         .flag("-ffreestanding")

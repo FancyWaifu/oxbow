@@ -6,6 +6,7 @@ members = [
     "kernel",
     "abi",
     "rt",
+    "libc",
     "servers/pong",
     "servers/beta",
     "servers/kbd",

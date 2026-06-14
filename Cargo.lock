@@ -93,8 +93,7 @@ name = "cc-hello"
 version = "0.0.0"
 dependencies = [
  "cc",
- "oxbow-abi",
- "oxbow-rt",
+ "oxbow-libc",
 ]
 
 [[package]]
@@ -415,6 +414,14 @@ dependencies = [
  "spin",
  "uart_16550",
  "x86_64",
+]
+
+[[package]]
+name = "oxbow-libc"
+version = "0.0.0"
+dependencies = [
+ "oxbow-abi",
+ "oxbow-rt",
 ]
 
 [[package]]

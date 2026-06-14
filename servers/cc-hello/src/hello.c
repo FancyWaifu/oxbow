@@ -1,39 +1,43 @@
-/* A real C program, compiled by clang, running on oxbow. It includes no system
- * headers (none exist yet) — it just declares the libc functions it calls,
- * which the Rust side provides over oxbow's capability syscalls. */
-int puts(const char *s);
-int printf(const char *fmt, ...);
-void *malloc(unsigned long);
-void free(void *);
+/* A C program on oxbow, compiled by clang. It uses the fuller oxbow-libc:
+ * argv, FILE* stdio (fopen/fgets/fprintf), <ctype.h>, <string.h>, malloc.
+ * Behaves like `cat -n`: number the lines of a file. With no argument it reads
+ * /etc/os-release; otherwise the path in argv[1] (relative to the shell's cwd). */
+#include <stddef.h>
+
+int printf(const char *, ...);
+int puts(const char *);
+
+typedef struct FILE FILE;
+FILE *fopen(const char *, const char *);
+int fclose(FILE *);
+char *fgets(char *, int, FILE *);
+int fprintf(FILE *, const char *, ...);
+extern FILE *stdout;
+
+int toupper(int);
 unsigned long strlen(const char *);
-int open(const char *path, int flags);
-long read(int fd, void *buf, unsigned long len);
-long write(int fd, const void *buf, unsigned long len);
-int close(int fd);
 
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
-    puts("hello from C, compiled by clang, running on oxbow");
-    printf("  2 + 2 = %d, and %s works too\n", 2 + 2, "printf");
+    const char *path = (argc > 1) ? argv[1] : "etc/os-release";
 
-    /* exercise the heap: malloc, build a string, print it, free it */
-    char *p = (char *)malloc(64);
-    for (int i = 0; i < 6; i++) p[i] = 'A' + i;
-    p[6] = 0;
-    printf("  malloc'd \"%s\" (strlen %d) on oxbow's slab heap\n", p, (int)strlen(p));
-    free(p);
-
-    /* POSIX file I/O over capabilities: open a file (relative to cwd),
-     * read it in a loop, write it to stdout — a tiny C cat. */
-    int fd = open("etc/os-release", 0);
-    if (fd < 0) {
-        puts("  (open etc/os-release failed — run me from /)");
-        return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        printf("cc-hello: cannot open %s\n", path);
+        return 1;
     }
-    puts("  open()/read()/write() etc/os-release via the fs capability:");
-    char buf[64];
-    long n;
-    while ((n = read(fd, buf, sizeof buf)) > 0) write(1, buf, n);
-    close(fd);
+
+    printf("cc-hello: numbering lines of %s (argc=%d)\n", path, argc);
+    char line[128];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        n++;
+        fprintf(stdout, "%4d  %s", n, line);
+        /* if the line had no trailing newline, add one */
+        unsigned long len = strlen(line);
+        if (len == 0 || line[len - 1] != '\n') puts("");
+    }
+    fclose(f);
+    printf("cc-hello: %d lines, uppercased first char of last = '%c'\n",
+           n, toupper(line[0]));
     return 0;
 }

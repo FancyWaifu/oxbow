@@ -1232,3 +1232,43 @@ capability — a tiny C `cat`, all over oxbow's syscalls.
 Factor the libc into a reusable `oxbow-libc` crate (so any C program links it);
 `argv`/`env`, `FILE*` stdio (`fopen`/`fread`/`fwrite`), `lseek`, `stat`,
 `getcwd`; then the headline — porting **TinyCC** for on-device compilation.
+
+## 27. oxbow-libc: a reusable libc + fuller POSIX (v1-libc2)
+
+The §26 shim, extracted into a real crate and grown into a usable C standard
+library.
+
+### 27.1 The crate
+`libc/` (`oxbow-libc`, an rlib) now holds the whole runtime + libc: `oxbow_main`
+(sets up `argv` + the stdio globals, then calls the C `main`) and every `extern
+"C"` function. A C program is a tiny binary crate — `extern crate oxbow_libc as
+_;` to force the link + a `build.rs` that compiles its `.c` — and the linker
+resolves the C program's `printf`/`open`/... against the libc rlib. The compiler
+is `clang` by default, overridable with `CC=` (e.g. a cross-`gcc`) — clang
+cross-compiles to x86_64 ELF with no extra toolchain to install, and gcc could
+never run *on* oxbow anyway (that's TinyCC's job).
+
+### 27.2 The surface
+- **entry/argv**: `argv` built from oxbow's argument string (argv[0] = a
+  placeholder, argv[1..] = the tokens); `argc`/`argv` reach `main`.
+- **stdio**: `FILE` over an fd; `stdin`/`stdout`/`stderr` (the tty); `fopen`,
+  `fclose`, `fgets`, `fgetc`, `fread`, `fwrite`, `fputs`, `fputc`, `putchar`,
+  `puts`, `feof`, `fflush`; `printf`/`fprintf` sharing one formatter (with width/
+  length flags skipped, not honored).
+- **unistd**: `open`/`read`/`write`/`close`/`lseek` over the fd table + fs caps.
+- **stdlib**: `malloc`/`free`/`calloc`/`realloc` (slab heap), `exit`, `abort`,
+  `atoi`, `abs`.
+- **string**: `strlen`, `strcmp`, `strncmp`, `strcpy`, `strncpy`, `strchr`,
+  `memchr` (+ `memcpy`/`memset`/`memmove`/`memcmp` from compiler-builtins).
+- **ctype**: `isspace`, `isdigit`, `isalpha`, `isalnum`, `isupper`, `islower`,
+  `toupper`, `tolower`.
+
+### 27.3 Demonstrated
+`cc-hello [path]` is a `cat -n`: it takes a filename via `argv` (default
+`etc/os-release`), `fopen`s it, `fgets` each line, and `fprintf`s it numbered —
+exercising argv + FILE* stdio + ctype + string, all over capabilities.
+
+### 27.4 Next
+`FILE*` read buffering (fgetc is one fs IPC per byte), `snprintf`/`sprintf`,
+`getcwd`/`stat`/`opendir`, `env`; then porting **TinyCC** over this libc for
+on-device compilation.
