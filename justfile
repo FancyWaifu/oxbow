@@ -8,7 +8,7 @@ ISO        := "oxbow.iso"
 # no display, the isa-debug-exit device so a future test harness can exit QEMU
 # from inside the kernel, and a legacy virtio-blk disk (oxbow-disk.img) for
 # persistent storage. Create the disk once with:  just disk
-qemu_flags := "-M q35 -m 256M -cdrom " + ISO + " -boot d -serial stdio -display none -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04 -netdev user,id=net0 -device e1000,netdev=net0 -drive file=oxbow-disk.img,if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0,disable-modern=on,disable-legacy=off"
+qemu_flags := "-M q35 -m 256M -cdrom " + ISO + " -boot d -serial stdio -display none -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04 -netdev user,id=net0 -device e1000,netdev=net0 -drive file=oxbow-disk.img,if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0"
 
 default: run
 
@@ -30,6 +30,7 @@ build-server:
     RUSTFLAGS="-C relocation-model=static" cargo build -p badge
     RUSTFLAGS="-C relocation-model=static" cargo build -p fs
     RUSTFLAGS="-C relocation-model=static" cargo build -p net
+    RUSTFLAGS="-C relocation-model=static" cargo build -p blk
     RUSTFLAGS="-C relocation-model=static" cargo build -p cat
     RUSTFLAGS="-C relocation-model=static" cargo build -p ls
     RUSTFLAGS="-C relocation-model=static" cargo build -p mkdir
@@ -82,6 +83,7 @@ _iso:
     cp target/x86_64-unknown-none/debug/badge iso_root/boot/badge.elf
     cp target/x86_64-unknown-none/debug/fs iso_root/boot/fs.elf
     cp target/x86_64-unknown-none/debug/net iso_root/boot/net.elf
+    cp target/x86_64-unknown-none/debug/blk iso_root/boot/blk.elf
     cp target/x86_64-unknown-none/debug/cat iso_root/boot/cat.elf
     cp target/x86_64-unknown-none/debug/ls iso_root/boot/ls.elf
     cp target/x86_64-unknown-none/debug/mkdir iso_root/boot/mkdir.elf

@@ -279,6 +279,13 @@ pub const BOOT_NET_IRQ: Handle = 9;
 /// packet buffers map at NET_DMA + n*0x1000).
 pub const NET_DMA: u64 = 0x4010_0000;
 
+/// Block driver (virtio-blk, modern/MMIO): the device's PciDevice cap is granted
+/// at `BOOT_PCI` in the blk server. It maps the device BAR (named by the virtio
+/// PCI capability structure) at `BLK_MMIO` and its DMA pages (virtqueue + request
+/// buffers) at `BLK_DMA + n*0x1000`.
+pub const BLK_MMIO: u64 = 0x4020_0000;
+pub const BLK_DMA: u64 = 0x4030_0000;
+
 // --- Filesystem (§15) ------------------------------------------------------
 /// The shell's root-directory capability: a BADGED endpoint to the fs server,
 /// badge = FS_ROOT. Open files relative to it (directories are capabilities).

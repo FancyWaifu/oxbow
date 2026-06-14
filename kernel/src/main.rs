@@ -521,6 +521,23 @@ fn kmain_stage2() -> ! {
                 );
             });
         }
+        if cmd == b"blk" {
+            // The block driver owns the virtio-blk PCI device: read/write config
+            // (R_IN|R_OUT) to negotiate + map its MMIO BAR (R_MAP). DMA comes from
+            // its standard Memory budget.
+            if let Some(d) = blk {
+                proc::with_proc_mut(pid, |p| {
+                    p.install(
+                        oxbow_abi::BOOT_PCI,
+                        object::HandleEntry {
+                            obj: object::ObjectRef::PciDevice(d.bdf()),
+                            rights: oxbow_abi::R_IN | oxbow_abi::R_OUT | oxbow_abi::R_MAP,
+                            badge: 0,
+                        },
+                    );
+                });
+            }
+        }
         let tcb = thread::spawn_user(pid, as_i, entry, user_rsp);
         println!("[user] {} scheduled as tcb {} (ring 3, IF=1)", name, tcb);
     }
