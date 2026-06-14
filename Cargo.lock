@@ -333,6 +333,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "jail"
+version = "0.0.0"
+dependencies = [
+ "oxbow-abi",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "kbd"
 version = "0.0.0"
 dependencies = [

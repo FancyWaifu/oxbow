@@ -9,7 +9,7 @@
 use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA, BOOT_NET_EP,
     BOOT_IMG_CAT, BOOT_IMG_CP, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_MKDIR, BOOT_IMG_MV, BOOT_IMG_PONG,
-    BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_LUA, BOOT_IMG_UPY, BOOT_IMG_QJS, BOOT_IMG_CURL, BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_TICK, BOOT_TTY,
+    BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_LUA, BOOT_IMG_UPY, BOOT_IMG_QJS, BOOT_IMG_CURL, BOOT_IMG_JAIL, BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_TICK, BOOT_TTY,
     HANDLE_NULL, R_GRANT, R_RECV,
     R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
@@ -370,6 +370,31 @@ fn tw_dec_u32(mut n: u32) {
         }
     }
     tw(&b[i..]);
+}
+
+/// `jail`: the capability-confinement showcase. Hand a hostile program a
+/// capability to exactly ONE directory (/tmp) and nothing else, then let it try
+/// every escape and watch the kernel deny each. The dir cap is the L3 test
+/// subject — jail can act inside /tmp but must not be able to walk above it.
+fn jail_cmd(sp: &Spawner) {
+    // Open /tmp under the root to mint a confined dir capability for jail.
+    let mut m = MsgBuf::new(TAG_FS_OPEN);
+    let name = b"tmp";
+    let dst = m.data.as_mut_ptr() as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(name.as_ptr(), dst, name.len());
+        *dst.add(name.len()) = 0;
+    }
+    m.data_len = 8;
+    let dir = if rt::sys_call(BOOT_FS_ROOT, &mut m).is_ok() && m.data[0] == 0 {
+        m.handles[0]
+    } else {
+        HANDLE_NULL // /tmp missing — jail still runs; its L3 test just no-ops
+    };
+    spawn_with(BOOT_IMG_JAIL, dir, b"", sp);
+    if dir != HANDLE_NULL {
+        let _ = rt::sys_close(dir);
+    }
 }
 
 /// `sync`: ask the fs to persist its writable tree to disk (TAG_FS_SYNC on the
@@ -819,6 +844,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"curl" => spawn_with_budget(BOOT_IMG_CURL, *cwd, rest, 48 * 1024 * 1024, sp),
         b"exec" => exec_cmd(*cwd, path, rest, sp),
         b"sync" => sync_cmd(),
+        b"jail" => jail_cmd(sp),
         b"badgetest" => badgetest(sp),
         b"help" => {
             tw(b"oxbow shell:  (ls cat mkdir touch are spawned programs)\n");
@@ -842,6 +868,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  curl <url>      fetch an http:// URL (no TLS)\n");
             tw(b"  exec <path>     load + run an ELF from the filesystem (exec-from-fs)\n");
             tw(b"  sync            persist writable files to disk (restored at boot)\n");
+            tw(b"  jail            confinement showcase: a hostile program is denied every escape\n");
             tw(b"  badgetest       exercise badged-endpoint mint rules\n");
             tw(b"  help            this list\n");
         }
