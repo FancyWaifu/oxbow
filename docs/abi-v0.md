@@ -1192,3 +1192,43 @@ every exec). Boot stays verbose.
 
 POSIX compliance and on-device compilation remain long-term goals; this is the
 "feels like a Unix box" groundwork.
+
+## 26. libc / POSIX shim — C programs on oxbow (v1-libc)
+
+The first step toward POSIX (and eventually on-device compilation): real C
+programs, compiled by clang, running on oxbow, with POSIX calls mapped onto
+oxbow's capabilities.
+
+### 26.1 The pipeline
+A C program builds with the **existing server pipeline** — no new toolchain
+plumbing. `servers/cc-hello` is a Rust binary crate whose `build.rs` compiles
+`src/hello.c` with `clang --target=x86_64-unknown-none -ffreestanding` (via the
+`cc` crate) and archives it with `llvm-ar` (Apple's `ar` can't index ELF). The
+Rust side provides `oxbow_main` (oxbow-rt's entry), which calls the C `main`, and
+the `extern "C"` libc functions; cargo links the C object + Rust into one ET_EXEC
+at 0x200000, same as every other server. It is a normal spawnable image
+(`BOOT_IMG_CCHELLO`, shell `cc-hello`).
+
+### 26.2 The libc (so far)
+- **stdio**: `printf` (a real varargs impl via `c_variadic`: `%d/%i/%u/%x/%c/%s/
+  %%`), `puts` — over the tty endpoint the spawner granted.
+- **unistd**: `write`/`read`/`open`/`close`. fds 0/1/2 are the tty; `open`
+  resolves a path against the **directory capability** the shell passes (its
+  cwd, at `BOOT_EP`), stores the returned fs file cap in an fd table, and
+  `read` pulls bytes via the fs READ protocol tracking a per-fd offset. So
+  `open()/read()/write()/close()` is a real POSIX path **backed by capabilities**
+  — no ambient filesystem.
+- **stdlib**: `malloc`/`free`/`calloc` over oxbow-rt's slab heap (a size header
+  lets `free` rebuild the `Layout`); `exit`.
+- **string**: `strlen`, `strcmp` (`memcpy`/`memset`/`memcmp`/`memmove` come from
+  compiler-builtins, shared by C and Rust).
+
+### 26.3 Demonstrated
+`cc-hello` (a clang-compiled C program) prints via `printf`, `malloc`s a string,
+then `open()/read()/write()/close()`s `/etc/os-release` through the fs
+capability — a tiny C `cat`, all over oxbow's syscalls.
+
+### 26.4 Next
+Factor the libc into a reusable `oxbow-libc` crate (so any C program links it);
+`argv`/`env`, `FILE*` stdio (`fopen`/`fread`/`fwrite`), `lseek`, `stat`,
+`getcwd`; then the headline — porting **TinyCC** for on-device compilation.

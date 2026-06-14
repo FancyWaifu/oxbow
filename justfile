@@ -40,6 +40,7 @@ build-server:
     # hardware SSE. Build it with soft-float off + SSE on (the kernel enabled the
     # FPU + does per-thread FXSAVE), and the non-SIMD curve25519 backend.
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2 --cfg curve25519_dalek_backend="serial"' cargo build -p drift
+    RUSTFLAGS="-C relocation-model=static" cargo build -p cc-hello
 
 # Same, but with the ABI negative-path selftests compiled in.
 build-server-selftest:
@@ -79,6 +80,7 @@ _iso:
     cp target/x86_64-unknown-none/debug/mv iso_root/boot/mv.elf
     cp target/x86_64-unknown-none/debug/cp iso_root/boot/cp.elf
     cp target/x86_64-unknown-none/debug/drift iso_root/boot/drift.elf
+    cp target/x86_64-unknown-none/debug/cc-hello iso_root/boot/cc-hello.elf
     # Stage the filesystem: the FHS skeleton (servers/fs/initrd) plus the live
     # oxbow source under /usr/src/oxbow so it is browsable on oxbow itself.
     rm -rf build/initrd

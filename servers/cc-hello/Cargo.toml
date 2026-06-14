@@ -1,0 +1,18 @@
+[package]
+name = "cc-hello"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cc-hello"
+path = "src/main.rs"
+
+[dependencies]
+oxbow-rt = { path = "../../rt" }
+oxbow-abi = { path = "../../abi" }
+
+[build-dependencies]
+cc = "1"
