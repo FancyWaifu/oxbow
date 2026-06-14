@@ -9,7 +9,7 @@
 use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA, BOOT_NET_EP,
     BOOT_IMG_CAT, BOOT_IMG_CP, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_MKDIR, BOOT_IMG_MV, BOOT_IMG_PONG,
-    BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_TICK, BOOT_TTY,
+    BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_LUA, BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_TICK, BOOT_TTY,
     HANDLE_NULL, R_GRANT, R_RECV,
     R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
@@ -780,6 +780,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"cc-hello" => spawn_with(BOOT_IMG_CCHELLO, *cwd, rest, sp),
         b"tcc" => spawn_with_budget(BOOT_IMG_TCC, *cwd, rest, 48 * 1024 * 1024, sp),
         b"cc" => cc_cmd(*cwd, rest, sp),
+        b"lua" => spawn_with_budget(BOOT_IMG_LUA, *cwd, rest, 32 * 1024 * 1024, sp),
         b"exec" => exec_cmd(*cwd, path, rest, sp),
         b"badgetest" => badgetest(sp),
         b"help" => {
@@ -798,6 +799,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  drift           DRIFT crypto self-test (X25519/ChaCha20, needs SSE)\n");
             tw(b"  run hello/pong  spawn a demo program\n");
             tw(b"  cc <src> -o <o> compile+link a C file to a standalone binary (tcc -static)\n");
+            tw(b"  lua [file.lua]  run the Lua 5.4 interpreter (built-in test, or a file)\n");
             tw(b"  exec <path>     load + run an ELF from the filesystem (exec-from-fs)\n");
             tw(b"  badgetest       exercise badged-endpoint mint rules\n");
             tw(b"  help            this list\n");

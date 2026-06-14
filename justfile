@@ -42,6 +42,11 @@ build-server:
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2 --cfg curve25519_dalek_backend="serial"' cargo build -p drift
     RUSTFLAGS="-C relocation-model=static" cargo build -p cc-hello
     RUSTFLAGS="-C relocation-model=static" cargo build -p oxtcc
+    # Lua uses doubles heavily; its clang-compiled C passes floats in XMM
+    # (hardware SSE), so oxbow-libc must too — build with soft-float OFF + SSE ON
+    # (the kernel enabled SSE at boot) so the float ABI matches across the
+    # Rust↔C boundary (pow/floor args, printf %f varargs).
+    RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p oxlua
 
 # Same, but with the ABI negative-path selftests compiled in.
 build-server-selftest:
@@ -84,6 +89,8 @@ _iso:
     cp target/x86_64-unknown-none/debug/cc-hello iso_root/boot/cc-hello.elf
     cp target/x86_64-unknown-none/debug/tcc iso_root/boot/tcc.elf
     -strip -S iso_root/boot/tcc.elf
+    cp target/x86_64-unknown-none/debug/lua iso_root/boot/lua.elf
+    -strip -S iso_root/boot/lua.elf
     # Stage the filesystem: the FHS skeleton (servers/fs/initrd) plus the live
     # oxbow source under /usr/src/oxbow so it is browsable on oxbow itself.
     rm -rf build/initrd

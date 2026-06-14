@@ -27,6 +27,7 @@ members = [
     "servers/drift",
     "servers/cc-hello",
     "servers/tcc",
+    "servers/lua",
     # "tools/*",  # initrd packer, etc.
 ]
 # Servers are excluded from the default build because they need a DIFFERENT

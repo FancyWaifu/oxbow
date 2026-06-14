@@ -1585,3 +1585,43 @@ A program's `#include <stdio.h>` resolves to `/usr/include/stdio.h`, which itsel
 pulls `<stddef_shim.h>` (same dir) and `<stdarg.h>` (from `/usr/lib/tcc/include`)
 — the whole chain resolves on the device. With real includes + the standalone
 link (§35) + real argv (§13.7), oxbow compiles and runs non-trivial C from source.
+
+## 37. Lua 5.4 — the first real language on oxbow (v1-lua)
+
+The Lua 5.4 interpreter runs on oxbow, executing both a built-in test and `.lua`
+scripts loaded from the filesystem:
+```
+oxbow:/$ lua /hello.lua
+hello from a .lua file on oxbow!
+counter:    1   2   3
+  3 squared is 9, sqrt is 3.000
+distance of (3,4) from origin = 5.0
+```
+Closures, tables/methods, the string library, integer + float arithmetic
+(`//`, `%`, `^`, `^0.5` = sqrt), `string.format` with `%d`/`%f` — all work.
+
+### 37.1 The port
+Vendored Lua 5.4.7 (`servers/lua/`), cross-compiled like tcc: clang →
+`x86_64-unknown-none`, linked against `oxbow-libc`, a `lua` boot image + shell
+command. `src/oxmain.c` replaces lua.c's REPL: it opens the libraries that work
+without a filesystem-of-record, a clock, or `dlopen` — **base, table, string,
+coroutine, utf8** (skipping `io`/`os`/`package`/`debug`/`math`-library; the core
+VM's `// % ^` only need `floor`/`fmod`/`pow`). `luaL_dofile` runs a named script.
+
+### 37.2 libc additions it forced
+- **`<math.h>`**: `floor`, `ceil`, `fmod`, `fabs`, `sqrt` (Newton), and
+  series-based `exp`/`log`/`pow` (pow has an exact integer-exponent fast path; the
+  general path is `exp(y·log x)`). Good to ~1e-12 — fine for an interpreter.
+- **`<locale.h>`**: `localeconv`/`setlocale` (C locale; Lua reads the decimal
+  point). **ctype**: `iscntrl`/`isgraph`/`ispunct`/`isxdigit`. **string**:
+  `strspn`, `strcoll`, real `frexp`.
+- **printf float conversions**: `vfmt` now handles `%f`/`%e`/`%g` (precision
+  captured; `%g` strips trailing zeros). Lua prints numbers via `%.14g`.
+
+### 37.3 The float-ABI fix (the subtle one)
+Lua's clang-compiled C passes doubles in XMM (hardware SSE), but Rust's
+`x86_64-unknown-none` defaults to **soft-float** (doubles in GP registers). So
+`pow`/`floor` received garbage and variadic `%f` read 0 (`2^10` → 2, `7/2` →
+0.0000). Fix: build oxbow-libc for the Lua image with `-C target-feature=
+-soft-float,+sse,+sse2` (the kernel enables SSE at boot, as for drift) so the
+float ABI matches across the Rust↔C boundary. `MAX_IMAGES` bumped 14→16.

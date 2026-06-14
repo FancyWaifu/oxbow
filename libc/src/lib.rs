@@ -469,6 +469,173 @@ unsafe fn print_int(emit: &mut dyn FnMut(&[u8]), v: i64) -> i32 {
     }
 }
 
+/// Format `x` in fixed notation with exactly `prec` fractional digits. Returns
+/// the byte count. Integer part uses u64 (fine for an interpreter's range).
+unsafe fn fmt_fixed(emit: &mut dyn FnMut(&[u8]), x: f64, prec: usize) -> i32 {
+    let mut w = 0i32;
+    // Round at the requested precision.
+    let mut scale = 1.0f64;
+    for _ in 0..prec {
+        scale *= 10.0;
+    }
+    let rounded = floor(x * scale + 0.5) / scale;
+    let ip = floor(rounded);
+    w += print_uint(emit, ip as u64, 10);
+    if prec > 0 {
+        emit(b".");
+        w += 1;
+        let mut frac_scaled = (rounded - ip) * scale + 0.5;
+        let mut fdv = frac_scaled as u64;
+        // guard the carry case (e.g. 0.9995 @ prec 3): cap at scale-1
+        let cap = scale as u64;
+        if fdv >= cap {
+            fdv = cap - 1;
+        }
+        let mut digits = [0u8; 24];
+        let mut t = fdv;
+        for k in (0..prec).rev() {
+            digits[k] = b'0' + (t % 10) as u8;
+            t /= 10;
+        }
+        emit(&digits[..prec]);
+        w += prec as i32;
+        let _ = &mut frac_scaled;
+    }
+    w
+}
+
+/// printf float conversions (f/e/g and a≈g). Pragmatic, not bit-exact, but good
+/// enough for an interpreter: `%g` strips trailing zeros and falls back to
+/// scientific outside [1e-4, 1e+P); Lua prints numbers via `%.14g`.
+unsafe fn fmt_float(emit: &mut dyn FnMut(&[u8]), x: f64, prec: i32, spec: u8) -> i32 {
+    let mut w = 0i32;
+    // sign / non-finite
+    let mut v = x;
+    if v != v {
+        emit(b"nan");
+        return 3;
+    }
+    if v < 0.0 {
+        emit(b"-");
+        w += 1;
+        v = -v;
+    }
+    if v == f64::INFINITY {
+        emit(b"inf");
+        return w + 3;
+    }
+    let lower = spec | 0x20; // fold case
+    if lower == b'f' {
+        let p = if prec < 0 { 6 } else { prec as usize };
+        return w + fmt_fixed(emit, v, p);
+    }
+    // %e / %g share an exponent.
+    let exp = if v == 0.0 { 0i32 } else { floor(log(v) / 2.302585092994046) as i32 };
+    if lower == b'g' {
+        // significant digits (default 6; 0 means 1).
+        let mut sig = if prec < 0 { 6 } else { prec };
+        if sig == 0 {
+            sig = 1;
+        }
+        // Recompute exp accurately near powers of ten by checking the mantissa.
+        let mut e = exp;
+        let mut m = v / pow(10.0, e as f64);
+        if m >= 10.0 {
+            e += 1;
+            m /= 10.0;
+        }
+        if v != 0.0 && m < 1.0 {
+            e -= 1;
+        }
+        if e >= -4 && e < sig {
+            // fixed notation with (sig-1-e) decimals, then strip trailing zeros.
+            let dec = (sig - 1 - e).max(0) as usize;
+            let mut tmp = TmpBuf::new();
+            fmt_fixed(&mut |s| tmp.push(s), v, dec);
+            let bytes = tmp.strip_g();
+            emit(bytes);
+            return w + bytes.len() as i32;
+        } else {
+            // scientific: mantissa with (sig-1) decimals, stripped, then eNN.
+            let mant = v / pow(10.0, e as f64);
+            let mut tmp = TmpBuf::new();
+            fmt_fixed(&mut |s| tmp.push(s), mant, (sig - 1).max(0) as usize);
+            let bytes = tmp.strip_g();
+            emit(bytes);
+            w += bytes.len() as i32;
+            w += emit_exp(emit, e);
+            return w;
+        }
+    }
+    // %e
+    let p = if prec < 0 { 6 } else { prec as usize };
+    let mant = if v == 0.0 { 0.0 } else { v / pow(10.0, exp as f64) };
+    w += fmt_fixed(emit, mant, p);
+    w += emit_exp(emit, exp);
+    w
+}
+
+/// Emit `e±NN` (at least two exponent digits), returning the byte count.
+unsafe fn emit_exp(emit: &mut dyn FnMut(&[u8]), e: i32) -> i32 {
+    emit(b"e");
+    let (sign, mag) = if e < 0 { (b'-', -e) } else { (b'+', e) };
+    emit(&[sign]);
+    let mut buf = [0u8; 8];
+    let mut n = 0;
+    let mut m = mag;
+    loop {
+        buf[n] = b'0' + (m % 10) as u8;
+        m /= 10;
+        n += 1;
+        if m == 0 {
+            break;
+        }
+    }
+    let mut out = 2i32;
+    if n < 2 {
+        emit(b"0");
+        out += 1;
+    }
+    let mut k = n;
+    while k > 0 {
+        k -= 1;
+        emit(&[buf[k]]);
+        out += 1;
+    }
+    out
+}
+
+/// A small fixed scratch buffer so `%g` can post-process digits (strip zeros).
+struct TmpBuf {
+    buf: [u8; 64],
+    len: usize,
+}
+impl TmpBuf {
+    fn new() -> Self {
+        TmpBuf { buf: [0; 64], len: 0 }
+    }
+    fn push(&mut self, s: &[u8]) {
+        for &b in s {
+            if self.len < self.buf.len() {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+    }
+    /// Strip trailing zeros (and a trailing '.') from a fixed-notation number.
+    fn strip_g(&mut self) -> &[u8] {
+        if self.buf[..self.len].contains(&b'.') {
+            while self.len > 0 && self.buf[self.len - 1] == b'0' {
+                self.len -= 1;
+            }
+            if self.len > 0 && self.buf[self.len - 1] == b'.' {
+                self.len -= 1;
+            }
+        }
+        &self.buf[..self.len]
+    }
+}
+
 unsafe fn vfmt(emit: &mut dyn FnMut(&[u8]), fmt: *const u8, ap: &mut VaList) -> i32 {
     if fmt.is_null() {
         return 0;
@@ -495,14 +662,18 @@ unsafe fn vfmt(emit: &mut dyn FnMut(&[u8]), fmt: *const u8, ap: &mut VaList) -> 
                 let _ = ap.next_arg::<i32>();
                 i += 1;
             }
+            let mut prec: i32 = -1; // -1 = unspecified
             if *fmt.add(i) == b'.' {
                 i += 1;
-                while matches!(*fmt.add(i), b'0'..=b'9') {
-                    i += 1;
-                }
                 if *fmt.add(i) == b'*' {
-                    let _ = ap.next_arg::<i32>();
+                    prec = ap.next_arg::<i32>();
                     i += 1;
+                } else {
+                    prec = 0;
+                    while matches!(*fmt.add(i), b'0'..=b'9') {
+                        prec = prec * 10 + (*fmt.add(i) - b'0') as i32;
+                        i += 1;
+                    }
                 }
             }
             let mut lng = false;
@@ -549,6 +720,10 @@ unsafe fn vfmt(emit: &mut dyn FnMut(&[u8]), fmt: *const u8, ap: &mut VaList) -> 
                         emit(core::slice::from_raw_parts(p, n));
                         w += n as i32;
                     }
+                }
+                b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => {
+                    let v = ap.next_arg::<f64>();
+                    w += fmt_float(emit, v, prec, spec);
                 }
                 b'%' => {
                     emit(b"%");
@@ -870,6 +1045,22 @@ pub extern "C" fn isupper(c: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn islower(c: i32) -> i32 {
     ((c as u8).is_ascii_lowercase()) as i32
+}
+#[no_mangle]
+pub extern "C" fn iscntrl(c: i32) -> i32 {
+    ((c as u8).is_ascii_control()) as i32
+}
+#[no_mangle]
+pub extern "C" fn isgraph(c: i32) -> i32 {
+    ((c as u8).is_ascii_graphic()) as i32
+}
+#[no_mangle]
+pub extern "C" fn ispunct(c: i32) -> i32 {
+    ((c as u8).is_ascii_punctuation()) as i32
+}
+#[no_mangle]
+pub extern "C" fn isxdigit(c: i32) -> i32 {
+    ((c as u8).is_ascii_hexdigit()) as i32
 }
 #[no_mangle]
 pub extern "C" fn toupper(c: i32) -> i32 {
@@ -1383,6 +1574,209 @@ pub extern "C" fn ldexp(x: f64, e: i32) -> f64 {
 }
 #[no_mangle]
 pub extern "C" fn ldexpl(x: f64, e: i32) -> f64 { ldexp(x, e) }
+
+#[no_mangle]
+pub unsafe extern "C" fn frexp(x: f64, e: *mut i32) -> f64 {
+    let set = |v: i32| if !e.is_null() { *e = v; };
+    if x == 0.0 || x != x || fabs(x) == f64::INFINITY {
+        set(0);
+        return x;
+    }
+    let mut m = fabs(x);
+    let mut exp = 0i32;
+    while m >= 1.0 { m *= 0.5; exp += 1; }
+    while m < 0.5 { m *= 2.0; exp -= 1; }
+    set(exp);
+    if x < 0.0 { -m } else { m }
+}
+
+/// Length of the initial span of `s` consisting only of bytes in `set`.
+#[no_mangle]
+pub unsafe extern "C" fn strspn(s: *const u8, set: *const u8) -> usize {
+    let mut n = 0usize;
+    'outer: while *s.add(n) != 0 {
+        let c = *s.add(n);
+        let mut k = 0usize;
+        while *set.add(k) != 0 {
+            if *set.add(k) == c {
+                n += 1;
+                continue 'outer;
+            }
+            k += 1;
+        }
+        break;
+    }
+    n
+}
+
+/// C-locale string collation is just byte comparison.
+#[no_mangle]
+pub unsafe extern "C" fn strcoll(a: *const u8, b: *const u8) -> i32 {
+    strcmp(a, b)
+}
+
+// --- <math.h>: enough for Lua's number operators (// % ^) and stdio %g/%a. -----
+// oxbow has hardware SSE doubles, so arithmetic is exact; these provide the named
+// functions. floor/ceil/fmod/fabs/sqrt are exact; exp/log/pow are series-based
+// (good to ~1e-12), sufficient for an interpreter's `^` operator and math lib.
+
+#[no_mangle]
+pub extern "C" fn fabs(x: f64) -> f64 {
+    if x < 0.0 { -x } else { x }
+}
+
+#[no_mangle]
+pub extern "C" fn floor(x: f64) -> f64 {
+    // |x| >= 2^53 (or NaN/inf): already integral / pass through.
+    if !(fabs(x) < 9.007199254740992e15) {
+        return x;
+    }
+    let t = x as i64 as f64; // trunc toward zero
+    if t > x { t - 1.0 } else { t }
+}
+
+#[no_mangle]
+pub extern "C" fn ceil(x: f64) -> f64 {
+    if !(fabs(x) < 9.007199254740992e15) {
+        return x;
+    }
+    let t = x as i64 as f64;
+    if t < x { t + 1.0 } else { t }
+}
+
+#[no_mangle]
+pub extern "C" fn fmod(x: f64, y: f64) -> f64 {
+    if y == 0.0 || !(fabs(x) < f64::INFINITY) {
+        return f64::NAN;
+    }
+    let q = (x / y) as i64 as f64; // trunc(x/y)
+    x - q * y
+}
+
+#[no_mangle]
+pub extern "C" fn sqrt(x: f64) -> f64 {
+    if x < 0.0 || x != x {
+        return f64::NAN;
+    }
+    if x == 0.0 || x == f64::INFINITY {
+        return x;
+    }
+    // Newton–Raphson: g <- (g + x/g)/2, to machine precision (stops when stable).
+    let mut g = x;
+    let mut prev = 0.0f64;
+    let mut i = 0;
+    while g != prev && i < 100 {
+        prev = g;
+        g = 0.5 * (g + x / g);
+        i += 1;
+    }
+    g
+}
+
+#[no_mangle]
+pub extern "C" fn exp(x: f64) -> f64 {
+    if x != x {
+        return x;
+    }
+    if x > 709.0 {
+        return f64::INFINITY;
+    }
+    if x < -745.0 {
+        return 0.0;
+    }
+    let k = x as i64; // trunc; r in (-1,1)
+    let r = x - k as f64;
+    let mut term = 1.0f64;
+    let mut sum = 1.0f64;
+    let mut n = 1.0f64;
+    for _ in 0..18 {
+        term *= r / n;
+        sum += term;
+        n += 1.0;
+    }
+    let e = 2.718281828459045f64;
+    let mut ek = 1.0f64;
+    if k >= 0 {
+        for _ in 0..k { ek *= e; }
+    } else {
+        for _ in 0..(-k) { ek /= e; }
+    }
+    sum * ek
+}
+
+#[no_mangle]
+pub extern "C" fn log(x: f64) -> f64 {
+    if x < 0.0 || x != x {
+        return f64::NAN;
+    }
+    if x == 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    let mut m = x;
+    let mut e = 0i32;
+    while m >= 2.0 { m *= 0.5; e += 1; }
+    while m < 1.0 { m *= 2.0; e -= 1; }
+    // log(m), m in [1,2): 2*atanh((m-1)/(m+1)).
+    let t = (m - 1.0) / (m + 1.0);
+    let t2 = t * t;
+    let mut term = t;
+    let mut sum = 0.0f64;
+    let mut k = 0i32;
+    for _ in 0..24 {
+        sum += term / (2 * k + 1) as f64;
+        term *= t2;
+        k += 1;
+    }
+    2.0 * sum + (e as f64) * 0.6931471805599453
+}
+
+#[no_mangle]
+pub extern "C" fn pow(x: f64, y: f64) -> f64 {
+    if y == 0.0 || x == 1.0 {
+        return 1.0;
+    }
+    // Integer exponent: exact via repeated squaring (covers 2^10, x^2, …).
+    if floor(y) == y && fabs(y) < 1024.0 {
+        let mut n = y as i64;
+        let neg = n < 0;
+        if neg { n = -n; }
+        let mut base = x;
+        let mut acc = 1.0f64;
+        while n > 0 {
+            if n & 1 == 1 { acc *= base; }
+            base *= base;
+            n >>= 1;
+        }
+        return if neg { 1.0 / acc } else { acc };
+    }
+    if x <= 0.0 {
+        return f64::NAN;
+    }
+    exp(y * log(x))
+}
+
+// --- <locale.h>: oxbow is "C" locale only (Lua reads the decimal point). -------
+#[repr(C)]
+pub struct Lconv {
+    decimal_point: *const u8,
+    thousands_sep: *const u8,
+    grouping: *const u8,
+}
+// SAFETY: the pointers are to immortal 'static byte-string literals; read-only.
+unsafe impl Sync for Lconv {}
+static LCONV: Lconv = Lconv {
+    decimal_point: b".\0".as_ptr(),
+    thousands_sep: b"\0".as_ptr(),
+    grouping: b"\0".as_ptr(),
+};
+#[no_mangle]
+pub extern "C" fn localeconv() -> *const Lconv {
+    &LCONV as *const Lconv
+}
+#[no_mangle]
+pub extern "C" fn setlocale(_category: i32, _locale: *const u8) -> *const u8 {
+    b"C\0".as_ptr()
+}
 #[no_mangle]
 pub unsafe extern "C" fn strtof(s: *const u8, e: *mut *mut u8) -> f32 { strtod(s, e) as f32 }
 #[no_mangle]
