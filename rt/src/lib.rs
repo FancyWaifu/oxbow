@@ -557,7 +557,8 @@ pub fn sys_uptime_ms() -> u64 {
 pub fn argv() -> &'static [u8] {
     let p = oxbow_abi::SPAWN_ARGV as *const u8;
     let mut n = 0usize;
-    while n < 55 && unsafe { *p.add(n) } != 0 {
+    // The kernel maps a full page (4 KiB) of arguments, NUL-terminated (§13).
+    while n < 4095 && unsafe { *p.add(n) } != 0 {
         n += 1;
     }
     unsafe { core::slice::from_raw_parts(p, n) }

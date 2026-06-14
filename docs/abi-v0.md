@@ -665,13 +665,20 @@ spawned `cat` is handed precisely the authority it needs and nothing more, and
 the kernel enforces it — `cat` has no handle to any other file. (Deferred: argv,
 which would let coreutils resolve their own names.)
 
-### 13.7 Spawn arguments (argv) (v1-argv)
-A spawned program can be given a single string argument. The parent packs it
-into the spawn MsgBuf's `data[1..]` (byte offset 8, NUL-terminated, ≤55 bytes —
-`data[0]` is still the budget). The kernel maps one read-only page into the child
-at `SPAWN_ARGV = 0x0F00_0000` and writes the string there (always mapped, empty
-if none; the +1 page is charged to the parent's budget). The child reads it via
-`rt::argv()`.
+### 13.7 Spawn arguments (argv) (v1-argv; widened in v1-real-argv)
+A spawned program is given an argument string. The parent passes it by reference:
+the spawn MsgBuf's `data[1]` = a pointer to the string in the *parent's* address
+space and `data[2]` = its length (`data[0]` is still the budget). The kernel
+`check_user`-validates the pointer, maps one read-only page into the child at
+`SPAWN_ARGV = 0x0F00_0000`, and copies the string there (always mapped, empty if
+none; the +1 page is charged to the parent's budget). The child reads it via
+`rt::argv()`. The cap is one page, so arguments are bounded at 4095 bytes + NUL.
+
+Originally (v1-argv) the string rode *inline* in `data[1..]`, capping it at 55
+bytes — too small for real command lines (a `cc` invocation with paths). The
+by-reference form (v1-real-argv) lifts that to a full page while keeping the same
+zero-copy, single-syscall shape; the pointer is read while the parent's AS is
+live and the kernel is non-preemptible, so it cannot change mid-call.
 
 This is what lets a coreutil take a *name*: `mkdir`/`touch` are spawned programs
 granted the current-directory capability at slot 1 and the new name as argv —

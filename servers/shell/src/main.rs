@@ -153,16 +153,14 @@ fn spawn_with(image: Handle, cap0: Handle, arg: &[u8], sp: &Spawner) {
 /// tcc needs a large working set to compile, so it asks for a big budget.
 fn spawn_with_budget(image: Handle, cap0: Handle, arg: &[u8], budget: u64, sp: &Spawner) {
     let mut m = MsgBuf::new(0);
-    // data[0] = budget (0 = default); the argument string rides in data[1..]
-    // (byte offset 8), NUL-terminated — the kernel maps it at SPAWN_ARGV (§13).
+    // data[0] = budget (0 = default). Real argv (§13): data[1] = pointer to the
+    // argument string, data[2] = its length — the kernel copies it into the
+    // child's argv page (up to a full page, lifting the old 55-byte limit). `arg`
+    // stays valid for this synchronous spawn call.
     m.data[0] = budget;
-    let n = core::cmp::min(arg.len(), 55);
-    let dst = m.data.as_mut_ptr() as *mut u8;
-    unsafe {
-        core::ptr::copy_nonoverlapping(arg.as_ptr(), dst.add(8), n);
-        *dst.add(8 + n) = 0;
-    }
-    m.data_len = 8;
+    m.data[1] = arg.as_ptr() as u64;
+    m.data[2] = arg.len() as u64;
+    m.data_len = 3;
     m.handle_count = 2;
     m.handles[0] = cap0; // slot 1 = BOOT_EP (a file/dir cap, or NULL)
     m.handles[1] = sp.stdout; // slot 2 = SPAWN_STDOUT
@@ -186,11 +184,11 @@ fn cc_cmd(cwd: Handle, rest: &[u8], sp: &Spawner) {
     }
     let prefix: &[u8] = b"-static ";
     let suffix: &[u8] = b" /lib/c.a";
-    if prefix.len() + rest.len() + suffix.len() > 55 {
-        tw(b"cc: command too long (55-byte argv limit; use short paths)\n");
+    let mut arg = [0u8; 1024];
+    if prefix.len() + rest.len() + suffix.len() > arg.len() {
+        tw(b"cc: command too long\n");
         return;
     }
-    let mut arg = [0u8; 56];
     let mut p = 0;
     for src in [prefix, rest, suffix] {
         arg[p..p + src.len()].copy_from_slice(src);
@@ -318,17 +316,13 @@ fn exec_cmd(cwd: Handle, path: &Path, arg_line: &[u8], sp: &Spawner) {
         tw(b"exec: empty or unreadable file\n");
         return;
     }
-    // Build the spawn MsgBuf: budget default, argv from `rest`, cwd at slot 1,
-    // stdout at slot 2 — then hand the ELF bytes to the kernel (exec-from-fs).
+    // Build the spawn MsgBuf: budget default, argv from `rest` by (ptr, len),
+    // cwd at slot 1, stdout at slot 2 — then hand the ELF bytes to the kernel.
     let mut sm = MsgBuf::new(0);
     sm.data[0] = 0;
-    let n = core::cmp::min(rest.len(), 55);
-    let dst = sm.data.as_mut_ptr() as *mut u8;
-    unsafe {
-        core::ptr::copy_nonoverlapping(rest.as_ptr(), dst.add(8), n);
-        *dst.add(8 + n) = 0;
-    }
-    sm.data_len = 8;
+    sm.data[1] = rest.as_ptr() as u64;
+    sm.data[2] = rest.len() as u64;
+    sm.data_len = 3;
     sm.handle_count = 2;
     sm.handles[0] = cwd;
     sm.handles[1] = sp.stdout;

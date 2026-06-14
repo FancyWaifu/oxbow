@@ -363,8 +363,8 @@ fn spawn_common(
         grant_count: usize,
         child_budget: u64,
         cost: u64,
-        argv: [u8; 56],
-        argv_len: usize,
+        arg_ptr: u64,
+        arg_len: usize,
     }
     let prep = (|| -> SysResult<Prep> {
         let me = proc::with_current(|p| p.lookup(mem_h as Handle, ObjType::Memory, R_MAP))?;
@@ -392,11 +392,16 @@ fn spawn_common(
             return Err(SysError::Msg);
         }
         let child_budget = if msg.data[0] == 0 { SPAWN_DEFAULT_BUDGET } else { msg.data[0] };
-        // The argument string rides in data[1..] (bytes 8..64), NUL-terminated.
-        let mut argv = [0u8; 56];
-        let db = unsafe { core::slice::from_raw_parts(msg.data.as_ptr() as *const u8, 64) };
-        argv.copy_from_slice(&db[8..64]);
-        let argv_len = argv.iter().position(|&b| b == 0).unwrap_or(argv.len());
+        // Real argv (§13): data[1] = pointer to the argument string in the
+        // spawner's address space, data[2] = its length. The kernel copies it
+        // into the child's argv page (one page, so capped at 4095 + NUL) — lifting
+        // the old 55-byte inline limit so full command lines fit. A null/zero-len
+        // pointer means no arguments (empty argv page).
+        let arg_ptr = msg.data[1];
+        let arg_len = (msg.data[2] as usize).min(4095);
+        if arg_len > 0 {
+            usermem::check_user(arg_ptr, arg_len, false)?;
+        }
         // Collect the granted handle entries; each non-null needs R_GRANT (§3.4).
         let mut grants: [Option<HandleEntry>; MSG_HANDLES] = [None; MSG_HANDLES];
         proc::with_current(|p| -> SysResult {
@@ -429,8 +434,8 @@ fn spawn_common(
             grant_count,
             child_budget,
             cost,
-            argv,
-            argv_len,
+            arg_ptr,
+            arg_len,
         })
     })();
     let prep = match prep {
@@ -474,7 +479,12 @@ fn spawn_common(
         unsafe {
             let dst = mm::phys_to_virt(argframe) as *mut u8;
             core::ptr::write_bytes(dst, 0, 4096);
-            core::ptr::copy_nonoverlapping(prep.argv.as_ptr(), dst, prep.argv_len);
+            // Copy the argument string from the spawner's address space (still the
+            // live AS during this syscall; arg_ptr was check_user-validated). The
+            // page is pre-zeroed, so it is implicitly NUL-terminated.
+            if prep.arg_len > 0 {
+                core::ptr::copy_nonoverlapping(prep.arg_ptr as *const u8, dst, prep.arg_len);
+            }
         }
         mm::vm::map_user_4k_in(pml4, oxbow_abi::SPAWN_ARGV, argframe, false, false);
     }
