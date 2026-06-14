@@ -1094,8 +1094,7 @@ ST_FUNC void relocate_syms(TCCState *s1, Section *symtab, int do_resolve)
                 /* dlsym() needs the undecorated name.  */
                 const char *name_ud = &name[s1->leading_underscore];
                 void *addr = NULL;
-                if (!s1->nostdlib)
-                    addr = dlsym(RTLD_DEFAULT, name_ud);
+                addr = dlsym(RTLD_DEFAULT, name_ud); /* oxbow: resident libc */
 		if (addr == NULL) {
 		    int i;
 		    for (i = 0; i < s1->nb_loaded_dlls; i++)

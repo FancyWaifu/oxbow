@@ -879,6 +879,7 @@ LIBTCCAPI TCCState *tcc_new(void)
     s->gnu_ext = 1;
     s->tcc_ext = 1;
     s->nocommon = 1;
+    s->nostdlib = 1; /* oxbow: no on-disk libc/crt; -run binds to the resident libc */
     s->dollars_in_identifiers = 1; /*on by default like in gcc/clang*/
     s->cversion = 199901; /* default unless -std=c11 is supplied */
     s->warn_implicit_function_declaration = 1;

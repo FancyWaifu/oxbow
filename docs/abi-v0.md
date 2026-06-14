@@ -1394,3 +1394,37 @@ relocation pass — so a compiled program's `printf` is still reported unresolve
 Closing that (provide stub `libc.a`/`libtcc1.a` under `CONFIG_TCCDIR`, or route
 the relocation resolver through `tcc_syms`) is the last mile to `printf`-on-oxbow
 from source. The codegen, the JIT memory model, and argv/stdio are all proven.
+
+## 32. C compiles AND runs on oxbow (v1-selfhost) — the last mile, done
+
+`tcc -run hello.c` now **compiles a C source into machine code on oxbow and
+executes it**:
+```
+oxbow:/$ tcc -run hello.c
+Hello from C, compiled AND run on oxbow by tcc -run!
+  the JIT-compiled loop says sum(1..10) = 55
+```
+The whole pipeline runs on the microkernel: tcc reads the file, compiles it
+(frontend + x86_64 codegen), JITs the code into RW memory, flips it to RX (the
+W^X-compliant `sys_protect` transition, §30), and calls `main` — whose `printf`
+binds to the resident oxbow-libc. "Compile code on oxbow directly" — achieved.
+
+### 32.1 The two fixes that closed it (vendored tcc patches)
+- **Symbol resolution under nostdlib**: tccelf.c only called `dlsym` to bind
+  undefined symbols `if (!s1->nostdlib)` — so skipping the (nonexistent on disk)
+  `-lc`/`libtcc1.a` *also* skipped resolving `printf`. Patched to always try
+  `dlsym`, which (with `CONFIG_TCC_STATIC`) routes through tcc's `tcc_syms` table
+  — extended to the common oxbow-libc functions — so a compiled program binds
+  `printf`/`malloc`/… to the libc already resident in the running tcc binary.
+- **Clean UX**: `tcc_new` defaults `nostdlib = 1` on oxbow (there is no on-disk
+  libc/crt to link), so `tcc -run file.c` Just Works with no extra flags. The
+  `-run` entry was already patched to call `main` directly (no `runmain.o`).
+
+### 32.2 What this means
+oxbow — a from-scratch capability microkernel — now has a real C toolchain on the
+device: a Unix-ish filesystem with its own source under `/usr/src`, oxbow-libc,
+and a C compiler that turns source into running code, all under W^X with zero
+ambient authority. The compiler is a normal capability process; the code it emits
+runs in pages it was granted, made executable only via a transition the kernel
+polices. Bootstrapping tcc to compile *itself* on oxbow (true self-hosting) is the
+horizon; the primitives are all in place.
