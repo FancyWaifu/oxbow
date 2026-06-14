@@ -161,9 +161,11 @@ fn spawn_with_budget(image: Handle, cap0: Handle, arg: &[u8], budget: u64, sp: &
     m.data[1] = arg.as_ptr() as u64;
     m.data[2] = arg.len() as u64;
     m.data_len = 3;
-    m.handle_count = 2;
+    m.handle_count = 4;
     m.handles[0] = cap0; // slot 1 = BOOT_EP (a file/dir cap, or NULL)
     m.handles[1] = sp.stdout; // slot 2 = SPAWN_STDOUT
+    m.handles[2] = HANDLE_NULL; // slot 4 = BOOT_TICK (unused here)
+    m.handles[3] = BOOT_NET_EP; // slot 20 = BOOT_NET_EP (network access)
     match rt::sys_spawn(image, BOOT_MEM, &m, sp.exit) {
         Ok(_) => wait_exits(sp, 1),
         Err(_) => tw(b"run: spawn failed\n"),
@@ -323,9 +325,11 @@ fn exec_cmd(cwd: Handle, path: &Path, arg_line: &[u8], sp: &Spawner) {
     sm.data[1] = rest.as_ptr() as u64;
     sm.data[2] = rest.len() as u64;
     sm.data_len = 3;
-    sm.handle_count = 2;
+    sm.handle_count = 4;
     sm.handles[0] = cwd;
     sm.handles[1] = sp.stdout;
+    sm.handles[2] = HANDLE_NULL; // slot 4 (unused)
+    sm.handles[3] = BOOT_NET_EP; // slot 20 = BOOT_NET_EP (network access)
     let elf = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(ELF_BUF) as *const u8, len) };
     match rt::sys_spawn_bytes(elf, BOOT_MEM, &sm, sp.exit) {
         Ok(_) => wait_exits(sp, 1),

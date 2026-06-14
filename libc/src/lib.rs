@@ -14,7 +14,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::ffi::VaList;
 use core::ptr::addr_of_mut;
-use oxbow_abi::{Handle, MsgBuf, BOOT_EP, BOOT_MEM, FS_FILE, TAG_FS_READ, TAG_FS_WRITE};
+use oxbow_abi::{Handle, MsgBuf, BOOT_EP, BOOT_NET_EP, BOOT_MEM, FS_FILE, TAG_FS_READ, TAG_FS_WRITE};
 use oxbow_rt as rt;
 
 extern "C" {
@@ -113,9 +113,13 @@ struct FdSlot {
     /// and `ftell` work on a file we are writing.
     size: u64,
     used: bool,
+    /// True if this fd is a BSD socket (handle = a TCP socket cap, or 0 until
+    /// `connect`). read/write/close then route through `rt::tcp` instead of the fs.
+    is_sock: bool,
 }
 const MAX_FD: usize = 32;
-static mut FDS: [FdSlot; MAX_FD] = [FdSlot { handle: 0, off: 0, size: 0, used: false }; MAX_FD];
+static mut FDS: [FdSlot; MAX_FD] =
+    [FdSlot { handle: 0, off: 0, size: 0, used: false, is_sock: false }; MAX_FD];
 
 // <fcntl.h> open flags (must match libc/include/fcntl.h).
 const O_WRONLY: i32 = 1;
@@ -173,7 +177,7 @@ pub unsafe extern "C" fn open(path: *const u8, flags: i32) -> i32 {
     for i in 3..MAX_FD {
         let slot = &mut (*addr_of_mut!(FDS))[i];
         if !slot.used {
-            *slot = FdSlot { handle: cap, off: 0, size, used: true };
+            *slot = FdSlot { handle: cap, off: 0, size, used: true, is_sock: false };
             return i as i32;
         }
     }
@@ -189,6 +193,10 @@ pub unsafe extern "C" fn read(fd: i32, buf: *mut u8, len: usize) -> isize {
     let slot = &mut (*addr_of_mut!(FDS))[fd as usize];
     if !slot.used {
         return -1;
+    }
+    if slot.is_sock {
+        let out = core::slice::from_raw_parts_mut(buf, len);
+        return rt::tcp::recv(slot.handle, out) as isize;
     }
     let mut tmp = [0u8; 56];
     let want = len.min(tmp.len());
@@ -207,6 +215,12 @@ pub unsafe extern "C" fn write(fd: i32, buf: *const u8, len: usize) -> isize {
         out_fd(fd, core::slice::from_raw_parts(buf, len));
         return len as isize;
     }
+    if fd >= 3 && (fd as usize) < MAX_FD {
+        let slot = &(*addr_of_mut!(FDS))[fd as usize];
+        if slot.used && slot.is_sock {
+            return sock_send(slot.handle, core::slice::from_raw_parts(buf, len));
+        }
+    }
     let w = fs_write_fd(fd, core::slice::from_raw_parts(buf, len));
     if w == 0 && len > 0 {
         -1
@@ -222,10 +236,274 @@ pub unsafe extern "C" fn close(fd: i32) -> i32 {
     }
     let slot = &mut (*addr_of_mut!(FDS))[fd as usize];
     if slot.used {
-        let _ = rt::sys_close(slot.handle);
+        if slot.is_sock {
+            if slot.handle != 0 {
+                rt::tcp::close(slot.handle);
+            }
+        } else {
+            let _ = rt::sys_close(slot.handle);
+        }
         slot.used = false;
+        slot.is_sock = false;
     }
     0
+}
+
+// ===========================================================================
+// BSD sockets (<sys/socket.h>, <netinet/in.h>, <netdb.h>) over the net server's
+// TCP capability API. Enough for an HTTP client: socket/connect/send/recv/close,
+// byte-order helpers, inet_pton, and getaddrinfo (numeric IPv4). IPv4/TCP only.
+// ===========================================================================
+#[no_mangle]
+pub extern "C" fn htons(x: u16) -> u16 { x.to_be() }
+#[no_mangle]
+pub extern "C" fn ntohs(x: u16) -> u16 { u16::from_be(x) }
+#[no_mangle]
+pub extern "C" fn htonl(x: u32) -> u32 { x.to_be() }
+#[no_mangle]
+pub extern "C" fn ntohl(x: u32) -> u32 { u32::from_be(x) }
+
+/// `struct sockaddr_in` — `sin_addr`/`sin_port` are network byte order, so the
+/// in-memory bytes of `sin_addr` are the dotted-quad in order [a,b,c,d].
+#[repr(C)]
+pub struct SockAddrIn {
+    pub sin_family: u16,
+    pub sin_port: u16,
+    pub sin_addr: u32,
+    pub sin_zero: [u8; 8],
+}
+
+const AF_INET: i32 = 2;
+const SOCK_STREAM: i32 = 1;
+
+#[no_mangle]
+pub unsafe extern "C" fn socket(domain: i32, ty: i32, _proto: i32) -> i32 {
+    if domain != AF_INET || ty != SOCK_STREAM {
+        return -1; // IPv4 TCP only
+    }
+    for i in 3..MAX_FD {
+        let slot = &mut (*addr_of_mut!(FDS))[i];
+        if !slot.used {
+            *slot = FdSlot { handle: 0, off: 0, size: 0, used: true, is_sock: true };
+            return i as i32;
+        }
+    }
+    -1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn connect(fd: i32, addr: *const SockAddrIn, _len: u32) -> i32 {
+    if fd < 3 || fd as usize >= MAX_FD || addr.is_null() {
+        return -1;
+    }
+    let slot = &mut (*addr_of_mut!(FDS))[fd as usize];
+    if !slot.used || !slot.is_sock {
+        return -1;
+    }
+    let ipb = (*addr).sin_addr.to_ne_bytes(); // memory bytes = [a,b,c,d]
+    let port = u16::from_be((*addr).sin_port);
+    match rt::tcp::connect(BOOT_NET_EP, ipb, port) {
+        Some(s) => {
+            slot.handle = s;
+            0
+        }
+        None => -1,
+    }
+}
+
+/// Loop `rt::tcp::send` (48-byte chunks) until all of `data` is sent.
+unsafe fn sock_send(sock: Handle, data: &[u8]) -> isize {
+    if sock == 0 {
+        return -1;
+    }
+    let mut i = 0usize;
+    while i < data.len() {
+        let n = core::cmp::min(48, data.len() - i);
+        if !rt::tcp::send(sock, &data[i..i + n]) {
+            break;
+        }
+        i += n;
+    }
+    i as isize
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn send(fd: i32, buf: *const u8, len: usize, _flags: i32) -> isize {
+    if fd < 3 || fd as usize >= MAX_FD || buf.is_null() {
+        return -1;
+    }
+    let slot = &(*addr_of_mut!(FDS))[fd as usize];
+    if !slot.used || !slot.is_sock {
+        return -1;
+    }
+    sock_send(slot.handle, core::slice::from_raw_parts(buf, len))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn recv(fd: i32, buf: *mut u8, len: usize, _flags: i32) -> isize {
+    if fd < 3 || fd as usize >= MAX_FD || buf.is_null() {
+        return -1;
+    }
+    let slot = &(*addr_of_mut!(FDS))[fd as usize];
+    if !slot.used || !slot.is_sock {
+        return -1;
+    }
+    let out = core::slice::from_raw_parts_mut(buf, len);
+    rt::tcp::recv(slot.handle, out) as isize
+}
+
+#[no_mangle]
+pub extern "C" fn shutdown(_fd: i32, _how: i32) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn setsockopt(_fd: i32, _lvl: i32, _opt: i32, _val: *const u8, _len: u32) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn getsockopt(_fd: i32, _lvl: i32, _opt: i32, _val: *mut u8, _len: *mut u32) -> i32 {
+    0
+}
+
+/// Parse "a.b.c.d" into `dst` (network byte order: memory = [a,b,c,d]).
+/// Returns 1 on success, 0 on a non-numeric string (matches inet_pton).
+#[no_mangle]
+pub unsafe extern "C" fn inet_pton(_af: i32, src: *const u8, dst: *mut u32) -> i32 {
+    if src.is_null() || dst.is_null() {
+        return 0;
+    }
+    let mut octets = [0u8; 4];
+    let mut idx = 0usize;
+    let mut val: u32 = 0;
+    let mut seen = false;
+    let mut i = 0usize;
+    loop {
+        let c = *src.add(i);
+        if c == b'.' || c == 0 {
+            if !seen || idx >= 4 || val > 255 {
+                return 0;
+            }
+            octets[idx] = val as u8;
+            idx += 1;
+            val = 0;
+            seen = false;
+            if c == 0 {
+                break;
+            }
+        } else if c.is_ascii_digit() {
+            val = val * 10 + (c - b'0') as u32;
+            seen = true;
+        } else {
+            return 0;
+        }
+        i += 1;
+    }
+    if idx != 4 {
+        return 0;
+    }
+    *dst = u32::from_ne_bytes(octets);
+    1
+}
+#[no_mangle]
+pub unsafe extern "C" fn inet_addr(src: *const u8) -> u32 {
+    let mut v: u32 = 0xffff_ffff;
+    inet_pton(AF_INET, src, &mut v);
+    v
+}
+
+/// `struct addrinfo` — layout must match `<netdb.h>` (the C side uses our header).
+#[repr(C)]
+pub struct AddrInfo {
+    pub ai_flags: i32,
+    pub ai_family: i32,
+    pub ai_socktype: i32,
+    pub ai_protocol: i32,
+    pub ai_addrlen: u32,
+    pub ai_addr: *mut SockAddrIn,
+    pub ai_canonname: *mut u8,
+    pub ai_next: *mut AddrInfo,
+}
+
+/// Minimal getaddrinfo: resolves a numeric IPv4 `node` (DNS is a follow-up) and a
+/// numeric/empty `service` port, returning one addrinfo. malloc'd; freeaddrinfo
+/// releases it.
+#[no_mangle]
+pub unsafe extern "C" fn getaddrinfo(
+    node: *const u8,
+    service: *const u8,
+    _hints: *const AddrInfo,
+    res: *mut *mut AddrInfo,
+) -> i32 {
+    if node.is_null() || res.is_null() {
+        return -2; // EAI_NONAME-ish
+    }
+    let mut ip: u32 = 0;
+    if inet_pton(AF_INET, node, &mut ip) != 1 {
+        return -2; // not numeric — DNS not yet wired here
+    }
+    let mut port: u16 = 0;
+    if !service.is_null() {
+        let mut i = 0usize;
+        while *service.add(i) != 0 {
+            let c = *service.add(i);
+            if c.is_ascii_digit() {
+                port = port.wrapping_mul(10).wrapping_add((c - b'0') as u16);
+            }
+            i += 1;
+        }
+    }
+    let ai = malloc(core::mem::size_of::<AddrInfo>()) as *mut AddrInfo;
+    let sa = malloc(core::mem::size_of::<SockAddrIn>()) as *mut SockAddrIn;
+    if ai.is_null() || sa.is_null() {
+        return -10;
+    }
+    (*sa).sin_family = AF_INET as u16;
+    (*sa).sin_port = port.to_be();
+    (*sa).sin_addr = ip;
+    (*sa).sin_zero = [0; 8];
+    (*ai).ai_flags = 0;
+    (*ai).ai_family = AF_INET;
+    (*ai).ai_socktype = SOCK_STREAM;
+    (*ai).ai_protocol = 0;
+    (*ai).ai_addrlen = core::mem::size_of::<SockAddrIn>() as u32;
+    (*ai).ai_addr = sa;
+    (*ai).ai_canonname = core::ptr::null_mut();
+    (*ai).ai_next = core::ptr::null_mut();
+    *res = ai;
+    0
+}
+#[no_mangle]
+pub unsafe extern "C" fn freeaddrinfo(ai: *mut AddrInfo) {
+    if !ai.is_null() {
+        free((*ai).ai_addr as *mut u8);
+        free(ai as *mut u8);
+    }
+}
+#[no_mangle]
+pub extern "C" fn gai_strerror(_e: i32) -> *const u8 {
+    b"getaddrinfo error\0".as_ptr()
+}
+
+/// Degenerate `select`/`poll`: oxbow's socket recv is blocking, so report every
+/// fd ready. The (easy-interface) caller then does a blocking recv. Returns the
+/// number of fds (best-effort) so callers that check `> 0` proceed.
+#[no_mangle]
+pub extern "C" fn select(nfds: i32, _r: *mut u8, _w: *mut u8, _e: *mut u8, _t: *mut u8) -> i32 {
+    if nfds > 0 {
+        nfds
+    } else {
+        0
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn poll(fds: *mut u8, nfds: u64, _timeout: i32) -> i32 {
+    // struct pollfd { int fd; short events; short revents; } — set revents=events.
+    for i in 0..nfds as usize {
+        let p = fds.add(i * 8);
+        let events = *(p.add(4) as *const u16);
+        *(p.add(6) as *mut u16) = events;
+    }
+    nfds as i32
 }
 
 /// `lseek` — SEEK_SET/CUR/END on a file fd. SEEK_END uses the tracked size

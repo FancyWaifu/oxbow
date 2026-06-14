@@ -1697,3 +1697,35 @@ context, installs `print`/`console.log`, and evals a script (built-in test or a
 
 Three languages now run on oxbow: **Lua, MicroPython, JavaScript** — plus C via
 tcc. Each reused the maturing libc; the surface keeps compounding.
+
+## 40. BSD sockets shim — POSIX networking in libc (v1-bsd-sockets)
+
+Toward porting curl/wget (and any networked C program), oxbow-libc gained a
+**BSD sockets compatibility layer** over the net server's capability TCP API. A C
+program compiled *on oxbow* does a real HTTP GET with the standard API:
+```
+oxbow:/$ cc /sockget.c -o /sg          # uses socket/connect/send/recv/inet_pton
+oxbow:/$ exec /sg 10.0.2.2 8080
+connected. sending request.
+HTTP/1.0 200 OK ... Hello from the host HTTP server -- oxbow BSD sockets work!
+```
+
+### 40.1 The shim
+The libc fd table now tags each fd file-or-socket; `read`/`write`/`close` route a
+socket fd through `rt::tcp` (the net server's `TAG_TCP_*` protocol) instead of the
+fs. New `<sys/socket.h>`/`<netinet/in.h>`/`<arpa/inet.h>`/`<netdb.h>` +
+implementations: `socket`/`connect`/`send`/`recv`/`shutdown`/`setsockopt`,
+`htons`/`ntohs`/`htonl`/`ntohl`, `inet_pton`/`inet_addr`, `getaddrinfo`/
+`freeaddrinfo` (numeric IPv4; DNS is a follow-up), and degenerate `select`/`poll`
+(oxbow's recv is blocking, so they report ready and the caller blocks in recv).
+IPv4/TCP only.
+
+### 40.2 Granting network access to children
+The net endpoint (`BOOT_NET_EP`=20) wasn't in the grantable spawn slots, so a
+spawned program couldn't reach the network. `SPAWN_SLOTS`'s unused 4th entry (was
+5) is now `BOOT_NET_EP`, and the shell passes its net cap (held `R_SEND|R_GRANT`)
+to the children it spawns — so `exec`'d binaries and the language interpreters can
+network. Still a capability: the child gets net only because the shell granted it.
+
+This is stage 1 of the curl port; the engine itself (HTTP-only, no TLS) is the
+next arc, now unblocked.

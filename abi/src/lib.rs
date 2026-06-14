@@ -359,7 +359,9 @@ pub const TAG_TCP_CLOSE: u64 = u32::from_le_bytes(*b"TCLO") as u64;
 /// `sys_spawn` grant convention: the handles in the spawn MsgBuf land in the
 /// child's table at these slots, in order (HANDLE_NULL entries are skipped).
 /// Slot 3 is always the child's fresh Memory budget, so it is not in this list.
-pub const SPAWN_SLOTS: [Handle; 4] = [1, 2, 4, 5];
+/// The 4th slot is `BOOT_NET_EP` (20) so a spawner can pass network access to a
+/// child (used by the BSD-sockets libc + curl); the previous spare (5) was unused.
+pub const SPAWN_SLOTS: [Handle; 4] = [1, 2, 4, BOOT_NET_EP];
 /// A spawned program's standard output endpoint (a tty R_SEND endpoint) — the
 /// parent passes it as the 2nd grant so it lands here. Mirrors BOOT_CONSOLE's
 /// number, so programs that printed via BOOT_CONSOLE need no slot change.
