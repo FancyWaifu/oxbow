@@ -11,8 +11,8 @@ use oxbow_abi::{
     SPAWN_DEFAULT_BUDGET, SPAWN_SLOTS, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE,
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
-    SYS_DMA_ALLOC, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE, SYS_RECV, SYS_REPLY, SYS_SEND,
-    SYS_SPAWN, SYS_UPTIME_MS, R_ACK,
+    SYS_DMA_ALLOC, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE, SYS_PROTECT, SYS_RECV, SYS_REPLY,
+    SYS_SEND, SYS_SPAWN, SYS_UPTIME_MS, PROT_EXEC, R_ACK,
     R_BIND, R_IN, R_OUT, R_SPAWN,
 };
 
@@ -93,6 +93,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_PCI_WRITE => sys_pci_write(a1, a2, a3),
         SYS_PCI_BAR_MAP => sys_pci_bar_map(a1, a2, a3),
         SYS_DMA_ALLOC => sys_dma_alloc(a1, a2),
+        SYS_PROTECT => sys_protect(a1, a2, a3, a4),
         SYS_UPTIME_MS => SyscallRet { rax: 0, rdx: crate::arch::ticks().wrapping_mul(10) },
         SYS_CONSOLE_WRITE => sys_console_write(a1, a2, a3),
         SYS_ATTENUATE => sys_attenuate(a1, a2),
@@ -797,6 +798,32 @@ fn sys_dma_alloc(mem: u64, vaddr: u64) -> SyscallRet {
         Ok(phys) => SyscallRet { rax: 0, rdx: phys },
         Err(e) => SyscallRet::err(e),
     }
+}
+
+/// `sys_protect(mem, vaddr, len, prot)` — change the protection of already-mapped
+/// user pages. The JIT/exec primitive: a runtime maps RW memory, writes code, and
+/// flips it to RX. W^X (law L4) is preserved — PROT_WRITE|PROT_EXEC is rejected;
+/// only RW↔RX transitions are allowed. Gated on the Memory cap (R_MAP), like map.
+fn sys_protect(mem: u64, vaddr: u64, len: u64, prot: u64) -> SyscallRet {
+    SyscallRet::from_result((|| -> SysResult {
+        let entry = proc::with_current(|p| p.lookup(mem as Handle, ObjType::Memory, R_MAP))?;
+        if !matches!(entry.obj, ObjectRef::Memory(_)) {
+            return Err(SysError::BadType);
+        }
+        if vaddr & 0xfff != 0 || vaddr >= LOWER_HALF_END {
+            return Err(SysError::Fault);
+        }
+        let writable = prot & PROT_WRITE != 0;
+        let executable = prot & PROT_EXEC != 0;
+        if prot & PROT_READ == 0 || (writable && executable) {
+            return Err(SysError::Msg); // must be readable; W^X forbids W|X (L4)
+        }
+        let pages = (len + 0xfff) / 0x1000;
+        let pml4 = mm::vm::current_pml4();
+        mm::vm::protect_user_range(pml4, vaddr, pages, writable, executable)
+            .map_err(|_| SysError::Fault)?;
+        Ok(())
+    })())
 }
 
 /// `sys_attenuate(src, new_rights)` — derive a strictly-weaker handle (law L5).

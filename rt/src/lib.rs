@@ -498,6 +498,14 @@ pub fn sys_dma_alloc(mem: Handle, vaddr: u64) -> SysResult<u64> {
     SysError::from_raw(rax).map(|_| rdx)
 }
 
+/// Change the protection of already-mapped pages (§24 / JIT). `prot` may be
+/// PROT_READ|PROT_WRITE or PROT_READ|PROT_EXEC — W^X forbids both at once.
+pub fn sys_protect(mem: Handle, vaddr: u64, len: u64, prot: u64) -> SysResult {
+    let (rax, _) =
+        unsafe { syscall4(oxbow_abi::SYS_PROTECT, mem as u64, vaddr, len, prot) };
+    SysError::from_raw(rax)
+}
+
 /// Monotonic uptime in milliseconds — an ambient clock for timer-driven code
 /// (smoltcp's TCP timers). Not a capability; every process may read the clock.
 pub fn sys_uptime_ms() -> u64 {

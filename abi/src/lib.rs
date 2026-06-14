@@ -56,11 +56,12 @@ pub const R_SPAWN: u32 = 1 << 22;
 pub const R_SIGNAL: u32 = R_SEND;
 pub const R_WAIT: u32 = R_RECV;
 
-// Mapping protection flags for sys_map / sys_frame_map (NOT rights; per call).
-// Exec is intentionally absent — W^X forbids writable+executable, and there is
-// no mprotect yet, so an executable anonymous page would be useless.
+// Mapping protection flags for sys_map / sys_frame_map / sys_protect (NOT rights;
+// per call). W^X (law L4) still holds: the kernel rejects WRITE|EXEC together —
+// but `sys_protect` allows the RW->RX *transition* a JIT needs (e.g. tcc -run).
 pub const PROT_READ: u64 = 1;
 pub const PROT_WRITE: u64 = 2; // implies read
+pub const PROT_EXEC: u64 = 4; // read + execute (never combined with WRITE)
 
 // ---------------------------------------------------------------------------
 // Syscall numbers (§4.3) — passed in rax
@@ -110,6 +111,11 @@ pub const SYS_DMA_ALLOC: u64 = 24; // (mem, vaddr) -> phys      needs R_MAP
 /// Monotonic uptime in milliseconds (in rdx). Ambient/unprivileged — a clock is
 /// not a capability — needed by timer-driven userland (e.g. smoltcp's TCP).
 pub const SYS_UPTIME_MS: u64 = 25; // () -> u64 ms
+
+/// Change the protection of already-mapped user pages (the JIT/exec primitive).
+/// W^X-enforced: `prot` may be PROT_READ|PROT_WRITE or PROT_READ|PROT_EXEC, never
+/// both — so a JIT writes code into an RW page then flips it to RX. Needs R_MAP.
+pub const SYS_PROTECT: u64 = 26; // (mem, vaddr, len, prot)
 
 // ---------------------------------------------------------------------------
 // Error codes (§6) — returned in rax; values are stable forever (append-only)

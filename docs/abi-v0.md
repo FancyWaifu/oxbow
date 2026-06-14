@@ -1347,3 +1347,30 @@ Actual compilation: `tcc -run hello.c` JITs code and jumps to it, which needs th
 RW→RX page-protection capability (§28.2) that oxbow's W^X requires. That + a
 process budget large enough for tcc's working set, and `/usr/include` on the fs,
 is the remaining work to compile C **on** oxbow.
+
+## 30. The JIT/exec capability — W^X meets a compiler (v1-jit)
+
+The keystone for on-device compilation: oxbow can now run dynamically-generated
+code while keeping W^X (law L4) intact.
+
+### 30.1 sys_protect
+`SYS_PROTECT(mem, vaddr, len, prot)` changes the protection of already-mapped
+user pages (`vm::protect_user_range` flips the leaf WRITABLE / NO_EXECUTE bits and
+TLB-flushes). `prot` is `PROT_READ|PROT_WRITE` or `PROT_READ|PROT_EXEC` — **never
+both**; the kernel rejects W|X, so W^X holds. What it allows is the RW→RX
+*transition* a JIT performs: map RW, emit code, flip to RX, jump. Gated on the
+Memory cap (R_MAP), like `sys_map`. `PROT_EXEC` is now a real ABI flag.
+
+### 30.2 mmap / mprotect
+oxbow-libc's `mmap` hands out anonymous RW pages from a reserved vaddr region
+(`sys_map` from the budget); `mprotect` wraps `sys_protect` (forcing RX when EXEC
+is requested — dropping write, W^X). So C code does the textbook JIT dance.
+
+### 30.3 Demonstrated
+`cc-hello` now `mmap`s a page RW, writes the machine code for `int f(){return
+42;}` (`b8 2a 00 00 00 c3`), `mprotect`s it RX, and calls it:
+```
+JIT: wrote code, flipped RW->RX, ran it -> 42 (W^X transition!)
+```
+TinyCC's `-run` uses exactly this. Remaining for `tcc -run` on oxbow: a process
+budget big enough for the compiler's working set, and `/usr/include` on the fs.

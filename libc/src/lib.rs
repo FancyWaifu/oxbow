@@ -14,7 +14,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::ffi::VaList;
 use core::ptr::addr_of_mut;
-use oxbow_abi::{Handle, MsgBuf, BOOT_EP, FS_FILE, TAG_FS_READ};
+use oxbow_abi::{Handle, MsgBuf, BOOT_EP, BOOT_MEM, FS_FILE, TAG_FS_READ};
 use oxbow_rt as rt;
 
 extern "C" {
@@ -1120,19 +1120,49 @@ pub extern "C" fn unlink(_p: *const u8) -> i32 {
     -1
 }
 
-// --- mmap/mprotect: STUBS for now (Phase C makes them real over a capability).
-//     tcc -run needs these; linking needs them defined. ---
+// --- mmap/mprotect over oxbow: the JIT/exec primitive (§30). mmap hands out
+//     anonymous RW pages from a reserved vaddr region; mprotect flips RW<->RX via
+//     sys_protect (W^X-enforced in the kernel). PROT_* match the oxbow ABI. ---
+use core::sync::atomic::{AtomicUsize, Ordering};
+static MMAP_NEXT: AtomicUsize = AtomicUsize::new(0x5000_0000);
+
 #[no_mangle]
-pub extern "C" fn mmap(_a: *mut u8, _l: usize, _p: i32, _f: i32, _fd: i32, _o: i64) -> *mut u8 {
-    usize::MAX as *mut u8 // MAP_FAILED
+pub unsafe extern "C" fn mmap(
+    _addr: *mut u8,
+    len: usize,
+    prot: i32,
+    _flags: i32,
+    _fd: i32,
+    _off: i64,
+) -> *mut u8 {
+    let bytes = (len + 0xfff) & !0xfff;
+    if bytes == 0 {
+        return usize::MAX as *mut u8;
+    }
+    let va = MMAP_NEXT.fetch_add(bytes, Ordering::Relaxed);
+    // Anonymous pages map RW first (W^X — can't map executable directly).
+    if rt::sys_map(BOOT_MEM, va as u64, bytes as u64, 1 | 2).is_err() {
+        return usize::MAX as *mut u8; // MAP_FAILED
+    }
+    if prot & 4 != 0 {
+        let _ = rt::sys_protect(BOOT_MEM, va as u64, bytes as u64, 1 | 4); // -> RX
+    }
+    va as *mut u8
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32 {
+    let oxprot: u64 = if prot & 4 != 0 { 1 | 4 } else { 1 | 2 }; // RX or RW (W^X)
+    let bytes = (len + 0xfff) & !0xfff;
+    match rt::sys_protect(BOOT_MEM, addr as u64, bytes as u64, oxprot) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn munmap(_a: *mut u8, _l: usize) -> i32 {
-    -1
-}
-#[no_mangle]
-pub extern "C" fn mprotect(_a: *mut u8, _l: usize, _p: i32) -> i32 {
-    -1
+    0 // the whole AS is reclaimed on exit (§16); no per-region unmap yet
 }
 
 // --- setjmp/longjmp (x86_64): save callee-saved + rsp + return address ---

@@ -306,6 +306,40 @@ pub fn map_mmio_4k_in(pml4_phys: u64, virt: u64, phys: u64) {
     }
 }
 
+/// Change the protection of already-mapped user pages in `[vaddr, vaddr+pages)`.
+/// The JIT primitive (`mmap` RW → write code → `mprotect` RX): it flips the
+/// WRITABLE / NO_EXECUTE leaf flags. W^X (L4) still holds — `!(writable &&
+/// executable)` is asserted, so no page is ever W and X at once; only the RW↔RX
+/// transition is allowed. Operates on the live CR3, so each page is TLB-flushed.
+/// Returns `Err` if any page in the range isn't mapped.
+pub fn protect_user_range(
+    pml4_phys: u64,
+    vaddr: u64,
+    pages: u64,
+    writable: bool,
+    executable: bool,
+) -> Result<(), ()> {
+    assert!(!(writable && executable), "W^X violation in protect");
+    let mut flags = Flags::PRESENT | Flags::USER_ACCESSIBLE;
+    if writable {
+        flags |= Flags::WRITABLE;
+    }
+    if !executable {
+        flags |= Flags::NO_EXECUTE;
+    }
+    let hhdm = VirtAddr::new(super::hhdm_offset());
+    let l4: &mut PageTable = unsafe { &mut *(super::phys_to_virt(pml4_phys) as *mut PageTable) };
+    let mut mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
+    for i in 0..pages {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr + i * 4096));
+        match unsafe { mapper.update_flags(page, flags) } {
+            Ok(flush) => flush.flush(),
+            Err(_) => return Err(()),
+        }
+    }
+    Ok(())
+}
+
 const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_HUGE: u64 = 1 << 7;
