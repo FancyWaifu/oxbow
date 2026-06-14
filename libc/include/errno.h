@@ -41,4 +41,11 @@ extern int errno;
 #define EADDRNOTAVAIL 99
 #define EDESTADDRREQ 89
 #define EMSGSIZE 90
+#define EISCONN 106
+#define ENOTSOCK 88
+#define EDQUOT 122
+#define ELOOP 40
+#define ENAMETOOLONG 36
+#define ENETDOWN 100
+#define EHOSTDOWN 112
 #endif

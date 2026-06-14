@@ -49,6 +49,7 @@ build-server:
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p oxlua
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p oxpy
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p oxqjs
+    RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p oxcurl
 
 # Same, but with the ABI negative-path selftests compiled in.
 build-server-selftest:
@@ -97,6 +98,8 @@ _iso:
     -strip -S iso_root/boot/micropython.elf
     cp target/x86_64-unknown-none/debug/qjs iso_root/boot/qjs.elf
     -strip -S iso_root/boot/qjs.elf
+    cp target/x86_64-unknown-none/debug/curl iso_root/boot/curl.elf
+    -strip -S iso_root/boot/curl.elf
     # Stage the filesystem: the FHS skeleton (servers/fs/initrd) plus the live
     # oxbow source under /usr/src/oxbow so it is browsable on oxbow itself.
     rm -rf build/initrd

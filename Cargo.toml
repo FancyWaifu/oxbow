@@ -30,6 +30,7 @@ members = [
     "servers/lua",
     "servers/micropython",
     "servers/quickjs",
+    "servers/curl",
     # "tools/*",  # initrd packer, etc.
 ]
 # Servers are excluded from the default build because they need a DIFFERENT

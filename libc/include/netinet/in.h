@@ -8,6 +8,10 @@ struct sockaddr_in { sa_family_t sin_family; in_port_t sin_port; struct in_addr 
 #define INADDR_ANY 0u
 #define INADDR_NONE 0xffffffffu
 #define IPPROTO_TCP 6
+#define IPPROTO_UDP 17
+#define IPPROTO_IPV6 41
+#define IPPROTO_RAW 255
+#define IPPROTO_ICMP 1
 #define IPPROTO_IP 0
 unsigned short htons(unsigned short);
 unsigned short ntohs(unsigned short);

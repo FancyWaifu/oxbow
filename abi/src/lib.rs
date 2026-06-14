@@ -330,6 +330,7 @@ pub const BOOT_IMG_TCC: Handle = 23;
 pub const BOOT_IMG_LUA: Handle = 24; // the Lua 5.4 interpreter
 pub const BOOT_IMG_UPY: Handle = 25; // the MicroPython interpreter
 pub const BOOT_IMG_QJS: Handle = 26; // the QuickJS JavaScript engine
+pub const BOOT_IMG_CURL: Handle = 27; // curl (HTTP, no TLS)
 /// The control-channel badge (distinct from any socket id, which are 1..=N).
 pub const NET_CTL: u64 = 0x00C0_FFEE;
 /// Bind a UDP socket: request on the NET_CTL cap, data[0]=port (0=ephemeral).

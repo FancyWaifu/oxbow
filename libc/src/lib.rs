@@ -361,7 +361,12 @@ pub extern "C" fn setsockopt(_fd: i32, _lvl: i32, _opt: i32, _val: *const u8, _l
     0
 }
 #[no_mangle]
-pub extern "C" fn getsockopt(_fd: i32, _lvl: i32, _opt: i32, _val: *mut u8, _len: *mut u32) -> i32 {
+pub unsafe extern "C" fn getsockopt(_fd: i32, _lvl: i32, _opt: i32, val: *mut u8, len: *mut u32) -> i32 {
+    // Report no error (SO_ERROR=0) — curl checks this after connect() to confirm
+    // the connection succeeded. Leaving the buffer untouched made it read garbage.
+    if !val.is_null() && (len.is_null() || *len >= 4) {
+        *(val as *mut i32) = 0;
+    }
     0
 }
 
@@ -497,13 +502,235 @@ pub extern "C" fn select(nfds: i32, _r: *mut u8, _w: *mut u8, _e: *mut u8, _t: *
 }
 #[no_mangle]
 pub unsafe extern "C" fn poll(fds: *mut u8, nfds: u64, _timeout: i32) -> i32 {
-    // struct pollfd { int fd; short events; short revents; } — set revents=events.
+    // struct pollfd { int fd; short events; short revents; }. Report only normal
+    // readiness — POLLIN|POLLOUT — and NOTHING else: curl maps POLLPRI, POLLNVAL,
+    // POLLERR, and POLLHUP in revents to its error condition (CURL_CSELECT_ERR),
+    // which failed the connect even though the socket was fine.
+    const READY: u16 = 0x001 | 0x004; // POLLIN | POLLOUT
+    let mut ready = 0i32;
     for i in 0..nfds as usize {
         let p = fds.add(i * 8);
+        let fd = *(p as *const i32);
         let events = *(p.add(4) as *const u16);
-        *(p.add(6) as *mut u16) = events;
+        let revents = if fd < 0 { 0 } else { events & READY };
+        *(p.add(6) as *mut u16) = revents;
+        if revents != 0 {
+            ready += 1;
+        }
     }
-    nfds as i32
+    ready
+}
+
+/// inet_ntop: format an IPv4 `src` (network-order u32) into "a.b.c.d".
+#[no_mangle]
+pub unsafe extern "C" fn inet_ntop(_af: i32, src: *const u32, dst: *mut u8, size: u32) -> *const u8 {
+    if src.is_null() || dst.is_null() {
+        return core::ptr::null();
+    }
+    let b = (*src).to_ne_bytes(); // [a,b,c,d]
+    let mut n = 0usize;
+    for (i, &oct) in b.iter().enumerate() {
+        if i > 0 {
+            if (n as u32) < size {
+                *dst.add(n) = b'.';
+            }
+            n += 1;
+        }
+        let mut tmp = [0u8; 3];
+        let mut k = 0;
+        let mut v = oct;
+        loop {
+            tmp[k] = b'0' + v % 10;
+            v /= 10;
+            k += 1;
+            if v == 0 {
+                break;
+            }
+        }
+        while k > 0 {
+            k -= 1;
+            if (n as u32) < size {
+                *dst.add(n) = tmp[k];
+            }
+            n += 1;
+        }
+    }
+    if (n as u32) < size {
+        *dst.add(n) = 0;
+    }
+    dst
+}
+
+// Socket stubs not backed by the net server (curl binds locally / queries names).
+#[no_mangle]
+pub extern "C" fn bind(_fd: i32, _addr: *const u8, _len: u32) -> i32 {
+    0
+}
+#[no_mangle]
+pub unsafe extern "C" fn getsockname(_fd: i32, addr: *mut u8, len: *mut u32) -> i32 {
+    if !addr.is_null() {
+        core::ptr::write_bytes(addr, 0, 16);
+        let sa = addr as *mut SockAddrIn;
+        (*sa).sin_family = AF_INET as u16; // curl validates the local family
+    }
+    if !len.is_null() {
+        *len = 16;
+    }
+    0
+}
+#[no_mangle]
+pub unsafe extern "C" fn getpeername(fd: i32, addr: *mut u8, len: *mut u32) -> i32 {
+    getsockname(fd, addr, len)
+}
+#[no_mangle]
+pub extern "C" fn ioctl(_fd: i32, _req: u64, _arg: usize) -> i32 {
+    0 // FIONBIO etc. — sockets stay blocking
+}
+#[no_mangle]
+pub extern "C" fn fcntl(_fd: i32, _cmd: i32, _arg: i64) -> i32 {
+    0 // blocking sockets; O_NONBLOCK is a no-op
+}
+#[no_mangle]
+pub unsafe extern "C" fn fileno(stream: *mut FILE) -> i32 {
+    if stream.is_null() {
+        -1
+    } else {
+        (*stream).fd
+    }
+}
+#[no_mangle]
+pub extern "C" fn stat(_path: *const u8, _st: *mut u8) -> i32 {
+    -1
+}
+#[no_mangle]
+pub extern "C" fn fstat(_fd: i32, _st: *mut u8) -> i32 {
+    -1
+}
+#[no_mangle]
+pub extern "C" fn pipe(_fds: *mut i32) -> i32 {
+    -1
+}
+#[no_mangle]
+pub extern "C" fn rename(_a: *const u8, _b: *const u8) -> i32 {
+    -1
+}
+#[no_mangle]
+pub extern "C" fn geteuid() -> u32 {
+    0
+}
+#[no_mangle]
+pub unsafe extern "C" fn getpwuid_r(
+    _u: u32,
+    _p: *mut u8,
+    _b: *mut u8,
+    _n: usize,
+    result: *mut *mut u8,
+) -> i32 {
+    if !result.is_null() {
+        *result = core::ptr::null_mut();
+    }
+    1
+}
+#[no_mangle]
+pub extern "C" fn getifaddrs(_a: *mut *mut u8) -> i32 {
+    -1
+}
+#[no_mangle]
+pub extern "C" fn freeifaddrs(_a: *mut u8) {}
+
+/// xorshift PRNG seeded from uptime — enough for curl's boundary/connection-id
+/// randomness (oxbow has no real entropy source).
+#[no_mangle]
+pub extern "C" fn arc4random() -> u32 {
+    static mut S: u64 = 0;
+    unsafe {
+        if S == 0 {
+            S = rt::sys_uptime_ms() | 1;
+        }
+        let mut x = S;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        S = x;
+        (x >> 32) as u32
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strcspn(s: *const u8, reject: *const u8) -> usize {
+    let mut n = 0usize;
+    'outer: while *s.add(n) != 0 {
+        let c = *s.add(n);
+        let mut k = 0;
+        while *reject.add(k) != 0 {
+            if *reject.add(k) == c {
+                break 'outer;
+            }
+            k += 1;
+        }
+        n += 1;
+    }
+    n
+}
+#[no_mangle]
+pub unsafe extern "C" fn strtok_r(s: *mut u8, delim: *const u8, saveptr: *mut *mut u8) -> *mut u8 {
+    let mut p = if s.is_null() { *saveptr } else { s };
+    if p.is_null() {
+        return core::ptr::null_mut();
+    }
+    let is_delim = |c: u8| -> bool {
+        let mut k = 0;
+        while *delim.add(k) != 0 {
+            if *delim.add(k) == c {
+                return true;
+            }
+            k += 1;
+        }
+        false
+    };
+    while *p != 0 && is_delim(*p) {
+        p = p.add(1);
+    }
+    if *p == 0 {
+        *saveptr = p;
+        return core::ptr::null_mut();
+    }
+    let tok = p;
+    while *p != 0 && !is_delim(*p) {
+        p = p.add(1);
+    }
+    if *p != 0 {
+        *p = 0;
+        *saveptr = p.add(1);
+    } else {
+        *saveptr = p;
+    }
+    tok
+}
+#[no_mangle]
+pub unsafe extern "C" fn strerror_r(_e: i32, buf: *mut u8, len: usize) -> i32 {
+    let msg = b"error";
+    let n = core::cmp::min(msg.len(), len.saturating_sub(1));
+    core::ptr::copy_nonoverlapping(msg.as_ptr(), buf, n);
+    if len > 0 {
+        *buf.add(n) = 0;
+    }
+    0
+}
+#[no_mangle]
+pub unsafe extern "C" fn basename(path: *mut u8) -> *mut u8 {
+    if path.is_null() {
+        return path;
+    }
+    let mut last = path;
+    let mut p = path;
+    while *p != 0 {
+        if *p == b'/' {
+            last = p.add(1);
+        }
+        p = p.add(1);
+    }
+    last
 }
 
 /// `lseek` — SEEK_SET/CUR/END on a file fd. SEEK_END uses the tracked size
@@ -1623,6 +1850,14 @@ pub unsafe extern "C" fn fseek(stream: *mut FILE, off: i64, whence: i32) -> i32 
         (*stream).eof = 0;
         0
     }
+}
+#[no_mangle]
+pub unsafe extern "C" fn fseeko(stream: *mut FILE, off: i64, whence: i32) -> i32 {
+    fseek(stream, off, whence)
+}
+#[no_mangle]
+pub unsafe extern "C" fn ftello(stream: *mut FILE) -> i64 {
+    ftell(stream)
 }
 #[no_mangle]
 pub unsafe extern "C" fn ftell(stream: *mut FILE) -> i64 {

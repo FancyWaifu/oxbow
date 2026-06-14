@@ -14,6 +14,8 @@ struct timespec { time_t tv_sec; long tv_nsec; };
 #define CLOCK_REALTIME 0
 #define CLOCK_MONOTONIC 1
 #define CLOCK_PROCESS_CPUTIME_ID 2
+#define CLOCK_MONOTONIC_RAW 4
+#define CLOCK_BOOTTIME 7
 int clock_gettime(int, struct timespec *);
 #define CLOCKS_PER_SEC 1000
 #endif
