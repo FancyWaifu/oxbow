@@ -96,6 +96,44 @@ pub extern "C" fn oxbow_main() -> ! {
                         // else: an un-echoed type-ahead char — vanish silently
                     }
                 }
+                // Ctrl-U: kill the whole input line. Rub out the echoed prefix;
+                // un-echoed type-ahead just vanishes.
+                0x15 => {
+                    while elen > 0 {
+                        elen -= 1;
+                        if echoed > elen {
+                            echoed = elen;
+                            w(b"\x08 \x08");
+                        }
+                    }
+                }
+                // Ctrl-W: erase the last word (trailing spaces, then non-spaces).
+                0x17 => {
+                    let erase_one = |elen: &mut usize, echoed: &mut usize| {
+                        *elen -= 1;
+                        if *echoed > *elen {
+                            *echoed = *elen;
+                            w(b"\x08 \x08");
+                        }
+                    };
+                    while elen > 0 && edit[elen - 1] == b' ' {
+                        erase_one(&mut elen, &mut echoed);
+                    }
+                    while elen > 0 && edit[elen - 1] != b' ' {
+                        erase_one(&mut elen, &mut echoed);
+                    }
+                }
+                // Ctrl-C: cancel the current line. Echo ^C, drop the buffer, and if
+                // a reader waits, hand it an empty line so the shell re-prompts.
+                0x03 => {
+                    w(b"^C\n");
+                    elen = 0;
+                    echoed = 0;
+                    if pending != HANDLE_NULL {
+                        let _ = send_chunk(pending, &[], 0);
+                        pending = HANDLE_NULL;
+                    }
+                }
                 b'\n' | b'\r' => {
                     if pending != HANDLE_NULL {
                         // Reader waiting (line echoed live): deliver it now, chunked.
