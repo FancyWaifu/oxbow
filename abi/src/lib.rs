@@ -330,9 +330,12 @@ pub const BLK_DMA: u64 = 0x4030_0000;
 /// write-back cache, so reads/writes are byte-granular streams that the fs server
 /// drives sequentially. (No badge: there is a single disk and a single client.)
 pub const BOOT_BLK_EP: Handle = 28;
-/// The largest payload a block read/write message carries (bytes), bounded by the
-/// 64-byte MsgBuf: write puts sector+offset+count in data[0..3] then 48 bytes.
-pub const BLK_CHUNK: usize = 48;
+/// The largest payload a block read/write message carries (bytes). Bounded by the
+/// 64-byte `data` array: WRITE puts sector+offset+count in data[0..3] (24 bytes)
+/// then the payload, so 24 + BLK_CHUNK must be <= 64 — hence 40, not 48. (At 48
+/// the last 8 bytes of every write chunk fell outside `data` and were dropped,
+/// silently corrupting every block written.)
+pub const BLK_CHUNK: usize = 40;
 /// READ: data[0]=sector (LBA), data[1]=offset within sector (0..512). Reply:
 /// data[0]=count (bytes, 0 on error/EOF), payload bytes from offset 8.
 pub const TAG_BLK_READ: u64 = u32::from_le_bytes(*b"BKRD") as u64;

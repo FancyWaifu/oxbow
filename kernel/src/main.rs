@@ -255,7 +255,7 @@ fn kmain_stage2() -> ! {
         // server maps an 8 MiB file-storage arena, so it gets 16 MiB.
         let budget = if cmd == b"shell" {
             96 * 1024 * 1024
-        } else if cmd == b"fs" {
+        } else if cmd == b"fs" || cmd == b"fsd" {
             16 * 1024 * 1024
         } else {
             mm::mem::BOOT_BUDGET
@@ -555,6 +555,7 @@ fn kmain_stage2() -> ! {
                     );
                 });
             }
+            // (see below: fsd — the lwext4 fs server — gets a SEND cap to EP4.)
             // It also owns the block-service endpoint UNBADGED with full rights
             // (the root of block authority): R_RECV to serve sector requests.
             // Installed even without a disk so the fs server's calls fail cleanly
@@ -565,6 +566,20 @@ fn kmain_stage2() -> ! {
                     object::HandleEntry {
                         obj: object::ObjectRef::Endpoint(ipc::EP4),
                         rights: oxbow_abi::R_SEND | oxbow_abi::R_RECV | oxbow_abi::R_GRANT,
+                        badge: 0,
+                    },
+                );
+            });
+        }
+        // fsd — the lwext4/ext2 filesystem server — gets a SEND cap to the block
+        // service (EP4) at BOOT_BLK_EP, its sole storage authority (no PCI/DMA).
+        if cmd == b"fsd" {
+            proc::with_proc_mut(pid, |p| {
+                p.install(
+                    oxbow_abi::BOOT_BLK_EP,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Endpoint(ipc::EP4),
+                        rights: oxbow_abi::R_SEND,
                         badge: 0,
                     },
                 );

@@ -17,13 +17,19 @@ use core::ptr::addr_of_mut;
 use oxbow_abi::{Handle, MsgBuf, BOOT_EP, BOOT_NET_EP, BOOT_MEM, FS_FILE, TAG_FS_READ, TAG_FS_WRITE};
 use oxbow_rt as rt;
 
+#[cfg(feature = "entry")]
 extern "C" {
     fn main(argc: i32, argv: *const *const u8) -> i32;
 }
 
 // ===========================================================================
-// Entry: argv + stdio setup, then call the C `main`.
+// Entry: argv + stdio setup, then call the C `main`. Gated behind the default
+// `entry` feature: spawned C programs (lua/tcc/curl/...) use it. A libc-hosted
+// BOOT MODULE (fsd) has no argv page / tty stdout, so it links libc with
+// `default-features = false` and supplies its own oxbow_main; malloc still works
+// (rt's allocator lazily maps from BOOT_MEM, independent of this entry).
 // ===========================================================================
+#[cfg(feature = "entry")]
 #[no_mangle]
 pub extern "C" fn oxbow_main() -> ! {
     unsafe {
@@ -39,6 +45,7 @@ pub extern "C" fn oxbow_main() -> ! {
 /// Build a C `argv` from oxbow's whitespace-separated argument string. argv[0]
 /// is a program-name placeholder (oxbow doesn't pass it); argv[1..] are the
 /// tokens. Allocations leak — the whole address space is reclaimed on exit.
+#[cfg(feature = "entry")]
 fn build_argv() -> (i32, *const *const u8) {
     let mut argv: Vec<*const u8> = Vec::new();
     argv.push(b"prog\0".as_ptr());

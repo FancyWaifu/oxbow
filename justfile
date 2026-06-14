@@ -31,6 +31,7 @@ build-server:
     RUSTFLAGS="-C relocation-model=static" cargo build -p fs
     RUSTFLAGS="-C relocation-model=static" cargo build -p net
     RUSTFLAGS="-C relocation-model=static" cargo build -p blk
+    RUSTFLAGS="-C relocation-model=static" cargo build -p fsd
     RUSTFLAGS="-C relocation-model=static" cargo build -p cat
     RUSTFLAGS="-C relocation-model=static" cargo build -p ls
     RUSTFLAGS="-C relocation-model=static" cargo build -p mkdir
@@ -86,6 +87,8 @@ _iso:
     cp target/x86_64-unknown-none/debug/fs iso_root/boot/fs.elf
     cp target/x86_64-unknown-none/debug/net iso_root/boot/net.elf
     cp target/x86_64-unknown-none/debug/blk iso_root/boot/blk.elf
+    cp target/x86_64-unknown-none/debug/fsd iso_root/boot/fsd.elf
+    -strip -S iso_root/boot/fsd.elf
     cp target/x86_64-unknown-none/debug/cat iso_root/boot/cat.elf
     cp target/x86_64-unknown-none/debug/ls iso_root/boot/ls.elf
     cp target/x86_64-unknown-none/debug/mkdir iso_root/boot/mkdir.elf

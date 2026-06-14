@@ -615,10 +615,11 @@ pub extern "C" fn oxbow_main() -> ! {
     let nodes = unsafe { &mut *core::ptr::addr_of_mut!(NODES) };
     build_tree(nodes);
 
-    // Overlay the persisted writable tree from disk (no-op on a fresh disk). The
-    // bump index `next` continues past the contiguous nodes the initrd seeded.
-    let mut next = (1..MAX_NODES).find(|&i| nodes[i].kind == 0).unwrap_or(MAX_NODES);
-    restore(nodes, arena, &mut next);
+    // Disk persistence is being migrated to the lwext4/ext2 server (fsd), which
+    // now owns the virtio-blk disk; the old OXBOWFS1 block-stream restore/sync are
+    // disabled so the two don't fight over the device. (restore/persist kept for
+    // reference until fsd fully replaces this ramfs in Stage 3.)
+    let _ = (&restore, &persist);
 
     w(b"[fs] ready\n");
 
@@ -967,13 +968,13 @@ pub extern "C" fn oxbow_main() -> ! {
                 let _ = rt::sys_reply(reply, &r);
             }
             TAG_FS_SYNC => {
-                // Persist the whole writable tree to disk. Any cap reaching the fs
-                // can trigger it (it's idempotent and reveals nothing); the shell
-                // exposes it as `sync`.
-                let (ok, count) = persist(nodes);
+                // Disabled: the disk now belongs to the lwext4/ext2 server (fsd).
+                // Reply success without writing so `sync` stays a harmless no-op
+                // and doesn't clobber the ext2 image. (Removed with the ramfs in
+                // Stage 3.)
                 let mut r = MsgBuf::new(0);
-                r.data[0] = if ok { 0 } else { 1 };
-                r.data[1] = count as u64;
+                r.data[0] = 0;
+                r.data[1] = 0;
                 r.data_len = 2;
                 let _ = rt::sys_reply(reply, &r);
             }

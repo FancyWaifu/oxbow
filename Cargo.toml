@@ -27,6 +27,7 @@ members = [
     "servers/blk",
     "servers/jail",
     "servers/fsext",
+    "servers/fsd",
     "servers/drift",
     "servers/cc-hello",
     "servers/tcc",

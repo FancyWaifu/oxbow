@@ -15,6 +15,12 @@ path = "src/lib.rs"
 # only the user's `main` undefined). Arc 3 of self-hosting.
 crate-type = ["rlib", "staticlib"]
 
+[features]
+# The spawned-program entry (_start -> oxbow_main -> C main, argv + tty stdio).
+# On by default. A libc-hosted boot module disables it and supplies its own entry.
+default = ["entry"]
+entry = []
+
 [dependencies]
 oxbow-rt = { path = "../rt" }
 oxbow-abi = { path = "../abi" }
