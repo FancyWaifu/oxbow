@@ -685,8 +685,67 @@ pub extern "C" fn abs(v: i32) -> i32 {
 }
 
 // ===========================================================================
-// <string.h> (memcpy/memset/memmove/memcmp come from compiler-builtins).
+// <string.h>
 // ===========================================================================
+
+// memcpy/memset/memmove/memcmp: compiler-builtins provides only WEAK versions,
+// which a from-archive static link (tcc on oxbow) won't pull in — leaving the
+// call site 0 and faulting. So define STRONG ones here. memcpy/memset use
+// rep movsb/stosb so LLVM can't "optimize" the loop back into a memcpy/memset
+// call (infinite recursion); the others use volatile loops for the same reason.
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    core::arch::asm!(
+        "rep movsb",
+        inout("rcx") n => _,
+        inout("rdi") dst => _,
+        inout("rsi") src => _,
+        options(nostack, preserves_flags),
+    );
+    dst
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memset(dst: *mut u8, c: i32, n: usize) -> *mut u8 {
+    core::arch::asm!(
+        "rep stosb",
+        inout("rcx") n => _,
+        inout("rdi") dst => _,
+        in("al") c as u8,
+        options(nostack, preserves_flags),
+    );
+    dst
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    // Forward copy is safe when dst is at or below src, or the ranges don't
+    // overlap; otherwise copy backward so we don't clobber unread source bytes.
+    if (dst as usize) <= (src as usize) || (dst as usize) >= (src as usize) + n {
+        memcpy(dst, src, n);
+    } else {
+        let mut i = n;
+        while i > 0 {
+            i -= 1;
+            core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
+        }
+    }
+    dst
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    let mut i = 0;
+    while i < n {
+        let (x, y) = (core::ptr::read_volatile(a.add(i)), core::ptr::read_volatile(b.add(i)));
+        if x != y {
+            return x as i32 - y as i32;
+        }
+        i += 1;
+    }
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
     cstr_len(s)
@@ -1127,8 +1186,21 @@ pub unsafe extern "C" fn perror(s: *const u8) {
 pub extern "C" fn ferror(_stream: *mut FILE) -> i32 {
     0
 }
+/// Wrap an already-open fd in a FILE* (the fd's offset/size state lives in the
+/// fd table, so the FILE just carries the fd). tcc uses this for its output.
 #[no_mangle]
-pub extern "C" fn fdopen(_fd: i32, _mode: *const u8) -> *mut FILE {
+pub unsafe extern "C" fn fdopen(fd: i32, _mode: *const u8) -> *mut FILE {
+    if fd < 0 {
+        return core::ptr::null_mut();
+    }
+    for i in 0..MAX_FILES {
+        let f = &mut (*addr_of_mut!(FILES))[i];
+        if f.fd < 0 {
+            f.fd = fd;
+            f.eof = 0;
+            return f as *mut FILE;
+        }
+    }
     core::ptr::null_mut()
 }
 

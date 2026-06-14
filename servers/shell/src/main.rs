@@ -172,6 +172,33 @@ fn spawn_with_budget(image: Handle, cap0: Handle, arg: &[u8], budget: u64, sp: &
     }
 }
 
+/// `cc <src> -o <out>`: compile + statically link a C program to a STANDALONE
+/// oxbow binary via tcc. Expands to `tcc -static <args> /lib/c.a` — `/lib/c.a` is
+/// liboxbow_libc.a, the C library archive that makes the output self-contained
+/// (no dynamic linker; tcc fills the GOT at link time). `-static` is essential:
+/// tcc defaults to a dynamic executable whose GOT a runtime ld.so would fill, but
+/// oxbow has none. Run the result with `exec <out>`. The whole toolchain runs on
+/// oxbow — the self-hosting milestone (ABI §35).
+fn cc_cmd(cwd: Handle, rest: &[u8], sp: &Spawner) {
+    if rest.is_empty() {
+        tw(b"cc: usage: cc <src.c> -o <out>   (then: exec <out>)\n");
+        return;
+    }
+    let prefix: &[u8] = b"-static ";
+    let suffix: &[u8] = b" /lib/c.a";
+    if prefix.len() + rest.len() + suffix.len() > 55 {
+        tw(b"cc: command too long (55-byte argv limit; use short paths)\n");
+        return;
+    }
+    let mut arg = [0u8; 56];
+    let mut p = 0;
+    for src in [prefix, rest, suffix] {
+        arg[p..p + src.len()].copy_from_slice(src);
+        p += src.len();
+    }
+    spawn_with_budget(BOOT_IMG_TCC, cwd, &arg[..p], 48 * 1024 * 1024, sp);
+}
+
 /// `ls [path]`: with no arg, list `dir`; with a path, OPEN it (must be a
 /// directory) and hand that capability to a spawned `ls`.
 fn ls_cmd(dir: Handle, path: &[u8], sp: &Spawner) {
@@ -222,7 +249,7 @@ fn cat_cmd(dir: Handle, name: &[u8], sp: &Spawner) {
 /// Scratch buffer holding an ELF read off the filesystem for `exec` (§33). Sized
 /// for a stripped no_std binary with headroom; a larger image truncates safely
 /// (read_all stops at the buffer end and try_validate then rejects it).
-const ELF_BUF_CAP: usize = 256 * 1024;
+const ELF_BUF_CAP: usize = 2 * 1024 * 1024;
 static mut ELF_BUF: [u8; ELF_BUF_CAP] = [0; ELF_BUF_CAP];
 
 /// Slurp an entire file capability into `buf` via the 56-byte FS_READ protocol,
@@ -308,8 +335,27 @@ fn exec_cmd(cwd: Handle, path: &Path, arg_line: &[u8], sp: &Spawner) {
     let elf = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(ELF_BUF) as *const u8, len) };
     match rt::sys_spawn_bytes(elf, BOOT_MEM, &sm, sp.exit) {
         Ok(_) => wait_exits(sp, 1),
-        Err(_) => tw(b"exec: not a valid program (spawn rejected)\n"),
+        Err(_) => {
+            tw(b"exec: not a valid program (spawn rejected, ");
+            tw_dec_u32(len as u32);
+            tw(b" bytes read)\n");
+        }
     }
+}
+
+/// Write a u32 as decimal ASCII to the tty.
+fn tw_dec_u32(mut n: u32) {
+    let mut b = [0u8; 10];
+    let mut i = 10;
+    loop {
+        i -= 1;
+        b[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    tw(&b[i..]);
 }
 
 /// Write a byte as decimal ASCII to the tty (for printing IP octets).
@@ -739,6 +785,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"drift" => spawn_with(BOOT_IMG_DRIFT, HANDLE_NULL, rest, sp),
         b"cc-hello" => spawn_with(BOOT_IMG_CCHELLO, *cwd, rest, sp),
         b"tcc" => spawn_with_budget(BOOT_IMG_TCC, *cwd, rest, 48 * 1024 * 1024, sp),
+        b"cc" => cc_cmd(*cwd, rest, sp),
         b"exec" => exec_cmd(*cwd, path, rest, sp),
         b"badgetest" => badgetest(sp),
         b"help" => {
@@ -756,6 +803,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  http <ip>       TCP GET / from <ip>:80 via the net socket API\n");
             tw(b"  drift           DRIFT crypto self-test (X25519/ChaCha20, needs SSE)\n");
             tw(b"  run hello/pong  spawn a demo program\n");
+            tw(b"  cc <src> -o <o> compile+link a C file to a standalone binary (tcc -static)\n");
             tw(b"  exec <path>     load + run an ELF from the filesystem (exec-from-fs)\n");
             tw(b"  badgetest       exercise badged-endpoint mint rules\n");
             tw(b"  help            this list\n");

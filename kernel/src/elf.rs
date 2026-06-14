@@ -106,6 +106,35 @@ impl<'a> Image<'a> {
     pub fn bytes(&self) -> &'a [u8] {
         self.bytes
     }
+
+    /// Validate that the program-header table and every PT_LOAD segment's file
+    /// range lie within the byte buffer, and that p_filesz ≤ p_memsz. Boot
+    /// modules are trusted (the loader asserts), but an ELF handed to
+    /// `sys_spawn_bytes` from a file is untrusted — a truncated or crafted image
+    /// must be REJECTED here, not panic the kernel in `load_into`. See ABI §33.
+    pub fn segments_in_bounds(&self) -> bool {
+        // The phdr table itself must be in bounds before we iterate it.
+        let phdr_end = match self.phoff.checked_add(self.phnum.saturating_mul(self.phentsize)) {
+            Some(e) => e,
+            None => return false,
+        };
+        if phdr_end > self.bytes.len() {
+            return false;
+        }
+        for ph in self.loads() {
+            if ph.p_filesz > ph.p_memsz {
+                return false;
+            }
+            let file_end = match ph.p_offset.checked_add(ph.p_filesz) {
+                Some(e) => e,
+                None => return false,
+            };
+            if file_end as usize > self.bytes.len() {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// "rwx"-style permission string for a program header's flags.

@@ -9,6 +9,11 @@ repository.workspace = true
 [lib]
 name = "oxbow_libc"
 path = "src/lib.rs"
+# rlib: consumed by Rust C-program crates (cc-hello, tcc). staticlib: a `.a`
+# archive tcc can statically LINK to produce a standalone ELF on oxbow (it bundles
+# rt+libc+core — _start, oxbow_main, printf, malloc, the syscall stubs — leaving
+# only the user's `main` undefined). Arc 3 of self-hosting.
+crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 oxbow-rt = { path = "../rt" }

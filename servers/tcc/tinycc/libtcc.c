@@ -982,6 +982,14 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
     /* add sections */
     tccelf_new(s);
 
+    /* oxbow: _start is the ELF entry but nothing *references* it, so the archive
+     * member (in liboxbow_c.a) that defines it would never be pulled in, leaving
+     * e_entry = 0. Force it undefined for executables so the link drags in
+     * _start (and, transitively, oxbow_main + the C library) and resolves the
+     * entry. See docs/abi-v0.md §35. */
+    if (output_type == TCC_OUTPUT_EXE)
+        set_global_sym(s, "_start", NULL, 0);
+
     if (output_type == TCC_OUTPUT_OBJ) {
         /* always elf for objects */
         s->output_format = TCC_OUTPUT_FORMAT_ELF;

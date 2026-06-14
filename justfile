@@ -100,6 +100,14 @@ _iso:
     mkdir -p build/initrd/bin
     cp target/x86_64-unknown-none/debug/hello build/initrd/bin/hello
     $(find $(rustc --print sysroot) -name llvm-strip | head -1) --strip-all build/initrd/bin/hello
+    # Self-hosting (§35): liboxbow_libc.a staged at /lib/c.a — the C library
+    # archive tcc statically links to produce a standalone binary on oxbow.
+    # `cc src.c -o out` expands to `tcc -static src.c -o out /lib/c.a`. Built with
+    # the same static relocation model as the servers (direct relocs, no PIC GOT
+    # that tcc would mishandle). Short path /lib/c.a fits the 55-byte spawn argv.
+    RUSTFLAGS="-C relocation-model=static" cargo build -p oxbow-libc --release
+    mkdir -p build/initrd/lib
+    cp target/x86_64-unknown-none/release/liboxbow_libc.a build/initrd/lib/c.a
     # Drop build artifacts + the (self-referential) initrd skeleton copy.
     find build/initrd/usr/src/oxbow -type d -name target -prune -exec rm -rf {} + 2>/dev/null || true
     rm -rf build/initrd/usr/src/oxbow/servers/fs/initrd

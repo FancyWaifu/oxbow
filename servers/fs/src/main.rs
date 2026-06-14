@@ -40,7 +40,7 @@ const READ_CHUNK: usize = 56; // 7 u64 of data[1..8]
 const ARENA: usize = 0x2000_0000;
 const ARENA_SIZE: usize = 8 * 1024 * 1024;
 const BLOCK: usize = 4096;
-const MAX_BLOCKS: usize = 128; // 512 KiB max file
+const MAX_BLOCKS: usize = 512; // 2 MiB max file
 const TOTAL_BLOCKS: usize = ARENA_SIZE / BLOCK;
 
 #[derive(Clone, Copy)]
@@ -273,13 +273,21 @@ fn build_tree(nodes: &mut [Node]) {
     }
 }
 
+/// The node table and arena allocator live in STATIC storage, not on the fs
+/// server's stack — the table is large (256 nodes × a per-node block list) and a
+/// stack-resident copy capped MAX_BLOCKS at the stack size. As statics they cost
+/// BSS instead, letting files grow to MAX_BLOCKS×BLOCK (2 MiB) — enough for a
+/// tcc-produced binary.
+static mut NODES: [Node; MAX_NODES] = [FREE; MAX_NODES];
+static mut ARENA_STATE: Arena = Arena::new();
+
 #[no_mangle]
 pub extern "C" fn oxbow_main() -> ! {
     // Map the file-storage arena from our Memory budget (read+write).
     let _ = rt::sys_map(BOOT_MEM, ARENA as u64, ARENA_SIZE as u64, PROT_READ | PROT_WRITE);
-    let mut arena = Arena::new();
-    let mut nodes = [FREE; MAX_NODES];
-    build_tree(&mut nodes);
+    let arena = unsafe { &mut *core::ptr::addr_of_mut!(ARENA_STATE) };
+    let nodes = unsafe { &mut *core::ptr::addr_of_mut!(NODES) };
+    build_tree(nodes);
 
     w(b"[fs] ready\n");
 
@@ -300,7 +308,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut r = MsgBuf::new(0);
                 // `name` may be a multi-component path (a/b/c); walk it.
                 let found = if valid && nodes[node_id].kind == FS_DIR {
-                    walk(&nodes, node_id, name)
+                    walk(nodes, node_id, name)
                 } else {
                     None
                 };
@@ -412,17 +420,17 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut r = MsgBuf::new(0);
                 // Resolve the parent path; create `base` (the last component) in it.
                 let target = if valid && nodes[node_id].kind == FS_DIR {
-                    walk_parent(&nodes, node_id, name)
+                    walk_parent(nodes, node_id, name)
                 } else {
                     None
                 };
                 let child = match target {
                     Some((par, base)) if name_ok(base) => {
-                        match find_child(&nodes, par, base) {
+                        match find_child(nodes, par, base) {
                             // A read-only initrd file can't be truncated/overwritten.
                             Some(i) if nodes[i].kind == FS_FILE && nodes[i].data != 0 => None,
                             Some(i) if nodes[i].kind == FS_FILE => {
-                                free_blocks(&mut nodes[i], &mut arena); // truncate
+                                free_blocks(&mut nodes[i], arena); // truncate
                                 Some(i)
                             }
                             Some(_) => None, // exists but is a directory
@@ -515,13 +523,13 @@ pub extern "C" fn oxbow_main() -> ! {
                 let name = &bytes[..nlen];
                 let mut r = MsgBuf::new(0);
                 let target = if valid && nodes[node_id].kind == FS_DIR {
-                    walk_parent(&nodes, node_id, name)
+                    walk_parent(nodes, node_id, name)
                 } else {
                     None
                 };
                 let ok = match target {
                     Some((par, base))
-                        if name_ok(base) && find_child(&nodes, par, base).is_none() =>
+                        if name_ok(base) && find_child(nodes, par, base).is_none() =>
                     {
                         match (1..MAX_NODES).find(|&i| nodes[i].kind == 0) {
                             Some(i) => {
@@ -544,12 +552,12 @@ pub extern "C" fn oxbow_main() -> ! {
                 let name = &bytes[..nlen];
                 let mut r = MsgBuf::new(0);
                 let target = if valid && nodes[node_id].kind == FS_DIR {
-                    walk_parent(&nodes, node_id, name)
+                    walk_parent(nodes, node_id, name)
                 } else {
                     None
                 };
                 let status = if let Some((par, base)) = target.filter(|(_, b)| name_ok(b)) {
-                    match find_child(&nodes, par, base) {
+                    match find_child(nodes, par, base) {
                         Some(i) => {
                             if nodes[i].kind == FS_DIR {
                                 let has_children = (1..MAX_NODES)
@@ -562,7 +570,7 @@ pub extern "C" fn oxbow_main() -> ! {
                                 }
                             } else {
                                 // file: reclaim all its blocks, then free the slot.
-                                free_blocks(&mut nodes[i], &mut arena);
+                                free_blocks(&mut nodes[i], arena);
                                 nodes[i].kind = 0;
                                 0
                             }
@@ -593,12 +601,12 @@ pub extern "C" fn oxbow_main() -> ! {
                 // Resolve src and dst parents independently — supports moving a
                 // node across directories (mv a/x b/y), all within the dir cap.
                 let src = if valid && nodes[node_id].kind == FS_DIR {
-                    walk_parent(&nodes, node_id, old)
+                    walk_parent(nodes, node_id, old)
                 } else {
                     None
                 };
                 let dst = if valid && nodes[node_id].kind == FS_DIR {
-                    walk_parent(&nodes, node_id, new)
+                    walk_parent(nodes, node_id, new)
                 } else {
                     None
                 };
@@ -606,9 +614,9 @@ pub extern "C" fn oxbow_main() -> ! {
                     (Some((spar, sbase)), Some((dpar, dbase)))
                         if name_ok(sbase)
                             && name_ok(dbase)
-                            && find_child(&nodes, dpar, dbase).is_none() =>
+                            && find_child(nodes, dpar, dbase).is_none() =>
                     {
-                        match find_child(&nodes, spar, sbase) {
+                        match find_child(nodes, spar, sbase) {
                             Some(i) => {
                                 let mut nb = [0u8; NAME_MAX];
                                 let k = core::cmp::min(dbase.len(), NAME_MAX);

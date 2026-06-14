@@ -534,6 +534,11 @@ fn sys_spawn_bytes(buf: u64, len: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u
         Ok(i) => i,
         Err(e) => return SyscallRet::err(e),
     };
+    // Untrusted image: reject out-of-bounds segments here so the loader's asserts
+    // are never reached (a truncated/crafted ELF is an error, not a panic).
+    if !img.segments_in_bounds() {
+        return SyscallRet::err(SysError::Msg);
+    }
     spawn_common(&img, mem_h, msg_ptr, exit_notif_h, "exec")
 }
 

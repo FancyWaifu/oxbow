@@ -173,9 +173,10 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: Pag
     // A user-mode page fault kills the offending thread/process, not the machine.
     if error_code.contains(PageFaultErrorCode::USER_MODE) {
         println!(
-            "[trap] #PF user cr2={:?} err={:?} -- killing tcb {} (proc {})",
+            "[trap] #PF user cr2={:?} err={:?} rip={:#x} -- killing tcb {} (proc {})",
             cr2,
             error_code,
+            frame.instruction_pointer.as_u64(),
             crate::thread::current(),
             crate::thread::current_proc()
         );

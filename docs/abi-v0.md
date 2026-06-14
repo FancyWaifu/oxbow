@@ -1501,3 +1501,56 @@ bytes (past the old 16 KiB ceiling → multi-block growth), `fseek`/`ftell`s it,
 then reopens and `fread`s it all back — roundtrip OK. A *separate* process (the
 shell's `cat`) then reads the persisted file. open→write→grow→seek→read→persist
 is the file-I/O surface tcc needs to emit a binary (arc 3: link a standalone ELF).
+
+## 35. Self-hosting: tcc produces a standalone binary on oxbow (v1-cc-static)
+
+The capstone of the toolchain arc: tcc, running on oxbow, compiles a C source,
+**statically links** it into a self-contained ELF, writes it to the filesystem,
+and oxbow runs it via exec-from-fs (§33):
+```
+oxbow:/$ cc /hello.c -o /h          # = tcc -static /hello.c -o /h /lib/c.a
+oxbow:/$ exec /h
+Hello from C, compiled AND run on oxbow by tcc -run!
+  the JIT-compiled loop says sum(1..10) = 55
+```
+Unlike `tcc -run` (§32, a JIT that binds symbols live via dlsym), this is a
+*persistent binary on disk* that links against a real C library and runs as its
+own process — the compile→link→write→exec loop entirely on the device.
+
+### 35.1 The C library archive
+`oxbow-libc` is built as a **staticlib** (`crate-type = ["staticlib"]`) producing
+`liboxbow_libc.a` — a standard ar archive of ELF objects bundling rt + libc +
+core: `_start`, `oxbow_main`, `printf`, `malloc`, the syscall stubs — everything
+but the user's `main`. Staged at `/lib/c.a` (short path for the 55-byte spawn
+argv). Built with `-C relocation-model=static` (matching the servers): direct
+relocations, not the PIC/GOT forms tcc mishandles.
+
+### 35.2 The four fixes
+1. **`-static` is essential.** tcc defaults to a *dynamic* executable: indirect
+   `call *GOT(%rip)` through slots a runtime `ld.so` fills. oxbow has no dynamic
+   linker, so the slots stayed 0 → call into null → #PF at 0x0. `-static` makes
+   tcc fill the GOT at link time and drop the `.interp`/`.dynsym`.
+2. **Force `_start` undefined for EXE output** (vendored `libtcc.c`): nothing
+   *references* `_start` (it's the entry, not called), so its archive member
+   would never be pulled and `e_entry` came out 0. `set_global_sym(s,"_start",…)`
+   in `tcc_set_output_type` drags it in (and, transitively, `oxbow_main` + libc).
+3. **Strong `mem*`** (libc): compiler-builtins only *weakly* defines
+   `memcpy`/`memset`/`memmove`/`memcmp`, which a from-archive link won't pull;
+   added strong versions (`rep movsb`/`stosb` so LLVM can't fold them into a
+   self-call).
+4. **`fdopen`** (libc): tcc wraps its output fd with `fdopen`, previously a
+   NULL-returning stub → "could not write". Now wraps the fd in a FILE*.
+
+### 35.3 Robustness + capacity
+- exec-from-fs now `segments_in_bounds`-validates an untrusted ELF (phdr table +
+  every PT_LOAD file range within the buffer, `p_filesz ≤ p_memsz`) so a
+  truncated/crafted image is rejected, never panics the loader.
+- The fs `nodes` table moved to **static** storage (it was a 512 KiB stack local
+  that capped file size); files now grow to 2 MiB (`MAX_BLOCKS=512`), enough for
+  a ~700 KiB tcc binary. The shell's exec buffer is 2 MiB to match.
+
+### 35.4 What's not yet here
+`#include` needs `/usr/include` on the fs (the test source declares its own
+prototypes). The 55-byte spawn argv forces short paths. Self-hosting *tcc itself*
+(tcc compiling its own source) needs those plus a larger budget — but the
+primitive — produce a standalone binary and run it — is proven.
