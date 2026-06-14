@@ -32,6 +32,7 @@ fn main() {
         .define("TCC_TARGET_X86_64", None)
         .define("ONE_SOURCE", "0")
         .define("CONFIG_TCC_PREDEFS", "1")
+        .define("CONFIG_TCC_STATIC", None)
         // No POSIX signals on oxbow — disable the crash-backtrace + bounds-check
         // features (they install signal handlers).
         .define("CONFIG_TCC_BACKTRACE", "0")

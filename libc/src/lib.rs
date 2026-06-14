@@ -1100,22 +1100,6 @@ pub extern "C" fn raise(_n: i32) -> i32 {
     0
 }
 #[no_mangle]
-pub extern "C" fn dlopen(_p: *const u8, _f: i32) -> *const u8 {
-    core::ptr::null()
-}
-#[no_mangle]
-pub extern "C" fn dlsym(_h: *const u8, _s: *const u8) -> *const u8 {
-    core::ptr::null()
-}
-#[no_mangle]
-pub extern "C" fn dlclose(_h: *const u8) -> i32 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn dlerror() -> *const u8 {
-    core::ptr::null()
-}
-#[no_mangle]
 pub extern "C" fn unlink(_p: *const u8) -> i32 {
     -1
 }

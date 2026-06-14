@@ -235,7 +235,9 @@ fn kmain_stage2() -> ! {
         let (pid, entry, user_rsp) = proc::create(&img, as_i, name).expect("boot: create");
         // The shell is the system's spawner; it needs a large budget to fund the
         // processes it launches (it pays from its own untyped). Drivers get 256K.
-        let budget = if cmd == b"shell" { 8 * 1024 * 1024 } else { mm::mem::BOOT_BUDGET };
+        // The shell funds every program it spawns from its own budget; tcc wants
+        // a large working set, so the shell needs plenty of headroom.
+        let budget = if cmd == b"shell" { 96 * 1024 * 1024 } else { mm::mem::BOOT_BUDGET };
         proc::grant_standard(pid, budget);
         // The kbd driver gets the i8042 I/O ports + IRQ line as capabilities. The
         // kernel is the root of hardware authority; it delegates here (L1 holds

@@ -1374,3 +1374,23 @@ JIT: wrote code, flipped RW->RX, ran it -> 42 (W^X transition!)
 ```
 TinyCC's `-run` uses exactly this. Remaining for `tcc -run` on oxbow: a process
 budget big enough for the compiler's working set, and `/usr/include` on the fs.
+
+## 31. Toward `tcc -run` on oxbow (Phase D, in progress)
+
+With the JIT capability (§30), the compiler frontend already works: **tcc reads
+and compiles a C file on oxbow with no errors**. The remaining gap is `tcc -run`'s
+runtime linking, where progress so far:
+- The shell grants tcc a large process budget (48 MiB; the shell's own budget
+  raised to 96 MiB) — a compiler needs a big working set. `spawn_with_budget`.
+- A test program lives at `/hello.c` (no `#include` — it declares what it uses).
+- tcc's `-run` entry was patched (vendored `tccrun.c`) to call `main` directly
+  instead of the absent `runmain.o`; its static symbol table (`tcc_syms`, used
+  under `CONFIG_TCC_STATIC`) was extended to the common oxbow-libc functions so
+  JIT-compiled code can bind `printf`/`malloc`/… against the resident libc.
+
+What's left: `tcc -run` still resolves its libc through a file-based path
+(`-lc` / `libtcc1.a`) and the static-symbol resolution isn't yet wired into the
+relocation pass — so a compiled program's `printf` is still reported unresolved.
+Closing that (provide stub `libc.a`/`libtcc1.a` under `CONFIG_TCCDIR`, or route
+the relocation resolver through `tcc_syms`) is the last mile to `printf`-on-oxbow
+from source. The codegen, the JIT memory model, and argv/stdio are all proven.

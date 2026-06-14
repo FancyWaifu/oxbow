@@ -236,10 +236,10 @@ LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
         return 0;
 
     tcc_add_symbol(s1, "__rt_exit", rt_exit);
-    s1->run_main = "_runmain", top_sym = "main";
+    s1->run_main = "main", top_sym = "main"; /* oxbow: call main directly */
     if (s1->elf_entryname)
         s1->run_main = top_sym = s1->elf_entryname;
-    tcc_add_support(s1, "runmain.o");
+    /* oxbow: no runmain.o on disk; call main directly */
 
     if (tcc_relocate(s1) < 0)
         return -1;
@@ -1560,10 +1560,12 @@ typedef struct TCCSyms {
 static TCCSyms tcc_syms[] = {
 #if !defined(CONFIG_TCCBOOT)
 #define TCCSYM(a) { #a, &a, },
-    TCCSYM(printf)
-    TCCSYM(fprintf)
-    TCCSYM(fopen)
-    TCCSYM(fclose)
+    TCCSYM(printf) TCCSYM(fprintf) TCCSYM(snprintf) TCCSYM(sprintf)
+    TCCSYM(puts) TCCSYM(putchar) TCCSYM(fputs) TCCSYM(fputc) TCCSYM(fwrite)
+    TCCSYM(fopen) TCCSYM(fclose) TCCSYM(fgets) TCCSYM(fread)
+    TCCSYM(malloc) TCCSYM(calloc) TCCSYM(realloc) TCCSYM(free)
+    TCCSYM(strlen) TCCSYM(strcmp) TCCSYM(strcpy) TCCSYM(strcat) TCCSYM(strchr)
+    TCCSYM(memcpy) TCCSYM(memset) TCCSYM(atoi) TCCSYM(exit)
 #undef TCCSYM
 #endif
     { NULL, NULL },

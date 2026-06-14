@@ -146,9 +146,16 @@ fn wait_exits(sp: &Spawner, n: u64) {
 /// input capability (e.g. hello). For ls/cat, `cap0` is the dir/file capability
 /// the shell hands over — the spawned coreutil never sees a name, just the cap.
 fn spawn_with(image: Handle, cap0: Handle, arg: &[u8], sp: &Spawner) {
+    spawn_with_budget(image, cap0, arg, 0, sp);
+}
+
+/// Like `spawn_with`, but requests a specific child Memory budget (0 = default).
+/// tcc needs a large working set to compile, so it asks for a big budget.
+fn spawn_with_budget(image: Handle, cap0: Handle, arg: &[u8], budget: u64, sp: &Spawner) {
     let mut m = MsgBuf::new(0);
     // data[0] = budget (0 = default); the argument string rides in data[1..]
     // (byte offset 8), NUL-terminated — the kernel maps it at SPAWN_ARGV (§13).
+    m.data[0] = budget;
     let n = core::cmp::min(arg.len(), 55);
     let dst = m.data.as_mut_ptr() as *mut u8;
     unsafe {
@@ -638,7 +645,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"http" => http_cmd(rest),
         b"drift" => spawn_with(BOOT_IMG_DRIFT, HANDLE_NULL, rest, sp),
         b"cc-hello" => spawn_with(BOOT_IMG_CCHELLO, *cwd, rest, sp),
-        b"tcc" => spawn_with(BOOT_IMG_TCC, *cwd, rest, sp),
+        b"tcc" => spawn_with_budget(BOOT_IMG_TCC, *cwd, rest, 48 * 1024 * 1024, sp),
         b"badgetest" => badgetest(sp),
         b"help" => {
             tw(b"oxbow shell:  (ls cat mkdir touch are spawned programs)\n");
