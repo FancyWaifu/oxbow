@@ -104,16 +104,32 @@ fn tw(s: &[u8]) {
     }
 }
 
-/// Read one line from the tty (blocks until Enter). Returns it in `buf`, length.
-fn read_line(buf: &mut [u8; 64]) -> usize {
-    let mut m = MsgBuf::new(TAG_TTY_READ);
-    if rt::sys_call(BOOT_TTY, &mut m).is_err() {
-        return 0;
+/// Read one line from the tty (blocks until Enter). The tty streams the line in
+/// chunks (data[0]=count, data[1]=more, payload at offset 16); accumulate them
+/// into `buf` until `more` is 0. Returns the line length.
+fn read_line(buf: &mut [u8; 256]) -> usize {
+    let mut total = 0usize;
+    loop {
+        let mut m = MsgBuf::new(TAG_TTY_READ);
+        if rt::sys_call(BOOT_TTY, &mut m).is_err() {
+            return total;
+        }
+        let n = core::cmp::min(m.data[0] as usize, 48);
+        let more = m.data[1];
+        let take = core::cmp::min(n, buf.len() - total);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (m.data.as_ptr() as *const u8).add(16),
+                buf.as_mut_ptr().add(total),
+                take,
+            );
+        }
+        total += take;
+        if more == 0 {
+            break;
+        }
     }
-    let bytes = unsafe { core::slice::from_raw_parts(m.data.as_ptr() as *const u8, 64) };
-    let n = bytes.iter().position(|&b| b == 0).unwrap_or(0);
-    buf[..n].copy_from_slice(&bytes[..n]);
-    n
+    total
 }
 
 /// Split a line into (command, rest-of-line) at the first run of spaces.
@@ -844,7 +860,7 @@ pub extern "C" fn oxbow_main() -> ! {
     // The current-directory capability + its path string (starts at the root).
     let mut cwd: Handle = BOOT_FS_ROOT;
     let mut path = Path::root();
-    let mut line = [0u8; 64];
+    let mut line = [0u8; 256];
     loop {
         // Path-aware prompt, e.g. `oxbow:/usr/src$ `.
         tw(b"oxbow:");

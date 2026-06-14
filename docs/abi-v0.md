@@ -1765,3 +1765,20 @@ stubs, more `errno`/fcntl flags.
    `revents`, including `POLLPRI` — which curl maps to `CURL_CSELECT_ERR`,
    failing every connect. Fix: report only `POLLIN|POLLOUT`, never the error
    bits. Connect → poll(writable) → getsockopt(0) → send → recv now all work.
+
+## 42. Long interactive input — chunked tty lines (v1-tty-longline)
+
+The tty delivered a completed line in a single MsgBuf, capping typed commands at
+63 chars (the `cc`/`curl` aliases existed to dodge it). Now the tty streams a
+line in chunks, so commands can be up to 255 chars:
+```
+oxbow:/$ tcc -static /hello.c -o /this-is-a-rather-long-output-binary-name /lib/c.a
+oxbow:/$ exec /this-is-a-rather-long-output-binary-name        # runs
+```
+
+`TAG_TTY_LINE` reply: `data[0]` = chunk byte count, `data[1]` = 1 if more chunks
+follow, payload at byte offset 16 (≤48 bytes/chunk). The tty tracks a per-line
+delivery cursor (`deliver`/`dvoff`); the shell's `read_line` loops READ,
+accumulating chunks until `more` is 0. Line buffers grew 64→256; the echo /
+type-ahead invariants are preserved (echo once at the first chunk). This is the
+first piece of Direction A (a usable system) — next is persistent storage.
