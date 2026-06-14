@@ -12,7 +12,7 @@ use oxbow_abi::{
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
     SYS_DMA_ALLOC, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE, SYS_PROTECT, SYS_RECV, SYS_REPLY,
-    SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_UPTIME_MS, PROT_EXEC, R_ACK,
+    SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_UPTIME_MS, PROT_EXEC, R_ACK,
     R_BIND, R_IN, R_OUT, R_SPAWN,
 };
 
@@ -88,6 +88,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_IRQ_ACK => sys_irq_ack(a1),
         SYS_SPAWN => sys_spawn(a1, a2, a3, a4),
         SYS_SPAWN_BYTES => sys_spawn_bytes(a1, a2, a3, a4, a5),
+        SYS_GETENTROPY => sys_getentropy(a1, a2),
         SYS_EP_CREATE => sys_ep_create(),
         SYS_MINT => sys_mint(a1, a2, a3),
         SYS_PCI_READ => sys_pci_read(a1, a2),
@@ -885,6 +886,24 @@ fn sys_protect(mem: u64, vaddr: u64, len: u64, prot: u64) -> SyscallRet {
         let pml4 = mm::vm::current_pml4();
         mm::vm::protect_user_range(pml4, vaddr, pages, writable, executable)
             .map_err(|_| SysError::Fault)?;
+        Ok(())
+    })())
+}
+
+/// `sys_getentropy(buf, len)` — fill up to 256 user bytes with CSPRNG output.
+/// Handle-free (like exit): random bytes name no object, so L1 is not weakened.
+fn sys_getentropy(buf: u64, len: u64) -> SyscallRet {
+    SyscallRet::from_result((|| -> SysResult {
+        let n = len as usize;
+        if n > 256 {
+            return Err(SysError::Msg);
+        }
+        usermem::check_user(buf, n, true)?;
+        // Generate into a kernel buffer, then copy out (never run the CSPRNG
+        // through a raw user pointer).
+        let mut tmp = [0u8; 256];
+        crate::rng::fill_bytes(&mut tmp[..n]);
+        unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf as *mut u8, n) };
         Ok(())
     })())
 }

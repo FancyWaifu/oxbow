@@ -397,6 +397,25 @@ fn jail_cmd(sp: &Spawner) {
     }
 }
 
+/// `rand`: print a few words from the kernel CSPRNG (getentropy). Real entropy
+/// now — RDSEED/RDRAND-seeded ChaCha20 — so the values differ every boot.
+fn rand_cmd() {
+    let mut buf = [0u8; 32];
+    if rt::sys_getentropy(&mut buf).is_err() {
+        tw(b"rand: getentropy failed\n");
+        return;
+    }
+    let hexd = b"0123456789abcdef";
+    tw(b"rand:");
+    for chunk in buf.chunks(4) {
+        tw(b" ");
+        for &byte in chunk {
+            tw(&[hexd[(byte >> 4) as usize], hexd[(byte & 0xf) as usize]]);
+        }
+    }
+    tw(b"\n");
+}
+
 /// `sync`: ask the fs to persist its writable tree to disk (TAG_FS_SYNC on the
 /// root dir cap). The tree is restored automatically at the next boot.
 fn sync_cmd() {
@@ -844,6 +863,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"curl" => spawn_with_budget(BOOT_IMG_CURL, *cwd, rest, 48 * 1024 * 1024, sp),
         b"exec" => exec_cmd(*cwd, path, rest, sp),
         b"sync" => sync_cmd(),
+        b"rand" => rand_cmd(),
         b"jail" => jail_cmd(sp),
         b"badgetest" => badgetest(sp),
         b"help" => {
@@ -868,6 +888,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  curl <url>      fetch an http:// URL (no TLS)\n");
             tw(b"  exec <path>     load + run an ELF from the filesystem (exec-from-fs)\n");
             tw(b"  sync            persist writable files to disk (restored at boot)\n");
+            tw(b"  rand            print random bytes from the kernel CSPRNG (getentropy)\n");
             tw(b"  jail            confinement showcase: a hostile program is denied every escape\n");
             tw(b"  badgetest       exercise badged-endpoint mint rules\n");
             tw(b"  help            this list\n");

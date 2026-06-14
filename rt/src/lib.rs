@@ -601,6 +601,14 @@ pub fn sys_irq_ack(irq: Handle) -> SysResult {
     SysError::from_raw(rax)
 }
 
+/// Fill `buf` (<=256 bytes) with CSPRNG bytes from the kernel. Returns Err on a
+/// too-large or unmapped buffer.
+pub fn sys_getentropy(buf: &mut [u8]) -> SysResult {
+    let (rax, _) =
+        unsafe { syscall2(oxbow_abi::SYS_GETENTROPY, buf.as_mut_ptr() as u64, buf.len() as u64) };
+    SysError::from_raw(rax)
+}
+
 pub fn sys_exit(code: u64) -> ! {
     unsafe {
         syscall1(SYS_EXIT, code);

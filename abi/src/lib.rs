@@ -124,6 +124,13 @@ pub const SYS_PROTECT: u64 = 26; // (mem, vaddr, len, prot)
 /// proved read access to the bytes (via a file cap) and pays with a Memory cap.
 pub const SYS_SPAWN_BYTES: u64 = 27; // (buf, len, mem, &MsgBuf, exit_notif) -> pid
 
+/// getentropy (§36) — fill a user buffer (<=256 bytes) with CSPRNG bytes. A
+/// handle-free syscall, like `sys_exit`: it conveys NO authority over any object
+/// (you cannot reach a kernel object or another process through random bytes), so
+/// it does not violate L1's "operate on a handle you hold" rule. Backs the libc
+/// arc4random and the stack-protector cookie.
+pub const SYS_GETENTROPY: u64 = 28; // (buf, len) -> 0 / E_MSG (len>256) / E_FAULT
+
 // ---------------------------------------------------------------------------
 // Error codes (§6) — returned in rax; values are stable forever (append-only)
 // ---------------------------------------------------------------------------

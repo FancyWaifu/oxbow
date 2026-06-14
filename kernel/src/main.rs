@@ -17,6 +17,7 @@ mod notif;
 mod object;
 mod pci;
 mod proc;
+mod rng;
 mod syscall;
 mod thread;
 mod usermem;
@@ -168,6 +169,9 @@ fn kmain_stage2() -> ! {
     mm::vm::as_hop_selftest();
 
     arch::timer_init(100); // PIT @ 100 Hz, IRQ0 unmasked (stays on)
+
+    // Seed the CSPRNG before any process loads — stack-base ASLR draws from it.
+    rng::init();
 
     ipc::init();
 

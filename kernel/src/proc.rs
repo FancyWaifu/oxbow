@@ -243,7 +243,13 @@ fn load_into(img: &Image, pml4_phys: u64) -> (u64, u64) {
         segments += 1;
     }
 
-    let stack_base = USER_STACK_TOP - USER_STACK_PAGES * FRAME;
+    // Stack-base ASLR: slide the stack top down by a random, page-aligned offset
+    // (up to ~2 MiB = 9 bits of entropy) so no two processes — and no two boots —
+    // share a stack layout. Cheap partial ASLR that needs no PIE; the program's
+    // fixed text/argv mappings sit far below and are unaffected.
+    let slide = (crate::rng::next_u64() % 512) * FRAME;
+    let stack_top = USER_STACK_TOP - slide;
+    let stack_base = stack_top - USER_STACK_PAGES * FRAME;
     for i in 0..USER_STACK_PAGES {
         let frame = pmm::alloc_frame().expect("elf: out of stack frames");
         mm::vm::map_user_4k_in(pml4_phys, stack_base + i * FRAME, frame, true, false);
@@ -251,13 +257,14 @@ fn load_into(img: &Image, pml4_phys: u64) -> (u64, u64) {
 
     if crate::verbose() {
         println!(
-            "[elf] {} segment(s), stack {} KiB @ {:#x} (guard below)",
+            "[elf] {} segment(s), stack {} KiB @ {:#x} (ASLR slide {:#x}, guard below)",
             segments,
             USER_STACK_PAGES * FRAME / 1024,
-            stack_base
+            stack_base,
+            slide
         );
     }
-    (img.entry, USER_STACK_TOP)
+    (img.entry, stack_top)
 }
 
 /// Create a process: claim a pool slot (reusing a `Dead` one), map the image

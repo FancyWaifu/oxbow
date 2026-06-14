@@ -666,21 +666,55 @@ pub extern "C" fn getifaddrs(_a: *mut *mut u8) -> i32 {
 #[no_mangle]
 pub extern "C" fn freeifaddrs(_a: *mut u8) {}
 
-/// xorshift PRNG seeded from uptime — enough for curl's boundary/connection-id
-/// randomness (oxbow has no real entropy source).
+/// getentropy(2): fill `buf` with up to 256 bytes of CSPRNG output from the
+/// kernel (ChaCha20, hardware-seeded). Returns 0 on success, -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn getentropy(buf: *mut u8, len: usize) -> i32 {
+    if len > 256 {
+        return -1;
+    }
+    let slice = core::slice::from_raw_parts_mut(buf, len);
+    if rt::sys_getentropy(slice).is_ok() {
+        0
+    } else {
+        -1
+    }
+}
+
+/// arc4random(3): a uniformly-random u32 straight from the kernel CSPRNG (real
+/// entropy now — RDSEED/RDRAND-seeded ChaCha20 — not the old uptime xorshift).
 #[no_mangle]
 pub extern "C" fn arc4random() -> u32 {
-    static mut S: u64 = 0;
-    unsafe {
-        if S == 0 {
-            S = rt::sys_uptime_ms() | 1;
+    let mut b = [0u8; 4];
+    let _ = rt::sys_getentropy(&mut b);
+    u32::from_le_bytes(b)
+}
+
+/// arc4random_buf(3): fill `buf` with random bytes (any length; chunked to the
+/// 256-byte getentropy limit).
+#[no_mangle]
+pub unsafe extern "C" fn arc4random_buf(buf: *mut u8, len: usize) {
+    let mut off = 0;
+    while off < len {
+        let n = core::cmp::min(256, len - off);
+        let _ = rt::sys_getentropy(core::slice::from_raw_parts_mut(buf.add(off), n));
+        off += n;
+    }
+}
+
+/// arc4random_uniform(3): a uniformly-random u32 in [0, bound), without modulo
+/// bias (rejection sampling, as in OpenBSD).
+#[no_mangle]
+pub extern "C" fn arc4random_uniform(bound: u32) -> u32 {
+    if bound < 2 {
+        return 0;
+    }
+    let min = bound.wrapping_neg() % bound; // 2^32 mod bound
+    loop {
+        let r = arc4random();
+        if r >= min {
+            return r % bound;
         }
-        let mut x = S;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        S = x;
-        (x >> 32) as u32
     }
 }
 
