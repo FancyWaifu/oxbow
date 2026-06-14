@@ -1,0 +1,23 @@
+# Language-stats hygiene for GitHub Linguist.
+#
+# oxbow is a from-scratch Rust capability microkernel. The bulk of the bytes in
+# this repo, though, are VENDORED upstream C sources for the language runtimes
+# and tools ported to run on oxbow (tcc, Lua, MicroPython, QuickJS, curl). Left
+# unmarked, Linguist reports the repo as ~92% C, which misrepresents the work:
+# the kernel, capability model, servers, drivers, rt/abi crates, and the port
+# glue are all Rust (plus a little thin C shim per port).
+#
+# Mark the vendored trees as vendored so they're excluded from the language
+# breakdown, and the generated trees as generated. Our OWN code (every src/ and
+# the micropython port/) stays counted.
+
+# --- Vendored upstream sources (not our code) ---
+servers/tcc/tinycc/**          linguist-vendored
+servers/lua/lua/**             linguist-vendored
+servers/micropython/mp/**      linguist-vendored
+servers/quickjs/qjs/**         linguist-vendored
+servers/curl/curl/**           linguist-vendored
+
+# --- Build-time generated sources ---
+servers/micropython/gen/**     linguist-generated
+servers/curl/config/**         linguist-generated
