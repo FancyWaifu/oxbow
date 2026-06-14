@@ -388,15 +388,59 @@ unsafe fn vfmt(emit: &mut dyn FnMut(&[u8]), fmt: *const u8, ap: &mut VaList) -> 
         }
         if c == b'%' {
             i += 1;
-            // skip width/precision/length digits + 'l' (we don't honor them)
-            while matches!(*fmt.add(i), b'0'..=b'9' | b'.' | b'l' | b'-' | b'+' | b' ' | b'#') {
+            // flags + width + precision (honored only enough to not misread args;
+            // '*' consumes an int arg). Track the length modifier so %ld/%lx read
+            // a 64-bit arg instead of 32 — tcc prints sizes/addresses this way.
+            while matches!(*fmt.add(i), b'-' | b'+' | b' ' | b'#' | b'0') {
+                i += 1;
+            }
+            while matches!(*fmt.add(i), b'0'..=b'9') {
+                i += 1;
+            }
+            if *fmt.add(i) == b'*' {
+                let _ = ap.next_arg::<i32>();
+                i += 1;
+            }
+            if *fmt.add(i) == b'.' {
+                i += 1;
+                while matches!(*fmt.add(i), b'0'..=b'9') {
+                    i += 1;
+                }
+                if *fmt.add(i) == b'*' {
+                    let _ = ap.next_arg::<i32>();
+                    i += 1;
+                }
+            }
+            let mut lng = false;
+            while matches!(*fmt.add(i), b'l' | b'z' | b'j' | b't') {
+                lng = true;
+                i += 1;
+            }
+            while *fmt.add(i) == b'h' {
                 i += 1;
             }
             let spec = *fmt.add(i);
             match spec {
-                b'd' | b'i' => w += print_int(emit, ap.next_arg::<i32>() as i64),
-                b'u' => w += print_uint(emit, ap.next_arg::<u32>() as u64, 10),
-                b'x' | b'p' => w += print_uint(emit, ap.next_arg::<usize>() as u64, 16),
+                b'd' | b'i' => {
+                    let v = if lng { ap.next_arg::<i64>() } else { ap.next_arg::<i32>() as i64 };
+                    w += print_int(emit, v);
+                }
+                b'u' => {
+                    let v = if lng { ap.next_arg::<u64>() } else { ap.next_arg::<u32>() as u64 };
+                    w += print_uint(emit, v, 10);
+                }
+                b'o' => {
+                    let v = if lng { ap.next_arg::<u64>() } else { ap.next_arg::<u32>() as u64 };
+                    w += print_uint(emit, v, 8);
+                }
+                b'x' | b'X' => {
+                    let v = if lng { ap.next_arg::<u64>() } else { ap.next_arg::<u32>() as u64 };
+                    w += print_uint(emit, v, 16);
+                }
+                b'p' => {
+                    emit(b"0x");
+                    w += 2 + print_uint(emit, ap.next_arg::<usize>() as u64, 16);
+                }
                 b'c' => {
                     emit(&[ap.next_arg::<i32>() as u8]);
                     w += 1;
@@ -682,3 +726,484 @@ pub extern "C" fn toupper(c: i32) -> i32 {
 pub extern "C" fn tolower(c: i32) -> i32 {
     (c as u8).to_ascii_lowercase() as i32
 }
+
+// ===========================================================================
+// Phase B: the rest of the surface TinyCC needs.
+// ===========================================================================
+
+// --- snprintf family (format into a buffer, sharing vfmt) ---
+unsafe fn vsnprintf_impl(buf: *mut u8, size: usize, fmt: *const u8, ap: &mut VaList) -> i32 {
+    let mut pos = 0usize;
+    {
+        let mut emit = |s: &[u8]| {
+            for &b in s {
+                if size > 0 && pos < size - 1 {
+                    *buf.add(pos) = b;
+                }
+                pos += 1;
+            }
+        };
+        let _ = vfmt(&mut emit, fmt, ap);
+    }
+    if size > 0 {
+        *buf.add(pos.min(size - 1)) = 0;
+    }
+    pos as i32
+}
+#[no_mangle]
+pub unsafe extern "C" fn vsnprintf(s: *mut u8, n: usize, fmt: *const u8, mut ap: VaList) -> i32 {
+    vsnprintf_impl(s, n, fmt, &mut ap)
+}
+#[no_mangle]
+pub unsafe extern "C" fn snprintf(s: *mut u8, n: usize, fmt: *const u8, mut args: ...) -> i32 {
+    vsnprintf_impl(s, n, fmt, &mut args)
+}
+#[no_mangle]
+pub unsafe extern "C" fn sprintf(s: *mut u8, fmt: *const u8, mut args: ...) -> i32 {
+    vsnprintf_impl(s, usize::MAX, fmt, &mut args)
+}
+#[no_mangle]
+pub unsafe extern "C" fn vfprintf(stream: *mut FILE, fmt: *const u8, mut ap: VaList) -> i32 {
+    let fd = if stream.is_null() { 1 } else { (*stream).fd };
+    let mut emit = |s: &[u8]| out_fd(fd, s);
+    vfmt(&mut emit, fmt, &mut ap)
+}
+
+// --- <stdlib.h> string→number ---
+unsafe fn parse_long(s: *const u8, endptr: *mut *mut u8, mut base: i32) -> i64 {
+    let mut i = 0isize;
+    while is_space_b(*s.offset(i)) {
+        i += 1;
+    }
+    let mut neg = false;
+    match *s.offset(i) {
+        b'-' => { neg = true; i += 1; }
+        b'+' => i += 1,
+        _ => {}
+    }
+    if (base == 0 || base == 16) && *s.offset(i) == b'0' && (*s.offset(i + 1) | 0x20) == b'x' {
+        base = 16;
+        i += 2;
+    } else if base == 0 && *s.offset(i) == b'0' {
+        base = 8;
+    } else if base == 0 {
+        base = 10;
+    }
+    let mut v: i64 = 0;
+    loop {
+        let c = *s.offset(i);
+        let d = match c {
+            b'0'..=b'9' => (c - b'0') as i32,
+            b'a'..=b'z' => (c - b'a' + 10) as i32,
+            b'A'..=b'Z' => (c - b'A' + 10) as i32,
+            _ => break,
+        };
+        if d >= base {
+            break;
+        }
+        v = v * base as i64 + d as i64;
+        i += 1;
+    }
+    if !endptr.is_null() {
+        *endptr = s.offset(i) as *mut u8;
+    }
+    if neg { -v } else { v }
+}
+#[no_mangle]
+pub unsafe extern "C" fn strtol(s: *const u8, e: *mut *mut u8, b: i32) -> i64 {
+    parse_long(s, e, b)
+}
+#[no_mangle]
+pub unsafe extern "C" fn strtoul(s: *const u8, e: *mut *mut u8, b: i32) -> u64 {
+    parse_long(s, e, b) as u64
+}
+#[no_mangle]
+pub unsafe extern "C" fn strtoll(s: *const u8, e: *mut *mut u8, b: i32) -> i64 {
+    parse_long(s, e, b)
+}
+#[no_mangle]
+pub unsafe extern "C" fn strtoull(s: *const u8, e: *mut *mut u8, b: i32) -> u64 {
+    parse_long(s, e, b) as u64
+}
+#[no_mangle]
+pub unsafe extern "C" fn strtod(s: *const u8, e: *mut *mut u8) -> f64 {
+    // enough for tcc's float-constant parsing: integer part . fraction
+    let mut i = 0isize;
+    while is_space_b(*s.offset(i)) {
+        i += 1;
+    }
+    let neg = *s.offset(i) == b'-';
+    if neg || *s.offset(i) == b'+' {
+        i += 1;
+    }
+    let mut v = 0f64;
+    while (*s.offset(i)).is_ascii_digit() {
+        v = v * 10.0 + (*s.offset(i) - b'0') as f64;
+        i += 1;
+    }
+    if *s.offset(i) == b'.' {
+        i += 1;
+        let mut scale = 0.1f64;
+        while (*s.offset(i)).is_ascii_digit() {
+            v += (*s.offset(i) - b'0') as f64 * scale;
+            scale *= 0.1;
+            i += 1;
+        }
+    }
+    if !e.is_null() {
+        *e = s.offset(i) as *mut u8;
+    }
+    if neg { -v } else { v }
+}
+
+// --- qsort (insertion sort; small arrays, correctness over speed) ---
+#[no_mangle]
+pub unsafe extern "C" fn qsort(
+    base: *mut u8,
+    n: usize,
+    size: usize,
+    cmp: extern "C" fn(*const u8, *const u8) -> i32,
+) {
+    if n < 2 || size == 0 {
+        return;
+    }
+    let tmp = malloc(size);
+    if tmp.is_null() {
+        return;
+    }
+    for i in 1..n {
+        core::ptr::copy_nonoverlapping(base.add(i * size), tmp, size);
+        let mut j = i;
+        while j > 0 && cmp(base.add((j - 1) * size), tmp) > 0 {
+            core::ptr::copy_nonoverlapping(base.add((j - 1) * size), base.add(j * size), size);
+            j -= 1;
+        }
+        core::ptr::copy_nonoverlapping(tmp, base.add(j * size), size);
+    }
+    free(tmp);
+}
+
+// --- more <string.h> ---
+#[no_mangle]
+pub unsafe extern "C" fn strrchr(s: *const u8, c: i32) -> *const u8 {
+    let t = c as u8;
+    let mut last = core::ptr::null();
+    let mut i = 0;
+    loop {
+        let ch = *s.add(i);
+        if ch == t {
+            last = s.add(i);
+        }
+        if ch == 0 {
+            return last;
+        }
+        i += 1;
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn strpbrk(s: *const u8, set: *const u8) -> *const u8 {
+    let mut i = 0;
+    while *s.add(i) != 0 {
+        let mut j = 0;
+        while *set.add(j) != 0 {
+            if *s.add(i) == *set.add(j) {
+                return s.add(i);
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    core::ptr::null()
+}
+#[no_mangle]
+pub unsafe extern "C" fn strstr(h: *const u8, n: *const u8) -> *const u8 {
+    let nl = cstr_len(n);
+    if nl == 0 {
+        return h;
+    }
+    let hl = cstr_len(h);
+    if nl > hl {
+        return core::ptr::null();
+    }
+    for i in 0..=(hl - nl) {
+        if strncmp(h.add(i), n, nl) == 0 {
+            return h.add(i);
+        }
+    }
+    core::ptr::null()
+}
+#[no_mangle]
+pub unsafe extern "C" fn strcat(dst: *mut u8, src: *const u8) -> *mut u8 {
+    let d = cstr_len(dst);
+    strcpy(dst.add(d), src);
+    dst
+}
+#[no_mangle]
+pub unsafe extern "C" fn strncat(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    let d = cstr_len(dst);
+    let mut i = 0;
+    while i < n && *src.add(i) != 0 {
+        *dst.add(d + i) = *src.add(i);
+        i += 1;
+    }
+    *dst.add(d + i) = 0;
+    dst
+}
+#[no_mangle]
+pub unsafe extern "C" fn strdup(s: *const u8) -> *mut u8 {
+    let n = cstr_len(s);
+    let p = malloc(n + 1);
+    if !p.is_null() {
+        core::ptr::copy_nonoverlapping(s, p, n + 1);
+    }
+    p
+}
+static mut STRTOK_SAVE: *mut u8 = core::ptr::null_mut();
+#[no_mangle]
+pub unsafe extern "C" fn strtok(s: *mut u8, delim: *const u8) -> *mut u8 {
+    let mut p = if s.is_null() { STRTOK_SAVE } else { s };
+    if p.is_null() {
+        return core::ptr::null_mut();
+    }
+    while *p != 0 && !strchr(delim, *p as i32).is_null() {
+        p = p.add(1);
+    }
+    if *p == 0 {
+        STRTOK_SAVE = core::ptr::null_mut();
+        return core::ptr::null_mut();
+    }
+    let start = p;
+    while *p != 0 && strchr(delim, *p as i32).is_null() {
+        p = p.add(1);
+    }
+    if *p != 0 {
+        *p = 0;
+        STRTOK_SAVE = p.add(1);
+    } else {
+        STRTOK_SAVE = core::ptr::null_mut();
+    }
+    start
+}
+#[no_mangle]
+pub unsafe extern "C" fn strerror(_n: i32) -> *const u8 {
+    b"error\0".as_ptr()
+}
+
+// --- more <stdio.h> ---
+#[no_mangle]
+pub unsafe extern "C" fn fseek(stream: *mut FILE, off: i64, whence: i32) -> i32 {
+    if stream.is_null() {
+        return -1;
+    }
+    if lseek((*stream).fd, off, whence) < 0 {
+        -1
+    } else {
+        (*stream).eof = 0;
+        0
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn ftell(stream: *mut FILE) -> i64 {
+    if stream.is_null() {
+        return -1;
+    }
+    lseek((*stream).fd, 0, 1) // SEEK_CUR
+}
+#[no_mangle]
+pub unsafe extern "C" fn getc(stream: *mut FILE) -> i32 {
+    fgetc(stream)
+}
+#[no_mangle]
+pub unsafe extern "C" fn putc(c: i32, stream: *mut FILE) -> i32 {
+    fputc(c, stream)
+}
+#[no_mangle]
+pub extern "C" fn ungetc(_c: i32, _stream: *mut FILE) -> i32 {
+    -1 // unsupported (tcc rarely needs it)
+}
+#[no_mangle]
+pub unsafe extern "C" fn perror(s: *const u8) {
+    if !s.is_null() && cstr_len(s) > 0 {
+        out_fd(2, core::slice::from_raw_parts(s, cstr_len(s)));
+        out_fd(2, b": ");
+    }
+    out_fd(2, b"error\n");
+}
+#[no_mangle]
+pub extern "C" fn ferror(_stream: *mut FILE) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn fdopen(_fd: i32, _mode: *const u8) -> *mut FILE {
+    core::ptr::null_mut()
+}
+
+// --- globals C expects ---
+#[no_mangle]
+pub static mut errno: i32 = 0;
+#[no_mangle]
+pub static mut environ: *const *const u8 = core::ptr::null();
+
+// --- stubs (features that won't run on oxbow but must link) ---
+#[no_mangle]
+pub extern "C" fn getenv(_name: *const u8) -> *const u8 {
+    core::ptr::null()
+}
+#[no_mangle]
+pub unsafe extern "C" fn realpath(path: *const u8, resolved: *mut u8) -> *mut u8 {
+    if resolved.is_null() {
+        return strdup(path);
+    }
+    strcpy(resolved, path)
+}
+#[no_mangle]
+pub extern "C" fn sem_init(_s: *mut i32, _p: i32, _v: u32) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn sem_post(_s: *mut i32) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn sem_wait(_s: *mut i32) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn sem_destroy(_s: *mut i32) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn time(_t: *mut i64) -> i64 {
+    rt::sys_uptime_ms() as i64 / 1000
+}
+#[no_mangle]
+pub extern "C" fn clock() -> i64 {
+    rt::sys_uptime_ms() as i64
+}
+#[no_mangle]
+pub extern "C" fn gettimeofday(tv: *mut i64, _tz: *mut u8) -> i32 {
+    if !tv.is_null() {
+        let ms = rt::sys_uptime_ms();
+        unsafe {
+            *tv = (ms / 1000) as i64;
+            *tv.add(1) = ((ms % 1000) * 1000) as i64;
+        }
+    }
+    0
+}
+#[no_mangle]
+pub extern "C" fn signal(_n: i32, _h: usize) -> usize {
+    0
+}
+#[no_mangle]
+pub extern "C" fn raise(_n: i32) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn dlopen(_p: *const u8, _f: i32) -> *const u8 {
+    core::ptr::null()
+}
+#[no_mangle]
+pub extern "C" fn dlsym(_h: *const u8, _s: *const u8) -> *const u8 {
+    core::ptr::null()
+}
+#[no_mangle]
+pub extern "C" fn dlclose(_h: *const u8) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn dlerror() -> *const u8 {
+    core::ptr::null()
+}
+#[no_mangle]
+pub extern "C" fn unlink(_p: *const u8) -> i32 {
+    -1
+}
+
+// --- mmap/mprotect: STUBS for now (Phase C makes them real over a capability).
+//     tcc -run needs these; linking needs them defined. ---
+#[no_mangle]
+pub extern "C" fn mmap(_a: *mut u8, _l: usize, _p: i32, _f: i32, _fd: i32, _o: i64) -> *mut u8 {
+    usize::MAX as *mut u8 // MAP_FAILED
+}
+#[no_mangle]
+pub extern "C" fn munmap(_a: *mut u8, _l: usize) -> i32 {
+    -1
+}
+#[no_mangle]
+pub extern "C" fn mprotect(_a: *mut u8, _l: usize, _p: i32) -> i32 {
+    -1
+}
+
+// --- setjmp/longjmp (x86_64): save callee-saved + rsp + return address ---
+core::arch::global_asm!(
+    r#"
+.global setjmp
+setjmp:
+    mov [rdi],    rbx
+    mov [rdi+8],  rbp
+    mov [rdi+16], r12
+    mov [rdi+24], r13
+    mov [rdi+32], r14
+    mov [rdi+40], r15
+    lea rax, [rsp+8]
+    mov [rdi+48], rax
+    mov rax, [rsp]
+    mov [rdi+56], rax
+    xor eax, eax
+    ret
+.global longjmp
+longjmp:
+    mov rbx, [rdi]
+    mov rbp, [rdi+8]
+    mov r12, [rdi+16]
+    mov r13, [rdi+24]
+    mov r14, [rdi+32]
+    mov r15, [rdi+40]
+    mov rsp, [rdi+48]
+    mov eax, esi
+    test eax, eax
+    jnz 1f
+    mov eax, 1
+1:
+    jmp [rdi+56]
+"#
+);
+
+// --- last few for tcc (mostly stubs; long double approximated as double) ---
+#[no_mangle]
+pub extern "C" fn execvp(_p: *const u8, _a: *const *const u8) -> i32 { -1 }
+#[no_mangle]
+pub extern "C" fn freopen(_p: *const u8, _m: *const u8, _s: *mut FILE) -> *mut FILE {
+    core::ptr::null_mut()
+}
+#[no_mangle]
+pub extern "C" fn remove(_p: *const u8) -> i32 { -1 }
+#[no_mangle]
+pub unsafe extern "C" fn getcwd(buf: *mut u8, size: usize) -> *mut u8 {
+    if buf.is_null() || size < 2 {
+        return core::ptr::null_mut();
+    }
+    *buf = b'/';
+    *buf.add(1) = 0;
+    buf
+}
+static mut TM_STUB: [i32; 9] = [0; 9];
+#[no_mangle]
+pub unsafe extern "C" fn localtime(_t: *const i64) -> *mut i32 {
+    addr_of_mut!(TM_STUB) as *mut i32
+}
+#[no_mangle]
+pub extern "C" fn ldexp(x: f64, e: i32) -> f64 {
+    let mut r = x;
+    let mut n = e;
+    while n > 0 { r *= 2.0; n -= 1; }
+    while n < 0 { r *= 0.5; n += 1; }
+    r
+}
+#[no_mangle]
+pub extern "C" fn ldexpl(x: f64, e: i32) -> f64 { ldexp(x, e) }
+#[no_mangle]
+pub unsafe extern "C" fn strtof(s: *const u8, e: *mut *mut u8) -> f32 { strtod(s, e) as f32 }
+#[no_mangle]
+pub unsafe extern "C" fn strtold(s: *const u8, e: *mut *mut u8) -> f64 { strtod(s, e) }

@@ -1311,3 +1311,39 @@ programs.
 - **C** — the `sys_protect` capability + `mmap`/`mprotect` in oxbow-libc.
 - **D** — `tcc -run hello.c` compiling + executing on oxbow; ship `/usr/include`.
 - **E** (optional) — tcc → ELF on the fs + exec-from-fs.
+
+## 29. TinyCC runs on oxbow (v1-tcc-runs) — Phase B done, and then some
+
+Phase B's target was "tcc *links* into an oxbow ELF." It over-delivered: the whole
+compiler **runs**.
+
+### 29.1 What works
+`tcc` (TinyCC 0.9.27, ~25 k lines of C) is compiled for `x86_64-unknown-none`
+against oxbow-libc and runs as an ordinary capability process:
+```
+oxbow:/$ tcc -v
+tcc version 0.9.27-oxbow (x86_64 Linux)
+oxbow:/$ tcc        # prints full usage
+```
+It parses argv, runs its real driver logic, and prints through the tty — proving
+oxbow-libc is complete enough for a large real program.
+
+### 29.2 How
+- `libc/` grew the surface tcc needs: `snprintf`/`vsnprintf`/`sprintf`/`vfprintf`
+  (the formatter now honors length modifiers so `%ld`/`%lx` read 64-bit args),
+  `strtol`/`strtoul`/`strtoull`/`strtod`, `qsort`, `strrchr`/`strpbrk`/`strstr`/
+  `strcat`/`strncat`/`strtok`/`strdup`/`strerror`, `fseek`/`ftell`/`getc`/`putc`/
+  `perror`, `errno`/`environ` globals, `getcwd`, and stubs for the things that
+  can't run on oxbow (`sem_*`, `signal`, `dl*`, `mmap`/`mprotect`, `execvp`,
+  `localtime`, …). **`setjmp`/`longjmp`** are real x86_64 asm.
+- `libc/include/` — the freestanding header set (§28).
+- `servers/tcc/` — the vendored TinyCC x86_64 source (LGPL, under
+  `tinycc/`); `build.rs` compiles the 11 core files with clang for the bare
+  target (backtrace/bcheck off — they need POSIX signals) and links with
+  oxbow-libc into a normal spawnable image (`BOOT_IMG_TCC`, shell `tcc`).
+
+### 29.3 What's left (Phase C/D)
+Actual compilation: `tcc -run hello.c` JITs code and jumps to it, which needs the
+RW→RX page-protection capability (§28.2) that oxbow's W^X requires. That + a
+process budget large enough for tcc's working set, and `/usr/include` on the fs,
+is the remaining work to compile C **on** oxbow.

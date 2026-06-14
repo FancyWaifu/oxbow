@@ -312,6 +312,8 @@ pub const BOOT_NET_EP: Handle = 20;
 pub const BOOT_IMG_DRIFT: Handle = 21;
 /// Spawnable image: a C program (clang-compiled) over the oxbow libc shim.
 pub const BOOT_IMG_CCHELLO: Handle = 22;
+/// Spawnable image: TinyCC (the C compiler) running on oxbow.
+pub const BOOT_IMG_TCC: Handle = 23;
 /// The control-channel badge (distinct from any socket id, which are 1..=N).
 pub const NET_CTL: u64 = 0x00C0_FFEE;
 /// Bind a UDP socket: request on the NET_CTL cap, data[0]=port (0=ephemeral).

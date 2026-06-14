@@ -29,6 +29,8 @@ int fflush(FILE *);
 int feof(FILE *);
 int ferror(FILE *);
 void perror(const char *);
+int remove(const char *);
+FILE *freopen(const char *, const char *, FILE *);
 int printf(const char *, ...);
 int fprintf(FILE *, const char *, ...);
 int sprintf(char *, const char *, ...);

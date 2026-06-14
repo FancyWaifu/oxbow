@@ -9,7 +9,7 @@
 use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA, BOOT_NET_EP,
     BOOT_IMG_CAT, BOOT_IMG_CP, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_MKDIR, BOOT_IMG_MV, BOOT_IMG_PONG,
-    BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_TICK, BOOT_TTY,
+    BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_TICK, BOOT_TTY,
     HANDLE_NULL, R_GRANT, R_RECV,
     R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
@@ -638,6 +638,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"http" => http_cmd(rest),
         b"drift" => spawn_with(BOOT_IMG_DRIFT, HANDLE_NULL, rest, sp),
         b"cc-hello" => spawn_with(BOOT_IMG_CCHELLO, *cwd, rest, sp),
+        b"tcc" => spawn_with(BOOT_IMG_TCC, *cwd, rest, sp),
         b"badgetest" => badgetest(sp),
         b"help" => {
             tw(b"oxbow shell:  (ls cat mkdir touch are spawned programs)\n");
