@@ -9,7 +9,7 @@
 use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA, BOOT_NET_EP,
     BOOT_IMG_CAT, BOOT_IMG_CP, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_MKDIR, BOOT_IMG_MV, BOOT_IMG_PONG,
-    BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_LUA, BOOT_IMG_UPY, BOOT_IMG_QJS, BOOT_IMG_CURL, BOOT_IMG_CARES, BOOT_IMG_FFI, BOOT_IMG_JAIL, BOOT_IMG_FSTEST, BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_TICK, BOOT_TTY,
+    BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_LUA, BOOT_IMG_UPY, BOOT_IMG_QJS, BOOT_IMG_CURL, BOOT_IMG_CARES, BOOT_IMG_FFI, BOOT_IMG_WL, BOOT_IMG_JAIL, BOOT_IMG_FSTEST, BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_TICK, BOOT_TTY,
     HANDLE_NULL, R_GRANT, R_RECV,
     R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
@@ -945,6 +945,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"curl" => spawn_with_budget(BOOT_IMG_CURL, *cwd, rest, 48 * 1024 * 1024, sp),
         b"cares-test" => spawn_with_budget(BOOT_IMG_CARES, HANDLE_NULL, rest, 48 * 1024 * 1024, sp),
         b"ffi-test" => spawn_with_budget(BOOT_IMG_FFI, HANDLE_NULL, rest, 16 * 1024 * 1024, sp),
+        b"wl-test" => spawn_with_budget(BOOT_IMG_WL, HANDLE_NULL, rest, 16 * 1024 * 1024, sp),
         b"exec" => exec_cmd(*cwd, path, rest, sp),
         b"sync" => sync_cmd(),
         b"chantest" => chantest(),

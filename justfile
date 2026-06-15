@@ -57,6 +57,7 @@ build-server:
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p oxcurl
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p oxares
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p oxffi
+    RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p oxwl
 
 # Same, but with the ABI negative-path selftests compiled in.
 build-server-selftest:
@@ -117,6 +118,8 @@ _iso:
     -strip -S iso_root/boot/cares-test.elf
     cp target/x86_64-unknown-none/debug/ffi-test iso_root/boot/ffi-test.elf
     -strip -S iso_root/boot/ffi-test.elf
+    cp target/x86_64-unknown-none/debug/wl-test iso_root/boot/wl-test.elf
+    -strip -S iso_root/boot/wl-test.elf
     # Stage the filesystem: the FHS skeleton (servers/fs/initrd) plus the live
     # oxbow source under /usr/src/oxbow so it is browsable on oxbow itself.
     rm -rf build/initrd

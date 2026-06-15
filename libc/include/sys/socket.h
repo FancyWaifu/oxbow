@@ -18,10 +18,16 @@ struct sockaddr_storage { sa_family_t ss_family; char __ss_pad[126]; };
 #define SO_KEEPALIVE 9
 #define SO_RCVBUF 8
 #define SO_SNDBUF 7
+#define SO_PEERCRED 17
+struct ucred { int pid; unsigned int uid; unsigned int gid; };
 #define SHUT_RD 0
 #define SHUT_WR 1
 #define SHUT_RDWR 2
 #define MSG_NOSIGNAL 0x4000
+#define MSG_DONTWAIT 0x40
+#define MSG_CMSG_CLOEXEC 0x40000000
+#define SOCK_CLOEXEC 02000000
+#define SOCK_NONBLOCK 04000
 int socket(int, int, int);
 int connect(int, const struct sockaddr *, socklen_t);
 long send(int, const void *, size_t, int);

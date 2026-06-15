@@ -58,4 +58,8 @@ extern int errno;
 #define ENOPROTOOPT 92
 #define EPROTONOSUPPORT 93
 #define ENOTSUPP 524
+#define E2BIG 7
+#define EOVERFLOW 75
+#define ENOMSG 42
+#define EPROTO 71
 #endif

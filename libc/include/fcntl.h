@@ -11,10 +11,12 @@
 #define O_NOCTTY 0400
 #define O_CLOEXEC 02000000
 #define O_BINARY 0
+#define F_DUPFD 0
 #define F_GETFD 1
 #define F_SETFD 2
 #define F_GETFL 3
 #define F_SETFL 4
+#define F_DUPFD_CLOEXEC 1030
 #define FD_CLOEXEC 1
 int open(const char *, int, ...);
 int fcntl(int, int, ...);
