@@ -29,4 +29,44 @@ long recv(int, void *, size_t, int);
 int shutdown(int, int);
 int setsockopt(int, int, int, const void *, socklen_t);
 int getsockopt(int, int, int, void *, socklen_t *);
+
+/* Ancillary-data message passing (sendmsg/recvmsg + SCM_RIGHTS) — the mechanism
+ * Wayland uses to pass fds. On oxbow an fd's backing capability is transferred
+ * over the channel, so SCM_RIGHTS = capability passing. Layout matches Linux. */
+struct iovec; /* from <sys/uio.h> */
+struct msghdr {
+    void         *msg_name;
+    socklen_t     msg_namelen;
+    struct iovec *msg_iov;
+    size_t        msg_iovlen;
+    void         *msg_control;
+    size_t        msg_controllen;
+    int           msg_flags;
+};
+struct cmsghdr {
+    size_t cmsg_len;
+    int    cmsg_level;
+    int    cmsg_type;
+};
+#define SCM_RIGHTS 1
+#define __CMSG_ALIGN(n) (((n) + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1))
+#define CMSG_ALIGN(n)   __CMSG_ALIGN(n)
+#define CMSG_DATA(c)    ((unsigned char *)((struct cmsghdr *)(c) + 1))
+#define CMSG_LEN(n)     (__CMSG_ALIGN(sizeof(struct cmsghdr)) + (n))
+#define CMSG_SPACE(n)   (__CMSG_ALIGN(sizeof(struct cmsghdr)) + __CMSG_ALIGN(n))
+#define CMSG_FIRSTHDR(m)                                                       \
+    ((size_t)(m)->msg_controllen >= sizeof(struct cmsghdr)                     \
+         ? (struct cmsghdr *)(m)->msg_control                                  \
+         : (struct cmsghdr *)0)
+#define CMSG_NXTHDR(m, c)                                                      \
+    (((unsigned char *)(c) + __CMSG_ALIGN((c)->cmsg_len) +                     \
+          __CMSG_ALIGN(sizeof(struct cmsghdr)) >                               \
+      (unsigned char *)(m)->msg_control + (m)->msg_controllen)                 \
+         ? (struct cmsghdr *)0                                                 \
+         : (struct cmsghdr *)((unsigned char *)(c) +                          \
+                              __CMSG_ALIGN((c)->cmsg_len)))
+
+int socketpair(int, int, int, int[2]);
+long sendmsg(int, const struct msghdr *, int);
+long recvmsg(int, struct msghdr *, int);
 #endif

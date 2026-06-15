@@ -123,10 +123,22 @@ struct FdSlot {
     /// True if this fd is a BSD socket (handle = a TCP socket cap, or 0 until
     /// `connect`). read/write/close then route through `rt::tcp` instead of the fs.
     is_sock: bool,
+    /// True if this fd is one end of an AF_UNIX channel (handle = a Channel cap);
+    /// read/write/close + sendmsg/recvmsg route through `rt::channel` (§40).
+    is_chan: bool,
+    /// O_NONBLOCK (fcntl F_SETFL): channel reads return EAGAIN instead of blocking.
+    nonblock: bool,
 }
 const MAX_FD: usize = 32;
-static mut FDS: [FdSlot; MAX_FD] =
-    [FdSlot { handle: 0, off: 0, size: 0, used: false, is_sock: false }; MAX_FD];
+static mut FDS: [FdSlot; MAX_FD] = [FdSlot {
+    handle: 0,
+    off: 0,
+    size: 0,
+    used: false,
+    is_sock: false,
+    is_chan: false,
+    nonblock: false,
+}; MAX_FD];
 
 // <fcntl.h> open flags (must match libc/include/fcntl.h).
 const O_WRONLY: i32 = 1;
@@ -184,7 +196,15 @@ pub unsafe extern "C" fn open(path: *const u8, flags: i32) -> i32 {
     for i in 3..MAX_FD {
         let slot = &mut (*addr_of_mut!(FDS))[i];
         if !slot.used {
-            *slot = FdSlot { handle: cap, off: 0, size, used: true, is_sock: false };
+            *slot = FdSlot {
+                handle: cap,
+                off: 0,
+                size,
+                used: true,
+                is_sock: false,
+                is_chan: false,
+                nonblock: false,
+            };
             return i as i32;
         }
     }
@@ -200,6 +220,17 @@ pub unsafe extern "C" fn read(fd: i32, buf: *mut u8, len: usize) -> isize {
     let slot = &mut (*addr_of_mut!(FDS))[fd as usize];
     if !slot.used {
         return -1;
+    }
+    if slot.is_chan {
+        let out = core::slice::from_raw_parts_mut(buf, len);
+        let mut caps: [Handle; 0] = [];
+        match rt::channel::recv(slot.handle, out, &mut caps, slot.nonblock) {
+            Some((n, _)) => return n as isize,
+            None => {
+                errno = 11; // EAGAIN (non-blocking, nothing ready)
+                return -1;
+            }
+        }
     }
     if slot.is_sock {
         let out = core::slice::from_raw_parts_mut(buf, len);
@@ -224,6 +255,10 @@ pub unsafe extern "C" fn write(fd: i32, buf: *const u8, len: usize) -> isize {
     }
     if fd >= 3 && (fd as usize) < MAX_FD {
         let slot = &(*addr_of_mut!(FDS))[fd as usize];
+        if slot.used && slot.is_chan {
+            let n = rt::channel::send(slot.handle, core::slice::from_raw_parts(buf, len), &[]);
+            return if n == 0 && len > 0 { -1 } else { n as isize };
+        }
         if slot.used && slot.is_sock {
             return sock_send(slot.handle, core::slice::from_raw_parts(buf, len));
         }
@@ -243,7 +278,9 @@ pub unsafe extern "C" fn close(fd: i32) -> i32 {
     }
     let slot = &mut (*addr_of_mut!(FDS))[fd as usize];
     if slot.used {
-        if slot.is_sock {
+        if slot.is_chan {
+            rt::channel::close(slot.handle);
+        } else if slot.is_sock {
             if slot.handle != 0 {
                 rt::tcp::close(slot.handle);
             }
@@ -252,6 +289,8 @@ pub unsafe extern "C" fn close(fd: i32) -> i32 {
         }
         slot.used = false;
         slot.is_sock = false;
+        slot.is_chan = false;
+        slot.nonblock = false;
     }
     0
 }
@@ -291,7 +330,15 @@ pub unsafe extern "C" fn socket(domain: i32, ty: i32, _proto: i32) -> i32 {
     for i in 3..MAX_FD {
         let slot = &mut (*addr_of_mut!(FDS))[i];
         if !slot.used {
-            *slot = FdSlot { handle: 0, off: 0, size: 0, used: true, is_sock: true };
+            *slot = FdSlot {
+                handle: 0,
+                off: 0,
+                size: 0,
+                used: true,
+                is_sock: true,
+                is_chan: false,
+                nonblock: false,
+            };
             return i as i32;
         }
     }
@@ -332,6 +379,171 @@ unsafe fn sock_send(sock: Handle, data: &[u8]) -> isize {
         i += n;
     }
     i as isize
+}
+
+/// Allocate a fresh fd backed by a channel capability `handle`.
+unsafe fn alloc_chan_fd(handle: Handle) -> i32 {
+    for i in 3..MAX_FD {
+        let slot = &mut (*addr_of_mut!(FDS))[i];
+        if !slot.used {
+            *slot = FdSlot {
+                handle,
+                off: 0,
+                size: 0,
+                used: true,
+                is_sock: false,
+                is_chan: true,
+                nonblock: false,
+            };
+            return i as i32;
+        }
+    }
+    -1
+}
+
+/// `socketpair(AF_UNIX, SOCK_STREAM, 0, sv)` — a connected pair of channel fds
+/// (§40). Either end streams bytes and can pass fds (their backing caps) via
+/// sendmsg/recvmsg SCM_RIGHTS.
+#[no_mangle]
+pub unsafe extern "C" fn socketpair(domain: i32, ty: i32, _proto: i32, sv: *mut i32) -> i32 {
+    if domain != 1 /*AF_UNIX*/ || (ty & 0xf) != 1 /*SOCK_STREAM*/ || sv.is_null() {
+        return -1;
+    }
+    let Some((h0, h1)) = rt::channel::pair() else { return -1 };
+    let fd0 = alloc_chan_fd(h0);
+    let fd1 = alloc_chan_fd(h1);
+    if fd0 < 0 || fd1 < 0 {
+        return -1;
+    }
+    *sv = fd0;
+    *sv.add(1) = fd1;
+    0
+}
+
+// C struct mirrors for the ancillary-data path (must match <sys/socket.h>).
+#[repr(C)]
+struct CIovec {
+    base: *mut u8,
+    len: usize,
+}
+#[repr(C)]
+struct CMsghdr {
+    name: *mut u8,
+    namelen: u32,
+    iov: *mut CIovec,
+    iovlen: usize,
+    control: *mut u8,
+    controllen: usize,
+    flags: i32,
+}
+#[repr(C)]
+struct CCmsghdr {
+    cmsg_len: usize,
+    cmsg_level: i32,
+    cmsg_type: i32,
+}
+const CMSG_HDR_SZ: usize = 16; // aligned sizeof(struct cmsghdr)
+
+/// `sendmsg` — gather the iov bytes and (for an SCM_RIGHTS control message) the
+/// fds, then stream the bytes + each fd's backing capability over the channel.
+#[no_mangle]
+pub unsafe extern "C" fn sendmsg(fd: i32, msg: *const CMsghdr, _flags: i32) -> isize {
+    if fd < 3 || fd as usize >= MAX_FD || msg.is_null() {
+        return -1;
+    }
+    let slot = &(*addr_of_mut!(FDS))[fd as usize];
+    if !slot.used || !slot.is_chan {
+        return -1;
+    }
+    // Gather iov into a contiguous buffer.
+    let mut data = [0u8; 4096];
+    let mut dlen = 0usize;
+    let iov = (*msg).iov;
+    for i in 0..(*msg).iovlen {
+        let v = &*iov.add(i);
+        let n = core::cmp::min(v.len, data.len() - dlen);
+        core::ptr::copy_nonoverlapping(v.base, data.as_mut_ptr().add(dlen), n);
+        dlen += n;
+    }
+    // Collect fds from an SCM_RIGHTS control message -> their capability handles.
+    let mut caps = [0u32; 8];
+    let mut ncaps = 0usize;
+    if !(*msg).control.is_null() && (*msg).controllen >= CMSG_HDR_SZ {
+        let c = (*msg).control as *const CCmsghdr;
+        if (*c).cmsg_level == 1 /*SOL_SOCKET*/ && (*c).cmsg_type == 1 /*SCM_RIGHTS*/ {
+            let nfd = ((*c).cmsg_len - CMSG_HDR_SZ) / 4;
+            let fds = ((*msg).control as *const u8).add(CMSG_HDR_SZ) as *const i32;
+            for i in 0..nfd.min(caps.len()) {
+                let pfd = *fds.add(i);
+                if pfd >= 0 && (pfd as usize) < MAX_FD {
+                    let ps = &(*addr_of_mut!(FDS))[pfd as usize];
+                    if ps.used {
+                        caps[ncaps] = ps.handle;
+                        ncaps += 1;
+                    }
+                }
+            }
+        }
+    }
+    let n = rt::channel::send(slot.handle, &data[..dlen], &caps[..ncaps]);
+    if n == 0 && dlen > 0 {
+        -1
+    } else {
+        n as isize
+    }
+}
+
+/// `recvmsg` — receive bytes into the iov and any passed capabilities, adopting
+/// each as a fresh fd reported back as an SCM_RIGHTS control message.
+#[no_mangle]
+pub unsafe extern "C" fn recvmsg(fd: i32, msg: *mut CMsghdr, _flags: i32) -> isize {
+    if fd < 3 || fd as usize >= MAX_FD || msg.is_null() {
+        return -1;
+    }
+    let nonblock = {
+        let slot = &(*addr_of_mut!(FDS))[fd as usize];
+        if !slot.used || !slot.is_chan {
+            return -1;
+        }
+        slot.nonblock
+    };
+    let handle = (*addr_of_mut!(FDS))[fd as usize].handle;
+    let mut data = [0u8; 4096];
+    let mut caps = [0u32; 8];
+    let (n, nc) = match rt::channel::recv(handle, &mut data, &mut caps, nonblock) {
+        Some(v) => v,
+        None => {
+            errno = 11; // EAGAIN
+            return -1;
+        }
+    };
+    // Scatter bytes into the iov.
+    let mut copied = 0usize;
+    let iov = (*msg).iov;
+    for i in 0..(*msg).iovlen {
+        if copied >= n {
+            break;
+        }
+        let v = &*iov.add(i);
+        let take = core::cmp::min(v.len, n - copied);
+        core::ptr::copy_nonoverlapping(data.as_ptr().add(copied), v.base, take);
+        copied += take;
+    }
+    // Report received caps as adopted fds in an SCM_RIGHTS control message.
+    if nc > 0 && !(*msg).control.is_null() && (*msg).controllen >= CMSG_HDR_SZ + nc * 4 {
+        let c = (*msg).control as *mut CCmsghdr;
+        (*c).cmsg_len = CMSG_HDR_SZ + nc * 4;
+        (*c).cmsg_level = 1; // SOL_SOCKET
+        (*c).cmsg_type = 1; // SCM_RIGHTS
+        let fds = ((*msg).control as *mut u8).add(CMSG_HDR_SZ) as *mut i32;
+        for i in 0..nc {
+            *fds.add(i) = alloc_chan_fd(caps[i]);
+        }
+        (*msg).controllen = CMSG_HDR_SZ + nc * 4;
+    } else {
+        (*msg).controllen = 0;
+    }
+    copied as isize
 }
 
 #[no_mangle]
@@ -670,8 +882,20 @@ pub extern "C" fn ioctl(_fd: i32, _req: u64, _arg: usize) -> i32 {
     0 // FIONBIO etc. — sockets stay blocking
 }
 #[no_mangle]
-pub extern "C" fn fcntl(_fd: i32, _cmd: i32, _arg: i64) -> i32 {
-    0 // blocking sockets; O_NONBLOCK is a no-op
+pub unsafe extern "C" fn fcntl(fd: i32, cmd: i32, arg: i64) -> i32 {
+    // F_SETFL(4): honor O_NONBLOCK(04000) on channel fds (event loops need it).
+    // F_GETFL(3): report the flag. Everything else is a no-op success.
+    if fd >= 3 && (fd as usize) < MAX_FD {
+        let slot = &mut (*addr_of_mut!(FDS))[fd as usize];
+        if slot.used {
+            if cmd == 4 {
+                slot.nonblock = (arg & 0o4000) != 0;
+            } else if cmd == 3 {
+                return if slot.nonblock { 0o4000 } else { 0 };
+            }
+        }
+    }
+    0
 }
 #[no_mangle]
 pub unsafe extern "C" fn fileno(stream: *mut FILE) -> i32 {

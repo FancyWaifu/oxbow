@@ -184,7 +184,11 @@ fn spawn_with_budget(image: Handle, cap0: Handle, arg: &[u8], budget: u64, sp: &
     m.handles[3] = BOOT_NET_EP; // slot 20 = BOOT_NET_EP (network access)
     match rt::sys_spawn(image, BOOT_MEM, &m, sp.exit) {
         Ok(_) => wait_exits(sp, 1),
-        Err(_) => tw(b"run: spawn failed\n"),
+        Err(e) => {
+            tw(b"run: spawn failed (err ");
+            tw_dec(e as u8);
+            tw(b")\n");
+        }
     }
 }
 
@@ -939,7 +943,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"py" | b"micropython" => spawn_with_budget(BOOT_IMG_UPY, *cwd, rest, 32 * 1024 * 1024, sp),
         b"js" | b"qjs" => spawn_with_budget(BOOT_IMG_QJS, *cwd, rest, 48 * 1024 * 1024, sp),
         b"curl" => spawn_with_budget(BOOT_IMG_CURL, *cwd, rest, 48 * 1024 * 1024, sp),
-        b"cares-test" => spawn_with_budget(BOOT_IMG_CARES, HANDLE_NULL, rest, 16 * 1024 * 1024, sp),
+        b"cares-test" => spawn_with_budget(BOOT_IMG_CARES, HANDLE_NULL, rest, 48 * 1024 * 1024, sp),
         b"exec" => exec_cmd(*cwd, path, rest, sp),
         b"sync" => sync_cmd(),
         b"chantest" => chantest(),

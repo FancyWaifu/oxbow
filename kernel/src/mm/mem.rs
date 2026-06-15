@@ -7,8 +7,11 @@
 //! handles transfer over IPC, shared — between address spaces.
 use spin::Mutex;
 
-const MEM_POOL: usize = 8;
-const FRAME_POOL: usize = 16;
+// One Memory-object slot per live process (boot servers + each running spawn).
+// Boot now starts 8 servers (…+ fb), so 8 left zero headroom for runtime spawns
+// (they failed with NoMem). 24 gives ample room for servers + concurrent spawns.
+const MEM_POOL: usize = 24;
+const FRAME_POOL: usize = 32;
 
 /// Memory a process is born holding (256 KiB). The kernel allocates user frames
 /// ONLY through budgets, so the sum of outstanding budgets is bounded by RAM.
