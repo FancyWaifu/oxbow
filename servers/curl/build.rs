@@ -25,13 +25,32 @@ fn main() {
         .include("config")           // curl_config.h
         .include("curl/include")     // public curl/*.h
         .include("curl/lib")         // internal headers
+        .include("bearssl/inc")      // BearSSL public headers (TLS backend)
+        .include("bearssl/src")      // BearSSL inner.h / config.h
         .include("../../libc/include")
         .define("HAVE_CONFIG_H", None)
         .define("BUILDING_LIBCURL", None)
         .define("__oxbow__", None)
+        // BearSSL's system PRNG seeder: use getentropy() (oxbow libc provides it,
+        // over the kernel CSPRNG). Without this BearSSL finds no entropy source
+        // and the TLS handshake can't generate randoms.
+        .define("BR_USE_GETENTROPY", "1")
         .flag("-ffreestanding").flag("-fno-stack-protector").flag("-fno-builtin")
         .flag("-Wno-implicit-function-declaration").flag("-Wno-everything")
         .opt_level(2);
+    // BearSSL — the TLS backend (no heap; MIT). Compile every bearssl/src/**/*.c.
+    fn walk_c(dir: &str, b: &mut cc::Build) {
+        for e in fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk_c(p.to_str().unwrap(), b);
+            } else if p.extension().map(|x| x == "c").unwrap_or(false) {
+                println!("cargo:rerun-if-changed={}", p.display());
+                b.file(&p);
+            }
+        }
+    }
+    walk_c("bearssl/src", &mut b);
     // libcurl core + vtls (no-backend stubs) + vauth. Skip vquic/vssh (HTTP/3/SSH).
     for d in ["curl/lib", "curl/lib/vtls", "curl/lib/vauth"] {
         for e in fs::read_dir(d).unwrap() {

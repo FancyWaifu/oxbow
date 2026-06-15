@@ -674,9 +674,13 @@ pub extern "C" fn oxbow_main() -> ! {
             // TCP socket channel: receive bytes (blocks until data or close).
             TAG_TCP_RECV => {
                 let sid = m.badge as usize;
+                // Consume only as many bytes as the client can take this call;
+                // smoltcp keeps the rest buffered for the next recv (byte-exact,
+                // which TLS requires).
+                let want = (m.data[0] as usize).clamp(1, 56);
                 if let Some(Sock::Tcp(handle)) = slot_of(&sockets, sid) {
                     let mut out = [0u8; 56];
-                    let n = tcp_stack.recv(handle, &mut out);
+                    let n = tcp_stack.recv(handle, &mut out[..want]);
                     r.data[0] = n as u64;
                     let dst = r.data.as_mut_ptr() as *mut u8;
                     unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), dst.add(8), n) };

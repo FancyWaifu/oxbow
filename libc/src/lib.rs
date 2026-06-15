@@ -2011,9 +2011,19 @@ pub extern "C" fn sem_wait(_s: *mut i32) -> i32 {
 pub extern "C" fn sem_destroy(_s: *mut i32) -> i32 {
     0
 }
+/// Wall-clock baseline: oxbow has no RTC, so `time()` returns a fixed build-era
+/// epoch plus uptime. Enough for TLS certificate validity windows (notBefore <
+/// now < notAfter). Limitation: it doesn't track real time across reboots, so a
+/// cert that expired shortly after this baseline can still validate; bump the
+/// constant at build time to stay current. 2026-06-14 00:00:00 UTC.
+const BUILD_EPOCH: i64 = 1_781_395_200;
 #[no_mangle]
-pub extern "C" fn time(_t: *mut i64) -> i64 {
-    rt::sys_uptime_ms() as i64 / 1000
+pub extern "C" fn time(t: *mut i64) -> i64 {
+    let now = BUILD_EPOCH + rt::sys_uptime_ms() as i64 / 1000;
+    if !t.is_null() {
+        unsafe { *t = now };
+    }
+    now
 }
 #[no_mangle]
 pub extern "C" fn clock() -> i64 {

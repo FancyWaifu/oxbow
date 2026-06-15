@@ -790,6 +790,11 @@ pub mod tcp {
     /// close); returns the byte count (0 = connection closed).
     pub fn recv(sock: Handle, out: &mut [u8]) -> usize {
         let mut m = MsgBuf::new(TAG_TCP_RECV);
+        // Tell the server how many bytes we can take, so it consumes only that
+        // much from the TCP stream — a smaller read must NOT drop the rest (TLS
+        // reads 5-byte record headers; dropped bytes corrupt the stream).
+        m.data[0] = out.len().min(56) as u64;
+        m.data_len = 1;
         if sys_call(sock, &mut m).is_err() {
             return 0;
         }

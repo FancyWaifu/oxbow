@@ -868,7 +868,7 @@
 /* #undef USE_ARES */
 
 /* if BearSSL is enabled */
-/* #undef USE_BEARSSL */
+#define USE_BEARSSL 1
 
 /* if ECH support is available */
 /* #undef USE_ECH */

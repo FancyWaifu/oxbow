@@ -22,3 +22,6 @@ servers/fsext/lwext4/**         linguist-vendored
 # --- Build-time generated sources ---
 servers/micropython/gen/**     linguist-generated
 servers/curl/config/**         linguist-generated
+
+servers/curl/bearssl/**             linguist-vendored
+servers/fs/initrd/etc/ssl/cacert.pem linguist-vendored

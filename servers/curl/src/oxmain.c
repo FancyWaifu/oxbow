@@ -15,7 +15,27 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
 }
 
 int main(int argc, char **argv) {
-    const char *url = (argc > 1) ? argv[1] : "http://10.0.2.2:8080/";
+    const char *url = NULL;
+    long verify = 1, verbose = 0;
+    const char *cainfo = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--insecure") == 0) {
+            verify = 0;
+        } else if (strcmp(argv[i], "-v") == 0) {
+            verbose = 1;
+        } else if (strcmp(argv[i], "--cacert") == 0 && i + 1 < argc) {
+            cainfo = argv[++i];
+        } else if (argv[i][0] != '-') {
+            url = argv[i];
+        }
+    }
+    if (!url) {
+        url = "http://10.0.2.2:8080/";
+    }
+    /* Default trust store: the CA bundle seeded onto the filesystem. */
+    if (verify && !cainfo) {
+        cainfo = "/etc/ssl/cacert.pem";
+    }
     curl_global_init(CURL_GLOBAL_DEFAULT);
     CURL *curl = curl_easy_init();
     if (!curl) {
@@ -27,6 +47,18 @@ int main(int argc, char **argv) {
     curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "curl/oxbow");
+    if (verbose) {
+        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+    }
+    /* TLS: -k skips peer/host verification (test the handshake without a CA
+     * bundle or a real clock); --cacert points at a PEM trust store. */
+    if (!verify) {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+    if (cainfo) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, cainfo);
+    }
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
         printf("\ncurl: (%d) %s\n", res, curl_easy_strerror(res));

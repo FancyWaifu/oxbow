@@ -585,6 +585,17 @@ static CURLcode bearssl_connect_step1(struct Curl_cfilter *cf,
   br_ssl_client_init_full(&backend->ctx, &backend->x509.minimal,
                           backend->anchors, backend->anchors_len);
 
+  /* oxbow: BearSSL's X.509 engine needs the current time for certificate
+   * validity checks; without it validation fails with BR_ERR_X509_TIME_UNKNOWN.
+   * Feed it time() (oxbow has no RTC; libc returns a build-era epoch + uptime).
+   * Days are counted from 0 AD (719528 days to the Unix epoch). */
+  {
+    time_t oxnow = time(NULL);
+    uint32_t oxdays = (uint32_t)(oxnow / 86400) + 719528;
+    uint32_t oxsecs = (uint32_t)(oxnow % 86400);
+    br_x509_minimal_set_time(&backend->x509.minimal, oxdays, oxsecs);
+  }
+
   ret = bearssl_set_ssl_version_min_max(data, &backend->ctx.eng, conn_config);
   if(ret != CURLE_OK)
     return ret;
