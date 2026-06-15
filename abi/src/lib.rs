@@ -439,6 +439,10 @@ pub const BOOT_IMG_FSTEST: Handle = 30; // fstest — lwext4/ext2 port self-test
 pub const NET_CTL: u64 = 0x00C0_FFEE;
 /// Bind a UDP socket: request on the NET_CTL cap, data[0]=port (0=ephemeral).
 /// Reply: data[0]=status, data[1]=bound port, handles[0]=badged socket cap.
+/// Query the network config on the NET_CTL cap: reply data[0..4] = the leased
+/// DNS resolver IP (so clients resolve via the DHCP-given server, not a hardcoded
+/// one). data[0] each byte: data[0]=a, data[1]=b, data[2]=c, data[3]=d.
+pub const TAG_NET_DNS: u64 = u32::from_le_bytes(*b"NDNS") as u64;
 pub const TAG_UDP_BIND: u64 = u32::from_le_bytes(*b"UBND") as u64;
 /// Send a datagram on a socket cap: data[0]=dst IPv4 (big-endian u32),
 /// data[1]=dst port, data[2]=len, bytes from offset 24. Reply: data[0]=status.

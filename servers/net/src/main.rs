@@ -27,7 +27,7 @@ use core::sync::atomic::{fence, Ordering};
 use eth::{ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use oxbow_abi::{
     MsgBuf, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_NET_IRQ, BOOT_PCI, NET_DMA, NET_MMIO, R_GRANT,
-    R_SEND, TAG_TCP_CLOSE, TAG_TCP_CONNECT, TAG_TCP_RECV, TAG_TCP_SEND, TAG_UDP_BIND,
+    R_SEND, TAG_NET_DNS, TAG_TCP_CLOSE, TAG_TCP_CONNECT, TAG_TCP_RECV, TAG_TCP_SEND, TAG_UDP_BIND,
     TAG_UDP_RECVFROM, TAG_UDP_SENDTO,
 };
 use oxbow_rt as rt;
@@ -250,6 +250,7 @@ struct Nic {
     mac: [u8; 6],
     our_ip: [u8; 4], // leased via DHCP at boot (0.0.0.0 until then)
     gw_ip: [u8; 4],  // default gateway (from the DHCP lease)
+    dns_ip: [u8; 4], // DNS resolver (from the DHCP lease; clients query it)
     notif: oxbow_abi::Handle,
     rx_ring_v: u64,
     rx_buf_v: [u64; RX_DESCS],
@@ -500,6 +501,7 @@ pub extern "C" fn oxbow_main() -> ! {
         mac,
         our_ip: [0; 4], // until DHCP leases one
         gw_ip: GW_IP,   // overwritten by the DHCP router option
+        dns_ip: [10, 0, 2, 3], // SLIRP DNS fallback; overwritten by the lease
         notif,
         rx_ring_v,
         rx_buf_v,
@@ -518,6 +520,9 @@ pub extern "C" fn oxbow_main() -> ! {
             nic.our_ip = l.yiaddr;
             if l.router != [0; 4] {
                 nic.gw_ip = l.router;
+            }
+            if l.dns != [0; 4] {
+                nic.dns_ip = l.dns;
             }
             w(format!(
                 "[net] DHCP lease: IP {}.{}.{}.{}  gw {}.{}.{}.{}  dns {}.{}.{}.{}\n",
@@ -559,6 +564,15 @@ pub extern "C" fn oxbow_main() -> ! {
         };
         let mut r = MsgBuf::new(0);
         match m.tag {
+            // Control channel (badge = NET_CTL): report the leased DNS resolver.
+            TAG_NET_DNS => {
+                r.data[0] = nic.dns_ip[0] as u64;
+                r.data[1] = nic.dns_ip[1] as u64;
+                r.data[2] = nic.dns_ip[2] as u64;
+                r.data[3] = nic.dns_ip[3] as u64;
+                r.data_len = 4;
+                let _ = rt::sys_reply(reply, &r);
+            }
             // Control channel (badge = NET_CTL): allocate a socket + mint its cap.
             TAG_UDP_BIND => {
                 let req_port = m.data[0] as u16;

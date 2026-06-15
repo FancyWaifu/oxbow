@@ -464,7 +464,8 @@ fn dns_cmd(name: &[u8]) {
         return;
     };
     let q = rt::dns::query(0x1234, name_str);
-    if !rt::udp::sendto(sock, [10, 0, 2, 3], 53, &q) {
+    let server = rt::udp::dns_server(BOOT_NET_EP); // DHCP-leased resolver, not hardcoded
+    if !rt::udp::sendto(sock, server, 53, &q) {
         tw(b"dns: send failed\n");
         let _ = rt::sys_close(sock);
         return;

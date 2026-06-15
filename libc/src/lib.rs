@@ -452,7 +452,10 @@ unsafe fn dns_resolve(name: *const u8) -> Option<u32> {
     let name_str = core::str::from_utf8(s).ok()?;
     let (sock, _) = rt::udp::bind(BOOT_NET_EP, 0)?;
     let q = rt::dns::query(0x1234, name_str);
-    if !rt::udp::sendto(sock, [10, 0, 2, 3], 53, &q) {
+    // Resolve via the DHCP-leased DNS server (was hardcoded to SLIRP's 10.0.2.3,
+    // which hangs on a real LAN whose resolver is e.g. the router at .38/.1).
+    let dns = rt::udp::dns_server(BOOT_NET_EP);
+    if !rt::udp::sendto(sock, dns, 53, &q) {
         let _ = rt::sys_close(sock);
         return None;
     }

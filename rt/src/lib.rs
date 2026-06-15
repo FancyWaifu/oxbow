@@ -687,7 +687,19 @@ fn panic(_info: &PanicInfo) -> ! {
 /// ride that cap (badge = socket id) so the server stays near-stateless.
 pub mod udp {
     use crate::{sys_call, Handle};
-    use oxbow_abi::{MsgBuf, TAG_UDP_BIND, TAG_UDP_RECVFROM, TAG_UDP_SENDTO};
+    use oxbow_abi::{MsgBuf, TAG_NET_DNS, TAG_UDP_BIND, TAG_UDP_RECVFROM, TAG_UDP_SENDTO};
+
+    /// The DHCP-leased DNS resolver IP, from the net control cap `ctl`. Falls back
+    /// to the SLIRP default if the query fails. Use this instead of a hardcoded
+    /// server so resolution works on a real LAN.
+    pub fn dns_server(ctl: Handle) -> [u8; 4] {
+        let mut m = MsgBuf::new(TAG_NET_DNS);
+        if sys_call(ctl, &mut m).is_ok() {
+            [m.data[0] as u8, m.data[1] as u8, m.data[2] as u8, m.data[3] as u8]
+        } else {
+            [10, 0, 2, 3]
+        }
+    }
 
     /// Bind a UDP socket via the control cap `ctl`; returns `(socket cap, port)`.
     /// `port` 0 asks the server for an ephemeral port.
