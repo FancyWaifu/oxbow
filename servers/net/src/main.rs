@@ -28,13 +28,13 @@ use eth::{ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use oxbow_abi::{
     MsgBuf, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_NET_IRQ, BOOT_PCI, NET_DMA, NET_MMIO, NET_SHARED,
     PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_NET_DNS, TAG_TCP_CLOSE, TAG_TCP_CONNECT,
-    TAG_TCP_RECV, TAG_TCP_SEND, TAG_UDP_ATTACH, TAG_UDP_BIND, TAG_UDP_RECVFROM, TAG_UDP_RECVV,
-    TAG_UDP_SENDTO, TAG_UDP_SENDV,
+    TAG_TCP_RECV, TAG_TCP_SEND, TAG_UDP_ATTACH, TAG_UDP_BIND, TAG_UDP_CLOSE, TAG_UDP_RECVFROM,
+    TAG_UDP_RECVV, TAG_UDP_SENDTO, TAG_UDP_SENDV,
 };
 use oxbow_rt as rt;
 use smoltcp::iface::SocketHandle;
 
-const MAX_SOCKETS: usize = 8;
+const MAX_SOCKETS: usize = 16;
 
 /// A socket-table slot, identified by its badge (= index + 1).
 #[derive(Clone, Copy)]
@@ -671,6 +671,18 @@ pub extern "C" fn oxbow_main() -> ! {
                 } else {
                     r.data[0] = 0;
                 }
+                r.data_len = 1;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            // Socket channel: free the UDP socket slot (else binds leak slots).
+            TAG_UDP_CLOSE => {
+                let sid = m.badge as usize;
+                if (1..=MAX_SOCKETS).contains(&sid) {
+                    if let Sock::Udp(_) = sockets[sid - 1] {
+                        sockets[sid - 1] = Sock::Free;
+                    }
+                }
+                r.data[0] = 0;
                 r.data_len = 1;
                 let _ = rt::sys_reply(reply, &r);
             }

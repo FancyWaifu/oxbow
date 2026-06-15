@@ -443,57 +443,72 @@ pub struct AddrInfo {
 /// standard A-record query to the DHCP-provided resolver (10.0.2.3 under QEMU
 /// slirp), and parse the first A answer. Returns the address as a network-order
 /// u32 (memory bytes [a,b,c,d]), or None.
-/// Cached pointer to the shared UDP transfer frame (attached once per process).
-static mut UDP_SHARED: *mut u8 = core::ptr::null_mut();
+// ---- c-ares DNS backend (cares_glue.c, compiled into libc by build.rs) -----
+// getaddrinfo is backed by real c-ares system-wide. The C glue calls these
+// extern "C" UDP helpers to reach the net server over the shared transfer frame.
+// IP convention: a u32 packed `a<<24 | b<<16 | c<<8 | d` (to_be_bytes => wire).
+extern "C" {
+    /// Resolve `host` to an IPv4 address (4 wire-order bytes). Returns 1 on success.
+    fn oxbow_cares_resolve(host: *const u8, out_ip: *mut u8) -> i32;
+}
 
-unsafe fn udp_shared() -> Option<*mut u8> {
-    if UDP_SHARED.is_null() {
-        UDP_SHARED = rt::udp::attach(BOOT_NET_EP).unwrap_or(core::ptr::null_mut());
-    }
-    if UDP_SHARED.is_null() {
-        None
-    } else {
-        Some(UDP_SHARED)
+/// Attach (once) to the net server's shared UDP frame; null on failure.
+#[no_mangle]
+pub extern "C" fn ox_udp_attach() -> *mut u8 {
+    rt::udp::attach(BOOT_NET_EP).unwrap_or(core::ptr::null_mut())
+}
+
+/// Bind a fresh UDP socket; returns its capability handle, or -1.
+#[no_mangle]
+pub extern "C" fn ox_udp_open() -> i64 {
+    match rt::udp::bind(BOOT_NET_EP, 0) {
+        Some((cap, _)) => cap as i64,
+        None => -1,
     }
 }
 
+/// Send the first `len` bytes of the shared frame to `ip:port` on `cap`.
+#[no_mangle]
+pub extern "C" fn ox_udp_sendv(cap: u64, ip: u32, port: u16, len: usize) -> i32 {
+    if rt::udp::sendv(cap as u32, ip.to_be_bytes(), port, len) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// Non-blocking receive into the shared frame; returns datagram length (0=none).
+#[no_mangle]
+pub extern "C" fn ox_udp_recvv(cap: u64) -> i64 {
+    rt::udp::recvv(cap as u32) as i64
+}
+
+/// Close a UDP socket capability (frees the net server's socket slot too).
+#[no_mangle]
+pub extern "C" fn ox_udp_close(cap: u64) {
+    rt::udp::close(cap as u32);
+}
+
+/// Milliseconds since boot (the c-ares driving loop's deadline clock).
+#[no_mangle]
+pub extern "C" fn ox_uptime_ms() -> u64 {
+    rt::sys_uptime_ms()
+}
+
+/// The DHCP-leased DNS resolver IP, packed `a<<24 | b<<16 | c<<8 | d`.
+#[no_mangle]
+pub extern "C" fn ox_dns_ip() -> u32 {
+    u32::from_be_bytes(rt::udp::dns_server(BOOT_NET_EP))
+}
+
+/// Resolve `name` to a network-order IPv4 u32 via c-ares.
 unsafe fn dns_resolve(name: *const u8) -> Option<u32> {
-    let n = cstr_len(name);
-    if n == 0 || n > 255 {
-        return None;
+    let mut ip = [0u8; 4];
+    if oxbow_cares_resolve(name, ip.as_mut_ptr()) == 1 {
+        Some(u32::from_ne_bytes(ip)) // memory = [a,b,c,d] (network order)
+    } else {
+        None
     }
-    let s = core::slice::from_raw_parts(name, n);
-    let name_str = core::str::from_utf8(s).ok()?;
-    let buf = udp_shared()?;
-    let (sock, _) = rt::udp::bind(BOOT_NET_EP, 0)?;
-    let q = rt::dns::query(0x1234, name_str);
-    // Resolve via the DHCP-leased DNS server (was hardcoded to SLIRP's 10.0.2.3,
-    // which hangs on a real LAN whose resolver is e.g. the router at .38/.1).
-    let dns = rt::udp::dns_server(BOOT_NET_EP);
-    // The whole query/response rides the shared frame (no 40-byte inline cap), so
-    // EDNS / multi-record answers fit — the path c-ares will reuse.
-    core::ptr::copy_nonoverlapping(q.as_ptr(), buf, q.len());
-    if !rt::udp::sendv(sock, dns, 53, q.len()) {
-        let _ = rt::sys_close(sock);
-        return None;
-    }
-    // Poll for the reply with a deadline — recvv is non-blocking, so a lost DNS
-    // response gives up after ~3s instead of hanging forever.
-    let mut got = 0;
-    let deadline = rt::sys_uptime_ms() + 3000;
-    while rt::sys_uptime_ms() < deadline {
-        got = rt::udp::recvv(sock);
-        if got > 0 {
-            break;
-        }
-    }
-    let _ = rt::sys_close(sock);
-    if got == 0 {
-        return None;
-    }
-    let resp = core::slice::from_raw_parts(buf, got);
-    let a = rt::dns::first_a(resp)?; // [a,b,c,d]
-    Some(u32::from_ne_bytes(a)) // memory = [a,b,c,d] (network order)
 }
 
 #[no_mangle]

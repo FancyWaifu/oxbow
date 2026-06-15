@@ -482,7 +482,7 @@ fn dns_cmd(name: &[u8]) {
     unsafe { core::ptr::copy_nonoverlapping(q.as_ptr(), buf, q.len()) };
     if !rt::udp::sendv(sock, server, 53, q.len()) {
         tw(b"dns: send failed\n");
-        let _ = rt::sys_close(sock);
+        rt::udp::close(sock);
         return;
     }
     // recvv is non-blocking; poll with a deadline so a lost reply doesn't hang.
@@ -494,7 +494,7 @@ fn dns_cmd(name: &[u8]) {
             break;
         }
     }
-    let _ = rt::sys_close(sock);
+    rt::udp::close(sock);
     let resp = unsafe { core::slice::from_raw_parts(buf, n) };
     match rt::dns::first_a(resp) {
         Some(ip) => {

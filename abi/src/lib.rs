@@ -484,6 +484,10 @@ pub const TAG_UDP_SENDV: u64 = u32::from_le_bytes(*b"USNV") as u64;
 /// RECVV (udp socket cap): non-blocking; net writes the next datagram for the
 /// bound port INTO the shared frame. Reply: data[0]=len (0 = none buffered).
 pub const TAG_UDP_RECVV: u64 = u32::from_le_bytes(*b"URVB") as u64;
+/// CLOSE (udp socket cap): free the net server's socket slot. Without this, every
+/// bind permanently consumes one of the (few) socket slots — c-ares opens/retries
+/// many UDP sockets per resolve, which starved later TCP connects. Reply: status.
+pub const TAG_UDP_CLOSE: u64 = u32::from_le_bytes(*b"UCLO") as u64;
 
 /// `sys_spawn` grant convention: the handles in the spawn MsgBuf land in the
 /// child's table at these slots, in order (HANDLE_NULL entries are skipped).

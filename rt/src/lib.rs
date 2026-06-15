@@ -688,8 +688,8 @@ fn panic(_info: &PanicInfo) -> ! {
 pub mod udp {
     use crate::{sys_call, sys_frame_map, Handle};
     use oxbow_abi::{
-        MsgBuf, PROT_READ, PROT_WRITE, TAG_NET_DNS, TAG_UDP_ATTACH, TAG_UDP_BIND, TAG_UDP_RECVFROM,
-        TAG_UDP_RECVV, TAG_UDP_SENDTO, TAG_UDP_SENDV,
+        MsgBuf, PROT_READ, PROT_WRITE, TAG_NET_DNS, TAG_UDP_ATTACH, TAG_UDP_BIND, TAG_UDP_CLOSE,
+        TAG_UDP_RECVFROM, TAG_UDP_RECVV, TAG_UDP_SENDTO, TAG_UDP_SENDV,
     };
 
     /// Client-side vaddr of the shared UDP transfer frame (large datagram path).
@@ -731,6 +731,15 @@ pub mod udp {
             return 0;
         }
         (m.data[0] as usize).min(1472)
+    }
+
+    /// Close a UDP socket: free the net server's socket slot AND the client cap.
+    /// Always use this (not a bare sys_close) — the net slot table is small and a
+    /// bind without a matching close leaks a slot.
+    pub fn close(sock: Handle) {
+        let mut m = MsgBuf::new(TAG_UDP_CLOSE);
+        let _ = sys_call(sock, &mut m);
+        let _ = crate::sys_close(sock);
     }
 
     /// The DHCP-leased DNS resolver IP, from the net control cap `ctl`. Falls back
