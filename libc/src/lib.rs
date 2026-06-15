@@ -443,6 +443,20 @@ pub struct AddrInfo {
 /// standard A-record query to the DHCP-provided resolver (10.0.2.3 under QEMU
 /// slirp), and parse the first A answer. Returns the address as a network-order
 /// u32 (memory bytes [a,b,c,d]), or None.
+/// Cached pointer to the shared UDP transfer frame (attached once per process).
+static mut UDP_SHARED: *mut u8 = core::ptr::null_mut();
+
+unsafe fn udp_shared() -> Option<*mut u8> {
+    if UDP_SHARED.is_null() {
+        UDP_SHARED = rt::udp::attach(BOOT_NET_EP).unwrap_or(core::ptr::null_mut());
+    }
+    if UDP_SHARED.is_null() {
+        None
+    } else {
+        Some(UDP_SHARED)
+    }
+}
+
 unsafe fn dns_resolve(name: *const u8) -> Option<u32> {
     let n = cstr_len(name);
     if n == 0 || n > 255 {
@@ -450,22 +464,25 @@ unsafe fn dns_resolve(name: *const u8) -> Option<u32> {
     }
     let s = core::slice::from_raw_parts(name, n);
     let name_str = core::str::from_utf8(s).ok()?;
+    let buf = udp_shared()?;
     let (sock, _) = rt::udp::bind(BOOT_NET_EP, 0)?;
     let q = rt::dns::query(0x1234, name_str);
     // Resolve via the DHCP-leased DNS server (was hardcoded to SLIRP's 10.0.2.3,
     // which hangs on a real LAN whose resolver is e.g. the router at .38/.1).
     let dns = rt::udp::dns_server(BOOT_NET_EP);
-    if !rt::udp::sendto(sock, dns, 53, &q) {
+    // The whole query/response rides the shared frame (no 40-byte inline cap), so
+    // EDNS / multi-record answers fit — the path c-ares will reuse.
+    core::ptr::copy_nonoverlapping(q.as_ptr(), buf, q.len());
+    if !rt::udp::sendv(sock, dns, 53, q.len()) {
         let _ = rt::sys_close(sock);
         return None;
     }
-    // Poll for the reply with a deadline — recvfrom is non-blocking now, so a lost
-    // DNS response gives up after ~3s instead of hanging forever.
-    let mut buf = [0u8; 64];
+    // Poll for the reply with a deadline — recvv is non-blocking, so a lost DNS
+    // response gives up after ~3s instead of hanging forever.
     let mut got = 0;
     let deadline = rt::sys_uptime_ms() + 3000;
     while rt::sys_uptime_ms() < deadline {
-        got = rt::udp::recvfrom(sock, &mut buf);
+        got = rt::udp::recvv(sock);
         if got > 0 {
             break;
         }
@@ -474,7 +491,8 @@ unsafe fn dns_resolve(name: *const u8) -> Option<u32> {
     if got == 0 {
         return None;
     }
-    let a = rt::dns::first_a(&buf[..got])?; // [a,b,c,d]
+    let resp = core::slice::from_raw_parts(buf, got);
+    let a = rt::dns::first_a(resp)?; // [a,b,c,d]
     Some(u32::from_ne_bytes(a)) // memory = [a,b,c,d] (network order)
 }
 

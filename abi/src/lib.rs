@@ -465,6 +465,25 @@ pub const TAG_TCP_RECV: u64 = u32::from_le_bytes(*b"TRCV") as u64;
 /// Close a TCP socket cap. Reply: data[0]=status.
 pub const TAG_TCP_CLOSE: u64 = u32::from_le_bytes(*b"TCLO") as u64;
 
+// --- Large UDP via a shared frame (§25) ------------------------------------
+// The inline UDP path caps a datagram at ~40 bytes — too small for DNS with
+// EDNS or multi-record answers (and c-ares). A client shares a page-sized Frame
+// with the net server (TAG_UDP_ATTACH on NET_CTL); thereafter SENDV writes the
+// datagram FROM that shared page and RECVV writes a received datagram TO it, so a
+// full <=1472-byte UDP payload moves in one IPC. (One shared frame per net
+// client; one resolver at a time.)
+/// Where the net server maps the client's shared UDP transfer frame.
+pub const NET_SHARED: u64 = 0x4050_0000;
+/// ATTACH (NET_CTL): handles[0] = a writable Frame; net maps it as the shared
+/// UDP buffer. Reply: data[0]=status (0 ok).
+pub const TAG_UDP_ATTACH: u64 = u32::from_le_bytes(*b"UATT") as u64;
+/// SENDV (udp socket cap): data[0]=dst IPv4 (BE u32), data[1]=dst port, data[2]=
+/// len. Net sends `len` bytes from the shared frame. Reply: data[0]=status.
+pub const TAG_UDP_SENDV: u64 = u32::from_le_bytes(*b"USNV") as u64;
+/// RECVV (udp socket cap): non-blocking; net writes the next datagram for the
+/// bound port INTO the shared frame. Reply: data[0]=len (0 = none buffered).
+pub const TAG_UDP_RECVV: u64 = u32::from_le_bytes(*b"URVB") as u64;
+
 /// `sys_spawn` grant convention: the handles in the spawn MsgBuf land in the
 /// child's table at these slots, in order (HANDLE_NULL entries are skipped).
 /// Slot 3 is always the child's fresh Memory budget, so it is not in this list.

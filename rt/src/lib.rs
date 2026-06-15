@@ -686,8 +686,52 @@ fn panic(_info: &PanicInfo) -> ! {
 /// NET_CTL control cap returns a fresh badged socket cap; `sendto`/`recvfrom`
 /// ride that cap (badge = socket id) so the server stays near-stateless.
 pub mod udp {
-    use crate::{sys_call, Handle};
-    use oxbow_abi::{MsgBuf, TAG_NET_DNS, TAG_UDP_BIND, TAG_UDP_RECVFROM, TAG_UDP_SENDTO};
+    use crate::{sys_call, sys_frame_map, Handle};
+    use oxbow_abi::{
+        MsgBuf, PROT_READ, PROT_WRITE, TAG_NET_DNS, TAG_UDP_ATTACH, TAG_UDP_BIND, TAG_UDP_RECVFROM,
+        TAG_UDP_RECVV, TAG_UDP_SENDTO, TAG_UDP_SENDV,
+    };
+
+    /// Client-side vaddr of the shared UDP transfer frame (large datagram path).
+    pub const UDP_XFER: u64 = 0x3E00_0000;
+
+    /// Attach to the net server's shared UDP transfer frame (TAG_UDP_ATTACH on
+    /// `ctl`). The server owns the frame and returns a cap to it; we map that same
+    /// physical page at `UDP_XFER`. Returns the buffer pointer on success;
+    /// thereafter `sendv` sends FROM it and `recvv` receives INTO it, so a whole
+    /// (<=1472-byte) UDP datagram moves in one IPC. Call once per process.
+    pub fn attach(ctl: Handle) -> Option<*mut u8> {
+        let mut m = MsgBuf::new(TAG_UDP_ATTACH);
+        if sys_call(ctl, &mut m).is_err() || m.data[0] != 0 || m.handle_count == 0 {
+            return None;
+        }
+        let frame = m.handles[0];
+        if sys_frame_map(frame, UDP_XFER, PROT_READ | PROT_WRITE).is_err() {
+            return None;
+        }
+        Some(UDP_XFER as *mut u8)
+    }
+
+    /// Send the first `len` bytes of the shared frame to `ip:dport` on `sock`.
+    /// Requires a prior `attach`.
+    pub fn sendv(sock: Handle, ip: [u8; 4], dport: u16, len: usize) -> bool {
+        let mut m = MsgBuf::new(TAG_UDP_SENDV);
+        m.data[0] = u32::from_be_bytes(ip) as u64;
+        m.data[1] = dport as u64;
+        m.data[2] = len.min(1472) as u64;
+        m.data_len = 3;
+        sys_call(sock, &mut m).is_ok() && m.data[0] == 0
+    }
+
+    /// Non-blocking: receive the next datagram for `sock` INTO the shared frame.
+    /// Returns its length (0 = nothing buffered now). Requires a prior `attach`.
+    pub fn recvv(sock: Handle) -> usize {
+        let mut m = MsgBuf::new(TAG_UDP_RECVV);
+        if sys_call(sock, &mut m).is_err() {
+            return 0;
+        }
+        (m.data[0] as usize).min(1472)
+    }
 
     /// The DHCP-leased DNS resolver IP, from the net control cap `ctl`. Falls back
     /// to the SLIRP default if the query fails. Use this instead of a hardcoded

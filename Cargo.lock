@@ -440,7 +440,9 @@ name = "oxares"
 version = "0.0.0"
 dependencies = [
  "cc",
+ "oxbow-abi",
  "oxbow-libc",
+ "oxbow-rt",
 ]
 
 [[package]]

@@ -26,9 +26,10 @@ use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 use eth::{ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use oxbow_abi::{
-    MsgBuf, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_NET_IRQ, BOOT_PCI, NET_DMA, NET_MMIO, R_GRANT,
-    R_SEND, TAG_NET_DNS, TAG_TCP_CLOSE, TAG_TCP_CONNECT, TAG_TCP_RECV, TAG_TCP_SEND, TAG_UDP_BIND,
-    TAG_UDP_RECVFROM, TAG_UDP_SENDTO,
+    MsgBuf, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_NET_IRQ, BOOT_PCI, NET_DMA, NET_MMIO, NET_SHARED,
+    PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_NET_DNS, TAG_TCP_CLOSE, TAG_TCP_CONNECT,
+    TAG_TCP_RECV, TAG_TCP_SEND, TAG_UDP_ATTACH, TAG_UDP_BIND, TAG_UDP_RECVFROM, TAG_UDP_RECVV,
+    TAG_UDP_SENDTO, TAG_UDP_SENDV,
 };
 use oxbow_rt as rt;
 use smoltcp::iface::SocketHandle;
@@ -584,6 +585,12 @@ pub extern "C" fn oxbow_main() -> ! {
     // 7. Serve the socket capability API: clients bind/connect sockets (each a
     //    fresh badged endpoint, badge = socket id) and send/recv through them.
     let mut sockets = [Sock::Free; MAX_SOCKETS];
+    // The net server OWNS one shared transfer frame, mapped at NET_SHARED, and
+    // hands a COPY of the cap to every client that attaches (handle transfer is a
+    // copy — §3.4 — so we keep ours; there is no unmap syscall, so mapping once is
+    // the only way multiple clients over our lifetime can share a buffer with us).
+    // One physical frame => one resolver at a time, which is all DNS needs.
+    let mut shared_frame: Option<oxbow_abi::Handle> = None;
     loop {
         let mut m = MsgBuf::new(0);
         let reply = match rt::sys_recv(BOOT_EP, &mut m) {
@@ -599,6 +606,72 @@ pub extern "C" fn oxbow_main() -> ! {
                 r.data[2] = nic.dns_ip[2] as u64;
                 r.data[3] = nic.dns_ip[3] as u64;
                 r.data_len = 4;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            // Control channel: hand the client a cap to our shared transfer frame
+            // (allocated + mapped at NET_SHARED on first use). The reply COPIES the
+            // cap into the client, which maps the same physical page on its side.
+            TAG_UDP_ATTACH => {
+                if shared_frame.is_none() {
+                    if let Ok(f) = rt::sys_frame_alloc(BOOT_MEM) {
+                        if rt::sys_frame_map(f, NET_SHARED, PROT_READ | PROT_WRITE).is_ok() {
+                            shared_frame = Some(f);
+                        }
+                    }
+                }
+                match shared_frame {
+                    Some(f) => {
+                        r.data[0] = 0;
+                        r.data_len = 1;
+                        r.handle_count = 1;
+                        r.handles[0] = f;
+                    }
+                    None => {
+                        r.data[0] = 1;
+                        r.data_len = 1;
+                    }
+                }
+                let _ = rt::sys_reply(reply, &r);
+            }
+            // Socket channel: send a datagram FROM the shared frame (large path).
+            TAG_UDP_SENDV => {
+                let sid = m.badge as usize;
+                if shared_frame.is_some() {
+                    if let Some(Sock::Udp(src_port)) = slot_of(&sockets, sid) {
+                        let dst_ip = (m.data[0] as u32).to_be_bytes();
+                        let dport = m.data[1] as u16;
+                        let len = (m.data[2] as usize).min(1472);
+                        let payload: Vec<u8> = unsafe {
+                            core::slice::from_raw_parts(NET_SHARED as *const u8, len)
+                        }
+                        .to_vec();
+                        send_udp(&mut nic, &mut cache, src_port, dst_ip, dport, &payload);
+                        r.data[0] = 0;
+                    } else {
+                        r.data[0] = 1;
+                    }
+                } else {
+                    r.data[0] = 1;
+                }
+                r.data_len = 1;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            // Socket channel: receive a datagram INTO the shared frame (large path).
+            TAG_UDP_RECVV => {
+                let sid = m.badge as usize;
+                if shared_frame.is_some() {
+                    if let Some(Sock::Udp(port)) = slot_of(&sockets, sid) {
+                        let out =
+                            unsafe { core::slice::from_raw_parts_mut(NET_SHARED as *mut u8, 1472) };
+                        let n = recv_udp_for(&mut nic, &mut cache, port, out);
+                        r.data[0] = n as u64;
+                    } else {
+                        r.data[0] = 0;
+                    }
+                } else {
+                    r.data[0] = 0;
+                }
+                r.data_len = 1;
                 let _ = rt::sys_reply(reply, &r);
             }
             // Control channel (badge = NET_CTL): allocate a socket + mint its cap.
