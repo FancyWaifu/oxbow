@@ -459,9 +459,21 @@ unsafe fn dns_resolve(name: *const u8) -> Option<u32> {
         let _ = rt::sys_close(sock);
         return None;
     }
+    // Poll for the reply with a deadline — recvfrom is non-blocking now, so a lost
+    // DNS response gives up after ~3s instead of hanging forever.
     let mut buf = [0u8; 64];
-    let got = rt::udp::recvfrom(sock, &mut buf);
+    let mut got = 0;
+    let deadline = rt::sys_uptime_ms() + 3000;
+    while rt::sys_uptime_ms() < deadline {
+        got = rt::udp::recvfrom(sock, &mut buf);
+        if got > 0 {
+            break;
+        }
+    }
     let _ = rt::sys_close(sock);
+    if got == 0 {
+        return None;
+    }
     let a = rt::dns::first_a(&buf[..got])?; // [a,b,c,d]
     Some(u32::from_ne_bytes(a)) // memory = [a,b,c,d] (network order)
 }

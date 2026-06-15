@@ -80,10 +80,14 @@ fn send_udp(
 
 /// Block (serving background traffic) until a UDP datagram for `port` arrives;
 /// copy its payload into `out` and return the length.
+/// NON-BLOCKING UDP receive: drain whatever the NIC ring currently holds,
+/// processing background traffic (ARP/ICMP), and return the first datagram for
+/// `port` (or 0 if none is buffered right now). The client polls with its own
+/// deadline — so a lost reply no longer blocks the server (or the caller) forever,
+/// and c-ares gets the non-blocking semantics it expects.
 fn recv_udp_for(nic: &mut Nic, cache: &mut arp::Cache, port: u16, out: &mut [u8]) -> usize {
     let mut buf = [0u8; BUF];
-    loop {
-        let n = nic.recv_blocking(&mut buf);
+    while let Some(n) = nic.recv_poll(&mut buf) {
         handle_background(nic, cache, &buf[..n]);
         let Some((_, _, et, off)) = eth::parse(&buf[..n]) else { continue };
         if et != ETHERTYPE_IPV4 {
@@ -102,6 +106,7 @@ fn recv_udp_for(nic: &mut Nic, cache: &mut arp::Cache, port: u16, out: &mut [u8]
             return len;
         }
     }
+    0
 }
 
 fn w(s: &[u8]) {
@@ -292,6 +297,29 @@ impl Nic {
 
     /// Return the next received frame (copied into `out`), blocking on the NIC
     /// interrupt when the ring is empty.
+    /// Non-blocking: return the next ready packet from the RX ring, or None if
+    /// the ring is currently empty (does NOT park). Recycles the descriptor.
+    fn recv_poll(&mut self, out: &mut [u8]) -> Option<usize> {
+        let d = (self.rx_ring_v as usize + self.rx_cur * 16) as *mut RxDesc;
+        let status = unsafe { read_volatile(addr_of!((*d).status)) };
+        if status & RXD_DD == 0 {
+            return None;
+        }
+        let len = unsafe { read_volatile(addr_of!((*d).length)) } as usize;
+        let n = len.min(out.len());
+        let src = self.rx_buf_v[self.rx_cur] as *const u8;
+        for (k, slot) in out[..n].iter_mut().enumerate() {
+            *slot = unsafe { read_volatile(src.add(k)) };
+        }
+        unsafe {
+            write_volatile(addr_of_mut!((*d).status), 0);
+            fence(Ordering::SeqCst);
+            setreg(RDT, self.rx_cur as u32);
+        }
+        self.rx_cur = (self.rx_cur + 1) % RX_DESCS;
+        Some(n)
+    }
+
     fn recv_blocking(&mut self, out: &mut [u8]) -> usize {
         loop {
             let d = (self.rx_ring_v as usize + self.rx_cur * 16) as *mut RxDesc;

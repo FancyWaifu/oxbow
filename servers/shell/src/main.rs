@@ -470,8 +470,16 @@ fn dns_cmd(name: &[u8]) {
         let _ = rt::sys_close(sock);
         return;
     }
+    // recvfrom is non-blocking; poll with a deadline so a lost reply doesn't hang.
     let mut buf = [0u8; 64];
-    let n = rt::udp::recvfrom(sock, &mut buf);
+    let mut n = 0;
+    let deadline = rt::sys_uptime_ms() + 3000;
+    while rt::sys_uptime_ms() < deadline {
+        n = rt::udp::recvfrom(sock, &mut buf);
+        if n > 0 {
+            break;
+        }
+    }
     let _ = rt::sys_close(sock);
     match rt::dns::first_a(&buf[..n]) {
         Some(ip) => {
