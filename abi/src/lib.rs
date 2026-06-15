@@ -171,6 +171,8 @@ pub const SYS_PIPE: u64 = 31; // () -> pipe handle (R_IN|R_OUT|R_GRANT|R_ATTENUA
 pub const SYS_PIPE_READ: u64 = 32; // (pipe, buf, len) -> count (0 = EOF). Needs R_IN
 pub const SYS_PIPE_WRITE: u64 = 33; // (pipe, buf, len) -> count. Needs R_OUT
 pub const SYS_PIPE_EOF: u64 = 34; // (pipe) -> 0. Mark the write side closed (R_OUT)
+pub const SYS_FB_INFO: u64 = 35; // (fb) -> packed geometry (R_MAP). See fb server.
+pub const SYS_FB_MAP: u64 = 36; // (fb, vaddr) -> 0. Map the framebuffer RW (R_MAP)
 
 // ---------------------------------------------------------------------------
 // Error codes (§6) — returned in rax; values are stable forever (append-only)
@@ -436,6 +438,12 @@ pub const BOOT_IMG_CURL: Handle = 27; // curl (HTTP, no TLS)
 pub const BOOT_IMG_JAIL: Handle = 29; // jail — the capability-confinement showcase
 pub const BOOT_IMG_FSTEST: Handle = 30; // fstest — lwext4/ext2 port self-test
 pub const BOOT_IMG_CARES: Handle = 31; // cares-test — c-ares DNS resolver port
+
+/// The framebuffer capability, granted to the `fb` server at boot. Gates
+/// SYS_FB_INFO (geometry) + SYS_FB_MAP (map the pixels RW). §34 (graphics).
+pub const BOOT_FB: Handle = 32;
+/// Fixed vaddr where the fb server maps the linear framebuffer.
+pub const FB_MMIO: u64 = 0x5000_0000;
 /// The control-channel badge (distinct from any socket id, which are 1..=N).
 pub const NET_CTL: u64 = 0x00C0_FFEE;
 /// Bind a UDP socket: request on the NET_CTL cap, data[0]=port (0=ephemeral).

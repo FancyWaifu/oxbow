@@ -530,6 +530,25 @@ pub fn sys_pci_bar_map(pcidev: Handle, bar: u32, vaddr: u64) -> SysResult {
     SysError::from_raw(rax)
 }
 
+/// Framebuffer geometry behind cap `fb`: `(width, height, pitch, bpp)`.
+pub fn sys_fb_info(fb: Handle) -> SysResult<(u32, u32, u32, u16)> {
+    let (rax, rdx) = unsafe { syscall1(oxbow_abi::SYS_FB_INFO, fb as u64) };
+    SysError::from_raw(rax).map(|_| {
+        (
+            (rdx & 0xffff) as u32,
+            ((rdx >> 16) & 0xffff) as u32,
+            ((rdx >> 32) & 0xffff) as u32,
+            ((rdx >> 48) & 0xffff) as u16,
+        )
+    })
+}
+
+/// Map the linear framebuffer (RW, uncacheable) into this AS at `vaddr`.
+pub fn sys_fb_map(fb: Handle, vaddr: u64) -> SysResult {
+    let (rax, _) = unsafe { syscall2(oxbow_abi::SYS_FB_MAP, fb as u64, vaddr) };
+    SysError::from_raw(rax)
+}
+
 /// Allocate one DMA frame from the `mem` budget, map it writable at `vaddr`, and
 /// return its physical address (§19) — for a driver's ring/buffer pointers.
 pub fn sys_dma_alloc(mem: Handle, vaddr: u64) -> SysResult<u64> {

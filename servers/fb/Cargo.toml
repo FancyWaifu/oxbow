@@ -1,0 +1,15 @@
+[package]
+name = "fb"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fb"
+path = "src/main.rs"
+
+[dependencies]
+oxbow-rt = { path = "../../rt" }
+oxbow-abi = { path = "../../abi" }

@@ -332,6 +332,20 @@ fn kmain_stage2() -> ! {
                 );
             });
         }
+        // The fb server gets the framebuffer capability — the sole holder of the
+        // authority to map + draw to the screen (every GUI pixel flows through it).
+        if cmd == b"fb" {
+            proc::with_proc_mut(pid, |p| {
+                p.install(
+                    oxbow_abi::BOOT_FB,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Framebuffer,
+                        rights: oxbow_abi::R_MAP | oxbow_abi::R_GRANT | oxbow_abi::R_ATTENUATE,
+                    badge: 0,
+                    },
+                )
+            });
+        }
         // The tty is the sole receiver on the TTY endpoint.
         if cmd == b"tty" {
             proc::with_proc_mut(pid, |p| {

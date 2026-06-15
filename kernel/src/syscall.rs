@@ -11,7 +11,8 @@ use oxbow_abi::{
     SPAWN_DEFAULT_BUDGET, SPAWN_SLOTS, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE,
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
-    SYS_DMA_ALLOC, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE, SYS_PROTECT, SYS_RECV, SYS_REPLY,
+    SYS_DMA_ALLOC, SYS_FB_INFO, SYS_FB_MAP, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE,
+    SYS_PROTECT, SYS_RECV, SYS_REPLY,
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_UPTIME_MS,
     SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_PIPE_EOF, PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT,
     R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM, PLEDGE_SPAWN, PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
@@ -114,6 +115,8 @@ pub extern "C" fn syscall_dispatch(
         SYS_PCI_READ => sys_pci_read(a1, a2),
         SYS_PCI_WRITE => sys_pci_write(a1, a2, a3),
         SYS_PCI_BAR_MAP => sys_pci_bar_map(a1, a2, a3),
+        SYS_FB_INFO => sys_fb_info(a1),
+        SYS_FB_MAP => sys_fb_map(a1, a2),
         SYS_DMA_ALLOC => sys_dma_alloc(a1, a2),
         SYS_PROTECT => sys_protect(a1, a2, a3, a4),
         SYS_UPTIME_MS => SyscallRet { rax: 0, rdx: crate::arch::ticks().wrapping_mul(10) },
@@ -852,6 +855,50 @@ fn sys_pci_bar_map(dev: u64, bar: u64, vaddr: u64) -> SyscallRet {
     })())
 }
 
+/// `sys_fb_info(fb) -> packed` — geometry of the framebuffer behind cap `fb`:
+/// rdx = width | height<<16 | pitch<<32 | bpp<<48 (each a u16; pitch < 65536 for
+/// our modes). Needs a Framebuffer handle with R_MAP.
+fn sys_fb_info(fb: u64) -> SyscallRet {
+    let result = (|| -> SysResult<u64> {
+        let e = proc::with_current(|p| p.lookup(fb as Handle, ObjType::Framebuffer, R_MAP))?;
+        let ObjectRef::Framebuffer = e.obj else {
+            return Err(SysError::BadType);
+        };
+        let info = crate::fb::info().ok_or(SysError::Gone)?;
+        Ok((info.width as u64)
+            | ((info.height as u64) << 16)
+            | ((info.pitch as u64) << 32)
+            | ((info.bpp as u64) << 48))
+    })();
+    match result {
+        Ok(packed) => SyscallRet { rax: 0, rdx: packed },
+        Err(e) => SyscallRet::err(e),
+    }
+}
+
+/// `sys_fb_map(fb, vaddr) -> 0` — map the linear framebuffer's physical region
+/// into the caller's AS at `vaddr` (writable, uncacheable), one page at a time.
+/// Needs a Framebuffer handle with R_MAP. The region is large but bounded by the
+/// mode (e.g. 1280x800x4 ≈ 4 MiB).
+fn sys_fb_map(fb: u64, vaddr: u64) -> SyscallRet {
+    SyscallRet::from_result((|| -> SysResult {
+        let e = proc::with_current(|p| p.lookup(fb as Handle, ObjType::Framebuffer, R_MAP))?;
+        let ObjectRef::Framebuffer = e.obj else {
+            return Err(SysError::BadType);
+        };
+        if vaddr & 0xfff != 0 || vaddr >= LOWER_HALF_END {
+            return Err(SysError::Fault);
+        }
+        let info = crate::fb::info().ok_or(SysError::Gone)?;
+        let pml4 = mm::vm::current_pml4();
+        let pages = info.size_bytes() / 0x1000;
+        for i in 0..pages {
+            mm::vm::map_mmio_4k_in(pml4, vaddr + i * 0x1000, info.phys + i * 0x1000);
+        }
+        Ok(())
+    })())
+}
+
 /// `sys_dma_alloc(mem, vaddr) -> phys` — allocate one frame, map it writable
 /// (cacheable) into the caller's AS at `vaddr`, and return its physical address
 /// in rdx. A bus-mastering driver needs known physical addresses to program a
@@ -969,7 +1016,7 @@ fn pledge_class(nr: u64) -> u64 {
         SYS_SPAWN | SYS_SPAWN_BYTES => PLEDGE_SPAWN,
         SYS_ATTENUATE => PLEDGE_CAP,
         SYS_IO_IN | SYS_IO_OUT | SYS_PCI_READ | SYS_PCI_WRITE | SYS_PCI_BAR_MAP | SYS_IRQ_BIND
-        | SYS_IRQ_ACK => PLEDGE_IO,
+        | SYS_IRQ_ACK | SYS_FB_INFO | SYS_FB_MAP => PLEDGE_IO,
         SYS_NOTIF_CREATE | SYS_NOTIF_SIGNAL | SYS_NOTIF_WAIT => PLEDGE_NOTIF,
         _ => 0, // unknown number: let the dispatch return E_NOSYS, don't kill
     }
