@@ -1002,4 +1002,14 @@ pub mod channel {
     pub fn close(h: Handle) {
         let _ = unsafe { syscall1(SYS_CHANNEL_CLOSE, h as u64) };
     }
+
+    /// Non-blocking readiness bits: 1=readable, 2=eof, 4=writable (for epoll/poll).
+    pub fn poll(h: Handle) -> u64 {
+        let (rax, rdx) = unsafe { syscall1(oxbow_abi::SYS_CHANNEL_POLL, h as u64) };
+        if rax != 0 {
+            0b011 // error => treat as readable+EOF so callers progress/close
+        } else {
+            rdx
+        }
+    }
 }

@@ -11,6 +11,7 @@ time_t mktime(struct tm *);
 size_t strftime(char *, size_t, const char *, const struct tm *);
 
 struct timespec { time_t tv_sec; long tv_nsec; };
+struct itimerspec { struct timespec it_interval; struct timespec it_value; };
 #define CLOCK_REALTIME 0
 #define CLOCK_MONOTONIC 1
 #define CLOCK_PROCESS_CPUTIME_ID 2

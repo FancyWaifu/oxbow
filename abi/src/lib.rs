@@ -178,6 +178,7 @@ pub const SYS_CHANNEL_PAIR: u64 = 37; // () -> rdx = h0 | h1<<32 (two channel en
 pub const SYS_CHANNEL_SEND: u64 = 38; // (h, buf, len, caps_ptr, ncaps) -> rdx = nbytes
 pub const SYS_CHANNEL_RECV: u64 = 39; // (h, buf, len, caps_out, ncaps_max|flags<<32)
 pub const SYS_CHANNEL_CLOSE: u64 = 40; // (h) -> 0. Close this end; peer sees EOF.
+pub const SYS_CHANNEL_POLL: u64 = 41; // (h) -> rdx readiness: 1=readable 2=eof 4=writable
 /// SYS_CHANNEL_RECV flag (in the high 32 bits of a5): don't block on empty.
 pub const CHAN_NONBLOCK: u64 = 1;
 

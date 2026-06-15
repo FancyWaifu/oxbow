@@ -273,6 +273,12 @@ pub unsafe extern "C" fn write(fd: i32, buf: *const u8, len: usize) -> isize {
 
 #[no_mangle]
 pub unsafe extern "C" fn close(fd: i32) -> i32 {
+    if fd >= EPOLL_FD_BASE {
+        if let Some(inst) = epoll_inst(fd) {
+            inst.used = false;
+        }
+        return 0;
+    }
     if fd < 3 || fd as usize >= MAX_FD {
         return 0;
     }
@@ -635,6 +641,165 @@ pub unsafe extern "C" fn inet_addr(src: *const u8) -> u32 {
     v
 }
 
+// ===========================================================================
+// epoll (userspace) — the readiness multiplexer libwayland's server event loop
+// is built on. An epoll instance is a libc-side table of watched fds; epoll_wait
+// polls each watched channel fd's readiness (SYS_CHANNEL_POLL) and reports the
+// ready ones. epoll fds live in a high number range so they don't collide with
+// the normal fd table. Busy-polls while waiting (no blocking-on-many-fds in the
+// kernel yet) — fine for a demo compositor; a power-efficient version would block
+// on a channel-wake. EPOLLIN=1 EPOLLOUT=4 EPOLLERR=8 EPOLLHUP=16.
+const EPOLL_FD_BASE: i32 = 1000;
+const EPOLL_MAX: usize = 4;
+const EPOLL_WATCH: usize = 48;
+
+#[repr(C, packed)]
+struct EpollEvent {
+    events: u32,
+    data: u64,
+}
+#[derive(Clone, Copy)]
+struct EpEntry {
+    fd: i32,
+    events: u32,
+    data: u64,
+}
+#[derive(Clone, Copy)]
+struct EpollInst {
+    used: bool,
+    n: usize,
+    w: [EpEntry; EPOLL_WATCH],
+}
+static mut EPOLLS: [EpollInst; EPOLL_MAX] =
+    [EpollInst { used: false, n: 0, w: [EpEntry { fd: 0, events: 0, data: 0 }; EPOLL_WATCH] };
+        EPOLL_MAX];
+
+#[no_mangle]
+pub unsafe extern "C" fn epoll_create1(_flags: i32) -> i32 {
+    for i in 0..EPOLL_MAX {
+        let e = &mut (*addr_of_mut!(EPOLLS))[i];
+        if !e.used {
+            e.used = true;
+            e.n = 0;
+            return EPOLL_FD_BASE + i as i32;
+        }
+    }
+    -1
+}
+#[no_mangle]
+pub unsafe extern "C" fn epoll_create(_size: i32) -> i32 {
+    epoll_create1(0)
+}
+
+unsafe fn epoll_inst(epfd: i32) -> Option<&'static mut EpollInst> {
+    let idx = (epfd - EPOLL_FD_BASE) as usize;
+    if epfd < EPOLL_FD_BASE || idx >= EPOLL_MAX {
+        return None;
+    }
+    let e = &mut (*addr_of_mut!(EPOLLS))[idx];
+    if e.used {
+        Some(e)
+    } else {
+        None
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn epoll_ctl(epfd: i32, op: i32, fd: i32, ev: *const EpollEvent) -> i32 {
+    let Some(inst) = epoll_inst(epfd) else { return -1 };
+    match op {
+        1 => {
+            // EPOLL_CTL_ADD
+            if inst.n < EPOLL_WATCH && !ev.is_null() {
+                inst.w[inst.n] = EpEntry { fd, events: (*ev).events, data: (*ev).data };
+                inst.n += 1;
+            } else {
+                return -1;
+            }
+        }
+        3 => {
+            // EPOLL_CTL_MOD
+            for i in 0..inst.n {
+                if inst.w[i].fd == fd && !ev.is_null() {
+                    inst.w[i].events = (*ev).events;
+                    inst.w[i].data = (*ev).data;
+                }
+            }
+        }
+        2 => {
+            // EPOLL_CTL_DEL
+            let mut i = 0;
+            while i < inst.n {
+                if inst.w[i].fd == fd {
+                    inst.w[i] = inst.w[inst.n - 1];
+                    inst.n -= 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        _ => return -1,
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn epoll_wait(
+    epfd: i32,
+    events: *mut EpollEvent,
+    maxevents: i32,
+    timeout: i32,
+) -> i32 {
+    if epoll_inst(epfd).is_none() || events.is_null() || maxevents <= 0 {
+        return -1;
+    }
+    let deadline = if timeout < 0 {
+        u64::MAX
+    } else {
+        rt::sys_uptime_ms().wrapping_add(timeout as u64)
+    };
+    loop {
+        let idx = (epfd - EPOLL_FD_BASE) as usize;
+        let inst = &(*addr_of_mut!(EPOLLS))[idx];
+        let mut count = 0usize;
+        for i in 0..inst.n {
+            if count >= maxevents as usize {
+                break;
+            }
+            let w = inst.w[i];
+            let mut revents = 0u32;
+            if w.fd >= 3 && (w.fd as usize) < MAX_FD {
+                let slot = &(*addr_of_mut!(FDS))[w.fd as usize];
+                if slot.used && slot.is_chan {
+                    let bits = rt::channel::poll(slot.handle);
+                    if bits & 1 != 0 && w.events & 1 != 0 {
+                        revents |= 1; // EPOLLIN
+                    }
+                    if bits & 2 != 0 {
+                        revents |= 16; // EPOLLHUP
+                    }
+                    if bits & 4 != 0 && w.events & 4 != 0 {
+                        revents |= 4; // EPOLLOUT
+                    }
+                }
+            }
+            if revents != 0 {
+                let e = events.add(count);
+                (*e).events = revents;
+                (*e).data = w.data;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            return count as i32;
+        }
+        if timeout == 0 || rt::sys_uptime_ms() >= deadline {
+            return 0;
+        }
+        // busy-poll (the timer preempts; a blocking version would await a wake)
+    }
+}
+
 /// `struct addrinfo` — layout must match `<netdb.h>` (the C side uses our header).
 #[repr(C)]
 pub struct AddrInfo {
@@ -883,6 +1048,27 @@ pub extern "C" fn ioctl(_fd: i32, _req: u64, _arg: usize) -> i32 {
 }
 #[no_mangle]
 pub unsafe extern "C" fn fcntl(fd: i32, cmd: i32, arg: i64) -> i32 {
+    // F_DUPFD(0)/F_DUPFD_CLOEXEC(1030): duplicate the fd into a new slot at or
+    // above `arg`, sharing the same backing (channel handle etc.). libwayland's
+    // event loop watches a DUP of each source fd, so this must work or epoll sees
+    // a bogus fd. (No fd refcounting yet — a dup + close closes the channel; fine
+    // for the current single-client flow.)
+    if cmd == 0 || cmd == 1030 {
+        if fd >= 3 && (fd as usize) < MAX_FD {
+            let src = (*addr_of_mut!(FDS))[fd as usize];
+            if src.used {
+                let minfd = if arg >= 3 { arg as usize } else { 3 };
+                for i in minfd..MAX_FD {
+                    let slot = &mut (*addr_of_mut!(FDS))[i];
+                    if !slot.used {
+                        *slot = src;
+                        return i as i32;
+                    }
+                }
+            }
+        }
+        return -1;
+    }
     // F_SETFL(4): honor O_NONBLOCK(04000) on channel fds (event loops need it).
     // F_GETFL(3): report the flag. Everything else is a no-op success.
     if fd >= 3 && (fd as usize) < MAX_FD {
@@ -1041,6 +1227,111 @@ pub extern "C" fn sendto(
 /// service argument (we pass NULL); stub to NULL so the symbol resolves.
 #[no_mangle]
 pub extern "C" fn getservbyname(_name: *const u8, _proto: *const u8) -> *mut u8 {
+    core::ptr::null_mut()
+}
+
+// ---- libwayland OS shims ---------------------------------------------------
+// `eventfd` is real (wl_display_create makes a terminate_efd added to its event
+// loop): a plain fd slot whose counter never fires in our flow, so epoll (which
+// only reports channel fds) simply never wakes on it. The rest are inert — they
+// back wl_event_loop_add_signal/add_timer and wl_display_add_socket, paths a
+// socketpair-driven compositor never takes; they only need to link.
+#[no_mangle]
+pub unsafe extern "C" fn eventfd(initval: u32, _flags: i32) -> i32 {
+    for i in 3..MAX_FD {
+        let slot = &mut (*addr_of_mut!(FDS))[i];
+        if !slot.used {
+            *slot = FdSlot {
+                handle: 0,
+                off: initval as u64,
+                size: 0,
+                used: true,
+                is_sock: false,
+                is_chan: false,
+                nonblock: false,
+            };
+            return i as i32;
+        }
+    }
+    -1
+}
+#[no_mangle]
+pub unsafe extern "C" fn eventfd_read(fd: i32, value: *mut u64) -> i32 {
+    if fd >= 3 && (fd as usize) < MAX_FD {
+        let slot = &mut (*addr_of_mut!(FDS))[fd as usize];
+        if slot.used {
+            if !value.is_null() {
+                *value = slot.off;
+            }
+            slot.off = 0;
+            return 0;
+        }
+    }
+    -1
+}
+#[no_mangle]
+pub unsafe extern "C" fn eventfd_write(fd: i32, value: u64) -> i32 {
+    if fd >= 3 && (fd as usize) < MAX_FD {
+        let slot = &mut (*addr_of_mut!(FDS))[fd as usize];
+        if slot.used {
+            slot.off = slot.off.wrapping_add(value);
+            return 0;
+        }
+    }
+    -1
+}
+
+#[no_mangle]
+pub extern "C" fn timerfd_create(_clockid: i32, _flags: i32) -> i32 {
+    -1
+}
+#[no_mangle]
+pub extern "C" fn timerfd_settime(_fd: i32, _flags: i32, _new: *const u8, _old: *mut u8) -> i32 {
+    -1
+}
+#[no_mangle]
+pub extern "C" fn timerfd_gettime(_fd: i32, _curr: *mut u8) -> i32 {
+    -1
+}
+#[no_mangle]
+pub extern "C" fn signalfd(_fd: i32, _mask: *const u8, _flags: i32) -> i32 {
+    -1
+}
+#[no_mangle]
+pub extern "C" fn flock(_fd: i32, _op: i32) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn sigemptyset(_set: *mut u64) -> i32 {
+    if !_set.is_null() {
+        unsafe { *_set = 0 }
+    }
+    0
+}
+#[no_mangle]
+pub extern "C" fn sigfillset(_set: *mut u64) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn sigaddset(_set: *mut u64, _signo: i32) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn sigdelset(_set: *mut u64, _signo: i32) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn sigismember(_set: *const u64, _signo: i32) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn sigprocmask(_how: i32, _set: *const u64, _old: *mut u64) -> i32 {
+    0
+}
+/// open_memstream(3): only reached by libwayland's WAYLAND_DEBUG message dump
+/// (off by default). NULL is handled gracefully by the caller (skips the log).
+#[no_mangle]
+pub extern "C" fn open_memstream(_buf: *mut *mut u8, _len: *mut usize) -> *mut u8 {
     core::ptr::null_mut()
 }
 

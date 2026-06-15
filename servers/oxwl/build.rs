@@ -45,6 +45,9 @@ fn main() {
         "wl-src/connection.c",
         "wl-src/wayland-os.c",
         "wl-src/wayland-protocol.c",
+        "wl-src/event-loop.c",
+        "wl-src/wayland-server.c",
+        "wl-src/wayland-client.c",
     ] {
         println!("cargo:rerun-if-changed={f}");
         b.file(f);
@@ -61,6 +64,8 @@ fn main() {
     ] {
         b.file(f);
     }
+    println!("cargo:rerun-if-changed=src/wl_server_side.c");
+    b.file("src/wl_server_side.c");
     b.file("src/oxmain.c");
     b.compile("wl");
 }

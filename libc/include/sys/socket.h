@@ -10,6 +10,8 @@ struct sockaddr_storage { sa_family_t ss_family; char __ss_pad[126]; };
 #define AF_UNSPEC 0
 #define PF_INET AF_INET
 #define PF_INET6 AF_INET6
+#define PF_LOCAL 1
+#define PF_UNIX 1
 #define SOCK_STREAM 1
 #define SOCK_DGRAM 2
 #define SOL_SOCKET 1

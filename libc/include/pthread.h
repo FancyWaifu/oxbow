@@ -1,6 +1,7 @@
 #ifndef _PTHREAD_H
 #define _PTHREAD_H
 #include <stddef_shim.h>
+#include <time.h>
 /* oxbow is single-threaded: pthreads are inert no-op stubs. Mutex lock/unlock
  * are no-ops (no contention possible); pthread_once runs the init once; thread
  * creation fails (so JS Workers/threaded features degrade, but eval works). */

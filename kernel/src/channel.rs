@@ -210,6 +210,31 @@ pub fn try_send(
     (n, taken, nwake)
 }
 
+/// Non-destructive readiness for `side` (for epoll/poll): bit0 readable (data,
+/// caps, or peer-closed-EOF pending), bit1 EOF (peer closed), bit2 writable
+/// (send buffer has room and the peer is open).
+pub fn poll(idx: u8, side: u8) -> u64 {
+    let conns = CONNS.lock();
+    let c = &conns[idx as usize];
+    if !c.in_use {
+        return 0b011; // gone: readable + EOF
+    }
+    let peer_open = c.open[side as usize ^ 1];
+    let rd = &c.dir[read_dir(side)];
+    let wr = &c.dir[side as usize];
+    let mut bits = 0u64;
+    if rd.len > 0 || rd.clen > 0 || !peer_open {
+        bits |= 0b001; // readable (or EOF-readable)
+    }
+    if !peer_open {
+        bits |= 0b010; // EOF
+    }
+    if peer_open && wr.len < CBUF {
+        bits |= 0b100; // writable
+    }
+    bits
+}
+
 /// Whether the peer of `side` is still open (false => sends should fail EPIPE).
 pub fn peer_open(idx: u8, side: u8) -> bool {
     let conns = CONNS.lock();

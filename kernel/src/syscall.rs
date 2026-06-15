@@ -11,7 +11,8 @@ use oxbow_abi::{
     SPAWN_DEFAULT_BUDGET, SPAWN_SLOTS, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE,
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
-    SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_DMA_ALLOC,
+    SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_POLL, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND,
+    SYS_DMA_ALLOC,
     SYS_FB_INFO, SYS_FB_MAP, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE,
     SYS_PROTECT, SYS_RECV, SYS_REPLY,
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_UPTIME_MS,
@@ -122,6 +123,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_CHANNEL_SEND => sys_channel_send(a1, a2, a3, a4, a5),
         SYS_CHANNEL_RECV => sys_channel_recv(a1, a2, a3, a4, a5),
         SYS_CHANNEL_CLOSE => sys_channel_close(a1),
+        SYS_CHANNEL_POLL => sys_channel_poll(a1),
         SYS_DMA_ALLOC => sys_dma_alloc(a1, a2),
         SYS_PROTECT => sys_protect(a1, a2, a3, a4),
         SYS_UPTIME_MS => SyscallRet { rax: 0, rdx: crate::arch::ticks().wrapping_mul(10) },
@@ -1015,7 +1017,7 @@ fn pledge_class(nr: u64) -> u64 {
         SYS_CONSOLE_WRITE | SYS_GETENTROPY | SYS_UPTIME_MS => PLEDGE_STDIO,
         SYS_SEND | SYS_RECV | SYS_CALL | SYS_REPLY | SYS_EP_CREATE | SYS_MINT | SYS_PIPE
         | SYS_PIPE_READ | SYS_PIPE_WRITE | SYS_PIPE_EOF | SYS_CHANNEL_PAIR | SYS_CHANNEL_SEND
-        | SYS_CHANNEL_RECV | SYS_CHANNEL_CLOSE => PLEDGE_IPC,
+        | SYS_CHANNEL_RECV | SYS_CHANNEL_CLOSE | SYS_CHANNEL_POLL => PLEDGE_IPC,
         SYS_MAP | SYS_PROTECT | SYS_IMMUTABLE | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC => {
             PLEDGE_MEM
         }
@@ -1308,6 +1310,15 @@ fn sys_channel_recv(h: u64, buf: u64, len: u64, caps_out: u64, packed: u64) -> S
             }
         }
     }
+}
+
+/// `sys_channel_poll(h) -> readiness bits` — non-blocking readiness for epoll/poll.
+fn sys_channel_poll(h: u64) -> SyscallRet {
+    let (conn, side) = match chan_of(h, 0) {
+        Ok(v) => v,
+        Err(e) => return SyscallRet::err(e),
+    };
+    SyscallRet { rax: 0, rdx: crate::channel::poll(conn, side) }
 }
 
 /// `sys_channel_close(h)` — close this end; the peer observes EOF.
