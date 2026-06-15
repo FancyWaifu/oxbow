@@ -13,8 +13,8 @@ use oxbow_abi::{
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
     SYS_DMA_ALLOC, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE, SYS_PROTECT, SYS_RECV, SYS_REPLY,
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_UPTIME_MS,
-    PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT, R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM,
-    PLEDGE_SPAWN, PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
+    SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_PIPE_EOF, PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT,
+    R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM, PLEDGE_SPAWN, PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
 };
 
 use crate::object::{HandleEntry, ObjType, ObjectRef};
@@ -105,6 +105,10 @@ pub extern "C" fn syscall_dispatch(
         SYS_GETENTROPY => sys_getentropy(a1, a2),
         SYS_PLEDGE => sys_pledge(a1),
         SYS_IMMUTABLE => sys_immutable(a1, a2, a3),
+        SYS_PIPE => sys_pipe(),
+        SYS_PIPE_READ => sys_pipe_read(a1, a2, a3),
+        SYS_PIPE_WRITE => sys_pipe_write(a1, a2, a3),
+        SYS_PIPE_EOF => sys_pipe_eof(a1),
         SYS_EP_CREATE => sys_ep_create(),
         SYS_MINT => sys_mint(a1, a2, a3),
         SYS_PCI_READ => sys_pci_read(a1, a2),
@@ -957,7 +961,8 @@ fn pledge_class(nr: u64) -> u64 {
     match nr {
         SYS_EXIT | SYS_PLEDGE | SYS_CLOSE => 0,
         SYS_CONSOLE_WRITE | SYS_GETENTROPY | SYS_UPTIME_MS => PLEDGE_STDIO,
-        SYS_SEND | SYS_RECV | SYS_CALL | SYS_REPLY | SYS_EP_CREATE | SYS_MINT => PLEDGE_IPC,
+        SYS_SEND | SYS_RECV | SYS_CALL | SYS_REPLY | SYS_EP_CREATE | SYS_MINT | SYS_PIPE
+        | SYS_PIPE_READ | SYS_PIPE_WRITE | SYS_PIPE_EOF => PLEDGE_IPC,
         SYS_MAP | SYS_PROTECT | SYS_IMMUTABLE | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC => {
             PLEDGE_MEM
         }
@@ -975,6 +980,126 @@ fn pledge_class(nr: u64) -> u64 {
 fn sys_pledge(promises: u64) -> SyscallRet {
     proc::with_current_mut(|p| p.pledge_narrow(promises));
     SyscallRet::from_result(Ok(()))
+}
+
+/// `sys_pipe()` — create a kernel byte pipe; returns a full-rights handle (§39).
+fn sys_pipe() -> SyscallRet {
+    match crate::pipe::create() {
+        Some(idx) => {
+            let r = proc::with_current_mut(|p| {
+                p.alloc_slot(HandleEntry {
+                    obj: ObjectRef::Pipe(idx),
+                    rights: R_IN | R_OUT | R_GRANT | R_ATTENUATE,
+                    badge: 0,
+                })
+            });
+            match r {
+                Ok(h) => SyscallRet::ok_handle(h),
+                Err(e) => SyscallRet::err(e),
+            }
+        }
+        None => SyscallRet::err(SysError::NoMem),
+    }
+}
+
+/// Resolve a Pipe handle requiring `right`, returning its pool index.
+fn pipe_idx(h: u64, right: u32) -> SysResult<u8> {
+    let entry = proc::with_current(|p| p.lookup(h as Handle, ObjType::Pipe, right))?;
+    match entry.obj {
+        ObjectRef::Pipe(i) => Ok(i),
+        _ => Err(SysError::BadType),
+    }
+}
+
+/// `sys_pipe_read(pipe, buf, len)` — read up to `len` bytes; blocks while empty,
+/// returns 0 at EOF (write side closed). Count in rdx.
+fn sys_pipe_read(h: u64, buf: u64, len: u64) -> SyscallRet {
+    let idx = match pipe_idx(h, R_IN) {
+        Ok(i) => i,
+        Err(e) => return SyscallRet::err(e),
+    };
+    let want = (len as usize).min(1024);
+    if want == 0 {
+        return SyscallRet { rax: 0, rdx: 0 };
+    }
+    loop {
+        let mut kbuf = [0u8; 1024];
+        let mut wake = [0usize; 8];
+        let (res, nwake) = crate::pipe::try_read(idx, &mut kbuf[..want], &mut wake);
+        for &t in &wake[..nwake] {
+            crate::thread::wake(t);
+        }
+        match res {
+            crate::pipe::ReadOut::Data(n) => {
+                if usermem::check_user(buf, n, true).is_err() {
+                    return SyscallRet::err(SysError::Fault);
+                }
+                unsafe { core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf as *mut u8, n) };
+                return SyscallRet { rax: 0, rdx: n as u64 };
+            }
+            crate::pipe::ReadOut::Eof => return SyscallRet { rax: 0, rdx: 0 },
+            crate::pipe::ReadOut::WouldBlock => {
+                crate::pipe::park_reader(idx, crate::thread::current());
+                crate::thread::block_current();
+                // resumed by a writer or by EOF — retry the read
+            }
+        }
+    }
+}
+
+/// `sys_pipe_write(pipe, buf, len)` — write all `len` bytes (blocking while full).
+/// Count written in rdx.
+fn sys_pipe_write(h: u64, buf: u64, len: u64) -> SyscallRet {
+    let idx = match pipe_idx(h, R_OUT) {
+        Ok(i) => i,
+        Err(e) => return SyscallRet::err(e),
+    };
+    let total = len as usize;
+    if total == 0 {
+        return SyscallRet { rax: 0, rdx: 0 };
+    }
+    if usermem::check_user(buf, total, false).is_err() {
+        return SyscallRet::err(SysError::Fault);
+    }
+    let mut done = 0usize;
+    while done < total {
+        let chunk = core::cmp::min(total - done, 1024);
+        let mut kbuf = [0u8; 1024];
+        unsafe {
+            core::ptr::copy_nonoverlapping((buf as *const u8).add(done), kbuf.as_mut_ptr(), chunk)
+        };
+        let mut off = 0usize;
+        while off < chunk {
+            let mut wake = [0usize; 8];
+            let (n, nwake) = crate::pipe::try_write(idx, &kbuf[off..chunk], &mut wake);
+            for &t in &wake[..nwake] {
+                crate::thread::wake(t);
+            }
+            if n == 0 {
+                crate::pipe::park_writer(idx, crate::thread::current());
+                crate::thread::block_current();
+            } else {
+                off += n;
+            }
+        }
+        done += chunk;
+    }
+    SyscallRet { rax: 0, rdx: done as u64 }
+}
+
+/// `sys_pipe_eof(pipe)` — mark the write side closed; pending/future reads drain
+/// then return EOF.
+fn sys_pipe_eof(h: u64) -> SyscallRet {
+    let idx = match pipe_idx(h, R_OUT) {
+        Ok(i) => i,
+        Err(e) => return SyscallRet::err(e),
+    };
+    let mut wake = [0usize; 8];
+    let nwake = crate::pipe::mark_eof(idx, &mut wake);
+    for &t in &wake[..nwake] {
+        crate::thread::wake(t);
+    }
+    SyscallRet { rax: 0, rdx: 0 }
 }
 
 /// `sys_attenuate(src, new_rights)` — derive a strictly-weaker handle (law L5).

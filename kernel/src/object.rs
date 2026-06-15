@@ -16,6 +16,7 @@ pub enum ObjType {
     Irq,
     Image,
     PciDevice,
+    Pipe,
 }
 
 /// What a handle points at: a pool index for Endpoint/Reply/Memory/Frame, or the
@@ -34,6 +35,8 @@ pub enum ObjectRef {
     Image(u8),
     /// A single PCI device (bus<<16 | dev<<8 | func) — config-space + BAR access.
     PciDevice(u32),
+    /// A kernel-buffered byte pipe, by pool index (see `kernel/src/pipe.rs`).
+    Pipe(u8),
 }
 
 impl ObjectRef {
@@ -49,6 +52,7 @@ impl ObjectRef {
             ObjectRef::Irq(_) => ObjType::Irq,
             ObjectRef::Image(_) => ObjType::Image,
             ObjectRef::PciDevice(_) => ObjType::PciDevice,
+            ObjectRef::Pipe(_) => ObjType::Pipe,
         }
     }
 }

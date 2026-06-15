@@ -16,6 +16,7 @@ mod mm;
 mod notif;
 mod object;
 mod pci;
+mod pipe;
 mod proc;
 mod rng;
 mod syscall;

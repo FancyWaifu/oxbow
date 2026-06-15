@@ -160,6 +160,18 @@ pub const PLEDGE_NOTIF: u64 = 1 << 6; // notif_create/signal/wait
 /// Gated on the Memory cap (R_MAP), like map/protect. One-way: no un-immutable.
 pub const SYS_IMMUTABLE: u64 = 30; // (mem, vaddr, len) -> 0 / E_NOMEM (table full)
 
+/// Pipes (§39) — a kernel-buffered unidirectional byte channel, the primitive
+/// behind shell pipelines (`cmd1 | cmd2`). `sys_pipe` mints one capability with
+/// full rights (R_IN|R_OUT); the holder attenuates it to a write end (R_OUT, for
+/// cmd1's stdout) and a read end (R_IN, for cmd2's stdin) and grants each to a
+/// child. A read blocks while the buffer is empty and returns 0 (EOF) once the
+/// write side is closed; a write blocks while the buffer is full. EOF is signaled
+/// explicitly by the pipeline owner via `sys_pipe_eof` (e.g. after cmd1 exits).
+pub const SYS_PIPE: u64 = 31; // () -> pipe handle (R_IN|R_OUT|R_GRANT|R_ATTENUATE)
+pub const SYS_PIPE_READ: u64 = 32; // (pipe, buf, len) -> count (0 = EOF). Needs R_IN
+pub const SYS_PIPE_WRITE: u64 = 33; // (pipe, buf, len) -> count. Needs R_OUT
+pub const SYS_PIPE_EOF: u64 = 34; // (pipe) -> 0. Mark the write side closed (R_OUT)
+
 // ---------------------------------------------------------------------------
 // Error codes (§6) — returned in rax; values are stable forever (append-only)
 // ---------------------------------------------------------------------------

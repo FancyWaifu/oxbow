@@ -625,6 +625,43 @@ pub fn sys_immutable(mem: Handle, vaddr: u64, len: u64) -> SysResult {
     SysError::from_raw(rax)
 }
 
+/// Create a kernel byte pipe; returns a full-rights handle (attenuate to a read
+/// end R_IN and a write end R_OUT). The primitive behind shell pipelines.
+pub fn sys_pipe() -> SysResult<Handle> {
+    let (rax, rdx) = unsafe { syscall1(oxbow_abi::SYS_PIPE, 0) };
+    SysError::from_raw(rax).map(|_| rdx as Handle)
+}
+
+/// Read up to `buf.len()` bytes from a pipe (blocks while empty; 0 = EOF). R_IN.
+pub fn sys_pipe_read(pipe: Handle, buf: &mut [u8]) -> usize {
+    let (rax, rdx) = unsafe {
+        syscall3(oxbow_abi::SYS_PIPE_READ, pipe as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
+    };
+    if SysError::from_raw(rax).is_ok() {
+        rdx as usize
+    } else {
+        0
+    }
+}
+
+/// Write all of `buf` to a pipe (blocks while full). Returns bytes written. R_OUT.
+pub fn sys_pipe_write(pipe: Handle, buf: &[u8]) -> usize {
+    let (rax, rdx) = unsafe {
+        syscall3(oxbow_abi::SYS_PIPE_WRITE, pipe as u64, buf.as_ptr() as u64, buf.len() as u64)
+    };
+    if SysError::from_raw(rax).is_ok() {
+        rdx as usize
+    } else {
+        0
+    }
+}
+
+/// Mark a pipe's write side closed; readers then drain and get EOF. R_OUT.
+pub fn sys_pipe_eof(pipe: Handle) -> SysResult {
+    let (rax, _) = unsafe { syscall1(oxbow_abi::SYS_PIPE_EOF, pipe as u64) };
+    SysError::from_raw(rax)
+}
+
 pub fn sys_exit(code: u64) -> ! {
     unsafe {
         syscall1(SYS_EXIT, code);
