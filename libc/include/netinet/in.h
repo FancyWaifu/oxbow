@@ -26,6 +26,30 @@ struct sockaddr_in6 {
 #define IPPROTO_RAW 255
 #define IPPROTO_ICMP 1
 #define IPPROTO_IP 0
+/* IPv6 address classification macros (so c-ares & friends don't see these as
+ * implicit function calls). oxbow is IPv4-only, but the predicates are correct. */
+#define IN6_IS_ADDR_MULTICAST(a) ((a)->s6_addr[0] == 0xff)
+#define IN6_IS_ADDR_LOOPBACK(a)                                            \
+    ((a)->s6_addr[0] == 0 && (a)->s6_addr[1] == 0 && (a)->s6_addr[2] == 0 && \
+     (a)->s6_addr[3] == 0 && (a)->s6_addr[4] == 0 && (a)->s6_addr[5] == 0 && \
+     (a)->s6_addr[6] == 0 && (a)->s6_addr[7] == 0 && (a)->s6_addr[8] == 0 && \
+     (a)->s6_addr[9] == 0 && (a)->s6_addr[10] == 0 && (a)->s6_addr[11] == 0 && \
+     (a)->s6_addr[12] == 0 && (a)->s6_addr[13] == 0 && (a)->s6_addr[14] == 0 && \
+     (a)->s6_addr[15] == 1)
+#define IN6_IS_ADDR_V4MAPPED(a)                                            \
+    ((a)->s6_addr[0] == 0 && (a)->s6_addr[1] == 0 && (a)->s6_addr[2] == 0 && \
+     (a)->s6_addr[3] == 0 && (a)->s6_addr[4] == 0 && (a)->s6_addr[5] == 0 && \
+     (a)->s6_addr[6] == 0 && (a)->s6_addr[7] == 0 && (a)->s6_addr[8] == 0 && \
+     (a)->s6_addr[9] == 0 && (a)->s6_addr[10] == 0xff && (a)->s6_addr[11] == 0xff)
+#define IN6_IS_ADDR_V4COMPAT(a)                                            \
+    ((a)->s6_addr[0] == 0 && (a)->s6_addr[1] == 0 && (a)->s6_addr[2] == 0 && \
+     (a)->s6_addr[3] == 0 && (a)->s6_addr[4] == 0 && (a)->s6_addr[5] == 0 && \
+     (a)->s6_addr[6] == 0 && (a)->s6_addr[7] == 0 && (a)->s6_addr[8] == 0 && \
+     (a)->s6_addr[9] == 0 && (a)->s6_addr[10] == 0 && (a)->s6_addr[11] == 0)
+#define IN6_IS_ADDR_LINKLOCAL(a) \
+    ((a)->s6_addr[0] == 0xfe && ((a)->s6_addr[1] & 0xc0) == 0x80)
+#define IN6_IS_ADDR_SITELOCAL(a) \
+    ((a)->s6_addr[0] == 0xfe && ((a)->s6_addr[1] & 0xc0) == 0xc0)
 unsigned short htons(unsigned short);
 unsigned short ntohs(unsigned short);
 unsigned int htonl(unsigned int);

@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 oxbow-libc = { path = "../../libc" }
+oxbow-rt = { path = "../../rt" }
+oxbow-abi = { path = "../../abi" }
 
 [build-dependencies]
 cc = "1"

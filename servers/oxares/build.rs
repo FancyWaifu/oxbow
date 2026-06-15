@@ -72,6 +72,11 @@ fn main() {
         }
     }
     walk("cares-src/lib", &skip, &mut b);
+    println!("cargo:rerun-if-changed=src/cares_glue.c");
+    println!("cargo:rerun-if-changed=src/oxmain.c");
+    println!("cargo:rerun-if-changed=src/oxudp.rs");
+    println!("cargo:rerun-if-changed=../../libc/include");
+    b.file("src/cares_glue.c");
     b.file("src/oxmain.c");
     b.compile("cares");
 }

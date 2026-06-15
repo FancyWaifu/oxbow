@@ -758,6 +758,53 @@ pub extern "C" fn arc4random_uniform(bound: u32) -> u32 {
     }
 }
 
+/// rand(3): c-ares uses this only as a last-resort RNG fallback. Back it with the
+/// kernel CSPRNG (ignoring the seed) — strictly better than a seeded LCG.
+#[no_mangle]
+pub extern "C" fn rand() -> i32 {
+    (arc4random() & 0x7fff_ffff) as i32
+}
+
+/// srand(3): no-op — `rand` draws from the kernel CSPRNG, not a seeded sequence.
+#[no_mangle]
+pub extern "C" fn srand(_seed: u32) {}
+
+/// recvfrom(2)/sendto(2): oxbow has no BSD fd sockets — net rides the capability
+/// API. c-ares references these in its DEFAULT socket backend, which we replace
+/// via ares_set_socket_functions, so they are never called; provide the symbols.
+#[no_mangle]
+pub extern "C" fn recvfrom(
+    _fd: i32,
+    _buf: *mut u8,
+    _len: usize,
+    _flags: i32,
+    _addr: *mut u8,
+    _addrlen: *mut u32,
+) -> isize {
+    unsafe { errno = 38 } // ENOSYS
+    -1
+}
+
+#[no_mangle]
+pub extern "C" fn sendto(
+    _fd: i32,
+    _buf: *const u8,
+    _len: usize,
+    _flags: i32,
+    _addr: *const u8,
+    _addrlen: u32,
+) -> isize {
+    unsafe { errno = 38 } // ENOSYS
+    -1
+}
+
+/// getservbyname(3): service-name lookup. c-ares calls this only for a non-NULL
+/// service argument (we pass NULL); stub to NULL so the symbol resolves.
+#[no_mangle]
+pub extern "C" fn getservbyname(_name: *const u8, _proto: *const u8) -> *mut u8 {
+    core::ptr::null_mut()
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn strcspn(s: *const u8, reject: *const u8) -> usize {
     let mut n = 0usize;
