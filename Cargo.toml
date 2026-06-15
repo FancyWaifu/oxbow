@@ -28,6 +28,7 @@ members = [
     "servers/jail",
     "servers/fsext",
     "servers/fsd",
+    "servers/oxares",
     "servers/drift",
     "servers/cc-hello",
     "servers/tcc",

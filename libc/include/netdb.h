@@ -27,6 +27,7 @@ struct addrinfo {
 #define NI_NUMERICHOST 1
 #define NI_NUMERICSERV 2
 struct hostent { char *h_name; char **h_aliases; int h_addrtype; int h_length; char **h_addr_list; };
+struct servent { char *s_name; char **s_aliases; int s_port; char *s_proto; };
 int getaddrinfo(const char *, const char *, const struct addrinfo *, struct addrinfo **);
 void freeaddrinfo(struct addrinfo *);
 const char *gai_strerror(int);

@@ -54,4 +54,8 @@ extern int errno;
 #define ENOTEMPTY 39
 #define ENODATA 61
 #define ENOATTR 61
+#define ESRCH 3
+#define ENOPROTOOPT 92
+#define EPROTONOSUPPORT 93
+#define ENOTSUPP 524
 #endif

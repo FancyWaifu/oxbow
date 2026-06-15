@@ -436,6 +436,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "oxares"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+]
+
+[[package]]
 name = "oxbow-abi"
 version = "0.0.0"
 

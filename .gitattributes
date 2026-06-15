@@ -25,3 +25,6 @@ servers/curl/config/**         linguist-generated
 
 servers/curl/bearssl/**             linguist-vendored
 servers/fs/initrd/etc/ssl/cacert.pem linguist-vendored
+
+servers/oxares/cares-src/**       linguist-vendored
+servers/oxares/cares-include/**   linguist-vendored
