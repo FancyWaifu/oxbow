@@ -30,6 +30,7 @@ members = [
     "servers/fsext",
     "servers/fsd",
     "servers/oxares",
+    "servers/oxffi",
     "servers/drift",
     "servers/cc-hello",
     "servers/tcc",

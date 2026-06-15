@@ -262,7 +262,7 @@ fn kmain_stage2() -> ! {
         // what gives a clean boot straight to the prompt (no demo spam).
         if matches!(
             cmd,
-            b"pong" | b"beta" | b"hello" | b"badge" | b"cat" | b"ls" | b"mkdir" | b"touch" | b"rm" | b"mv" | b"cp" | b"drift" | b"cc-hello" | b"tcc" | b"lua" | b"micropython" | b"qjs" | b"curl" | b"cares-test" | b"jail" | b"fstest"
+            b"pong" | b"beta" | b"hello" | b"badge" | b"cat" | b"ls" | b"mkdir" | b"touch" | b"rm" | b"mv" | b"cp" | b"drift" | b"cc-hello" | b"tcc" | b"lua" | b"micropython" | b"qjs" | b"curl" | b"cares-test" | b"ffi-test" | b"jail" | b"fstest"
         ) {
             image::register(cmd, bytes);
             println!("[mod] image '{}' registered ({} bytes)", name, bytes.len());
@@ -413,6 +413,7 @@ fn kmain_stage2() -> ! {
                     (oxbow_abi::BOOT_IMG_JAIL, b"jail".as_slice()),
                     (oxbow_abi::BOOT_IMG_FSTEST, b"fstest".as_slice()),
                     (oxbow_abi::BOOT_IMG_CARES, b"cares-test".as_slice()),
+                    (oxbow_abi::BOOT_IMG_FFI, b"ffi-test".as_slice()),
                 ] {
                     if let Some(idx) = image::find(iname) {
                         p.install(

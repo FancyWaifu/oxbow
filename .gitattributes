@@ -28,3 +28,5 @@ servers/fs/initrd/etc/ssl/cacert.pem linguist-vendored
 
 servers/oxares/cares-src/**       linguist-vendored
 servers/oxares/cares-include/**   linguist-vendored
+servers/oxffi/ffi-src/** linguist-vendored
+servers/oxffi/ffi-include/** linguist-vendored

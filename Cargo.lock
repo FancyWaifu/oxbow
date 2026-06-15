@@ -491,6 +491,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxffi"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+]
+
+[[package]]
 name = "oxlua"
 version = "0.0.0"
 dependencies = [
