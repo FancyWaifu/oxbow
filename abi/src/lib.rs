@@ -173,6 +173,13 @@ pub const SYS_PIPE_WRITE: u64 = 33; // (pipe, buf, len) -> count. Needs R_OUT
 pub const SYS_PIPE_EOF: u64 = 34; // (pipe) -> 0. Mark the write side closed (R_OUT)
 pub const SYS_FB_INFO: u64 = 35; // (fb) -> packed geometry (R_MAP). See fb server.
 pub const SYS_FB_MAP: u64 = 36; // (fb, vaddr) -> 0. Map the framebuffer RW (R_MAP)
+// Bidirectional byte+capability channel (§40) — the socketpair/SCM_RIGHTS prim.
+pub const SYS_CHANNEL_PAIR: u64 = 37; // () -> rdx = h0 | h1<<32 (two channel ends)
+pub const SYS_CHANNEL_SEND: u64 = 38; // (h, buf, len, caps_ptr, ncaps) -> rdx = nbytes
+pub const SYS_CHANNEL_RECV: u64 = 39; // (h, buf, len, caps_out, ncaps_max|flags<<32)
+pub const SYS_CHANNEL_CLOSE: u64 = 40; // (h) -> 0. Close this end; peer sees EOF.
+/// SYS_CHANNEL_RECV flag (in the high 32 bits of a5): don't block on empty.
+pub const CHAN_NONBLOCK: u64 = 1;
 
 // ---------------------------------------------------------------------------
 // Error codes (§6) — returned in rax; values are stable forever (append-only)

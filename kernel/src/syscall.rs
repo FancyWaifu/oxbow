@@ -11,10 +11,11 @@ use oxbow_abi::{
     SPAWN_DEFAULT_BUDGET, SPAWN_SLOTS, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE,
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
-    SYS_DMA_ALLOC, SYS_FB_INFO, SYS_FB_MAP, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE,
+    SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_DMA_ALLOC,
+    SYS_FB_INFO, SYS_FB_MAP, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE,
     SYS_PROTECT, SYS_RECV, SYS_REPLY,
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_UPTIME_MS,
-    SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_PIPE_EOF, PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT,
+    SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_PIPE_EOF, CHAN_NONBLOCK, PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT,
     R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM, PLEDGE_SPAWN, PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
 };
 
@@ -117,6 +118,10 @@ pub extern "C" fn syscall_dispatch(
         SYS_PCI_BAR_MAP => sys_pci_bar_map(a1, a2, a3),
         SYS_FB_INFO => sys_fb_info(a1),
         SYS_FB_MAP => sys_fb_map(a1, a2),
+        SYS_CHANNEL_PAIR => sys_channel_pair(),
+        SYS_CHANNEL_SEND => sys_channel_send(a1, a2, a3, a4, a5),
+        SYS_CHANNEL_RECV => sys_channel_recv(a1, a2, a3, a4, a5),
+        SYS_CHANNEL_CLOSE => sys_channel_close(a1),
         SYS_DMA_ALLOC => sys_dma_alloc(a1, a2),
         SYS_PROTECT => sys_protect(a1, a2, a3, a4),
         SYS_UPTIME_MS => SyscallRet { rax: 0, rdx: crate::arch::ticks().wrapping_mul(10) },
@@ -1009,7 +1014,8 @@ fn pledge_class(nr: u64) -> u64 {
         SYS_EXIT | SYS_PLEDGE | SYS_CLOSE => 0,
         SYS_CONSOLE_WRITE | SYS_GETENTROPY | SYS_UPTIME_MS => PLEDGE_STDIO,
         SYS_SEND | SYS_RECV | SYS_CALL | SYS_REPLY | SYS_EP_CREATE | SYS_MINT | SYS_PIPE
-        | SYS_PIPE_READ | SYS_PIPE_WRITE | SYS_PIPE_EOF => PLEDGE_IPC,
+        | SYS_PIPE_READ | SYS_PIPE_WRITE | SYS_PIPE_EOF | SYS_CHANNEL_PAIR | SYS_CHANNEL_SEND
+        | SYS_CHANNEL_RECV | SYS_CHANNEL_CLOSE => PLEDGE_IPC,
         SYS_MAP | SYS_PROTECT | SYS_IMMUTABLE | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC => {
             PLEDGE_MEM
         }
@@ -1146,6 +1152,176 @@ fn sys_pipe_eof(h: u64) -> SyscallRet {
     for &t in &wake[..nwake] {
         crate::thread::wake(t);
     }
+    SyscallRet { rax: 0, rdx: 0 }
+}
+
+/// Resolve a Channel handle to (conn, side), checking `right`.
+fn chan_of(h: u64, right: u32) -> SysResult<(u8, u8)> {
+    let e = proc::with_current(|p| p.lookup(h as Handle, ObjType::Channel, right))?;
+    match e.obj {
+        ObjectRef::Channel { conn, side } => Ok((conn, side)),
+        _ => Err(SysError::BadType),
+    }
+}
+
+/// `sys_channel_pair() -> rdx = h0 | h1<<32` — a connected pair; both ends land
+/// in the caller's table (full rights). One end is typically passed to a child.
+fn sys_channel_pair() -> SyscallRet {
+    let result = (|| -> SysResult<u64> {
+        let conn = crate::channel::create().ok_or(SysError::NoMem)?;
+        let rights = R_IN | R_OUT | R_GRANT | R_ATTENUATE;
+        let h0 = proc::with_current_mut(|p| {
+            p.alloc_slot(HandleEntry { obj: ObjectRef::Channel { conn, side: 0 }, rights, badge: 0 })
+        })?;
+        let h1 = proc::with_current_mut(|p| {
+            p.alloc_slot(HandleEntry { obj: ObjectRef::Channel { conn, side: 1 }, rights, badge: 0 })
+        })?;
+        Ok((h0 as u64) | ((h1 as u64) << 32))
+    })();
+    match result {
+        Ok(packed) => SyscallRet { rax: 0, rdx: packed },
+        Err(e) => SyscallRet::err(e),
+    }
+}
+
+/// `sys_channel_send(h, buf, len, caps_ptr, ncaps) -> rdx = nbytes` — stream all
+/// `len` bytes (blocking while the peer's buffer is full) and attach up to
+/// `ncaps` capabilities (each needs R_GRANT, like IPC; copied — sender retains).
+fn sys_channel_send(h: u64, buf: u64, len: u64, caps_ptr: u64, ncaps: u64) -> SyscallRet {
+    let (conn, side) = match chan_of(h, R_OUT) {
+        Ok(v) => v,
+        Err(e) => return SyscallRet::err(e),
+    };
+    // Gather the caps to send (HandleEntry copies), validating R_GRANT.
+    let ncaps = (ncaps as usize).min(8usize);
+    let mut caps = [HandleEntry { obj: ObjectRef::Console, rights: 0, badge: 0 }; 8];
+    if ncaps > 0 {
+        if usermem::check_user(caps_ptr, ncaps * 4, false).is_err() {
+            return SyscallRet::err(SysError::Fault);
+        }
+        for i in 0..ncaps {
+            let ch = unsafe { core::ptr::read((caps_ptr as *const u32).add(i)) };
+            match proc::with_current(|p| p.get(ch as Handle)) {
+                Ok(e) if e.rights & R_GRANT != 0 => caps[i] = e,
+                Ok(_) => return SyscallRet::err(SysError::Rights),
+                Err(e) => return SyscallRet::err(e),
+            }
+        }
+    }
+    let total = (len as usize).min(1 << 20);
+    if total > 0 && usermem::check_user(buf, total, false).is_err() {
+        return SyscallRet::err(SysError::Fault);
+    }
+    let mut done = 0usize;
+    let mut caps_left = ncaps;
+    loop {
+        let mut kbuf = [0u8; 1024];
+        let chunk = core::cmp::min(total - done, 1024);
+        if chunk > 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (buf as *const u8).add(done),
+                    kbuf.as_mut_ptr(),
+                    chunk,
+                )
+            };
+        }
+        let mut wake = [0usize; 8];
+        let (n, taken, nwake) =
+            crate::channel::try_send(conn, side, &kbuf[..chunk], &caps[..caps_left], &mut wake);
+        for &t in &wake[..nwake] {
+            crate::thread::wake(t);
+        }
+        // try_send returns 0,0 if the peer is gone -> EPIPE-ish (stop, report).
+        if n == 0 && taken == 0 && chunk > 0 && !crate::channel::peer_open(conn, side) {
+            break;
+        }
+        done += n;
+        caps_left -= taken;
+        if done >= total && caps_left == 0 {
+            break;
+        }
+        if n == 0 && taken == 0 {
+            crate::channel::park_send(conn, side, crate::thread::current());
+            crate::thread::block_current();
+        }
+    }
+    SyscallRet { rax: 0, rdx: done as u64 }
+}
+
+/// `sys_channel_recv(h, buf, len, caps_out, ncaps_max|flags<<32)` — receive bytes
+/// + any attached caps (installed into the caller's table; their handles written
+/// to `caps_out`). rdx = nbytes | ncaps<<32. EOF -> rax=0,rdx=0. Non-blocking
+/// (CHAN_NONBLOCK) on empty -> rax=EAGAIN(11).
+fn sys_channel_recv(h: u64, buf: u64, len: u64, caps_out: u64, packed: u64) -> SyscallRet {
+    let (conn, side) = match chan_of(h, R_IN) {
+        Ok(v) => v,
+        Err(e) => return SyscallRet::err(e),
+    };
+    let ncaps_max = ((packed & 0xffff_ffff) as usize).min(8);
+    let nonblock = (packed >> 32) & CHAN_NONBLOCK != 0;
+    let want = (len as usize).min(1024);
+    loop {
+        let mut kbuf = [0u8; 1024];
+        let mut ents = [HandleEntry { obj: ObjectRef::Console, rights: 0, badge: 0 }; 8];
+        let mut wake = [0usize; 8];
+        let (res, nc, nwake) = crate::channel::try_recv(
+            conn,
+            side,
+            &mut kbuf[..want],
+            &mut ents[..ncaps_max],
+            &mut wake,
+        );
+        for &t in &wake[..nwake] {
+            crate::thread::wake(t);
+        }
+        match res {
+            crate::channel::RecvOut::Data(n) => {
+                if n > 0 && usermem::check_user(buf, n, true).is_err() {
+                    return SyscallRet::err(SysError::Fault);
+                }
+                if n > 0 {
+                    unsafe { core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf as *mut u8, n) };
+                }
+                // Install received caps; write their new handle numbers out.
+                if nc > 0 {
+                    if usermem::check_user(caps_out, nc * 4, true).is_err() {
+                        return SyscallRet::err(SysError::Fault);
+                    }
+                    for i in 0..nc {
+                        let nh = match proc::with_current_mut(|p| p.alloc_slot(ents[i])) {
+                            Ok(v) => v,
+                            Err(e) => return SyscallRet::err(e),
+                        };
+                        unsafe { core::ptr::write((caps_out as *mut u32).add(i), nh as u32) };
+                    }
+                }
+                return SyscallRet { rax: 0, rdx: (n as u64) | ((nc as u64) << 32) };
+            }
+            crate::channel::RecvOut::Eof => return SyscallRet { rax: 0, rdx: 0 },
+            crate::channel::RecvOut::WouldBlock => {
+                if nonblock {
+                    return SyscallRet::err(SysError::WouldBlock);
+                }
+                crate::channel::park_recv(conn, side, crate::thread::current());
+                crate::thread::block_current();
+            }
+        }
+    }
+}
+
+/// `sys_channel_close(h)` — close this end; the peer observes EOF.
+fn sys_channel_close(h: u64) -> SyscallRet {
+    let (conn, side) = match chan_of(h, 0) {
+        Ok(v) => v,
+        Err(e) => return SyscallRet::err(e),
+    };
+    let mut wake = [0usize; 8];
+    let nwake = crate::channel::close(conn, side, &mut wake);
+    for &t in &wake[..nwake] {
+        crate::thread::wake(t);
+    }
+    let _ = proc::with_current_mut(|p| p.close(h as Handle));
     SyscallRet { rax: 0, rdx: 0 }
 }
 

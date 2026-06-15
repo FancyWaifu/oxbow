@@ -932,3 +932,74 @@ pub mod tcp {
         let _ = sys_close(sock);
     }
 }
+
+/// Bidirectional byte+capability channels (§40): the socketpair/SCM_RIGHTS
+/// primitive that local protocols (e.g. Wayland) run over. Both ends are
+/// Channel handles; either can stream bytes and pass capabilities to the peer.
+pub mod channel {
+    use crate::{syscall1, syscall5, Handle};
+    use oxbow_abi::{
+        CHAN_NONBLOCK, SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND,
+    };
+
+    /// Create a connected pair; returns both ends `(h0, h1)` in this process.
+    pub fn pair() -> Option<(Handle, Handle)> {
+        let (rax, rdx) = unsafe { syscall1(SYS_CHANNEL_PAIR, 0) };
+        if rax != 0 {
+            return None;
+        }
+        Some(((rdx & 0xffff_ffff) as Handle, (rdx >> 32) as Handle))
+    }
+
+    /// Send `bytes` (all of them, blocking while full) plus the capabilities in
+    /// `caps`. Returns bytes sent (0 if the peer is gone).
+    pub fn send(h: Handle, bytes: &[u8], caps: &[Handle]) -> usize {
+        let (rax, rdx) = unsafe {
+            syscall5(
+                SYS_CHANNEL_SEND,
+                h as u64,
+                bytes.as_ptr() as u64,
+                bytes.len() as u64,
+                caps.as_ptr() as u64,
+                caps.len() as u64,
+            )
+        };
+        if rax != 0 {
+            0
+        } else {
+            rdx as usize
+        }
+    }
+
+    /// Receive into `buf`, delivering up to `caps_out.len()` capabilities (their
+    /// handles written into `caps_out`). Returns `(nbytes, ncaps)`; `(0, 0)` on
+    /// EOF. With `nonblock`, returns `None` if nothing is buffered.
+    pub fn recv(
+        h: Handle,
+        buf: &mut [u8],
+        caps_out: &mut [Handle],
+        nonblock: bool,
+    ) -> Option<(usize, usize)> {
+        let flags = if nonblock { CHAN_NONBLOCK } else { 0 };
+        let packed = (caps_out.len() as u64) | (flags << 32);
+        let (rax, rdx) = unsafe {
+            syscall5(
+                SYS_CHANNEL_RECV,
+                h as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+                caps_out.as_mut_ptr() as u64,
+                packed,
+            )
+        };
+        if rax != 0 {
+            return None; // WouldBlock (nonblocking)
+        }
+        Some(((rdx & 0xffff_ffff) as usize, (rdx >> 32) as usize))
+    }
+
+    /// Close this end; the peer observes EOF.
+    pub fn close(h: Handle) {
+        let _ = unsafe { syscall1(SYS_CHANNEL_CLOSE, h as u64) };
+    }
+}

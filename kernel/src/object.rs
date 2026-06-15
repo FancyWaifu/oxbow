@@ -18,6 +18,7 @@ pub enum ObjType {
     PciDevice,
     Pipe,
     Framebuffer,
+    Channel,
 }
 
 /// What a handle points at: a pool index for Endpoint/Reply/Memory/Frame, or the
@@ -41,6 +42,9 @@ pub enum ObjectRef {
     /// The linear framebuffer (singleton): map it + query geometry. Geometry
     /// lives in `kernel/src/fb.rs`; the cap just gates access (law L1).
     Framebuffer,
+    /// One end of a bidirectional byte+capability channel (see channel.rs):
+    /// `conn` is the connection pool index, `side` is 0 or 1.
+    Channel { conn: u8, side: u8 },
 }
 
 impl ObjectRef {
@@ -58,6 +62,7 @@ impl ObjectRef {
             ObjectRef::PciDevice(_) => ObjType::PciDevice,
             ObjectRef::Pipe(_) => ObjType::Pipe,
             ObjectRef::Framebuffer => ObjType::Framebuffer,
+            ObjectRef::Channel { .. } => ObjType::Channel,
         }
     }
 }

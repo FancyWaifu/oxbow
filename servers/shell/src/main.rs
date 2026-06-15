@@ -416,6 +416,60 @@ fn rand_cmd() {
     tw(b"\n");
 }
 
+/// `chantest`: exercise the byte+capability channel (§40) — the Wayland/socketpair
+/// transport. Create a pair, write a magic word into a fresh frame, send "PING"
+/// plus that frame CAP over one end, receive on the other, map the received cap,
+/// and confirm the magic — proving both byte streaming and capability passing.
+fn chantest() {
+    let Some((h0, h1)) = rt::channel::pair() else {
+        tw(b"chan: pair failed\n");
+        return;
+    };
+    let Ok(frame) = rt::sys_frame_alloc(BOOT_MEM) else {
+        tw(b"chan: frame alloc failed\n");
+        return;
+    };
+    const V1: u64 = 0x3C00_0000;
+    const V2: u64 = 0x3C10_0000;
+    const PROT_RW: u64 = oxbow_abi::PROT_READ | oxbow_abi::PROT_WRITE;
+    if rt::sys_frame_map(frame, V1, PROT_RW).is_err() {
+        tw(b"chan: map1 failed\n");
+        return;
+    }
+    unsafe { core::ptr::write_volatile(V1 as *mut u32, 0xCAFE_BABE) };
+
+    let _ = rt::channel::send(h0, b"PING", &[frame]);
+
+    let mut buf = [0u8; 16];
+    let mut caps = [0u32; 4];
+    let Some((n, nc)) = rt::channel::recv(h1, &mut buf, &mut caps, false) else {
+        tw(b"chan: recv failed\n");
+        return;
+    };
+    tw(b"chan: got ");
+    tw_dec(n as u8);
+    tw(b" bytes \"");
+    tw(&buf[..n]);
+    tw(b"\" + ");
+    tw_dec(nc as u8);
+    tw(b" cap(s)\n");
+
+    if nc >= 1 && rt::sys_frame_map(caps[0], V2, PROT_RW).is_ok() {
+        let magic = unsafe { core::ptr::read_volatile(V2 as *const u32) };
+        if magic == 0xCAFE_BABE {
+            tw(b"chan: capability passed OK (frame magic matches across the channel)\n");
+        } else {
+            tw(b"chan: FAIL - magic mismatch\n");
+        }
+    } else if nc >= 1 {
+        tw(b"chan: FAIL - could not map received cap\n");
+    } else {
+        tw(b"chan: FAIL - no cap received\n");
+    }
+    rt::channel::close(h0);
+    rt::channel::close(h1);
+}
+
 /// `sync`: ask the fs to persist its writable tree to disk (TAG_FS_SYNC on the
 /// root dir cap). The tree is restored automatically at the next boot.
 fn sync_cmd() {
@@ -888,6 +942,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"cares-test" => spawn_with_budget(BOOT_IMG_CARES, HANDLE_NULL, rest, 16 * 1024 * 1024, sp),
         b"exec" => exec_cmd(*cwd, path, rest, sp),
         b"sync" => sync_cmd(),
+        b"chantest" => chantest(),
         b"rand" => rand_cmd(),
         b"fstest" => spawn_with_budget(BOOT_IMG_FSTEST, HANDLE_NULL, rest, 16 * 1024 * 1024, sp),
         b"jail" => jail_cmd(sp),

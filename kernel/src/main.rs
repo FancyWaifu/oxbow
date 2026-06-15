@@ -8,6 +8,7 @@
 #![feature(abi_x86_interrupt)]
 
 mod arch;
+mod channel;
 mod elf;
 mod fb;
 mod image;
