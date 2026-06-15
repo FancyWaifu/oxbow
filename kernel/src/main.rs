@@ -9,6 +9,7 @@
 
 mod arch;
 mod elf;
+mod fb;
 mod image;
 mod ipc;
 mod irq;
@@ -26,8 +27,8 @@ mod usermem;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 use limine::request::{
-    ExecutableAddressRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker,
-    RequestsStartMarker,
+    ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest,
+    RequestsEndMarker, RequestsStartMarker,
 };
 use limine::BaseRevision;
 
@@ -86,6 +87,12 @@ static EXEC_ADDR_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::n
 #[link_section = ".requests"]
 static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
 
+/// Ask Limine for a linear framebuffer (the foundation for graphics: the fb
+/// server will own this region as a capability and composite into it).
+#[used]
+#[link_section = ".requests"]
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+
 /// Kernel entry point. Limine jumps here — see `ENTRY(kmain)` in linker.ld —
 /// with a 64-bit, higher-half environment already established.
 #[no_mangle]
@@ -120,6 +127,22 @@ extern "C" fn kmain() -> ! {
         usable / (1024 * 1024),
         regions
     );
+
+    // -- Framebuffer: record geometry + paint a smoke-test pattern -----------
+    if let Some(fb) = FRAMEBUFFER_REQUEST.get_response().and_then(|r| r.framebuffers().next()) {
+        fb::init(fb.addr() as u64, fb.width() as u32, fb.height() as u32, fb.pitch() as u32, fb.bpp());
+        println!(
+            "[fb] {}x{} {}bpp pitch={} @ {:#x}",
+            fb.width(),
+            fb.height(),
+            fb.bpp(),
+            fb.pitch(),
+            fb.addr() as u64
+        );
+        fb::test_pattern();
+    } else {
+        println!("[fb] no framebuffer from Limine");
+    }
 
     // Prove the HHDM math before paging starts depending on it: grab a frame,
     // write a sentinel through the direct map, read it back.
