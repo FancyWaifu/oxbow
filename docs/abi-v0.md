@@ -1806,6 +1806,32 @@ keycode. The **libxkbcommon** port (real keycodes + an xkb keymap, so modifiers
 and layouts decode properly) is the next step, followed by libvterm + FreeType
 for an actual terminal window.
 
+## 48. libxkbcommon — standards-correct keymaps (v1-xkbcommon)
+
+Ported the real **XKB keymap compiler + state machine** (`servers/oxxkb`, ~28 C
+files: the bison-generated parser, scanner, the keycodes/types/compat/symbols
+compilation passes, keysym tables, and `xkb_state`). It compiles cleanly to the
+oxbow freestanding target with the standard harness (clang `-nostdinc` + clang
+resource headers + libc, `llvm-ar`); the only libc additions were `access()` +
+the `R_OK`/`X_OK` flags, and a hand-written `config.h` (utils.c self-provides the
+`strndup`/`asprintf` fallbacks).
+
+We only ever compile a keymap **from a string** — the compositor ships a complete,
+self-contained US keymap (`us_keymap.h`, generated on the host with `xkbcli
+compile-keymap --layout us`), so the on-disk xkb config tree is never needed
+(`XKB_CONTEXT_NO_DEFAULT_INCLUDES`). `xkb-test` proves the whole pipeline on real
+hardware:
+```
+[xkb-test] keymap compiled (69888-byte source)
+[xkb-test] key 38        -> 'a'        # keycode (evdev KEY_A+8) -> char
+[xkb-test] shift+key 38  -> 'A'        # modifier state tracking
+[xkb-test] key 36 sym    = 0xff0d      # Return keysym
+```
+The image registry cap (`MAX_IMAGES`) grew 24→32 to fit the 5 MB test binary.
+Next: wire it into the keyboard path — the compositor sends this keymap via
+`wl_keyboard.keymap` and the kbd driver sends evdev keycodes, so clients decode
+keys with `xkb_state` (and then libvterm + FreeType for a terminal window).
+
 ## 43. Capability-native identity — users without ambient authority (v1-identity)
 
 oxbow has no uid-based access control and never will: authority is the set of

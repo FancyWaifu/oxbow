@@ -9,6 +9,11 @@
 #define STDIN_FILENO 0
 #define STDOUT_FILENO 1
 #define STDERR_FILENO 2
+#define F_OK 0
+#define X_OK 1
+#define W_OK 2
+#define R_OK 4
+int access(const char *, int);
 ssize_t read(int, void *, size_t);
 ssize_t write(int, const void *, size_t);
 int close(int);

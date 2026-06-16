@@ -549,6 +549,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxxkb"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+]
+
+[[package]]
 name = "poly1305"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

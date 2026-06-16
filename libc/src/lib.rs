@@ -1113,6 +1113,13 @@ pub unsafe extern "C" fn fileno(stream: *mut FILE) -> i32 {
         (*stream).fd
     }
 }
+/// access(2): oxbow has no ambient filesystem path namespace (capabilities, not
+/// paths), so report "no access" — callers fall back accordingly. xkbcommon uses
+/// it only to probe config dirs, a path never taken when compiling from a string.
+#[no_mangle]
+pub extern "C" fn access(_path: *const u8, _mode: i32) -> i32 {
+    -1
+}
 #[no_mangle]
 pub extern "C" fn stat(_path: *const u8, _st: *mut u8) -> i32 {
     -1

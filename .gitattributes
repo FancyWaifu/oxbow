@@ -35,3 +35,5 @@ servers/oxffi/ffi-src/**      linguist-vendored
 servers/oxffi/ffi-include/**  linguist-vendored
 servers/oxwl/wl-src/**        linguist-vendored
 servers/oxwl/wl-include/**    linguist-vendored
+# libxkbcommon (oxxkb) — vendored upstream C; the XKB keymap compiler + state.
+servers/oxxkb/xkb/**          linguist-vendored
