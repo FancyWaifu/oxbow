@@ -315,13 +315,13 @@ fn exec_cmd(cwd: Handle, path: &Path, arg_line: &[u8], sp: &Spawner) {
         tw(b"exec: usage: exec <path> [args]\n");
         return;
     }
-    // Resolve to an absolute path and OPEN it from the root cap (the shell holds
-    // root, so any absolute path resolves; the fs walks multi-component paths).
+    // Resolve relative to the SESSION root (§45) — a user can only exec programs
+    // within their own home subtree; root resolves from the fs root.
     let mut target = *path;
     target.apply(pathname);
     let mut m = MsgBuf::new(TAG_FS_OPEN);
     pack_name(&mut m, target.as_bytes());
-    if rt::sys_call(BOOT_FS_ROOT, &mut m).is_err() || m.data[0] != 0 {
+    if rt::sys_call(session_root(), &mut m).is_err() || m.data[0] != 0 {
         tw(b"exec: ");
         tw(pathname);
         tw(b": not found\n");
@@ -921,26 +921,27 @@ fn write_file(dir: Handle, name: &[u8], text: &[u8], append: bool) {
 /// current one. Confinement: there is no `cd ..` — you can't walk above a dir cap
 /// you hold; `cd /` works only because the shell still holds the root cap.
 fn cd(name: &[u8], cwd: &mut Handle, path: &mut Path) {
-    // Normalize to an absolute target (handles `..`, `.`, absolute + relative),
-    // then re-resolve it FROM ROOT. The fs forbids `..` within a directory cap
-    // (you can't escape a capability), but the shell holds the root cap, so it
-    // can always resolve any absolute path — that's what makes `cd ..` work.
+    // Normalize to a session-absolute target (handles `..`, `.`, absolute +
+    // relative), then re-resolve it FROM SESSION_ROOT (§45) — the user's home
+    // for non-root, the fs root for root. The fs rejects `..` past a cap and
+    // collapses a leading `/` onto the cap's subtree, so this can never escape
+    // the session root. `/` (and `cd` with no path) returns to the session root.
     let mut target = *path;
     target.apply(name);
     let commit = |cwd: &mut Handle, cap: Handle| {
-        if *cwd != BOOT_FS_ROOT {
+        if *cwd != BOOT_FS_ROOT && *cwd != session_root() {
             let _ = rt::sys_close(*cwd);
         }
         *cwd = cap;
     };
     if target.len == 1 {
-        commit(cwd, BOOT_FS_ROOT);
+        commit(cwd, session_root());
         *path = target;
         return;
     }
     let mut m = MsgBuf::new(TAG_FS_OPEN);
     pack_name(&mut m, target.as_bytes());
-    if rt::sys_call(BOOT_FS_ROOT, &mut m).is_err() || m.data[0] != 0 {
+    if rt::sys_call(session_root(), &mut m).is_err() || m.data[0] != 0 {
         tw(b"cd: ");
         tw(name);
         tw(b": no such directory\n");
@@ -1020,6 +1021,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"id" => id_cmd(),
         b"groups" => groups_cmd(),
         b"su" => su_cmd(rest, cwd, path),
+        b"passwd" => passwd_cmd(),
         b"logout" | b"exit" => login_gate(cwd, path),
         b"help" => {
             tw(b"oxbow shell:  (ls cat mkdir touch are spawned programs)\n");
@@ -1049,6 +1051,7 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  whoami          print the current user (capability-native identity)\n");
             tw(b"  id / groups     print uid/gid and group membership\n");
             tw(b"  su [user]       switch user (re-authenticate; default root)\n");
+            tw(b"  passwd          change your password\n");
             tw(b"  logout          end the session and return to the login prompt\n");
             tw(b"  help            this list\n");
         }
@@ -1100,8 +1103,21 @@ static mut SEEDED: bool = false;
 /// stamped on every spawned child.
 static mut CUR_IDENT: IdentRec = IdentRec::zeroed();
 
+/// The capability that roots the current session's filesystem namespace (§45):
+/// `BOOT_FS_ROOT` for root, the user's HOME dir cap for everyone else. The shell
+/// resolves every user path — `cd`, `exec`, and the dir caps it hands to spawned
+/// programs — FROM here, so a logged-in user is confined to their home subtree by
+/// the filesystem (the fs collapses leading `/` onto the cap and rejects `..`).
+/// The broad root cap is still held for the login machinery only (seeding /etc,
+/// opening home dirs at auth) — never to resolve a session path.
+static mut SESSION_ROOT: Handle = BOOT_FS_ROOT;
+
 fn cur_ident() -> &'static IdentRec {
     unsafe { &*core::ptr::addr_of!(CUR_IDENT) }
+}
+
+fn session_root() -> Handle {
+    unsafe { SESSION_ROOT }
 }
 
 /// Current login name, defaulting to "root" before/without a name.
@@ -1182,29 +1198,40 @@ fn seed_accounts() {
     write_file(BOOT_FS_ROOT, b"/etc/group", b"root:0:\nwheel:27:root,bryson\nbryson:1000:\n", false);
 }
 
-/// Point cwd at account `i`'s home capability (the login cap handoff). root stays
-/// at the filesystem root; other users get their home dir cap.
+/// Establish account `i`'s session: SESSION_ROOT becomes their home capability
+/// (the login cap handoff), cwd starts there, and their home is presented as `/`
+/// — so they are confined to it (§45). root's session root is the fs root.
 fn set_cwd_home(i: usize, cwd: &mut Handle, path: &mut Path) {
     let a = &ACCTS[i];
-    if *cwd != BOOT_FS_ROOT {
+    // Release the previous session's home cap (but never the shared root cap).
+    unsafe {
+        if SESSION_ROOT != BOOT_FS_ROOT {
+            let _ = rt::sys_close(SESSION_ROOT);
+        }
+    }
+    if *cwd != BOOT_FS_ROOT && *cwd != session_root() {
         let _ = rt::sys_close(*cwd);
     }
-    *cwd = BOOT_FS_ROOT;
+    // Default to root's namespace; override below for users with a real home.
+    unsafe {
+        SESSION_ROOT = BOOT_FS_ROOT;
+    }
     *path = Path::root();
-    if a.home == b"/" {
-        return;
+    if a.home != b"/" {
+        // Mint the home dir cap from the root authority (login machinery), then
+        // adopt it as the session root — the only fs cap this session will use.
+        let mut m = MsgBuf::new(TAG_FS_OPEN);
+        pack_name(&mut m, a.home);
+        if rt::sys_call(BOOT_FS_ROOT, &mut m).is_ok()
+            && m.data[0] == 0
+            && m.data[1] == oxbow_abi::FS_DIR
+        {
+            unsafe {
+                SESSION_ROOT = m.handles[0];
+            }
+        }
     }
-    let mut m = MsgBuf::new(TAG_FS_OPEN);
-    pack_name(&mut m, a.home);
-    if rt::sys_call(BOOT_FS_ROOT, &mut m).is_ok()
-        && m.data[0] == 0
-        && m.data[1] == oxbow_abi::FS_DIR
-    {
-        *cwd = m.handles[0];
-        let mut p = Path::root();
-        p.apply(a.home);
-        *path = p;
-    }
+    *cwd = session_root();
 }
 
 /// Read a line as a password (echoes — the tty has no no-echo mode yet).
@@ -1263,6 +1290,45 @@ fn su_cmd(arg: &[u8], cwd: &mut Handle, path: &mut Path) {
         tw(name);
         tw(b"\n");
     }
+}
+
+/// `passwd`: change the current user's password (re-hash with a fresh salt).
+/// In-memory only — the seeded defaults are restored at the next boot until the
+/// credential store is persisted (next arc).
+fn passwd_cmd() {
+    let i = match ACCTS.iter().position(|a| a.name == cur_name()) {
+        Some(i) => i,
+        None => {
+            tw(b"passwd: unknown user\n");
+            return;
+        }
+    };
+    let mut line = [0u8; 256];
+    tw(b"current password: ");
+    let n = read_line(&mut line);
+    if hash_pw(unsafe { &SALTS[i] }, trim(&line[..n])) != unsafe { HASHES[i] } {
+        tw(b"passwd: Authentication failure\n");
+        return;
+    }
+    tw(b"new password: ");
+    let n = read_line(&mut line);
+    let np = trim(&line[..n]);
+    let mut nb = [0u8; 128];
+    let nl = core::cmp::min(np.len(), 128);
+    nb[..nl].copy_from_slice(&np[..nl]);
+    tw(b"retype new password: ");
+    let n2 = read_line(&mut line);
+    if trim(&line[..n2]) != &nb[..nl] {
+        tw(b"passwd: passwords do not match\n");
+        return;
+    }
+    let mut salt = [0u8; 16];
+    let _ = rt::sys_getentropy(&mut salt);
+    unsafe {
+        SALTS[i] = salt;
+        HASHES[i] = hash_pw(&salt, &nb[..nl]);
+    }
+    tw(b"passwd: updated (in-memory; resets to the default at reboot)\n");
 }
 
 #[no_mangle]

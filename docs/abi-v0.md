@@ -1828,8 +1828,32 @@ kernel trusts.
 - **Builtins.** `su [user]` re-authenticates and swaps identity + home cwd;
   `logout` returns to the `login:` prompt. The prompt shows `user@oxbow:path$`.
 
-Honest scope: the shell still holds the broad fs-root cap behind the scenes, so
-this is real auth + real identity + the home-cap handoff, but not yet *strict*
-isolation (`bryson` can still `cd /`). Dropping to a home-only cap bundle — so a
-user is physically unable to reach another's files — is the next arc, along with
-`passwd`/`adduser` writing the credential store.
+## 45. Per-user filesystem isolation — the session root cap (v1-isolation)
+
+Logging in now confines you. The shell resolves **every** session path — `cd`,
+`exec`, and the dir caps it hands to spawned programs — from a `SESSION_ROOT`
+capability: `BOOT_FS_ROOT` for root, the user's **home dir cap** for everyone
+else. Your home is presented as `/`.
+
+Because the fs collapses a leading `/` onto the cap's own subtree and rejects
+`..` (§ the id→path bridge), a non-root session physically cannot escape its
+home — the *same* command is allowed or denied purely by which capability roots
+the session:
+```
+bryson@oxbow:/$ cat /etc/passwd        # -> home/bryson/etc/passwd
+cat: /etc/passwd: not found            # confined by the fs
+bryson@oxbow:/$ su root
+root@oxbow:/$ cat /etc/passwd          # the real one
+root:x:0:0:/:/bin/sh
+```
+This holds for spawned programs too (`ls`/`cat`/`tcc` get the home cap as their
+cwd), so untrusted code is kernel-confined to the user's home. `passwd` re-hashes
+(in-memory) with a fresh salt.
+
+Honest scope: the trusted shell process still *holds* `BOOT_FS_ROOT`, used only
+by the login machinery (seeding, minting a home cap at auth) — never to resolve a
+logged-in user's path, much like `login`/`su` are setuid-root on Unix. Moving
+that authority into a separate `login` server (shell holds zero root) is
+defense-in-depth for later; the user-visible isolation is already enforced by the
+filesystem. Persisting the credential store + `adduser` are the remaining
+account-management pieces.
