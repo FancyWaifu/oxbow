@@ -1857,3 +1857,16 @@ that authority into a separate `login` server (shell holds zero root) is
 defense-in-depth for later; the user-visible isolation is already enforced by the
 filesystem. Persisting the credential store + `adduser` are the remaining
 account-management pieces.
+
+## 46. Frame callbacks — the surface animates (v1-frame-callback)
+
+The compositor (`oxcomp`) now honours `wl_surface.frame`: it keeps the client's
+`wl_callback` and, immediately after compositing that surface, fires
+`wl_callback.done(time)` with a milliseconds-since-boot stamp (`ox_now_ms`, from
+`rt::sys_uptime_ms`). weston-simple-shm's `done` handler redraws — new buffer,
+new frame request, commit — so the loop closes and the rings **animate**
+continuously instead of freezing on frame one. The pump loop no longer parks
+after the first frame; a compositor is a service and runs for the life of the
+session (it still gives up after 15 s if no client ever shows). Verified by two
+screendumps 3 s apart differing across ~140 KB of pixels. Next graphics steps:
+input (`wl_seat` + the `kbd` driver) and compositing more than one surface.

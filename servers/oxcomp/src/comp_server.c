@@ -8,6 +8,8 @@
 #include "xdg-shell-server-protocol.h"
 
 extern void ox_log(const char *p, unsigned long len);
+/* Milliseconds since boot — the frame-callback timestamp clients animate from. */
+extern unsigned int ox_now_ms(void);
 static void slog(const char *s)
 {
   unsigned long n = 0;
@@ -24,6 +26,7 @@ struct surf {
   struct wl_resource *buffer;       /* pending/current attached wl_buffer */
   struct wl_resource *xdg_surface;  /* the xdg_surface role object, if any */
   struct wl_resource *xdg_toplevel; /* the xdg_toplevel, if any */
+  struct wl_resource *frame_cb;     /* pending wl_callback from wl_surface.frame */
   int                 configured;   /* have we sent the initial configure? */
 };
 
@@ -49,7 +52,11 @@ static void surface_damage(struct wl_client *c, struct wl_resource *res,
 }
 static void surface_frame(struct wl_client *c, struct wl_resource *res, uint32_t cb)
 {
-  (void)c; (void)res; (void)cb;
+  struct surf *s = wl_resource_get_user_data(res);
+  /* The client asks to be told when it may draw the next frame. Create the
+   * wl_callback now; we fire its `done` right after we composite this surface,
+   * which drives the client's redraw loop = animation. */
+  s->frame_cb = wl_resource_create(c, &wl_callback_interface, 1, cb);
 }
 static void surface_set_opaque_region(struct wl_client *c, struct wl_resource *res,
                                       struct wl_resource *region)
@@ -100,6 +107,13 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
   wl_shm_buffer_end_access(shm);
   g_composited = 1;
   wl_buffer_send_release(s->buffer); /* client may reuse the buffer */
+  /* Tell the client this frame is on screen and it may draw the next one. Its
+   * frame-callback handler redraws + commits again → the surface animates. */
+  if (s->frame_cb) {
+    wl_callback_send_done(s->frame_cb, ox_now_ms());
+    wl_resource_destroy(s->frame_cb);
+    s->frame_cb = NULL;
+  }
 }
 static void surface_set_buffer_transform(struct wl_client *c, struct wl_resource *r, int32_t t)
 {

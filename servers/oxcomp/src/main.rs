@@ -26,6 +26,13 @@ pub extern "C" fn ox_log(p: *const u8, len: usize) {
     let _ = rt::sys_console_write(BOOT_CONSOLE, p, len);
 }
 
+/// Milliseconds since boot — the timestamp the compositor stamps on frame-callback
+/// `done` events; Wayland clients animate off its delta.
+#[no_mangle]
+pub extern "C" fn ox_now_ms() -> u32 {
+    rt::sys_uptime_ms() as u32
+}
+
 extern "C" {
     fn comp_server_setup(fd: i32, fb: *mut u32, w: i32, h: i32, pitch_words: i32) -> *mut u8;
     fn comp_server_pump(d: *mut u8);
@@ -82,27 +89,22 @@ pub extern "C" fn oxbow_main() -> ! {
     // deadline, not an iteration count), and keep compositing a while after the
     // first frame so animation settles before a screen capture.
     let start = rt::sys_uptime_ms();
-    let mut first: u64 = 0;
+    let mut announced = false;
     loop {
         unsafe { comp_server_pump(display) };
-        let now = rt::sys_uptime_ms();
         if unsafe { comp_server_composited() } != 0 {
-            if first == 0 {
-                first = now;
+            if !announced {
+                // Once a client's frame lands, keep compositing forever: each
+                // commit fires a frame callback, the client redraws, and the
+                // surface animates. The compositor is a service — it never parks.
+                w(b"[oxcomp] composited a client surface (animating)\n");
+                announced = true;
             }
-            if now - first > 4000 {
-                break; // composited + 4s of frames
-            }
-        } else if now - start > 15000 {
-            break; // give up after 15s
+        } else if rt::sys_uptime_ms() - start > 15000 {
+            w(b"[oxcomp] no surface composited\n");
+            park(); // no client showed up — give up and idle
         }
     }
-    if unsafe { comp_server_composited() } != 0 {
-        w(b"[oxcomp] composited a client surface\n");
-    } else {
-        w(b"[oxcomp] no surface composited\n");
-    }
-    park();
 }
 
 fn park() -> ! {
