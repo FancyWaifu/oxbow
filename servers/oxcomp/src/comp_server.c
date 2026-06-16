@@ -27,6 +27,57 @@ static void slog(const char *s)
 static unsigned int *g_fb;
 static int           g_w, g_h, g_pitch_words;
 static struct wl_resource *g_keyboard;  /* the client's wl_keyboard, if bound */
+
+/* ---- software cursor (§54) ---------------------------------------------- */
+#define CURW 11
+#define CURH 17
+/* A classic top-left arrow: 'X' = black outline, '.' = white fill, ' ' = clear. */
+static const char *const cursor_bits[CURH] = {
+  "X          ", "XX         ", "X.X        ", "X..X       ",
+  "X...X      ", "X....X     ", "X.....X    ", "X......X   ",
+  "X.......X  ", "X........X ", "X.....XXXXX", "X..X..X    ",
+  "X.X X..X   ", "XX  X..X   ", "X    X..X  ", "     X..X  ",
+  "      XX   ",
+};
+static int          g_cx = 200, g_cy = 200; /* logical cursor position */
+static int          g_cur_drawn = 0, g_cdx, g_cdy; /* last DRAWN position */
+static unsigned int g_cur_save[CURW * CURH];
+
+/* Restore the pixels the cursor overwrote (call before any fb change). */
+static void erase_cursor(void)
+{
+  if (!g_cur_drawn)
+    return;
+  for (int j = 0; j < CURH; j++)
+    for (int i = 0; i < CURW; i++) {
+      if (cursor_bits[j][i] == ' ')
+        continue;
+      int x = g_cdx + i, y = g_cdy + j;
+      if (x < 0 || x >= g_w || y < 0 || y >= g_h)
+        continue;
+      g_fb[(long)y * g_pitch_words + x] = g_cur_save[j * CURW + i];
+    }
+  g_cur_drawn = 0;
+}
+
+/* Save the pixels under the cursor + draw it on top (call after any fb change). */
+static void draw_cursor(void)
+{
+  g_cdx = g_cx;
+  g_cdy = g_cy;
+  for (int j = 0; j < CURH; j++)
+    for (int i = 0; i < CURW; i++) {
+      char c = cursor_bits[j][i];
+      if (c == ' ')
+        continue;
+      int x = g_cdx + i, y = g_cdy + j;
+      if (x < 0 || x >= g_w || y < 0 || y >= g_h)
+        continue;
+      g_cur_save[j * CURW + i] = g_fb[(long)y * g_pitch_words + x];
+      g_fb[(long)y * g_pitch_words + x] = (c == 'X') ? 0x00000000u : 0x00ffffffu;
+    }
+  g_cur_drawn = 1;
+}
 static struct wl_resource *g_focus;     /* the surface holding keyboard focus */
 static unsigned int        g_serial;    /* event serial counter */
 static int           g_composited;
@@ -106,6 +157,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
   wl_shm_buffer_begin_access(shm);
   unsigned char *data = wl_shm_buffer_get_data(shm);
   int ox = 140, oy = 130; /* where the window lands on screen */
+  erase_cursor(); /* §54: lift the cursor before the window blit... */
   for (int y = 0; y < bh && oy + y < g_h; y++) {
     unsigned int *src = (unsigned int *)(data + (long)y * stride);
     for (int x = 0; x < bw && ox + x < g_w; x++) {
@@ -113,6 +165,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
       g_fb[(long)(oy + y) * g_pitch_words + (ox + x)] = src[x];
     }
   }
+  draw_cursor(); /* ...and put it back on top */
   wl_shm_buffer_end_access(shm);
   g_composited = 1;
   /* Give this surface keyboard focus the first time it shows pixels (§47). */
@@ -386,20 +439,59 @@ static int on_input(int fd, uint32_t mask, void *data)
   return 0;
 }
 
+/* §54: drain PS/2 mouse packets and move the cursor. Each packet is 3 bytes:
+ * [flags, dx, dy] with 9-bit signed deltas (sign bits in flags). Mouse Y points
+ * up, screen Y down, so dy is subtracted. */
+static int on_mouse(int fd, uint32_t mask, void *data)
+{
+  (void)mask;
+  (void)data;
+  static unsigned char pkt[3];
+  static int           pi = 0;
+  unsigned char        buf[192];
+  long                 n = read(fd, buf, sizeof buf);
+  int                  moved = 0;
+  for (long i = 0; i < n; i++) {
+    pkt[pi++] = buf[i];
+    if (pi < 3)
+      continue;
+    pi = 0;
+    int flags = pkt[0];
+    int dx = pkt[1] - ((flags & 0x10) ? 256 : 0);
+    int dy = pkt[2] - ((flags & 0x20) ? 256 : 0);
+    g_cx += dx;
+    g_cy -= dy;
+    if (g_cx < 0) g_cx = 0;
+    if (g_cx >= g_w) g_cx = g_w - 1;
+    if (g_cy < 0) g_cy = 0;
+    if (g_cy >= g_h) g_cy = g_h - 1;
+    moved = 1;
+  }
+  if (moved) {
+    erase_cursor();
+    draw_cursor();
+  }
+  return 0;
+}
+
 /* ---- exported driver entry points --------------------------------------- */
-void *comp_server_setup(int fd, int input_fd, unsigned int *fb, int w, int h, int pitch_words)
+void *comp_server_setup(int fd, int input_fd, int mouse_fd, unsigned int *fb, int w, int h,
+                        int pitch_words)
 {
   g_fb = fb;
   g_w = w;
   g_h = h;
   g_pitch_words = pitch_words;
   g_composited = 0;
+  g_cx = w / 2;
+  g_cy = h / 2;
 
   /* Paint a desktop background so the screen is self-contained (the client
    * window then composites on top of it). */
   for (int y = 0; y < h; y++)
     for (int x = 0; x < w; x++)
       fb[(long)y * pitch_words + x] = 0x000d3b45; /* deep teal */
+  draw_cursor(); /* §54: show the cursor from the start */
 
   struct wl_display *d = wl_display_create();
   if (!d)
@@ -416,6 +508,10 @@ void *comp_server_setup(int fd, int input_fd, unsigned int *fb, int w, int h, in
   if (input_fd >= 0)
     wl_event_loop_add_fd(wl_display_get_event_loop(d), input_fd, WL_EVENT_READABLE,
                          on_input, d);
+  /* §54: the mouse channel — moves the software cursor. */
+  if (mouse_fd >= 0)
+    wl_event_loop_add_fd(wl_display_get_event_loop(d), mouse_fd, WL_EVENT_READABLE,
+                         on_mouse, d);
   if (!wl_client_create(d, fd)) {
     wl_display_destroy(d);
     return NULL;

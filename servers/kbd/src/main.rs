@@ -14,7 +14,7 @@
 
 use oxbow_abi::{
     MsgBuf, SysError, BOOT_CONSOLE, BOOT_INPUT_CHAN, BOOT_IRQ, BOOT_KBD_DATA, BOOT_KBD_STATUS,
-    BOOT_TTY, R_IN, TAG_TTY_CHAR,
+    BOOT_MOUSE_CHAN, BOOT_MOUSE_IRQ, BOOT_TTY, R_IN, TAG_TTY_CHAR,
 };
 use oxbow_rt as rt;
 
@@ -27,6 +27,65 @@ struct Mods {
     shift: bool,
     ctrl: bool,
     caps: bool,
+}
+
+/// PS/2 mouse packet assembly (§54): the device sends 3-byte packets. We forward
+/// each completed packet verbatim to the compositor, which decodes it.
+struct Mouse {
+    pkt: [u8; 3],
+    idx: usize,
+}
+
+// --- i8042 controller I/O (the kbd driver owns 0x60/0x64) -------------------
+fn i8042_status() -> u8 {
+    rt::sys_io_in(BOOT_KBD_STATUS, 0x64).unwrap_or(0)
+}
+/// Wait until the input buffer is empty (status bit 1 clear) so a write lands.
+fn wait_write() {
+    for _ in 0..200_000 {
+        if i8042_status() & 0x02 == 0 {
+            return;
+        }
+    }
+}
+/// Wait until the output buffer is full (status bit 0 set) so a read is valid.
+fn wait_read() {
+    for _ in 0..200_000 {
+        if i8042_status() & 0x01 != 0 {
+            return;
+        }
+    }
+}
+fn ctrl_cmd(c: u8) {
+    wait_write();
+    let _ = rt::sys_io_out(BOOT_KBD_STATUS, 0x64, c);
+}
+fn data_write(d: u8) {
+    wait_write();
+    let _ = rt::sys_io_out(BOOT_KBD_DATA, 0x60, d);
+}
+fn data_read() -> u8 {
+    wait_read();
+    rt::sys_io_in(BOOT_KBD_DATA, 0x60).unwrap_or(0)
+}
+/// Send a command byte to the mouse (aux device) — prefixed with 0xD4.
+fn mouse_cmd(d: u8) {
+    ctrl_cmd(0xD4);
+    data_write(d);
+}
+/// Initialise the PS/2 mouse: enable the aux port + IRQ12, then data reporting.
+fn mouse_init() {
+    ctrl_cmd(0xA8); // enable the auxiliary (mouse) device
+    ctrl_cmd(0x20); // "read controller config byte"
+    let mut cfg = data_read();
+    cfg |= 0x02; // enable IRQ12 (aux interrupt)
+    cfg &= !0x20; // clear "aux clock disable" → enable the mouse clock
+    ctrl_cmd(0x60); // "write controller config byte"
+    data_write(cfg);
+    mouse_cmd(0xF6); // set defaults
+    let _ = data_read(); // ACK (0xFA)
+    mouse_cmd(0xF4); // enable data reporting
+    let _ = data_read(); // ACK (0xFA)
 }
 
 /// Scancode set 1 make-code → (unshifted, shifted) ASCII for the US-QWERTY main
@@ -93,13 +152,35 @@ fn keychar(sc: u8) -> (u8, u8) {
 /// Drain every byte the i8042 has buffered (status 0x64 bit 0 = output full),
 /// updating modifier state and forwarding translated characters to the tty.
 /// 0xE0-extended keys (arrows, right-side modifiers) are swallowed for now.
-fn drain(mods: &mut Mods) {
+fn mouse_byte(m: &mut Mouse, b: u8) {
+    // The first packet byte always has bit 3 set — use it to resync if we slip.
+    if m.idx == 0 && b & 0x08 == 0 {
+        return;
+    }
+    m.pkt[m.idx] = b;
+    m.idx += 1;
+    if m.idx == 3 {
+        m.idx = 0;
+        rt::channel::send(BOOT_MOUSE_CHAN, &m.pkt, &[]);
+    }
+}
+
+fn drain(mods: &mut Mods, mouse: &mut Mouse) {
     let mut ext = false;
-    while rt::sys_io_in(BOOT_KBD_STATUS, 0x64).map(|s| s & 1 != 0).unwrap_or(false) {
+    loop {
+        let status = i8042_status();
+        if status & 0x01 == 0 {
+            break; // output buffer empty — nothing more to drain
+        }
         let sc = match rt::sys_io_in(BOOT_KBD_DATA, 0x60) {
             Ok(v) => v,
             Err(_) => break,
         };
+        // §54: status bit 5 set ⟹ this byte came from the mouse (aux device).
+        if status & 0x20 != 0 {
+            mouse_byte(mouse, sc);
+            continue;
+        }
         if sc == 0xE0 {
             ext = true; // extended-key prefix — swallow the next code
             continue;
@@ -167,14 +248,22 @@ pub extern "C" fn oxbow_main() -> ! {
     }
 
     let mut mods = Mods { shift: false, ctrl: false, caps: false };
+    let mut mouse = Mouse { pkt: [0; 3], idx: 0 };
     let _ = rt::sys_irq_bind(BOOT_IRQ, notif);
-    // Drain anything buffered from boot, then ack to arm the line.
-    drain(&mut mods);
+    // §54: initialise the PS/2 mouse, then bind its IRQ (12) to the SAME notif —
+    // both keyboard and mouse interrupts wake us; drain() routes by status bit 5.
+    mouse_init();
+    let _ = rt::sys_irq_bind(BOOT_MOUSE_IRQ, notif);
+    w(b"[kbd] ps/2 mouse enabled (irq12)\n");
+    // Drain anything buffered from boot, then ack both lines to arm them.
+    drain(&mut mods, &mut mouse);
     let _ = rt::sys_irq_ack(BOOT_IRQ);
+    let _ = rt::sys_irq_ack(BOOT_MOUSE_IRQ);
 
     loop {
-        let _ = rt::sys_notif_wait(notif); // block until the keyboard IRQ fires
-        drain(&mut mods); // read the scancode(s) — MUST drain before acking
-        let _ = rt::sys_irq_ack(BOOT_IRQ); // re-arm for the next interrupt
+        let _ = rt::sys_notif_wait(notif); // block until a kbd OR mouse IRQ fires
+        drain(&mut mods, &mut mouse); // read all buffered bytes before acking
+        let _ = rt::sys_irq_ack(BOOT_IRQ); // re-arm both lines
+        let _ = rt::sys_irq_ack(BOOT_MOUSE_IRQ);
     }
 }

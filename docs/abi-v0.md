@@ -2028,3 +2028,26 @@ groups=1000(bryson),27(wheel)` — all rendered on screen in DejaVu Sans Mono. Y
 type your username and password into a window and get a working shell. The desktop
 loop is closed end to end: keyboard → shell → tty → channel → libvterm → FreeType
 → wl_shm → compositor → framebuffer.
+
+## 54. A mouse cursor — PS/2 pointer + software cursor (v1-mouse)
+
+First step toward a window manager: a moving cursor, driven by a real PS/2 mouse.
+The mouse shares the i8042 with the keyboard, so the `kbd` driver handles both:
+
+- **Kernel:** IRQ12 (slave PIC, vector 0x2C) installed alongside IRQ9–11 via the
+  same `pci_irq!` macro (the fill-loop that defaults unknown vectors to
+  `unexpected_irq` had to stop clobbering 0x2C). A `mouse_chan` channel + an
+  Irq(12) cap are granted to the kbd driver; the receive end goes to oxcomp.
+- **kbd driver:** initialises the aux device (enable aux, enable IRQ12 in the
+  config byte, `0xF4` enable reporting), binds IRQ12 to the *same* notification as
+  IRQ1, and in `drain()` routes each byte by i8042 status bit 5 (mouse vs key).
+  Completed 3-byte packets are forwarded verbatim to the compositor.
+- **oxcomp:** an event-loop fd decodes the packets (9-bit signed deltas), moves a
+  logical cursor (clamped to the screen), and paints a **save-under software
+  cursor** — a classic arrow that saves the pixels it covers, so it composites
+  cleanly over windows with no trails. It's lifted before each window blit and
+  redrawn on top after.
+
+Verified headlessly: `mouse_move` over the QEMU monitor walks the cursor across
+the screen, over the terminal text, intact. Next: `wl_pointer` (deliver motion +
+clicks to clients) and window management (focus, move, multiple windows).

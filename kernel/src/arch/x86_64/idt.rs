@@ -30,6 +30,7 @@ pci_irq!(pci_irq5, 5);
 pci_irq!(pci_irq9, 9);
 pci_irq!(pci_irq10, 10);
 pci_irq!(pci_irq11, 11);
+pci_irq!(mouse_irq, 12); // IRQ12 — i8042 PS/2 mouse (slave PIC, bindable)
 
 /// Vector the PIT timer (IRQ0) lands on after the PIC remap.
 const TIMER_VECTOR: u8 = 0x20;
@@ -62,9 +63,10 @@ pub fn init() {
         idt[0x29].set_handler_fn(pci_irq9); // IRQ9   — PCI INTx (bindable)
         idt[0x2A].set_handler_fn(pci_irq10); // IRQ10 — PCI INTx (bindable)
         idt[0x2B].set_handler_fn(pci_irq11); // IRQ11 — PCI INTx, e1000 on QEMU q35
+        idt[0x2C].set_handler_fn(mouse_irq); // IRQ12 — i8042 PS/2 mouse (bindable)
         idt[0x2F].set_handler_fn(spurious_slave); // IRQ15 spurious: EOI master
         for v in 0x22u8..=0x2E {
-            if !matches!(v, 0x24 | 0x25 | 0x27 | 0x29 | 0x2A | 0x2B) {
+            if !matches!(v, 0x24 | 0x25 | 0x27 | 0x29 | 0x2A | 0x2B | 0x2C) {
                 idt[v].set_handler_fn(unexpected_irq);
             }
         }

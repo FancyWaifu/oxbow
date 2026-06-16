@@ -253,6 +253,10 @@ fn kmain_stage2() -> ! {
     // reads it and renders it. So the login/shell text appears on screen.
     let term_chan = channel::create();
 
+    // §54: a channel carrying PS/2 mouse packets from the kbd/i8042 driver
+    // (side 0) to the compositor (side 1), which moves the cursor.
+    let mouse_chan = channel::create();
+
     for file in mods.iter() {
         let bytes: &'static [u8] =
             unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) };
@@ -364,6 +368,30 @@ fn kmain_stage2() -> ! {
                         },
                     );
                 }
+                // §54: the PS/2 mouse IRQ line (12) + the SEND end of the mouse
+                // packet channel. The kbd driver owns the shared i8042, so it
+                // also services the mouse.
+                p.install(
+                    oxbow_abi::BOOT_MOUSE_IRQ,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Irq(12),
+                        rights: oxbow_abi::R_BIND
+                            | oxbow_abi::R_ACK
+                            | oxbow_abi::R_GRANT
+                            | oxbow_abi::R_ATTENUATE,
+                        badge: 0,
+                    },
+                );
+                if let Some(conn) = mouse_chan {
+                    p.install(
+                        oxbow_abi::BOOT_MOUSE_CHAN,
+                        object::HandleEntry {
+                            obj: object::ObjectRef::Channel { conn, side: 0 },
+                            rights: oxbow_abi::R_IN | oxbow_abi::R_OUT,
+                            badge: 0,
+                        },
+                    );
+                }
             });
         }
         // The fb server / oxcomp compositor get the framebuffer capability — the
@@ -402,6 +430,18 @@ fn kmain_stage2() -> ! {
                         object::HandleEntry {
                             obj: object::ObjectRef::Channel { conn, side: 1 },
                             rights: oxbow_abi::R_IN | oxbow_abi::R_OUT | oxbow_abi::R_GRANT,
+                            badge: 0,
+                        },
+                    );
+                }
+                // §54: the RECEIVE end of the mouse-packet channel — the compositor
+                // moves the cursor and emits wl_pointer from these.
+                if let Some(conn) = mouse_chan {
+                    p.install(
+                        oxbow_abi::BOOT_MOUSE_CHAN,
+                        object::HandleEntry {
+                            obj: object::ObjectRef::Channel { conn, side: 1 },
+                            rights: oxbow_abi::R_IN | oxbow_abi::R_OUT,
                             badge: 0,
                         },
                     );

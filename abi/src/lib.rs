@@ -478,6 +478,12 @@ pub const BOOT_INPUT_CHAN: Handle = 36;
 /// receive end which it passes to oxterm at spawn — so the shell/login text the
 /// tty prints also renders on screen (§53). Handle 41 (37–40 are images).
 pub const BOOT_TERM_CHAN: Handle = 41;
+/// The PS/2 mouse IRQ line (12), granted to the kbd driver — which owns the
+/// shared i8042 and so handles the mouse too (§54). Bindable like the keyboard.
+pub const BOOT_MOUSE_IRQ: Handle = 42;
+/// A kernel-created channel carrying mouse packets from the kbd/i8042 driver
+/// (send) to the compositor (receive), which moves the cursor + emits wl_pointer.
+pub const BOOT_MOUSE_CHAN: Handle = 43;
 /// Fixed vaddr where the fb server maps the linear framebuffer.
 pub const FB_MMIO: u64 = 0x5000_0000;
 /// The control-channel badge (distinct from any socket id, which are 1..=N).
