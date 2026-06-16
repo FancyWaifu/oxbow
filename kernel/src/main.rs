@@ -20,6 +20,7 @@ mod object;
 mod pci;
 mod pipe;
 mod proc;
+mod shm;
 mod rng;
 mod syscall;
 mod thread;

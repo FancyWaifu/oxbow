@@ -128,6 +128,9 @@ struct FdSlot {
     is_chan: bool,
     /// O_NONBLOCK (fcntl F_SETFL): channel reads return EAGAIN instead of blocking.
     nonblock: bool,
+    /// True if this fd is a memfd/shm region (handle = an Shm cap). mmap maps it
+    /// RW into the AS; the fd (its cap) can be passed via SCM_RIGHTS for wl_shm.
+    is_shm: bool,
 }
 const MAX_FD: usize = 32;
 static mut FDS: [FdSlot; MAX_FD] = [FdSlot {
@@ -138,6 +141,7 @@ static mut FDS: [FdSlot; MAX_FD] = [FdSlot {
     is_sock: false,
     is_chan: false,
     nonblock: false,
+    is_shm: false,
 }; MAX_FD];
 
 // <fcntl.h> open flags (must match libc/include/fcntl.h).
@@ -204,6 +208,7 @@ pub unsafe extern "C" fn open(path: *const u8, flags: i32) -> i32 {
                 is_sock: false,
                 is_chan: false,
                 nonblock: false,
+                is_shm: false,
             };
             return i as i32;
         }
@@ -286,6 +291,8 @@ pub unsafe extern "C" fn close(fd: i32) -> i32 {
     if slot.used {
         if slot.is_chan {
             rt::channel::close(slot.handle);
+        } else if slot.is_shm {
+            let _ = rt::sys_close(slot.handle); // close the cap; region freed on AS teardown
         } else if slot.is_sock {
             if slot.handle != 0 {
                 rt::tcp::close(slot.handle);
@@ -297,6 +304,7 @@ pub unsafe extern "C" fn close(fd: i32) -> i32 {
         slot.is_sock = false;
         slot.is_chan = false;
         slot.nonblock = false;
+        slot.is_shm = false;
     }
     0
 }
@@ -344,6 +352,7 @@ pub unsafe extern "C" fn socket(domain: i32, ty: i32, _proto: i32) -> i32 {
                 is_sock: true,
                 is_chan: false,
                 nonblock: false,
+                is_shm: false,
             };
             return i as i32;
         }
@@ -400,6 +409,7 @@ unsafe fn alloc_chan_fd(handle: Handle) -> i32 {
                 is_sock: false,
                 is_chan: true,
                 nonblock: false,
+                is_shm: false,
             };
             return i as i32;
         }
@@ -543,7 +553,7 @@ pub unsafe extern "C" fn recvmsg(fd: i32, msg: *mut CMsghdr, _flags: i32) -> isi
         (*c).cmsg_type = 1; // SCM_RIGHTS
         let fds = ((*msg).control as *mut u8).add(CMSG_HDR_SZ) as *mut i32;
         for i in 0..nc {
-            *fds.add(i) = alloc_chan_fd(caps[i]);
+            *fds.add(i) = alloc_cap_fd(caps[i]); // channel or shm, per its kind
         }
         (*msg).controllen = CMSG_HDR_SZ + nc * 4;
     } else {
@@ -1249,6 +1259,7 @@ pub unsafe extern "C" fn eventfd(initval: u32, _flags: i32) -> i32 {
                 is_sock: false,
                 is_chan: false,
                 nonblock: false,
+                is_shm: false,
             };
             return i as i32;
         }
@@ -2718,12 +2729,25 @@ pub unsafe extern "C" fn mmap(
     len: usize,
     prot: i32,
     _flags: i32,
-    _fd: i32,
+    fd: i32,
     _off: i64,
 ) -> *mut u8 {
     let bytes = (len + 0xfff) & !0xfff;
     if bytes == 0 {
         return usize::MAX as *mut u8;
+    }
+    // File-backed mmap of a memfd/shm fd: map the SHARED region's frames, so the
+    // mapper and anyone holding the same Shm cap (e.g. a wl_shm client and the
+    // compositor) see the same memory.
+    if fd >= 3 && (fd as usize) < MAX_FD {
+        let slot = &(*addr_of_mut!(FDS))[fd as usize];
+        if slot.used && slot.is_shm && slot.handle != 0 {
+            let va = MMAP_NEXT.fetch_add(bytes, Ordering::Relaxed);
+            match rt::sys_shm_map(slot.handle, va as u64) {
+                Ok(_) => return va as *mut u8,
+                Err(_) => return usize::MAX as *mut u8,
+            }
+        }
     }
     let va = MMAP_NEXT.fetch_add(bytes, Ordering::Relaxed);
     // Anonymous pages map RW first (W^X — can't map executable directly).
@@ -2749,6 +2773,76 @@ pub unsafe extern "C" fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn munmap(_a: *mut u8, _l: usize) -> i32 {
     0 // the whole AS is reclaimed on exit (§16); no per-region unmap yet
+}
+
+/// memfd_create(2): an anonymous shareable memory fd (Wayland's wl_shm pools).
+/// The backing shm region is allocated by the subsequent ftruncate.
+#[no_mangle]
+pub unsafe extern "C" fn memfd_create(_name: *const u8, _flags: u32) -> i32 {
+    for i in 3..MAX_FD {
+        let slot = &mut (*addr_of_mut!(FDS))[i];
+        if !slot.used {
+            *slot = FdSlot {
+                handle: 0,
+                off: 0,
+                size: 0,
+                used: true,
+                is_sock: false,
+                is_chan: false,
+                nonblock: false,
+                is_shm: true,
+            };
+            return i as i32;
+        }
+    }
+    -1
+}
+
+/// ftruncate(2): on a memfd, allocate the shm region (ceil(length/page) frames).
+/// Resizing an already-sized memfd is a no-op (wl_shm pool growth unsupported).
+#[no_mangle]
+pub unsafe extern "C" fn ftruncate(fd: i32, length: i64) -> i32 {
+    if fd >= 3 && (fd as usize) < MAX_FD {
+        let slot = &mut (*addr_of_mut!(FDS))[fd as usize];
+        if slot.used && slot.is_shm {
+            if slot.handle == 0 && length > 0 {
+                let pages = ((length as usize + 4095) / 4096) as u64;
+                match rt::sys_shm_create(BOOT_MEM, pages) {
+                    Ok(h) => {
+                        slot.handle = h;
+                        slot.size = length as u64;
+                        return 0;
+                    }
+                    Err(_) => return -1,
+                }
+            }
+            return 0;
+        }
+    }
+    0
+}
+
+/// Adopt a capability received via SCM_RIGHTS as a fresh fd, reconstructing the
+/// right flavor from its kind (channel stream vs shm region).
+unsafe fn alloc_cap_fd(handle: Handle) -> i32 {
+    let kind = rt::sys_cap_type(handle);
+    for i in 3..MAX_FD {
+        let slot = &mut (*addr_of_mut!(FDS))[i];
+        if !slot.used {
+            *slot = FdSlot {
+                handle,
+                off: 0,
+                size: 0,
+                used: true,
+                is_sock: false,
+                is_chan: kind == oxbow_abi::CAP_CHANNEL,
+                nonblock: false,
+                is_shm: kind == oxbow_abi::CAP_SHM,
+            };
+            return i as i32;
+        }
+    }
+    -1
 }
 
 // --- setjmp/longjmp (x86_64): save callee-saved + rsp + return address ---

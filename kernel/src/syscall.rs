@@ -11,8 +11,8 @@ use oxbow_abi::{
     SPAWN_DEFAULT_BUDGET, SPAWN_SLOTS, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE,
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
-    SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_POLL, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND,
-    SYS_DMA_ALLOC,
+    SYS_CAP_TYPE, SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_POLL, SYS_CHANNEL_RECV,
+    SYS_CHANNEL_SEND, SYS_DMA_ALLOC, SYS_SHM_CREATE, SYS_SHM_MAP, CAP_CHANNEL, CAP_OTHER, CAP_SHM,
     SYS_FB_INFO, SYS_FB_MAP, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE,
     SYS_PROTECT, SYS_RECV, SYS_REPLY,
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_UPTIME_MS,
@@ -124,6 +124,9 @@ pub extern "C" fn syscall_dispatch(
         SYS_CHANNEL_RECV => sys_channel_recv(a1, a2, a3, a4, a5),
         SYS_CHANNEL_CLOSE => sys_channel_close(a1),
         SYS_CHANNEL_POLL => sys_channel_poll(a1),
+        SYS_SHM_CREATE => sys_shm_create(a1, a2),
+        SYS_SHM_MAP => sys_shm_map(a1, a2),
+        SYS_CAP_TYPE => sys_cap_type(a1),
         SYS_DMA_ALLOC => sys_dma_alloc(a1, a2),
         SYS_PROTECT => sys_protect(a1, a2, a3, a4),
         SYS_UPTIME_MS => SyscallRet { rax: 0, rdx: crate::arch::ticks().wrapping_mul(10) },
@@ -938,6 +941,80 @@ fn sys_dma_alloc(mem: u64, vaddr: u64) -> SyscallRet {
     }
 }
 
+/// `sys_shm_create(mem, pages) -> Shm handle` — allocate a shared region of
+/// `pages` frames, paid from the Memory budget (R_MAP). The handle is grantable
+/// (passes over a channel) and maps writable — it backs memfd/wl_shm buffers.
+fn sys_shm_create(mem: u64, pages: u64) -> SyscallRet {
+    let result = (|| -> SysResult<Handle> {
+        let entry = proc::with_current(|p| p.lookup(mem as Handle, ObjType::Memory, R_MAP))?;
+        let ObjectRef::Memory(midx) = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        let pages = pages as usize;
+        let bytes = (pages as u64).checked_mul(4096).ok_or(SysError::Msg)?;
+        if !mm::mem::debit(midx, bytes) {
+            return Err(SysError::NoMem);
+        }
+        let idx = match crate::shm::create(pages) {
+            Some(i) => i,
+            None => {
+                mm::mem::credit(midx, bytes); // refund on failure
+                return Err(SysError::NoMem);
+            }
+        };
+        proc::with_current_mut(|p| {
+            p.alloc_slot(HandleEntry {
+                obj: ObjectRef::Shm(idx),
+                rights: R_MAP | R_WRITE | R_GRANT | R_ATTENUATE,
+                badge: 0,
+            })
+        })
+    })();
+    match result {
+        Ok(h) => SyscallRet::ok_handle(h),
+        Err(e) => SyscallRet::err(e),
+    }
+}
+
+/// `sys_shm_map(shm, vaddr) -> size` — map every page of the region behind cap
+/// `shm` at consecutive vaddrs starting at `vaddr` (writable). rdx = byte size.
+fn sys_shm_map(shm: u64, vaddr: u64) -> SyscallRet {
+    let result = (|| -> SysResult<u64> {
+        let entry = proc::with_current(|p| p.lookup(shm as Handle, ObjType::Shm, R_MAP))?;
+        let ObjectRef::Shm(idx) = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        if vaddr & 0xfff != 0 || vaddr >= LOWER_HALF_END {
+            return Err(SysError::Fault);
+        }
+        let writable = entry.rights & R_WRITE != 0;
+        let pml4 = mm::vm::current_pml4();
+        let n = crate::shm::map(idx, pml4, vaddr, writable);
+        if n == 0 {
+            return Err(SysError::Fault);
+        }
+        Ok((n as u64) * 4096)
+    })();
+    match result {
+        Ok(size) => SyscallRet { rax: 0, rdx: size },
+        Err(e) => SyscallRet::err(e),
+    }
+}
+
+/// `sys_cap_type(h) -> kind` — report a handle's capability kind (CAP_CHANNEL /
+/// CAP_SHM / CAP_OTHER), so a receiver of a passed fd can reconstruct the right
+/// fd flavor. Errors (bad handle) report CAP_OTHER.
+fn sys_cap_type(h: u64) -> SyscallRet {
+    let kind = proc::with_current(|p| p.get(h as Handle))
+        .map(|e| match e.obj {
+            ObjectRef::Channel { .. } => CAP_CHANNEL,
+            ObjectRef::Shm(_) => CAP_SHM,
+            _ => CAP_OTHER,
+        })
+        .unwrap_or(CAP_OTHER);
+    SyscallRet { rax: 0, rdx: kind }
+}
+
 /// `sys_protect(mem, vaddr, len, prot)` — change the protection of already-mapped
 /// user pages. The JIT/exec primitive: a runtime maps RW memory, writes code, and
 /// flips it to RX. W^X (law L4) is preserved — PROT_WRITE|PROT_EXEC is rejected;
@@ -1018,9 +1095,9 @@ fn pledge_class(nr: u64) -> u64 {
         SYS_SEND | SYS_RECV | SYS_CALL | SYS_REPLY | SYS_EP_CREATE | SYS_MINT | SYS_PIPE
         | SYS_PIPE_READ | SYS_PIPE_WRITE | SYS_PIPE_EOF | SYS_CHANNEL_PAIR | SYS_CHANNEL_SEND
         | SYS_CHANNEL_RECV | SYS_CHANNEL_CLOSE | SYS_CHANNEL_POLL => PLEDGE_IPC,
-        SYS_MAP | SYS_PROTECT | SYS_IMMUTABLE | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC => {
-            PLEDGE_MEM
-        }
+        SYS_MAP | SYS_PROTECT | SYS_IMMUTABLE | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC
+        | SYS_SHM_CREATE | SYS_SHM_MAP => PLEDGE_MEM,
+        SYS_CAP_TYPE => PLEDGE_IPC,
         SYS_SPAWN | SYS_SPAWN_BYTES => PLEDGE_SPAWN,
         SYS_ATTENUATE => PLEDGE_CAP,
         SYS_IO_IN | SYS_IO_OUT | SYS_PCI_READ | SYS_PCI_WRITE | SYS_PCI_BAR_MAP | SYS_IRQ_BIND

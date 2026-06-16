@@ -19,6 +19,7 @@ pub enum ObjType {
     Pipe,
     Framebuffer,
     Channel,
+    Shm,
 }
 
 /// What a handle points at: a pool index for Endpoint/Reply/Memory/Frame, or the
@@ -45,6 +46,9 @@ pub enum ObjectRef {
     /// One end of a bidirectional byte+capability channel (see channel.rs):
     /// `conn` is the connection pool index, `side` is 0 or 1.
     Channel { conn: u8, side: u8 },
+    /// A shared multi-page memory region (see shm.rs), by pool index — backs
+    /// memfd/mmap + Wayland's wl_shm pixel buffers.
+    Shm(u8),
 }
 
 impl ObjectRef {
@@ -63,6 +67,7 @@ impl ObjectRef {
             ObjectRef::Pipe(_) => ObjType::Pipe,
             ObjectRef::Framebuffer => ObjType::Framebuffer,
             ObjectRef::Channel { .. } => ObjType::Channel,
+            ObjectRef::Shm(_) => ObjType::Shm,
         }
     }
 }

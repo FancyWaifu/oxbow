@@ -1,0 +1,99 @@
+//! shm — shared multi-page memory regions (§41), the backing for POSIX
+//! memfd/mmap and thus Wayland's wl_shm pixel buffers. A region owns N physical
+//! frames; mapping it lands those frames at N consecutive page-aligned vaddrs in
+//! the caller's address space. The region is a capability (ObjectRef::Shm), so a
+//! client can pass it to a compositor over a channel (SCM_RIGHTS) and BOTH map
+//! the same frames — genuine shared memory between two processes.
+//!
+//! Frames need not be physically contiguous; the page tables give a contiguous
+//! virtual view. Regions are reset in place (never built by value — a Region is
+//! ~4 KiB and would overflow the kernel stack, like the channel pool).
+use spin::Mutex;
+
+const NREGIONS: usize = 4;
+/// Max pages per region: 512 * 4 KiB = 2 MiB (e.g. a 720x720x4 buffer).
+const MAX_PAGES: usize = 512;
+
+#[derive(Clone, Copy)]
+struct Region {
+    in_use: bool,
+    npages: usize,
+    frames: [u64; MAX_PAGES],
+}
+impl Region {
+    const fn new() -> Self {
+        Region { in_use: false, npages: 0, frames: [0; MAX_PAGES] }
+    }
+}
+
+static REGIONS: Mutex<[Region; NREGIONS]> = Mutex::new([Region::new(); NREGIONS]);
+
+/// Allocate a region of `npages` frames. Returns its pool index, or None if the
+/// pool is full, `npages` is out of range, or the PMM is exhausted (any frames
+/// grabbed on a partial failure are returned).
+pub fn create(npages: usize) -> Option<u8> {
+    if npages == 0 || npages > MAX_PAGES {
+        return None;
+    }
+    let mut regs = REGIONS.lock();
+    let idx = regs.iter().position(|r| !r.in_use)?;
+    let r = &mut regs[idx];
+    // Allocate frames; on shortfall, free what we took and fail.
+    for i in 0..npages {
+        match crate::mm::pmm::alloc_frame() {
+            Some(phys) => r.frames[i] = phys,
+            None => {
+                for &p in &r.frames[..i] {
+                    crate::mm::pmm::free_frame(p);
+                }
+                return None;
+            }
+        }
+    }
+    r.in_use = true;
+    r.npages = npages;
+    Some(idx as u8)
+}
+
+/// Total byte size of region `idx` (npages * 4096), or 0 if free.
+pub fn size(idx: u8) -> usize {
+    let regs = REGIONS.lock();
+    let r = &regs[idx as usize];
+    if r.in_use {
+        r.npages * 4096
+    } else {
+        0
+    }
+}
+
+/// Map region `idx` into the live address space `pml4` at `vaddr` (writable),
+/// one page per frame. Returns the page count mapped, or 0 on failure.
+pub fn map(idx: u8, pml4: u64, vaddr: u64, writable: bool) -> usize {
+    let regs = REGIONS.lock();
+    let r = &regs[idx as usize];
+    if !r.in_use {
+        return 0;
+    }
+    // Pre-check the whole range is unmapped before touching anything.
+    if crate::mm::vm::probe_user_range(pml4, vaddr, r.npages as u64).is_err() {
+        return 0;
+    }
+    for i in 0..r.npages {
+        crate::mm::vm::map_user_4k_live(pml4, vaddr + (i as u64) * 4096, r.frames[i], writable);
+    }
+    r.npages
+}
+
+/// Free region `idx` (returns its frames to the PMM). Reset in place.
+#[allow(dead_code)]
+pub fn free(idx: u8) {
+    let mut regs = REGIONS.lock();
+    let r = &mut regs[idx as usize];
+    if r.in_use {
+        for &p in &r.frames[..r.npages] {
+            crate::mm::pmm::free_frame(p);
+        }
+        r.in_use = false;
+        r.npages = 0;
+    }
+}

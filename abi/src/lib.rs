@@ -179,6 +179,15 @@ pub const SYS_CHANNEL_SEND: u64 = 38; // (h, buf, len, caps_ptr, ncaps) -> rdx =
 pub const SYS_CHANNEL_RECV: u64 = 39; // (h, buf, len, caps_out, ncaps_max|flags<<32)
 pub const SYS_CHANNEL_CLOSE: u64 = 40; // (h) -> 0. Close this end; peer sees EOF.
 pub const SYS_CHANNEL_POLL: u64 = 41; // (h) -> rdx readiness: 1=readable 2=eof 4=writable
+// Shared multi-page memory (§41) — backs memfd/mmap + Wayland wl_shm buffers.
+pub const SYS_SHM_CREATE: u64 = 42; // (mem, pages) -> Shm handle (R_MAP|R_WRITE|R_GRANT)
+pub const SYS_SHM_MAP: u64 = 43; // (shm, vaddr) -> size. Map all pages RW at vaddr.
+pub const SYS_CAP_TYPE: u64 = 44; // (h) -> rdx cap kind (CAP_* below). For fd-passing.
+/// Capability kinds reported by SYS_CAP_TYPE (so recvmsg can reconstruct the
+/// right fd flavor from a passed handle). 0 = anything else.
+pub const CAP_OTHER: u64 = 0;
+pub const CAP_CHANNEL: u64 = 1;
+pub const CAP_SHM: u64 = 2;
 /// SYS_CHANNEL_RECV flag (in the high 32 bits of a5): don't block on empty.
 pub const CHAN_NONBLOCK: u64 = 1;
 

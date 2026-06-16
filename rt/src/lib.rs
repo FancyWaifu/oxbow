@@ -549,6 +549,30 @@ pub fn sys_fb_map(fb: Handle, vaddr: u64) -> SysResult {
     SysError::from_raw(rax)
 }
 
+/// Create a shared memory region of `pages` frames from the `mem` budget (§41).
+/// Returns a grantable Shm handle (passable over a channel, mappable RW).
+pub fn sys_shm_create(mem: Handle, pages: u64) -> SysResult<Handle> {
+    let (rax, rdx) = unsafe { syscall2(oxbow_abi::SYS_SHM_CREATE, mem as u64, pages) };
+    SysError::from_raw(rax).map(|_| rdx as Handle)
+}
+
+/// Map every page of shm region `shm` at consecutive vaddrs from `vaddr` (RW).
+/// Returns the byte size mapped.
+pub fn sys_shm_map(shm: Handle, vaddr: u64) -> SysResult<u64> {
+    let (rax, rdx) = unsafe { syscall2(oxbow_abi::SYS_SHM_MAP, shm as u64, vaddr) };
+    SysError::from_raw(rax).map(|_| rdx)
+}
+
+/// Report a handle's capability kind (CAP_CHANNEL / CAP_SHM / CAP_OTHER).
+pub fn sys_cap_type(h: Handle) -> u64 {
+    let (rax, rdx) = unsafe { syscall1(oxbow_abi::SYS_CAP_TYPE, h as u64) };
+    if rax != 0 {
+        oxbow_abi::CAP_OTHER
+    } else {
+        rdx
+    }
+}
+
 /// Allocate one DMA frame from the `mem` budget, map it writable at `vaddr`, and
 /// return its physical address (§19) — for a driver's ring/buffer pointers.
 pub fn sys_dma_alloc(mem: Handle, vaddr: u64) -> SysResult<u64> {
