@@ -202,12 +202,13 @@ run-faulttest: build build-server-faulttest _iso
 run-isolation: build build-server-isolation _iso
     qemu-system-x86_64 {{qemu_flags}}
 
-# Boot WITH a graphical window so you can type at the shell. The i8042 keyboard
-# needs a display to capture keystrokes; kernel output still streams to serial on
-# this terminal. Type in the QEMU window, watch results here. (Quit: close the
-# window, or Ctrl-A X in this terminal.)
+# Boot WITH a graphical window so you can log in on screen. The oxterm terminal
+# (FreeType + libvterm) shows the shell; click the QEMU window to give it keyboard
+# focus, then log in (bryson/bryson or root/root). Kernel output + a serial mirror
+# stream to this terminal. 512M for the graphics stack. (Quit: close the window,
+# or Ctrl-A X in this terminal.)
 run-tty: iso
-    qemu-system-x86_64 -M q35 -m 256M -cdrom {{ISO}} -boot d -serial stdio -display cocoa -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04
+    qemu-system-x86_64 -M q35 -m 512M -cdrom {{ISO}} -boot d -serial stdio -display cocoa -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive file=oxbow-disk.img,if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0
 
 # Headless serial-console test target: COM1 routed to a TCP socket so a harness
 # can both TYPE (write) and READ on one stream. server=on,wait=on makes QEMU
