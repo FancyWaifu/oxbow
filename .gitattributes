@@ -37,3 +37,5 @@ servers/oxwl/wl-src/**        linguist-vendored
 servers/oxwl/wl-include/**    linguist-vendored
 # libxkbcommon (oxxkb) — vendored upstream C; the XKB keymap compiler + state.
 servers/oxxkb/xkb/**          linguist-vendored
+# libvterm (oxvterm) — the terminal state machine (parser + screen grid).
+servers/oxvterm/vterm/**   linguist-vendored

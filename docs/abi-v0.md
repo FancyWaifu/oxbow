@@ -1940,3 +1940,22 @@ after the first frame; a compositor is a service and runs for the life of the
 session (it still gives up after 15 s if no client ever shows). Verified by two
 screendumps 3 s apart differing across ~140 KB of pixels. Next graphics steps:
 input (`wl_seat` + the `kbd` driver) and compositing more than one surface.
+
+## 50. libvterm — the terminal state machine (v1-libvterm)
+
+Ported libvterm (neovim's maintained fork, `servers/oxvterm`, 9 C files): the VT
+state machine that parses terminal output (escape sequences, SGR colours, cursor
+motion) and maintains the screen grid + scrollback — with **no** UI, font, or PTY
+of its own (the parts that don't fit oxbow's spawn model; we supply those as thin
+glue). It is gloriously self-contained: no config.h, no generated files (the
+encoding `.inc` tables ship pre-built), and it compiled + linked with the
+standard harness and **zero** libc additions.
+
+`vterm-test`, on oxbow:
+```
+row 0 = "Hello, oxbow!RED"        # text parsed into the grid (escapes consumed)
+cell 13 'R' fg = palette idx 1    # the SGR 31 (red) colour applied to that cell
+```
+Next: FreeType for glyph rasterization, then the terminal window itself — a
+Wayland client that feeds the shell's output through libvterm and rasterizes the
+grid with FreeType into an shm buffer.
