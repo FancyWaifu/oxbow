@@ -33,6 +33,7 @@ members = [
     "servers/oxffi",
     "servers/oxxkb",
     "servers/oxvterm",
+    "servers/oxft",
     "servers/oxwl",
     "servers/oxcomp",
     "servers/wlclient",

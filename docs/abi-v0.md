@@ -1959,3 +1959,24 @@ cell 13 'R' fg = palette idx 1    # the SGR 31 (red) colour applied to that cell
 Next: FreeType for glyph rasterization, then the terminal window itself — a
 Wayland client that feeds the shell's output through libvterm and rasterizes the
 grid with FreeType into an shm buffer.
+
+## 51. FreeType — glyph rasterization (v1-freetype)
+
+Ported FreeType 2.13.3 (`servers/oxft`) — the font rasterizer essentially every
+Linux/BSD desktop uses. Minimal module set for TrueType: the base, sfnt, the
+TrueType driver, psnames, the smooth (anti-aliased) + mono renderers, and the
+autofitter, built with FreeType's "smush" single-file units (~12 compile units).
+`ftstdlib.h` maps straight to our libc, and the two dependencies that usually
+bite a bare-metal port — `setjmp`/`longjmp` (the smooth rasterizer's overflow
+recovery) and `qsort` — were already in libc. A trimmed `ftmodule.h` selects only
+the vendored modules; `ftdebug`/`ftmm`/`ftgzip` were added to satisfy the linker.
+
+`ft-test` on oxbow:
+```
+[ft-test] FreeType 2.13.3 initialised
+```
+`FT_Init_FreeType` loads and registers all the modules, so the driver/renderer
+machinery works. Next: embed a monospace font and rasterize glyphs — then the
+terminal window itself, which feeds the shell's output through libvterm (§50) and
+draws each grid cell with FreeType into an shm buffer (§42 wl_shm) shown by the
+compositor, with keys decoded via xkb (§49). That's the whole desktop loop.

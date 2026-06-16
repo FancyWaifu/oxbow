@@ -39,3 +39,5 @@ servers/oxwl/wl-include/**    linguist-vendored
 servers/oxxkb/xkb/**          linguist-vendored
 # libvterm (oxvterm) — the terminal state machine (parser + screen grid).
 servers/oxvterm/vterm/**   linguist-vendored
+# FreeType (oxft) — the glyph rasterizer for the terminal.
+servers/oxft/ft/**   linguist-vendored

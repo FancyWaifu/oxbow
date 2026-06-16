@@ -461,6 +461,7 @@ pub const BOOT_IMG_WL: Handle = 34; // wl-test — libwayland wire-core port
 pub const BOOT_IMG_WLCLIENT: Handle = 35; // wlclient — the compositor's Wayland client
 pub const BOOT_IMG_XKB: Handle = 37; // xkb-test — libxkbcommon keymap/keysym port (36 = BOOT_INPUT_CHAN)
 pub const BOOT_IMG_VTERM: Handle = 38; // vterm-test — libvterm terminal state machine port
+pub const BOOT_IMG_FT: Handle = 39; // ft-test — FreeType glyph rasterizer port
 
 /// The framebuffer capability, granted to the `fb` server at boot. Gates
 /// SYS_FB_INFO (geometry) + SYS_FB_MAP (map the pixels RW). §34 (graphics).
