@@ -1832,6 +1832,27 @@ Next: wire it into the keyboard path — the compositor sends this keymap via
 `wl_keyboard.keymap` and the kbd driver sends evdev keycodes, so clients decode
 keys with `xkb_state` (and then libvterm + FreeType for a terminal window).
 
+## 49. xkb in the keyboard path — real key decoding (v1-xkb-keyboard)
+
+Wired libxkbcommon into the live keyboard flow, the standard Wayland way:
+
+- **kbd** forwards raw set-1 scancodes (make AND break) over the input channel —
+  the low 7 bits are the evdev keycode for the main block, the 0x80 bit is the
+  release edge. (The ASCII→tty path is unchanged, so the serial console still
+  works.)
+- **oxcomp** ships the US keymap (`us_keymap.h`) to each client via
+  `wl_keyboard.keymap`: it stages the string into a memfd (the same SCM_RIGHTS
+  cap-passing as wl_shm) and sends the fd. It then forwards each scancode as a
+  `wl_keyboard.key` (keycode + press/release) — no xkb needed server-side.
+- **the client** mmaps the keymap, `xkb_keymap_new_from_string` + `xkb_state_new`,
+  and on each key does `xkb_state_update_key` (which tracks modifiers internally)
+  + `xkb_state_key_get_utf8`. So `a`→`a`, shift+`a`→`A`, shift+`1`→`!` — verified
+  by injecting keys and watching the client log the decoded characters.
+
+Only the client links libxkbcommon (built as a separate archive in wlclient's
+build so its `config.h` doesn't collide with the wayland/client ones). Next:
+libvterm + FreeType for a terminal window that renders these characters.
+
 ## 43. Capability-native identity — users without ambient authority (v1-identity)
 
 oxbow has no uid-based access control and never will: authority is the set of

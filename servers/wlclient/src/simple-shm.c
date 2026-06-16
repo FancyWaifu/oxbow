@@ -25,6 +25,8 @@
 #include "config.h"
 extern int ox_chan_fd(unsigned int); /* oxbow: inherited Wayland socket */
 
+#include <sys/mman.h>
+#include <xkbcommon/xkbcommon.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,6 +67,9 @@ struct display {
 	struct xdg_wm_base *wm_base;
 	struct wl_seat *seat;
 	struct wl_keyboard *keyboard;
+	struct xkb_context *xkb_ctx;
+	struct xkb_keymap *xkb_keymap;
+	struct xkb_state *xkb_state;
 	struct wl_shm *shm;
 	const struct format *format;
 	bool paint_format;
@@ -273,12 +278,40 @@ create_shm_buffer(struct window *window, struct buffer *buffer,
 	return 0;
 }
 
+extern void ox_clog(const char *, unsigned long);
+static void cl(const char *s){unsigned long n=0;while(s[n])n++;ox_clog(s,n);}
+
 static void
 keyboard_handle_keymap(void *data, struct wl_keyboard *keyboard,
 		       uint32_t format, int fd, uint32_t size)
 {
-	/* Just so we don’t leak the keymap fd */
+	struct display *d = data;
+	if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+		close(fd);
+		return;
+	}
+	/* §48: mmap the keymap the compositor sent and compile it with xkb, so we
+	 * decode keycodes → characters (with modifiers) the standard way. */
+	char *map = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
 	close(fd);
+	if (map == MAP_FAILED)
+		return;
+	if (!d->xkb_ctx)
+		d->xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_DEFAULT_INCLUDES);
+	struct xkb_keymap *km = xkb_keymap_new_from_string(
+		d->xkb_ctx, map, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+	munmap(map, size);
+	if (!km) {
+		cl("[cli] xkb keymap compile FAILED\n");
+		return;
+	}
+	if (d->xkb_state)
+		xkb_state_unref(d->xkb_state);
+	if (d->xkb_keymap)
+		xkb_keymap_unref(d->xkb_keymap);
+	d->xkb_keymap = km;
+	d->xkb_state = xkb_state_new(km);
+	cl("[cli] xkb keymap compiled\n");
 }
 
 static void
@@ -294,7 +327,6 @@ keyboard_handle_leave(void *data, struct wl_keyboard *keyboard,
 {
 }
 
-extern void ox_clog(const char *, unsigned long);
 static void
 keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
 		    uint32_t serial, uint32_t time, uint32_t key,
@@ -302,12 +334,27 @@ keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
 {
 	struct display *d = data;
 
-	if (state) {
-		/* §47 demo: prove keystrokes reach the client. The compositor
-		 * currently sends the ASCII byte as `key`. */
-		char msg[16] = "[cli] key 'X'\n";
-		msg[11] = (key >= 32 && key < 127) ? (char)key : '?';
-		ox_clog(msg, 14);
+	/* §48: decode the keycode through xkb. The Wayland keycode is evdev; xkb
+	 * keycodes are offset by 8. update_key tracks modifiers internally, so
+	 * shift/caps/ctrl combine correctly. */
+	if (d->xkb_state) {
+		xkb_keycode_t kc = key + 8;
+		xkb_state_update_key(d->xkb_state, kc,
+				     state ? XKB_KEY_DOWN : XKB_KEY_UP);
+		if (state) {
+			char buf[16] = {0};
+			xkb_state_key_get_utf8(d->xkb_state, kc, buf, sizeof buf);
+			if (buf[0]) {
+				char msg[32];
+				int j = 0;
+				const char *p = "[cli] xkb: ";
+				while (*p) msg[j++] = *p++;
+				for (int b = 0; buf[b] && j < 28; b++)
+					msg[j++] = buf[b];
+				msg[j++] = '\n';
+				ox_clog(msg, j);
+			}
+		}
 	}
 
 	if (key == KEY_F11 && state) {

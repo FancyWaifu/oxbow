@@ -3,10 +3,15 @@
  * framebuffer. Separate translation unit (server headers) from the client. */
 #include <stddef.h>
 #include <stdlib.h>
-#include <unistd.h> /* read() on the input channel fd */
+#include <string.h>
+#include <unistd.h>   /* read(), ftruncate(), close() */
+#include <sys/mman.h> /* mmap for staging the keymap into a memfd */
 #include "wayland-server.h"
 #include "wayland-server-protocol.h"
 #include "xdg-shell-server-protocol.h"
+#include "../../oxxkb/xkb/us_keymap.h" /* the US keymap we hand clients (§48) */
+
+extern int memfd_create(const char *name, unsigned int flags);
 
 extern void ox_log(const char *p, unsigned long len);
 /* Milliseconds since boot — the frame-callback timestamp clients animate from. */
@@ -302,13 +307,37 @@ static void keyboard_resource_destroy(struct wl_resource *res)
   if (g_keyboard == res)
     g_keyboard = NULL;
 }
+/* Hand the client our keymap (§48): stage the keymap string into a memfd and
+ * send it as wl_keyboard.keymap. The client mmaps it and builds an xkb_state, so
+ * it decodes keycodes → characters the standard way. */
+static void send_keymap(struct wl_resource *kbd)
+{
+  size_t size = sizeof us_keymap; /* includes the trailing NUL */
+  int    fd   = memfd_create("xkb-keymap", 0);
+  if (fd < 0)
+    return;
+  if (ftruncate(fd, (long)size) < 0) {
+    close(fd);
+    return;
+  }
+  void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (p == MAP_FAILED) {
+    close(fd);
+    return;
+  }
+  memcpy(p, us_keymap, size);
+  munmap(p, size);
+  wl_keyboard_send_keymap(kbd, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd, (uint32_t)size);
+  close(fd);
+}
 static void seat_get_keyboard(struct wl_client *c, struct wl_resource *res, uint32_t id)
 {
   struct wl_resource *k =
     wl_resource_create(c, &wl_keyboard_interface, wl_resource_get_version(res), id);
   wl_resource_set_implementation(k, &keyboard_impl, NULL, keyboard_resource_destroy);
   g_keyboard = k;
-  slog("[oxcomp/srv] wl_keyboard bound\n");
+  send_keymap(k);
+  slog("[oxcomp/srv] wl_keyboard bound (keymap sent)\n");
 }
 static void seat_get_pointer(struct wl_client *c, struct wl_resource *res, uint32_t id)
 {
@@ -334,11 +363,11 @@ static void seat_bind(struct wl_client *c, void *data, uint32_t version, uint32_
   wl_seat_send_capabilities(res, WL_SEAT_CAPABILITY_KEYBOARD);
 }
 
-/* Event-loop callback: drain the keyboard channel and deliver each byte to the
- * focused client as a wl_keyboard key press+release. We always read() (even with
- * no focus) so the kbd driver's channel never backs up. NOTE (arc 1): the wire
- * value is the kbd driver's ASCII byte; real evdev keycodes + an xkb keymap
- * arrive with the libxkbcommon port. */
+/* Event-loop callback: drain the keyboard channel and deliver each set-1 scancode
+ * to the focused client as a wl_keyboard.key event (§48). The break bit (0x80)
+ * selects press vs release; the low 7 bits ARE the evdev keycode for the main
+ * block, which the client offsets by 8 for xkb. We always read() (even with no
+ * focus) so the kbd driver's channel never backs up. */
 static int on_input(int fd, uint32_t mask, void *data)
 {
   (void)mask;
@@ -348,9 +377,11 @@ static int on_input(int fd, uint32_t mask, void *data)
   for (long i = 0; i < n; i++) {
     if (!g_keyboard || !g_focus)
       continue;
-    unsigned int t = ox_now_ms();
-    wl_keyboard_send_key(g_keyboard, ++g_serial, t, buf[i], WL_KEYBOARD_KEY_STATE_PRESSED);
-    wl_keyboard_send_key(g_keyboard, ++g_serial, t, buf[i], WL_KEYBOARD_KEY_STATE_RELEASED);
+    unsigned char sc      = buf[i];
+    uint32_t      keycode = sc & 0x7f;
+    uint32_t      state   = (sc & 0x80) ? WL_KEYBOARD_KEY_STATE_RELEASED
+                                        : WL_KEYBOARD_KEY_STATE_PRESSED;
+    wl_keyboard_send_key(g_keyboard, ++g_serial, ox_now_ms(), keycode, state);
   }
   return 0;
 }

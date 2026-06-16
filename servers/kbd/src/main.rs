@@ -108,6 +108,11 @@ fn drain(mods: &mut Mods) {
             ext = false;
             continue;
         }
+        // §48: forward the raw set-1 scancode (make AND break) to the compositor
+        // for xkb decoding. Main-block set-1 make codes == evdev keycodes, so the
+        // compositor just masks the break bit. The ASCII→tty path below is kept so
+        // the serial console still works.
+        rt::channel::send(BOOT_INPUT_CHAN, &[sc], &[]);
         match sc {
             0x2A | 0x36 => mods.shift = true,  // L/R Shift make
             0xAA | 0xB6 => mods.shift = false, // L/R Shift break
@@ -134,10 +139,6 @@ fn drain(mods: &mut Mods) {
                 m.data_len = 1;
                 m.data[0] = c as u64;
                 let _ = rt::sys_send(BOOT_TTY, &m);
-                // §47: also stream the key byte to the compositor over the input
-                // channel, so the graphical environment receives keyboard input
-                // (the serial/text console keeps working via the tty path above).
-                rt::channel::send(BOOT_INPUT_CHAN, &[c], &[]);
             }
         }
     }

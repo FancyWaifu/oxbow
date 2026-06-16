@@ -20,6 +20,41 @@ fn main() {
     .unwrap();
     let res_inc = format!("{}/include", res.trim());
 
+    // libxkbcommon (§48) needs its OWN config.h, which would collide with the
+    // client/wayland config.h if compiled in the same unit — so build it as a
+    // separate archive whose include path puts xkb/config.h first.
+    let mut x = cc::Build::new();
+    x.compiler(std::env::var("CC").unwrap_or_else(|_| "clang".into()))
+        .archiver(&llvm_ar)
+        .flag("-nostdinc")
+        .flag("-isystem")
+        .flag(&res_inc)
+        .include("../oxxkb/xkb") // xkb config.h
+        .include("../oxxkb/xkb/include")
+        .include("../oxxkb/xkb/src")
+        .include("../oxxkb/xkb/src/xkbcomp")
+        .include("../../libc/include")
+        .define("HAVE_CONFIG_H", None)
+        .flag("-ffreestanding")
+        .flag("-fno-stack-protector")
+        .flag("-fno-builtin")
+        .flag("-Wno-everything")
+        .opt_level(2);
+    for f in [
+        "atom", "context", "context-priv", "keymap", "keymap-priv", "keysym",
+        "keysym-utf", "state", "text", "utf8", "util-list", "utils",
+    ] {
+        x.file(format!("../oxxkb/xkb/src/{f}.c"));
+    }
+    for f in [
+        "action", "ast-build", "compat", "expr", "include", "keycodes", "keymap",
+        "keymap-dump", "keywords", "parser", "rules", "scanner", "symbols", "types",
+        "vmod", "xkbcomp",
+    ] {
+        x.file(format!("../oxxkb/xkb/src/xkbcomp/{f}.c"));
+    }
+    x.compile("xkbcommon");
+
     let mut b = cc::Build::new();
     b.compiler(std::env::var("CC").unwrap_or_else(|_| "clang".into()))
         .archiver(&llvm_ar)
@@ -29,6 +64,7 @@ fn main() {
         .include("include") // weston shims: config.h, shared/, libweston/, linux/
         .include("../oxwl/wl-include")
         .include("../oxffi/ffi-include")
+        .include("../oxxkb/xkb/include") // xkbcommon.h for the client (§48)
         .include("../../libc/include")
         .include("../oxwl")
         .define("HAVE_CONFIG_H", None)
