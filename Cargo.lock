@@ -669,6 +669,7 @@ dependencies = [
 name = "shell"
 version = "0.0.0"
 dependencies = [
+ "blake2",
  "oxbow-abi",
  "oxbow-rt",
 ]

@@ -10,10 +10,14 @@ use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA, BOOT_NET_EP,
     BOOT_IMG_CAT, BOOT_IMG_CP, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_MKDIR, BOOT_IMG_MV, BOOT_IMG_PONG,
     BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_LUA, BOOT_IMG_UPY, BOOT_IMG_QJS, BOOT_IMG_CURL, BOOT_IMG_CARES, BOOT_IMG_FFI, BOOT_IMG_WL, BOOT_IMG_JAIL, BOOT_IMG_FSTEST, BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_TICK, BOOT_TTY,
-    HANDLE_NULL, R_GRANT, R_RECV,
-    R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
+    HANDLE_NULL, IdentRec, R_GRANT, R_RECV,
+    R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
+use blake2::{Blake2b, Digest};
+use blake2::digest::consts::U32;
+/// Blake2b with a 32-byte digest — our password KDF primitive.
+type Blake2b256 = Blake2b<U32>;
 
 /// The current-directory path string, tracked alongside the cwd capability so
 /// the prompt can show it (a Unix shell shows where you are).
@@ -178,7 +182,7 @@ fn spawn_with_budget(image: Handle, cap0: Handle, arg: &[u8], budget: u64, sp: &
     m.data[2] = arg.len() as u64;
     m.data_len = 3;
     // §24: children inherit OUR identity (whoami stays consistent across exec).
-    rt::msg_set_identity(&mut m, rt::identity());
+    rt::msg_set_identity(&mut m, cur_ident());
     m.handle_count = 4;
     m.handles[0] = cap0; // slot 1 = BOOT_EP (a file/dir cap, or NULL)
     m.handles[1] = sp.stdout; // slot 2 = SPAWN_STDOUT
@@ -347,7 +351,7 @@ fn exec_cmd(cwd: Handle, path: &Path, arg_line: &[u8], sp: &Spawner) {
     sm.data[1] = rest.as_ptr() as u64;
     sm.data[2] = rest.len() as u64;
     sm.data_len = 3;
-    rt::msg_set_identity(&mut sm, rt::identity()); // §24: exec'd program inherits our identity
+    rt::msg_set_identity(&mut sm, cur_ident()); // §44: exec'd program inherits our identity
     sm.handle_count = 4;
     sm.handles[0] = cwd;
     sm.handles[1] = sp.stdout;
@@ -364,21 +368,32 @@ fn exec_cmd(cwd: Handle, path: &Path, arg_line: &[u8], sp: &Spawner) {
     }
 }
 
-/// `whoami`: our login name (§24). Read straight from the inherited identity.
+/// `whoami`: our login name (§44). The shell's current identity.
 fn whoami_cmd() {
-    tw(rt::user_name());
+    tw(cur_name());
     tw(b"\n");
+}
+
+/// Print `gid` then `(name)` if the gid has a known name.
+fn tw_gid(gid: u32) {
+    tw_dec_u32(gid);
+    let n = gid_name(gid);
+    if !n.is_empty() {
+        tw(b"(");
+        tw(n);
+        tw(b")");
+    }
 }
 
 /// `id`: uid/gid + supplementary groups, the POSIX way.
 fn id_cmd() {
-    let id = rt::identity();
+    let id = cur_ident();
     tw(b"uid=");
     tw_dec_u32(id.uid);
     tw(b"(");
-    tw(rt::user_name());
+    tw(cur_name());
     tw(b") gid=");
-    tw_dec_u32(id.gid);
+    tw_gid(id.gid);
     let n = id.ngroups as usize;
     if n > 0 {
         tw(b" groups=");
@@ -386,7 +401,7 @@ fn id_cmd() {
             if i > 0 {
                 tw(b",");
             }
-            tw_dec_u32(id.groups[i]);
+            tw_gid(id.groups[i]);
         }
     }
     tw(b"\n");
@@ -394,7 +409,7 @@ fn id_cmd() {
 
 /// `groups`: our group ids, space-separated.
 fn groups_cmd() {
-    let id = rt::identity();
+    let id = cur_ident();
     let n = id.ngroups as usize;
     if n == 0 {
         tw_dec_u32(id.gid);
@@ -1004,6 +1019,8 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"whoami" => whoami_cmd(),
         b"id" => id_cmd(),
         b"groups" => groups_cmd(),
+        b"su" => su_cmd(rest, cwd, path),
+        b"logout" | b"exit" => login_gate(cwd, path),
         b"help" => {
             tw(b"oxbow shell:  (ls cat mkdir touch are spawned programs)\n");
             tw(b"  echo <text>     print text (echo .. > f redirects to a file)\n");
@@ -1031,6 +1048,8 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  badgetest       exercise badged-endpoint mint rules\n");
             tw(b"  whoami          print the current user (capability-native identity)\n");
             tw(b"  id / groups     print uid/gid and group membership\n");
+            tw(b"  su [user]       switch user (re-authenticate; default root)\n");
+            tw(b"  logout          end the session and return to the login prompt\n");
             tw(b"  help            this list\n");
         }
         _ => {
@@ -1038,6 +1057,211 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(cmd);
             tw(b": command not found\n");
         }
+    }
+}
+
+// ===========================================================================
+// §44 — the login gate. Capability-native: authenticating proves who you are
+// (blake2-hashed password) and, for non-root users, switches your cwd to your
+// HOME-directory capability — the cap handoff. Identity is the shell's own
+// mutable state (CUR_IDENT), propagated to every child it spawns. Authority is
+// still the caps we hold; strict root-drop isolation is the next arc.
+// ===========================================================================
+
+/// A seeded account. `default_pw` is the plaintext we hash once at boot (the
+/// known default — real systems seed from install config); after `passwd` lands
+/// the stored hash no longer corresponds to anything in the binary.
+struct AcctDef {
+    name: &'static [u8],
+    uid: u32,
+    gid: u32,
+    home: &'static [u8],
+    groups: &'static [u32],
+    default_pw: &'static [u8],
+}
+
+const ACCTS: &[AcctDef] = &[
+    AcctDef { name: b"root", uid: 0, gid: 0, home: b"/", groups: &[0, 27], default_pw: b"root" },
+    AcctDef {
+        name: b"bryson",
+        uid: 1000,
+        gid: 1000,
+        home: b"/home/bryson",
+        groups: &[1000, 27],
+        default_pw: b"bryson",
+    },
+];
+const NACCT: usize = 2;
+
+static mut SALTS: [[u8; 16]; NACCT] = [[0; 16]; NACCT];
+static mut HASHES: [[u8; 32]; NACCT] = [[0; 32]; NACCT];
+static mut SEEDED: bool = false;
+/// The shell's current identity — set by the login gate, read by whoami/id and
+/// stamped on every spawned child.
+static mut CUR_IDENT: IdentRec = IdentRec::zeroed();
+
+fn cur_ident() -> &'static IdentRec {
+    unsafe { &*core::ptr::addr_of!(CUR_IDENT) }
+}
+
+/// Current login name, defaulting to "root" before/without a name.
+fn cur_name() -> &'static [u8] {
+    let n = cur_ident().name_bytes();
+    if n.is_empty() {
+        b"root"
+    } else {
+        n
+    }
+}
+
+/// Salted, iterated blake2b — a real (if modest) password KDF. 4096 rounds.
+fn hash_pw(salt: &[u8; 16], pw: &[u8]) -> [u8; 32] {
+    let mut h = Blake2b256::new();
+    h.update(salt);
+    h.update(pw);
+    let mut out: [u8; 32] = h.finalize().into();
+    for _ in 0..4096 {
+        let mut h = Blake2b256::new();
+        h.update(salt);
+        h.update(&out);
+        out = h.finalize().into();
+    }
+    out
+}
+
+/// Map a gid to a display name (for `id`); empty if unknown.
+fn gid_name(gid: u32) -> &'static [u8] {
+    match gid {
+        0 => b"root",
+        27 => b"wheel",
+        100 => b"users",
+        1000 => b"bryson",
+        _ => b"",
+    }
+}
+
+/// Adopt account `i`'s identity into CUR_IDENT.
+fn set_ident(i: usize) {
+    let a = &ACCTS[i];
+    let mut id = IdentRec::new(a.uid, a.gid, a.name, a.home);
+    for &g in a.groups {
+        id.add_group(g);
+    }
+    unsafe {
+        CUR_IDENT = id;
+    }
+}
+
+/// Best-effort `mkdir` of an absolute path against the root cap (ignores
+/// already-exists / errors — seeding is idempotent).
+fn mkdir_one(path: &[u8]) {
+    let mut m = MsgBuf::new(TAG_FS_MKDIR);
+    pack_name(&mut m, path);
+    let _ = rt::sys_call(BOOT_FS_ROOT, &mut m);
+}
+
+/// First-boot seed: random per-account salts + hashes, home directories, and a
+/// human-readable /etc/passwd + /etc/group (cosmetic — auth uses the table).
+fn seed_accounts() {
+    unsafe {
+        if SEEDED {
+            return;
+        }
+        for (i, a) in ACCTS.iter().enumerate() {
+            let mut salt = [0u8; 16];
+            let _ = rt::sys_getentropy(&mut salt);
+            SALTS[i] = salt;
+            HASHES[i] = hash_pw(&salt, a.default_pw);
+        }
+        SEEDED = true;
+    }
+    mkdir_one(b"/home");
+    mkdir_one(b"/home/bryson");
+    mkdir_one(b"/etc");
+    write_file(BOOT_FS_ROOT, b"/etc/passwd", b"root:x:0:0:/:/bin/sh\nbryson:x:1000:1000:/home/bryson:/bin/sh\n", false);
+    write_file(BOOT_FS_ROOT, b"/etc/group", b"root:0:\nwheel:27:root,bryson\nbryson:1000:\n", false);
+}
+
+/// Point cwd at account `i`'s home capability (the login cap handoff). root stays
+/// at the filesystem root; other users get their home dir cap.
+fn set_cwd_home(i: usize, cwd: &mut Handle, path: &mut Path) {
+    let a = &ACCTS[i];
+    if *cwd != BOOT_FS_ROOT {
+        let _ = rt::sys_close(*cwd);
+    }
+    *cwd = BOOT_FS_ROOT;
+    *path = Path::root();
+    if a.home == b"/" {
+        return;
+    }
+    let mut m = MsgBuf::new(TAG_FS_OPEN);
+    pack_name(&mut m, a.home);
+    if rt::sys_call(BOOT_FS_ROOT, &mut m).is_ok()
+        && m.data[0] == 0
+        && m.data[1] == oxbow_abi::FS_DIR
+    {
+        *cwd = m.handles[0];
+        let mut p = Path::root();
+        p.apply(a.home);
+        *path = p;
+    }
+}
+
+/// Read a line as a password (echoes — the tty has no no-echo mode yet).
+fn read_secret(line: &mut [u8; 256]) -> usize {
+    tw(b"password: ");
+    read_line(line)
+}
+
+/// The login prompt loop. Blocks until a correct name+password, then sets the
+/// identity and home cwd. Re-entered by `logout`.
+fn login_gate(cwd: &mut Handle, path: &mut Path) {
+    seed_accounts();
+    let mut line = [0u8; 256];
+    let mut namebuf = [0u8; 64];
+    loop {
+        tw(b"\nlogin: ");
+        let n = read_line(&mut line);
+        let nm = trim(&line[..n]);
+        let nl = core::cmp::min(nm.len(), 64);
+        namebuf[..nl].copy_from_slice(&nm[..nl]);
+        let name = &namebuf[..nl];
+        let sn = read_secret(&mut line);
+        let pw = trim(&line[..sn]);
+        if let Some(i) = ACCTS.iter().position(|a| a.name == name) {
+            let h = hash_pw(unsafe { &SALTS[i] }, pw);
+            if h == unsafe { HASHES[i] } {
+                set_ident(i);
+                set_cwd_home(i, cwd, path);
+                tw(b"Welcome, ");
+                tw(ACCTS[i].name);
+                tw(b".\n");
+                return;
+            }
+        }
+        tw(b"Login incorrect\n");
+    }
+}
+
+/// `su [user]` (default root): re-authenticate and swap identity + home cwd.
+fn su_cmd(arg: &[u8], cwd: &mut Handle, path: &mut Path) {
+    let (name, _) = split_cmd(arg);
+    let name = if name.is_empty() { b"root".as_slice() } else { name };
+    if let Some(i) = ACCTS.iter().position(|a| a.name == name) {
+        let mut line = [0u8; 256];
+        let sn = read_secret(&mut line);
+        let pw = trim(&line[..sn]);
+        let h = hash_pw(unsafe { &SALTS[i] }, pw);
+        if h == unsafe { HASHES[i] } {
+            set_ident(i);
+            set_cwd_home(i, cwd, path);
+        } else {
+            tw(b"su: Authentication failure\n");
+        }
+    } else {
+        tw(b"su: unknown user: ");
+        tw(name);
+        tw(b"\n");
     }
 }
 
@@ -1064,9 +1288,13 @@ pub extern "C" fn oxbow_main() -> ! {
     let mut cwd: Handle = BOOT_FS_ROOT;
     let mut path = Path::root();
     let mut line = [0u8; 256];
+    // §44: authenticate before the first prompt. login_gate sets our identity and
+    // switches cwd to the user's home capability.
+    login_gate(&mut cwd, &mut path);
     loop {
-        // Path-aware prompt, e.g. `oxbow:/usr/src$ `.
-        tw(b"oxbow:");
+        // user@oxbow path-aware prompt, e.g. `bryson@oxbow:/home/bryson$ `.
+        tw(cur_name());
+        tw(b"@oxbow:");
         tw(path.as_bytes());
         tw(b"$ ");
         let n = read_line(&mut line);

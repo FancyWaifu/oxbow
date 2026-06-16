@@ -13,3 +13,5 @@ path = "src/main.rs"
 [dependencies]
 oxbow-rt = { path = "../../rt" }
 oxbow-abi = { path = "../../abi" }
+# Password hashing for the login gate (§44) — integer-only, no_std, no SSE.
+blake2 = { version = "0.10", default-features = false }

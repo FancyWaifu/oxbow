@@ -1808,5 +1808,28 @@ decoupled:
 so `whoami` is stable across `exec`). libc answers `getuid/geteuid/getgid/getegid/
 getgroups/getlogin/getpwuid/getpwnam` (+ `_r`) from it — note there is **no
 `setuid`**: you cannot change identity to gain authority. Shell builtins `whoami`,
-`id`, `groups`. Next: a `login` server + credential store hand out per-user cap
-bundles (real multi-user, still capability-native).
+`id`, `groups`.
+
+## 44. The login gate — multi-user terminal, still capability-native (v1-login)
+
+The shell now opens with a `login:` prompt. Authenticating is how you *receive
+your identity and your home-directory capability* — not how you set a uid the
+kernel trusts.
+
+- **Passwords** are verified with salted, 4096-round **blake2b** (the same crate
+  DRIFT uses). Seeded accounts: `root` (uid 0, wheel) and `bryson` (uid 1000,
+  wheel); each default password equals the name. Per-account 16-byte salts are
+  drawn from the kernel CSPRNG at first boot; `/etc/passwd` + `/etc/group` are
+  written for visibility (auth uses the in-shell table).
+- **The cap handoff.** On success the shell sets `CUR_IDENT` (its own mutable
+  identity, propagated to every child it spawns) and switches cwd to the user's
+  **home directory capability** — root stays at the fs root, `bryson` lands on a
+  `/home/bryson` dir cap. That cwd cap *is* the authority you operate under.
+- **Builtins.** `su [user]` re-authenticates and swaps identity + home cwd;
+  `logout` returns to the `login:` prompt. The prompt shows `user@oxbow:path$`.
+
+Honest scope: the shell still holds the broad fs-root cap behind the scenes, so
+this is real auth + real identity + the home-cap handoff, but not yet *strict*
+isolation (`bryson` can still `cd /`). Dropping to a home-only cap bundle — so a
+user is physically unable to reach another's files — is the next arc, along with
+`passwd`/`adduser` writing the credential store.
