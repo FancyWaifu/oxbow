@@ -177,6 +177,8 @@ fn spawn_with_budget(image: Handle, cap0: Handle, arg: &[u8], budget: u64, sp: &
     m.data[1] = arg.as_ptr() as u64;
     m.data[2] = arg.len() as u64;
     m.data_len = 3;
+    // §24: children inherit OUR identity (whoami stays consistent across exec).
+    rt::msg_set_identity(&mut m, rt::identity());
     m.handle_count = 4;
     m.handles[0] = cap0; // slot 1 = BOOT_EP (a file/dir cap, or NULL)
     m.handles[1] = sp.stdout; // slot 2 = SPAWN_STDOUT
@@ -345,6 +347,7 @@ fn exec_cmd(cwd: Handle, path: &Path, arg_line: &[u8], sp: &Spawner) {
     sm.data[1] = rest.as_ptr() as u64;
     sm.data[2] = rest.len() as u64;
     sm.data_len = 3;
+    rt::msg_set_identity(&mut sm, rt::identity()); // §24: exec'd program inherits our identity
     sm.handle_count = 4;
     sm.handles[0] = cwd;
     sm.handles[1] = sp.stdout;
@@ -359,6 +362,51 @@ fn exec_cmd(cwd: Handle, path: &Path, arg_line: &[u8], sp: &Spawner) {
             tw(b" bytes read)\n");
         }
     }
+}
+
+/// `whoami`: our login name (§24). Read straight from the inherited identity.
+fn whoami_cmd() {
+    tw(rt::user_name());
+    tw(b"\n");
+}
+
+/// `id`: uid/gid + supplementary groups, the POSIX way.
+fn id_cmd() {
+    let id = rt::identity();
+    tw(b"uid=");
+    tw_dec_u32(id.uid);
+    tw(b"(");
+    tw(rt::user_name());
+    tw(b") gid=");
+    tw_dec_u32(id.gid);
+    let n = id.ngroups as usize;
+    if n > 0 {
+        tw(b" groups=");
+        for i in 0..n {
+            if i > 0 {
+                tw(b",");
+            }
+            tw_dec_u32(id.groups[i]);
+        }
+    }
+    tw(b"\n");
+}
+
+/// `groups`: our group ids, space-separated.
+fn groups_cmd() {
+    let id = rt::identity();
+    let n = id.ngroups as usize;
+    if n == 0 {
+        tw_dec_u32(id.gid);
+    } else {
+        for i in 0..n {
+            if i > 0 {
+                tw(b" ");
+            }
+            tw_dec_u32(id.groups[i]);
+        }
+    }
+    tw(b"\n");
 }
 
 /// Write a u32 as decimal ASCII to the tty.
@@ -953,6 +1001,9 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"fstest" => spawn_with_budget(BOOT_IMG_FSTEST, HANDLE_NULL, rest, 16 * 1024 * 1024, sp),
         b"jail" => jail_cmd(sp),
         b"badgetest" => badgetest(sp),
+        b"whoami" => whoami_cmd(),
+        b"id" => id_cmd(),
+        b"groups" => groups_cmd(),
         b"help" => {
             tw(b"oxbow shell:  (ls cat mkdir touch are spawned programs)\n");
             tw(b"  echo <text>     print text (echo .. > f redirects to a file)\n");
@@ -978,6 +1029,8 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  rand            print random bytes from the kernel CSPRNG (getentropy)\n");
             tw(b"  jail            confinement showcase: a hostile program is denied every escape\n");
             tw(b"  badgetest       exercise badged-endpoint mint rules\n");
+            tw(b"  whoami          print the current user (capability-native identity)\n");
+            tw(b"  id / groups     print uid/gid and group membership\n");
             tw(b"  help            this list\n");
         }
         _ => {

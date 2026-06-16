@@ -400,6 +400,8 @@ fn spawn_common(
         cost: u64,
         arg_ptr: u64,
         arg_len: usize,
+        ident_ptr: u64,
+        ident_len: usize,
     }
     let prep = (|| -> SysResult<Prep> {
         let me = proc::with_current(|p| p.lookup(mem_h as Handle, ObjType::Memory, R_MAP))?;
@@ -437,6 +439,15 @@ fn spawn_common(
         if arg_len > 0 {
             usermem::check_user(arg_ptr, arg_len, false)?;
         }
+        // Identity record (§24): data[3] = pointer to an IdentRec in the spawner's
+        // address space, data[4] = its length. Copied into the child's read-only
+        // SPAWN_IDENT page. Descriptive only — grants nothing (law L1). Zero/absent
+        // means the child inherits a zeroed page, which rt reads as root.
+        let ident_ptr = msg.data[3];
+        let ident_len = (msg.data[4] as usize).min(4095);
+        if ident_len > 0 {
+            usermem::check_user(ident_ptr, ident_len, false)?;
+        }
         // Collect the granted handle entries; each non-null needs R_GRANT (§3.4).
         let mut grants: [Option<HandleEntry>; MSG_HANDLES] = [None; MSG_HANDLES];
         proc::with_current(|p| -> SysResult {
@@ -453,8 +464,9 @@ fn spawn_common(
             }
             Ok(())
         })?;
-        // +1 page for the argv page the kernel maps into the child (§13).
-        let cost = (spawn_load_pages(img) + STACK_PAGES + PT_OVERHEAD + 1) * 4096 + child_budget;
+        // +2 pages for the argv page (§13) and the identity page (§24) the kernel
+        // maps into the child.
+        let cost = (spawn_load_pages(img) + STACK_PAGES + PT_OVERHEAD + 2) * 4096 + child_budget;
         // Authority bound: the parent must be able to afford it. We CHECK rather
         // than debit here so a later slot-full failure costs nothing; the kernel
         // is non-preemptible (IF=0, single CPU), so nothing allocates between the
@@ -471,6 +483,8 @@ fn spawn_common(
             cost,
             arg_ptr,
             arg_len,
+            ident_ptr,
+            ident_len,
         })
     })();
     let prep = match prep {
@@ -522,6 +536,19 @@ fn spawn_common(
             }
         }
         mm::vm::map_user_4k_in(pml4, oxbow_abi::SPAWN_ARGV, argframe, false, false);
+    }
+    // Map the identity page (read-only) into the child at SPAWN_IDENT (§24). Always
+    // mapped (zeroed if no identity passed, which rt reads as root) so any child can
+    // read rt::identity() without faulting. Charged via the +2 pages in `cost`.
+    if let Some(idframe) = mm::pmm::alloc_frame() {
+        unsafe {
+            let dst = mm::phys_to_virt(idframe) as *mut u8;
+            core::ptr::write_bytes(dst, 0, 4096);
+            if prep.ident_len > 0 {
+                core::ptr::copy_nonoverlapping(prep.ident_ptr as *const u8, dst, prep.ident_len);
+            }
+        }
+        mm::vm::map_user_4k_in(pml4, oxbow_abi::SPAWN_IDENT, idframe, false, false);
     }
     // Debit the parent now (guaranteed to succeed — we checked `remaining`).
     let _ = mm::mem::debit(prep.midx, prep.cost);

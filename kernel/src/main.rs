@@ -274,6 +274,15 @@ fn kmain_stage2() -> ! {
         let img = elf::Image::validate(bytes);
         let as_i = mm::vm::new_user_pml4();
         let (pid, entry, user_rsp) = proc::create(&img, as_i, name).expect("boot: create");
+        // §24: map a zeroed identity page so boot modules read as root via
+        // rt::identity() (runtime spawns get theirs in spawn_common). Without this
+        // the first read of SPAWN_IDENT faults.
+        if let Some(idframe) = mm::pmm::alloc_frame() {
+            unsafe {
+                core::ptr::write_bytes(mm::phys_to_virt(idframe) as *mut u8, 0, 0x1000);
+            }
+            mm::vm::map_user_4k_in(as_i, oxbow_abi::SPAWN_IDENT, idframe, false, false);
+        }
         // The shell is the system's spawner; it needs a large budget to fund the
         // processes it launches (it pays from its own untyped). Drivers get 256K.
         // The shell funds every program it spawns from its own budget; tcc wants

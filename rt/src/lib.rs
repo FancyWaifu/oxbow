@@ -620,6 +620,54 @@ pub fn args() -> impl Iterator<Item = &'static [u8]> {
     argv().split(|&b| b == b' ').filter(|s| !s.is_empty())
 }
 
+/// This process's inherited identity record (§24): who we are for `whoami`,
+/// `getpwnam`, and POSIX compat. The kernel mapped it read-only at SPAWN_IDENT;
+/// a zeroed page (no identity passed) reads as root. DESCRIPTIVE only — it grants
+/// nothing; authority is the capabilities we hold.
+pub fn identity() -> &'static oxbow_abi::IdentRec {
+    // SAFETY: the kernel maps a zero-filled, IdentRec-sized page here on every
+    // spawn (page-aligned, so well-aligned for IdentRec's u32 fields).
+    unsafe { &*(oxbow_abi::SPAWN_IDENT as *const oxbow_abi::IdentRec) }
+}
+
+pub fn uid() -> u32 {
+    identity().uid
+}
+
+pub fn gid() -> u32 {
+    identity().gid
+}
+
+/// The login name, defaulting to `root` when the record carries no name.
+pub fn user_name() -> &'static [u8] {
+    let n = identity().name_bytes();
+    if n.is_empty() {
+        b"root"
+    } else {
+        n
+    }
+}
+
+/// The home directory, defaulting to `/` when the record carries no home.
+pub fn home() -> &'static [u8] {
+    let h = identity().home_bytes();
+    if h.is_empty() {
+        b"/"
+    } else {
+        h
+    }
+}
+
+/// Point a spawn `MsgBuf` at `id` so the child inherits it (§24). `id` must stay
+/// alive (its address is read by the kernel) until `sys_spawn` returns.
+pub fn msg_set_identity(msg: &mut MsgBuf, id: &oxbow_abi::IdentRec) {
+    msg.data[3] = id as *const oxbow_abi::IdentRec as u64;
+    msg.data[4] = core::mem::size_of::<oxbow_abi::IdentRec>() as u64;
+    if msg.data_len < 5 {
+        msg.data_len = 5;
+    }
+}
+
 pub fn sys_notif_signal(notif: Handle) -> SysResult {
     let (rax, _) = unsafe { syscall1(SYS_NOTIF_SIGNAL, notif as u64) };
     SysError::from_raw(rax)

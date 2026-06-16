@@ -1782,3 +1782,31 @@ delivery cursor (`deliver`/`dvoff`); the shell's `read_line` loops READ,
 accumulating chunks until `more` is 0. Line buffers grew 64→256; the echo /
 type-ahead invariants are preserved (echo once at the first chunk). This is the
 first piece of Direction A (a usable system) — next is persistent storage.
+
+## 43. Capability-native identity — users without ambient authority (v1-identity)
+
+oxbow has no uid-based access control and never will: authority is the set of
+capabilities you hold (law L1), not a number the kernel trusts. But software and
+humans still want to know *who* they are — `whoami`, `getpwnam`, `$HOME`. So
+identity here is **descriptive, not authorizing**, and the two are deliberately
+decoupled:
+
+- **Identity = who you are.** A fixed `IdentRec { uid, gid, groups[], name, home }`
+  inherited at spawn, mapped read-only by the kernel at `SPAWN_IDENT`
+  (`0x0F00_1000`), exactly mirroring the argv page. The spawn `MsgBuf` carries it
+  in `data[3]` (pointer) / `data[4]` (length); `spawn_common` copies it into the
+  child. A zeroed page (no identity passed, or any boot module) reads as **root**
+  (uid 0, home `/`).
+- **Authority = what you can do.** Still the capabilities in your handle table.
+  Logging in as someone means *receiving their cap bundle* (home-dir cap, group
+  caps), not setting a uid. A parent may stamp any identity on its child; that is
+  harmless precisely because identity grants nothing — a process that calls
+  itself `alice` with no alice caps can do nothing alice can.
+
+`rt::identity()/uid()/gid()/user_name()/home()` read the record;
+`rt::msg_set_identity()` stamps it on a child spawn (the shell propagates its own,
+so `whoami` is stable across `exec`). libc answers `getuid/geteuid/getgid/getegid/
+getgroups/getlogin/getpwuid/getpwnam` (+ `_r`) from it — note there is **no
+`setuid`**: you cannot change identity to gain authority. Shell builtins `whoami`,
+`id`, `groups`. Next: a `login` server + credential store hand out per-user cap
+bundles (real multi-user, still capability-native).

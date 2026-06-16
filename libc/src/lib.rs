@@ -1129,22 +1129,230 @@ pub extern "C" fn pipe(_fds: *mut i32) -> i32 {
 pub extern "C" fn rename(_a: *const u8, _b: *const u8) -> i32 {
     -1
 }
+// ---- POSIX identity (§24) — answered from the inherited IdentRec. -----------
+// These report WHO we are; they grant nothing. There is no setuid/seteuid: on a
+// capability system you cannot change identity to gain authority — you re-launch
+// under a new identity + cap bundle (see the `login`/`su` flow).
+
 #[no_mangle]
-pub extern "C" fn geteuid() -> u32 {
-    0
+pub extern "C" fn getuid() -> u32 {
+    rt::uid()
 }
 #[no_mangle]
-pub unsafe extern "C" fn getpwuid_r(
-    _u: u32,
-    _p: *mut u8,
-    _b: *mut u8,
-    _n: usize,
-    result: *mut *mut u8,
+pub extern "C" fn geteuid() -> u32 {
+    rt::uid()
+}
+#[no_mangle]
+pub extern "C" fn getgid() -> u32 {
+    rt::gid()
+}
+#[no_mangle]
+pub extern "C" fn getegid() -> u32 {
+    rt::gid()
+}
+
+/// getgroups(2): fill `list` with our supplementary group ids. `size`==0 returns
+/// the count without writing (POSIX). Returns -1 if `size` is too small.
+#[no_mangle]
+pub unsafe extern "C" fn getgroups(size: i32, list: *mut u32) -> i32 {
+    let id = rt::identity();
+    let n = id.ngroups as usize;
+    if size == 0 {
+        return n as i32;
+    }
+    if (size as usize) < n {
+        return -1;
+    }
+    for i in 0..n {
+        *list.add(i) = id.groups[i];
+    }
+    n as i32
+}
+
+/// getlogin(3): our login name (points at a static buffer).
+#[no_mangle]
+pub unsafe extern "C" fn getlogin() -> *const u8 {
+    let name = rt::user_name();
+    let n = core::cmp::min(name.len(), 32);
+    PW_NAME[..n].copy_from_slice(&name[..n]);
+    PW_NAME[n] = 0;
+    PW_NAME.as_ptr()
+}
+#[no_mangle]
+pub unsafe extern "C" fn getlogin_r(buf: *mut u8, len: usize) -> i32 {
+    let name = rt::user_name();
+    if len < name.len() + 1 {
+        return 34; // ERANGE
+    }
+    core::ptr::copy_nonoverlapping(name.as_ptr(), buf, name.len());
+    *buf.add(name.len()) = 0;
+    0
+}
+
+#[repr(C)]
+pub struct passwd {
+    pw_name: *const u8,
+    pw_passwd: *const u8,
+    pw_uid: u32,
+    pw_gid: u32,
+    pw_gecos: *const u8,
+    pw_dir: *const u8,
+    pw_shell: *const u8,
+}
+
+static mut PW: passwd = passwd {
+    pw_name: core::ptr::null(),
+    pw_passwd: core::ptr::null(),
+    pw_uid: 0,
+    pw_gid: 0,
+    pw_gecos: core::ptr::null(),
+    pw_dir: core::ptr::null(),
+    pw_shell: core::ptr::null(),
+};
+static mut PW_NAME: [u8; 33] = [0; 33];
+static mut PW_DIR: [u8; 129] = [0; 129];
+
+/// Populate the shared `PW` scratch (matches non-reentrant getpwuid semantics).
+unsafe fn fill_pw(uid: u32, gid: u32, name: &[u8], home: &[u8]) -> *mut passwd {
+    let nn = core::cmp::min(name.len(), 32);
+    PW_NAME[..nn].copy_from_slice(&name[..nn]);
+    PW_NAME[nn] = 0;
+    let hn = core::cmp::min(home.len(), 128);
+    PW_DIR[..hn].copy_from_slice(&home[..hn]);
+    PW_DIR[hn] = 0;
+    PW = passwd {
+        pw_name: PW_NAME.as_ptr(),
+        pw_passwd: b"x\0".as_ptr(),
+        pw_uid: uid,
+        pw_gid: gid,
+        pw_gecos: b"\0".as_ptr(),
+        pw_dir: PW_DIR.as_ptr(),
+        pw_shell: b"/bin/sh\0".as_ptr(),
+    };
+    addr_of_mut!(PW)
+}
+
+/// getpwuid(3): resolve a uid to a passwd entry. We can answer for our own
+/// identity and for root (uid 0); other uids return NULL until a name service
+/// (/etc/passwd via fsd) lands. Returns a pointer to static storage.
+#[no_mangle]
+pub unsafe extern "C" fn getpwuid(uid: u32) -> *mut passwd {
+    let id = rt::identity();
+    if uid == id.uid {
+        fill_pw(id.uid, id.gid, rt::user_name(), rt::home())
+    } else if uid == 0 {
+        fill_pw(0, 0, b"root", b"/")
+    } else {
+        core::ptr::null_mut()
+    }
+}
+
+/// getpwnam(3): resolve a login name to a passwd entry (see getpwuid caveats).
+#[no_mangle]
+pub unsafe extern "C" fn getpwnam(name: *const u8) -> *mut passwd {
+    if name.is_null() {
+        return core::ptr::null_mut();
+    }
+    let mut n = 0usize;
+    while *name.add(n) != 0 {
+        n += 1;
+    }
+    let want = core::slice::from_raw_parts(name, n);
+    let id = rt::identity();
+    if want == rt::user_name() {
+        fill_pw(id.uid, id.gid, rt::user_name(), rt::home())
+    } else if want == b"root" {
+        fill_pw(0, 0, b"root", b"/")
+    } else {
+        core::ptr::null_mut()
+    }
+}
+
+/// Reentrant fill: write the strings into the caller's `buf` and point `pwd` at
+/// them. Returns 0 and sets `*result=pwd` on success, ENOENT-style (0 + NULL
+/// result) on no match, ERANGE (34) if `buf` is too small.
+unsafe fn fill_pw_r(
+    found: bool,
+    uid: u32,
+    gid: u32,
+    name: &[u8],
+    home: &[u8],
+    pwd: *mut passwd,
+    buf: *mut u8,
+    buflen: usize,
+    result: *mut *mut passwd,
 ) -> i32 {
     if !result.is_null() {
         *result = core::ptr::null_mut();
     }
-    1
+    if !found || pwd.is_null() {
+        return 0;
+    }
+    let need = name.len() + 1 + home.len() + 1;
+    if buflen < need {
+        return 34; // ERANGE
+    }
+    let name_p = buf;
+    core::ptr::copy_nonoverlapping(name.as_ptr(), name_p, name.len());
+    *name_p.add(name.len()) = 0;
+    let dir_p = buf.add(name.len() + 1);
+    core::ptr::copy_nonoverlapping(home.as_ptr(), dir_p, home.len());
+    *dir_p.add(home.len()) = 0;
+    (*pwd).pw_name = name_p;
+    (*pwd).pw_passwd = b"x\0".as_ptr();
+    (*pwd).pw_uid = uid;
+    (*pwd).pw_gid = gid;
+    (*pwd).pw_gecos = b"\0".as_ptr();
+    (*pwd).pw_dir = dir_p;
+    (*pwd).pw_shell = b"/bin/sh\0".as_ptr();
+    if !result.is_null() {
+        *result = pwd;
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn getpwuid_r(
+    uid: u32,
+    pwd: *mut passwd,
+    buf: *mut u8,
+    buflen: usize,
+    result: *mut *mut passwd,
+) -> i32 {
+    let id = rt::identity();
+    if uid == id.uid {
+        fill_pw_r(true, id.uid, id.gid, rt::user_name(), rt::home(), pwd, buf, buflen, result)
+    } else if uid == 0 {
+        fill_pw_r(true, 0, 0, b"root", b"/", pwd, buf, buflen, result)
+    } else {
+        fill_pw_r(false, 0, 0, b"", b"", pwd, buf, buflen, result)
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn getpwnam_r(
+    name: *const u8,
+    pwd: *mut passwd,
+    buf: *mut u8,
+    buflen: usize,
+    result: *mut *mut passwd,
+) -> i32 {
+    if name.is_null() {
+        return fill_pw_r(false, 0, 0, b"", b"", pwd, buf, buflen, result);
+    }
+    let mut n = 0usize;
+    while *name.add(n) != 0 {
+        n += 1;
+    }
+    let want = core::slice::from_raw_parts(name, n);
+    let id = rt::identity();
+    if want == rt::user_name() {
+        fill_pw_r(true, id.uid, id.gid, rt::user_name(), rt::home(), pwd, buf, buflen, result)
+    } else if want == b"root" {
+        fill_pw_r(true, 0, 0, b"root", b"/", pwd, buf, buflen, result)
+    } else {
+        fill_pw_r(false, 0, 0, b"", b"", pwd, buf, buflen, result)
+    }
 }
 #[no_mangle]
 pub extern "C" fn getifaddrs(_a: *mut *mut u8) -> i32 {

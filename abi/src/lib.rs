@@ -535,6 +535,101 @@ pub const SPAWN_DEFAULT_BUDGET: u64 = 64 * 4096;
 /// there. A spawned program reads its argument from `SPAWN_ARGV` (`rt::argv()`).
 pub const SPAWN_ARGV: u64 = 0x0F00_0000;
 
+/// The caller's IDENTITY record (`IdentRec`) rides in the spawn MsgBuf's
+/// `data[3]` (pointer) / `data[4]` (length); the kernel maps a read-only page at
+/// this vaddr in the child and copies it there. A program reads it via
+/// `rt::identity()`. §24 (capability-native identity): identity is DESCRIPTIVE —
+/// it names who you are (uid/name/home for `whoami`, `getpwnam`, POSIX compat)
+/// and grants NOTHING. Authority remains the capabilities you hold (law L1). A
+/// parent may set any identity for its child; that is harmless precisely because
+/// identity confers no access. The page is zeroed when no identity is passed,
+/// which `rt` reads as root (uid 0, home "/").
+pub const SPAWN_IDENT: u64 = 0x0F00_1000;
+
+/// Max bytes for the username and home-path fields of [`IdentRec`] (NUL-padded).
+pub const IDENT_NAME_MAX: usize = 32;
+pub const IDENT_HOME_MAX: usize = 128;
+/// Max supplementary groups carried in an [`IdentRec`].
+pub const IDENT_GROUPS_MAX: usize = 16;
+
+/// The inherited identity record (see [`SPAWN_IDENT`]). Fixed layout so kernel,
+/// rt, and libc agree byte-for-byte; ~236 bytes, well under a page. Purely
+/// descriptive — holding it grants no authority.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IdentRec {
+    pub uid: u32,
+    pub gid: u32,
+    /// Valid entries in `groups` (`0..=IDENT_GROUPS_MAX`).
+    pub ngroups: u32,
+    pub groups: [u32; IDENT_GROUPS_MAX],
+    /// Login name, NUL-padded (empty = "root" when uid==0).
+    pub name: [u8; IDENT_NAME_MAX],
+    /// Home directory path, NUL-padded (empty = "/").
+    pub home: [u8; IDENT_HOME_MAX],
+}
+
+impl IdentRec {
+    pub const fn zeroed() -> Self {
+        IdentRec {
+            uid: 0,
+            gid: 0,
+            ngroups: 0,
+            groups: [0; IDENT_GROUPS_MAX],
+            name: [0; IDENT_NAME_MAX],
+            home: [0; IDENT_HOME_MAX],
+        }
+    }
+
+    /// Build a record from parts (truncating over-long name/home, NUL-padded).
+    pub fn new(uid: u32, gid: u32, name: &[u8], home: &[u8]) -> Self {
+        let mut r = Self::zeroed();
+        r.uid = uid;
+        r.gid = gid;
+        r.set_name(name);
+        r.set_home(home);
+        r
+    }
+
+    pub fn set_name(&mut self, s: &[u8]) {
+        copy_field(&mut self.name, s);
+    }
+
+    pub fn set_home(&mut self, s: &[u8]) {
+        copy_field(&mut self.home, s);
+    }
+
+    /// Append a supplementary group (ignored once `IDENT_GROUPS_MAX` is reached).
+    pub fn add_group(&mut self, gid: u32) {
+        let n = self.ngroups as usize;
+        if n < IDENT_GROUPS_MAX {
+            self.groups[n] = gid;
+            self.ngroups += 1;
+        }
+    }
+
+    /// The login name as bytes, trimmed at the first NUL.
+    pub fn name_bytes(&self) -> &[u8] {
+        let n = self.name.iter().position(|&b| b == 0).unwrap_or(self.name.len());
+        &self.name[..n]
+    }
+
+    /// The home path as bytes, trimmed at the first NUL.
+    pub fn home_bytes(&self) -> &[u8] {
+        let n = self.home.iter().position(|&b| b == 0).unwrap_or(self.home.len());
+        &self.home[..n]
+    }
+}
+
+/// Copy `src` into a fixed NUL-padded byte field, truncating if too long.
+fn copy_field(dst: &mut [u8], src: &[u8]) {
+    let n = core::cmp::min(dst.len(), src.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    for b in &mut dst[n..] {
+        *b = 0;
+    }
+}
+
 /// "PING" — request tag for the v0 roundtrip.
 pub const TAG_PING: u64 = 0x474E4950;
 /// "PONG" — reply tag for the v0 roundtrip.

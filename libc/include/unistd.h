@@ -18,4 +18,12 @@ int unlink(const char *);
 int execvp(const char *, char *const *);
 char *getcwd(char *, size_t);
 extern char **environ;
+#include <sys/types.h>
+uid_t getuid(void);
+uid_t geteuid(void);
+gid_t getgid(void);
+gid_t getegid(void);
+int getgroups(int, gid_t *);
+char *getlogin(void);
+int getlogin_r(char *, size_t);
 #endif
