@@ -12,7 +12,7 @@
 extern crate oxbow_libc as _;
 
 use oxbow_abi::{
-    Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_IMG_WLCLIENT, BOOT_INPUT_CHAN, BOOT_MEM, FB_MMIO,
+    Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_IMG_OXTERM, BOOT_INPUT_CHAN, BOOT_MEM, FB_MMIO,
     HANDLE_NULL,
 };
 use oxbow_rt as rt;
@@ -73,14 +73,14 @@ pub extern "C" fn oxbow_main() -> ! {
     // we can tell when it dies).
     let exit = rt::sys_notif_create().unwrap_or(HANDLE_NULL);
     let mut m = MsgBuf::new(0);
-    m.data[0] = 16 * 1024 * 1024; // child Memory budget
+    m.data[0] = 24 * 1024 * 1024; // child Memory budget (FreeType + vterm + font)
     m.data_len = 3; // data[1]/data[2] = empty argv
     m.handle_count = 3;
     m.handles[0] = cli_end; // -> child slot 1 (the Wayland socket)
     m.handles[1] = HANDLE_NULL; // slot 2 (stdout) — unused
     m.handles[2] = BOOT_CONSOLE; // -> child slot 4: a console for debug logging
-    if rt::sys_spawn(BOOT_IMG_WLCLIENT, BOOT_MEM, &m, exit).is_err() {
-        w(b"[oxcomp] failed to spawn wlclient\n");
+    if rt::sys_spawn(BOOT_IMG_OXTERM, BOOT_MEM, &m, exit).is_err() {
+        w(b"[oxcomp] failed to spawn the terminal\n");
         park();
     }
     w(b"[oxcomp] compositor up; wlclient spawned\n");

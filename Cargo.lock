@@ -549,6 +549,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxterm"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+]
+
+[[package]]
 name = "oxvterm"
 version = "0.0.0"
 dependencies = [

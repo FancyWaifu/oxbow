@@ -41,3 +41,5 @@ servers/oxxkb/xkb/**          linguist-vendored
 servers/oxvterm/vterm/**   linguist-vendored
 # FreeType (oxft) — the glyph rasterizer for the terminal.
 servers/oxft/ft/**   linguist-vendored
+# Embedded DejaVu Sans Mono (the terminal font).
+servers/oxterm/font/**   linguist-vendored

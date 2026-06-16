@@ -33,6 +33,7 @@ build-server:
     RUSTFLAGS="-C relocation-model=static" cargo build -p fb
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p oxcomp
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p wlclient
+    RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p oxterm
     RUSTFLAGS="-C relocation-model=static" cargo build -p fsd
     RUSTFLAGS="-C relocation-model=static" cargo build -p cat
     RUSTFLAGS="-C relocation-model=static" cargo build -p ls
@@ -98,6 +99,8 @@ _iso:
     cp target/x86_64-unknown-none/debug/blk iso_root/boot/blk.elf
     cp target/x86_64-unknown-none/debug/wlclient iso_root/boot/wlclient.elf
     -strip -S iso_root/boot/wlclient.elf
+    cp target/x86_64-unknown-none/debug/oxterm iso_root/boot/oxterm.elf
+    -strip -S iso_root/boot/oxterm.elf
     cp target/x86_64-unknown-none/debug/oxcomp iso_root/boot/oxcomp.elf
     -strip -S iso_root/boot/oxcomp.elf
     cp target/x86_64-unknown-none/debug/cat iso_root/boot/cat.elf

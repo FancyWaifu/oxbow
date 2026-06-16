@@ -1980,3 +1980,29 @@ machinery works. Next: embed a monospace font and rasterize glyphs — then the
 terminal window itself, which feeds the shell's output through libvterm (§50) and
 draws each grid cell with FreeType into an shm buffer (§42 wl_shm) shown by the
 compositor, with keys decoded via xkb (§49). That's the whole desktop loop.
+
+## 52. oxterm — a Wayland terminal window (v1-oxterm)
+
+The whole desktop stack, assembled. `oxterm` is a Wayland client (the one the
+compositor now spawns) that links the entire ported toolchain — libwayland +
+libffi + libxkbcommon + libvterm + FreeType — and renders a terminal in a window:
+
+- **FreeType** rasterizes glyphs from an embedded DejaVu Sans Mono (`FT_New_Memory_Face`
+  on the in-binary TTF, 16 px); cell metrics come from the face.
+- **libvterm** holds the screen grid; bytes written to it (a banner now, the
+  shell next) become cells.
+- Each redraw walks the grid, `FT_Load_Char(...RENDER)` per cell, and alpha-blends
+  the coverage bitmap as fg-over-bg into the wl_shm buffer the compositor shows.
+- **Keys** arrive via wl_keyboard, decode through `xkb_state` (§49), and are fed
+  to libvterm — so typing echoes live in the window.
+
+Verified by screendump: the window shows crisp anti-aliased text, and injecting
+`ls -a /etc` renders `$ ls -a /etc`. The build compiles xkb/vterm/freetype as
+separate archives (their private headers + config.h don't collide), with only
+their public headers on the main unit's path.
+
+What's left to "log in on screen": wire the terminal to the real shell — a
+bidirectional channel where the tty forwards the shell's output to oxterm (→
+libvterm) and oxterm sends keystrokes back (→ tty → shell). Then the login prompt
+appears in the window and you type your password into it. The rendering + input
+half is done; that channel is the last piece.
