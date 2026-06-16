@@ -13,6 +13,18 @@ typedef unsigned long sigset_t;
 #define SIGPIPE 13
 #define SIGTERM 15
 #define SIGCHLD 17
+#define SIGBUS  7
+#define SA_SIGINFO 0x00000004
+#define SA_NODEFER 0x40000000
+#define SA_RESTART 0x10000000
+typedef struct { int si_signo; int si_code; void *si_addr; } siginfo_t;
+struct sigaction {
+    void (*sa_handler)(int);
+    void (*sa_sigaction)(int, siginfo_t *, void *);
+    sigset_t sa_mask;
+    int      sa_flags;
+};
+int sigaction(int, const struct sigaction *, struct sigaction *);
 #define SIG_DFL ((sighandler_t)0)
 #define SIG_IGN ((sighandler_t)1)
 #define SIG_BLOCK   0

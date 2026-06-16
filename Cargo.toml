@@ -32,6 +32,7 @@ members = [
     "servers/oxares",
     "servers/oxffi",
     "servers/oxwl",
+    "servers/oxcomp",
     "servers/drift",
     "servers/cc-hello",
     "servers/tcc",

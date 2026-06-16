@@ -483,6 +483,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxcomp"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-abi",
+ "oxbow-libc",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "oxcurl"
 version = "0.0.0"
 dependencies = [

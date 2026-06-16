@@ -1312,6 +1312,11 @@ pub extern "C" fn signalfd(_fd: i32, _mask: *const u8, _flags: i32) -> i32 {
 pub extern "C" fn flock(_fd: i32, _op: i32) -> i32 {
     0
 }
+/// msync(2): shm regions are plain RAM mappings here (no writeback needed). No-op.
+#[no_mangle]
+pub extern "C" fn msync(_addr: *mut u8, _len: usize, _flags: i32) -> i32 {
+    0
+}
 #[no_mangle]
 pub extern "C" fn sigemptyset(_set: *mut u64) -> i32 {
     if !_set.is_null() {
@@ -1338,6 +1343,47 @@ pub extern "C" fn sigismember(_set: *const u64, _signo: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn sigprocmask(_how: i32, _set: *const u64, _old: *mut u64) -> i32 {
     0
+}
+/// sigaction(2): oxbow has no signals; libwayland's wl_shm installs a SIGBUS
+/// handler for client pool-shrink protection that can never fire here. No-op.
+#[no_mangle]
+pub extern "C" fn sigaction(_signum: i32, _act: *const u8, _old: *mut u8) -> i32 {
+    0
+}
+
+// pthread thread-local keys: single-threaded, so one value per key (a small
+// table) is a faithful TLS. wl_shm uses one key for its sigbus-handler context.
+static mut PKEYS: [usize; 16] = [0; 16];
+static mut PKEY_NEXT: usize = 1;
+#[no_mangle]
+pub unsafe extern "C" fn pthread_key_create(key: *mut usize, _dtor: *const u8) -> i32 {
+    if PKEY_NEXT >= 16 {
+        return 11; // EAGAIN
+    }
+    *key = PKEY_NEXT;
+    PKEY_NEXT += 1;
+    0
+}
+#[no_mangle]
+pub extern "C" fn pthread_key_delete(_key: usize) -> i32 {
+    0
+}
+#[no_mangle]
+pub unsafe extern "C" fn pthread_getspecific(key: usize) -> *mut u8 {
+    if key < 16 {
+        (*addr_of_mut!(PKEYS))[key] as *mut u8
+    } else {
+        core::ptr::null_mut()
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn pthread_setspecific(key: usize, value: *const u8) -> i32 {
+    if key < 16 {
+        (*addr_of_mut!(PKEYS))[key] = value as usize;
+        0
+    } else {
+        22 // EINVAL
+    }
 }
 /// open_memstream(3): only reached by libwayland's WAYLAND_DEBUG message dump
 /// (off by default). NULL is handled gracefully by the caller (skips the log).
@@ -2721,7 +2767,9 @@ pub extern "C" fn unlink(_p: *const u8) -> i32 {
 //     anonymous RW pages from a reserved vaddr region; mprotect flips RW<->RX via
 //     sys_protect (W^X-enforced in the kernel). PROT_* match the oxbow ABI. ---
 use core::sync::atomic::{AtomicUsize, Ordering};
-static MMAP_NEXT: AtomicUsize = AtomicUsize::new(0x5000_0000);
+// Base for anonymous + shm mmaps. Must clear FB_MMIO (0x5000_0000, where the
+// compositor maps the framebuffer) — they used to collide, failing shm mmaps.
+static MMAP_NEXT: AtomicUsize = AtomicUsize::new(0x6000_0000);
 
 #[no_mangle]
 pub unsafe extern "C" fn mmap(

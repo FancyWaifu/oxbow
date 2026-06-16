@@ -50,4 +50,11 @@ static inline int pthread_once(pthread_once_t *once, void (*f)(void)) {
     if (once && !*once) { *once = 1; f(); }
     return 0;
 }
+
+/* Thread-local keys: single-threaded, so one global value per key suffices. */
+typedef unsigned long pthread_key_t;
+int  pthread_key_create(pthread_key_t *key, void (*destructor)(void *));
+int  pthread_key_delete(pthread_key_t key);
+void *pthread_getspecific(pthread_key_t key);
+int  pthread_setspecific(pthread_key_t key, const void *value);
 #endif

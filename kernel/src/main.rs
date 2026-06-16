@@ -283,6 +283,8 @@ fn kmain_stage2() -> ! {
             96 * 1024 * 1024
         } else if cmd == b"fs" {
             16 * 1024 * 1024
+        } else if cmd == b"oxcomp" {
+            32 * 1024 * 1024 // libwayland + shm buffers
         } else {
             mm::mem::BOOT_BUDGET
         };
@@ -334,9 +336,9 @@ fn kmain_stage2() -> ! {
                 );
             });
         }
-        // The fb server gets the framebuffer capability — the sole holder of the
-        // authority to map + draw to the screen (every GUI pixel flows through it).
-        if cmd == b"fb" {
+        // The fb server / oxcomp compositor get the framebuffer capability — the
+        // sole holder of the authority to map + draw to the screen.
+        if cmd == b"fb" || cmd == b"oxcomp" {
             proc::with_proc_mut(pid, |p| {
                 p.install(
                     oxbow_abi::BOOT_FB,

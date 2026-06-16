@@ -1,0 +1,19 @@
+[package]
+name = "oxcomp"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oxcomp"
+path = "src/main.rs"
+
+[dependencies]
+oxbow-libc = { path = "../../libc", default-features = false }
+oxbow-rt = { path = "../../rt" }
+oxbow-abi = { path = "../../abi" }
+
+[build-dependencies]
+cc = "1"
