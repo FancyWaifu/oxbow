@@ -26,9 +26,12 @@ servers/curl/config/**         linguist-generated
 servers/curl/bearssl/**             linguist-vendored
 servers/fs/initrd/etc/ssl/cacert.pem linguist-vendored
 
-servers/oxares/cares-src/**       linguist-vendored
-servers/oxares/cares-include/**   linguist-vendored
-servers/oxffi/ffi-src/** linguist-vendored
-servers/oxffi/ffi-include/** linguist-vendored
-servers/oxwl/wl-src/** linguist-vendored
-servers/oxwl/wl-include/** linguist-vendored
+# c-ares: vendored into libc (backs getaddrinfo system-wide; moved from oxares).
+libc/cares-src/**       linguist-vendored
+libc/cares-include/**   linguist-vendored
+libc/cares-config/**    linguist-vendored
+# libffi (oxffi) + libwayland (oxwl) — vendored upstream C for the graphics stack.
+servers/oxffi/ffi-src/**      linguist-vendored
+servers/oxffi/ffi-include/**  linguist-vendored
+servers/oxwl/wl-src/**        linguist-vendored
+servers/oxwl/wl-include/**    linguist-vendored

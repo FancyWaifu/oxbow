@@ -24,6 +24,38 @@ Read that first; everything in a microkernel is downstream of the IPC/capability
 
 ## Status
 
+### What works today
+
+oxbow boots (QEMU **and real hardware** — a Proxmox KVM VM gets a real LAN IP)
+to an interactive shell, and the userland on top of the capability kernel is now
+substantial — POSIX/Unix feel built *over* the capabilities, the kernel staying
+capability-pure (the Redox model):
+
+- **Filesystem** — a real **ext2** on a `virtio-blk` disk (vendored lwext4),
+  persistent across reboots, with `ls`/`cat`/`cp`/`mv`/`rm`/`mkdir` as separate
+  capability-confined programs (each gets only a directory/file cap, never a name).
+- **Network stack, from scratch** — an `e1000` driver, Ethernet/ARP/IPv4/ICMP/
+  UDP/TCP (smoltcp for TCP), DHCP, a socket **capability** API, and **validated
+  HTTPS**: `curl https://…` works (BearSSL + the kernel CSPRNG). DNS is a full
+  **c-ares** port backing `getaddrinfo` system-wide.
+- **Real programs** — an oxbow libc + a C-port harness run **TinyCC, Lua,
+  MicroPython, QuickJS, and curl** on the kernel; TinyCC even runs *on* oxbow.
+- **Graphics → a Wayland compositor** — a linear framebuffer owned as a
+  capability, a byte+capability **channel** transport (socketpair + `SCM_RIGHTS`),
+  ports of **libffi** and **libwayland** (wire + server + client + an epoll event
+  loop), **shm/memfd/mmap** shared buffers — and `oxcomp`, a tiny **Wayland
+  compositor**: a real Wayland client draws a window into an shm buffer, the buffer
+  fd is passed to the compositor over the channel, and its pixels are composited
+  onto the screen.
+- **OpenBSD-style hardening** — a kernel CSPRNG (RDSEED/RDRAND→ChaCha20),
+  `pledge`, `mimmutable`, W^X everywhere, and the `jail` confinement showcase.
+
+It remains a from-scratch **Rust** capability microkernel; the large C trees in
+the tree are *vendored* upstream sources (lwext4, BearSSL, c-ares, libffi,
+libwayland, the language runtimes) ported to run on it — see `.gitattributes`.
+
+The verified milestone-by-milestone history follows.
+
 **v0 — PONG: complete and verified booting in QEMU.** The kernel boots via
 Limine, manages physical and virtual memory under W^X, sets up GDT/TSS/IDT and
 the `syscall` fast path, hand-builds one user-mode server (`pong`) from a Limine
@@ -204,13 +236,15 @@ API (`rt::fs::open`/`read_all`/`readdir`) wraps the fs protocol. The coreutils
 were rewritten against it — `cat` is `read_all` + `stdout_write`, `ls` a
 `readdir` loop with `println!`, `hello` uses `Vec`/`format!`. See §17.
 
-### Next — toward a fuller userspace
+### Next — frontier
 
-File growth/realloc → a real **argv vector** → buffered **stdin** + a `read`
-builtin → pipes (`a | b`) → richer coreutils. The substrate is now a real libc. POSIX and the Unix feel live in *userspace*
-over the capability kernel (the Redox model) — the kernel stays capability-pure.
-Plus, eventually: frame reclamation + budget refund, the orphaned selftest rework,
-untyped/retype + `sys_unmap`, SMP, and the `aarch64` port.
+On the graphics track: **cross-process** Wayland (the compositor spawns the
+client with an inherited `WAYLAND_SOCKET` fd), **input routing** (keyboard →
+focused surface), `xdg_shell` toplevels, and multiple windows. Underneath:
+turning the epoll busy-poll into a block-on-channel-wake, **SMP** + a user-thread
+syscall, frame reclamation + budget refund, `sys_unmap`, and an `aarch64` port.
+POSIX and the Unix feel keep growing in *userspace* over the capability kernel
+(the Redox model) — the kernel stays capability-pure.
 
 ## Building & running
 
