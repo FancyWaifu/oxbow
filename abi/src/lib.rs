@@ -463,6 +463,12 @@ pub const BOOT_IMG_WLCLIENT: Handle = 35; // wlclient — the compositor's Wayla
 /// The framebuffer capability, granted to the `fb` server at boot. Gates
 /// SYS_FB_INFO (geometry) + SYS_FB_MAP (map the pixels RW). §34 (graphics).
 pub const BOOT_FB: Handle = 32;
+/// A kernel-created channel for keyboard events: the `kbd` driver holds the send
+/// end and `oxcomp` the receive end (both at this handle). kbd writes each key
+/// byte; the compositor's event loop watches the fd and turns bytes into
+/// wl_keyboard events (§47, on-screen input). Distinct from BOOT_TTY so the
+/// serial console keeps working alongside the graphical path.
+pub const BOOT_INPUT_CHAN: Handle = 36;
 /// Fixed vaddr where the fb server maps the linear framebuffer.
 pub const FB_MMIO: u64 = 0x5000_0000;
 /// The control-channel badge (distinct from any socket id, which are 1..=N).

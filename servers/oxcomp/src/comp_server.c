@@ -3,6 +3,7 @@
  * framebuffer. Separate translation unit (server headers) from the client. */
 #include <stddef.h>
 #include <stdlib.h>
+#include <unistd.h> /* read() on the input channel fd */
 #include "wayland-server.h"
 #include "wayland-server-protocol.h"
 #include "xdg-shell-server-protocol.h"
@@ -20,6 +21,9 @@ static void slog(const char *s)
 
 static unsigned int *g_fb;
 static int           g_w, g_h, g_pitch_words;
+static struct wl_resource *g_keyboard;  /* the client's wl_keyboard, if bound */
+static struct wl_resource *g_focus;     /* the surface holding keyboard focus */
+static unsigned int        g_serial;    /* event serial counter */
 static int           g_composited;
 
 struct surf {
@@ -106,6 +110,14 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
   }
   wl_shm_buffer_end_access(shm);
   g_composited = 1;
+  /* Give this surface keyboard focus the first time it shows pixels (§47). */
+  if (g_keyboard && !g_focus) {
+    struct wl_array keys;
+    wl_array_init(&keys);
+    wl_keyboard_send_enter(g_keyboard, ++g_serial, res, &keys);
+    wl_array_release(&keys);
+    g_focus = res;
+  }
   wl_buffer_send_release(s->buffer); /* client may reuse the buffer */
   /* Tell the client this frame is on screen and it may draw the next one. Its
    * frame-callback handler redraws + commits again → the surface animates. */
@@ -278,8 +290,73 @@ static void compositor_bind(struct wl_client *c, void *data, uint32_t version, u
   wl_resource_set_implementation(res, &compositor_impl, NULL, NULL);
 }
 
+/* ---- wl_seat / wl_keyboard (§47, on-screen input) ----------------------- */
+static void keyboard_release(struct wl_client *c, struct wl_resource *res)
+{
+  (void)c;
+  wl_resource_destroy(res);
+}
+static const struct wl_keyboard_interface keyboard_impl = { keyboard_release };
+static void keyboard_resource_destroy(struct wl_resource *res)
+{
+  if (g_keyboard == res)
+    g_keyboard = NULL;
+}
+static void seat_get_keyboard(struct wl_client *c, struct wl_resource *res, uint32_t id)
+{
+  struct wl_resource *k =
+    wl_resource_create(c, &wl_keyboard_interface, wl_resource_get_version(res), id);
+  wl_resource_set_implementation(k, &keyboard_impl, NULL, keyboard_resource_destroy);
+  g_keyboard = k;
+  slog("[oxcomp/srv] wl_keyboard bound\n");
+}
+static void seat_get_pointer(struct wl_client *c, struct wl_resource *res, uint32_t id)
+{
+  (void)c; (void)res; (void)id;
+}
+static void seat_get_touch(struct wl_client *c, struct wl_resource *res, uint32_t id)
+{
+  (void)c; (void)res; (void)id;
+}
+static void seat_release(struct wl_client *c, struct wl_resource *res)
+{
+  (void)c;
+  wl_resource_destroy(res);
+}
+static const struct wl_seat_interface seat_impl = {
+  seat_get_pointer, seat_get_keyboard, seat_get_touch, seat_release
+};
+static void seat_bind(struct wl_client *c, void *data, uint32_t version, uint32_t id)
+{
+  (void)data;
+  struct wl_resource *res = wl_resource_create(c, &wl_seat_interface, version, id);
+  wl_resource_set_implementation(res, &seat_impl, NULL, NULL);
+  wl_seat_send_capabilities(res, WL_SEAT_CAPABILITY_KEYBOARD);
+}
+
+/* Event-loop callback: drain the keyboard channel and deliver each byte to the
+ * focused client as a wl_keyboard key press+release. We always read() (even with
+ * no focus) so the kbd driver's channel never backs up. NOTE (arc 1): the wire
+ * value is the kbd driver's ASCII byte; real evdev keycodes + an xkb keymap
+ * arrive with the libxkbcommon port. */
+static int on_input(int fd, uint32_t mask, void *data)
+{
+  (void)mask;
+  (void)data;
+  unsigned char buf[64];
+  long          n = read(fd, buf, sizeof buf);
+  for (long i = 0; i < n; i++) {
+    if (!g_keyboard || !g_focus)
+      continue;
+    unsigned int t = ox_now_ms();
+    wl_keyboard_send_key(g_keyboard, ++g_serial, t, buf[i], WL_KEYBOARD_KEY_STATE_PRESSED);
+    wl_keyboard_send_key(g_keyboard, ++g_serial, t, buf[i], WL_KEYBOARD_KEY_STATE_RELEASED);
+  }
+  return 0;
+}
+
 /* ---- exported driver entry points --------------------------------------- */
-void *comp_server_setup(int fd, unsigned int *fb, int w, int h, int pitch_words)
+void *comp_server_setup(int fd, int input_fd, unsigned int *fb, int w, int h, int pitch_words)
 {
   g_fb = fb;
   g_w = w;
@@ -298,10 +375,16 @@ void *comp_server_setup(int fd, unsigned int *fb, int w, int h, int pitch_words)
     return NULL;
   wl_global_create(d, &wl_compositor_interface, 4, NULL, compositor_bind);
   wl_global_create(d, &xdg_wm_base_interface, 1, NULL, wm_base_bind);
+  wl_global_create(d, &wl_seat_interface, 5, NULL, seat_bind);
   if (wl_display_init_shm(d) < 0) {
     wl_display_destroy(d);
     return NULL;
   }
+  /* Watch the keyboard channel fd in the same event loop as the Wayland clients,
+   * so the busy-poll dispatch picks up keystrokes (§47). */
+  if (input_fd >= 0)
+    wl_event_loop_add_fd(wl_display_get_event_loop(d), input_fd, WL_EVENT_READABLE,
+                         on_input, d);
   if (!wl_client_create(d, fd)) {
     wl_display_destroy(d);
     return NULL;

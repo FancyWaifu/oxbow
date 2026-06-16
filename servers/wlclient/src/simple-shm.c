@@ -294,12 +294,21 @@ keyboard_handle_leave(void *data, struct wl_keyboard *keyboard,
 {
 }
 
+extern void ox_clog(const char *, unsigned long);
 static void
 keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
 		    uint32_t serial, uint32_t time, uint32_t key,
 		    uint32_t state)
 {
 	struct display *d = data;
+
+	if (state) {
+		/* §47 demo: prove keystrokes reach the client. The compositor
+		 * currently sends the ASCII byte as `key`. */
+		char msg[16] = "[cli] key 'X'\n";
+		msg[11] = (key >= 32 && key < 127) ? (char)key : '?';
+		ox_clog(msg, 14);
+	}
 
 	if (key == KEY_F11 && state) {
 		if (d->window->fullscreen)

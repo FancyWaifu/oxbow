@@ -243,6 +243,11 @@ fn kmain_stage2() -> ! {
     // base, size); module load addresses are page-aligned (Limine).
     let mut initrd: Option<(u64, u64)> = None;
 
+    // §47: a kernel-created channel carrying keyboard events from the `kbd` driver
+    // (side 0, send) to the `oxcomp` compositor (side 1, receive). Both ends are
+    // installed at BOOT_INPUT_CHAN as the modules come up below.
+    let input_chan = channel::create();
+
     for file in mods.iter() {
         let bytes: &'static [u8] =
             unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) };
@@ -343,6 +348,17 @@ fn kmain_stage2() -> ! {
                     badge: 0,
                     },
                 );
+                // §47: the SEND end of the keyboard channel to the compositor.
+                if let Some(conn) = input_chan {
+                    p.install(
+                        oxbow_abi::BOOT_INPUT_CHAN,
+                        object::HandleEntry {
+                            obj: object::ObjectRef::Channel { conn, side: 0 },
+                            rights: oxbow_abi::R_IN | oxbow_abi::R_OUT,
+                        badge: 0,
+                        },
+                    );
+                }
             });
         }
         // The fb server / oxcomp compositor get the framebuffer capability — the
@@ -358,6 +374,22 @@ fn kmain_stage2() -> ! {
                     },
                 )
             });
+        }
+        // §47: the compositor gets the RECEIVE end of the keyboard channel; its
+        // event loop watches this fd and turns key bytes into wl_keyboard events.
+        if cmd == b"oxcomp" {
+            if let Some(conn) = input_chan {
+                proc::with_proc_mut(pid, |p| {
+                    p.install(
+                        oxbow_abi::BOOT_INPUT_CHAN,
+                        object::HandleEntry {
+                            obj: object::ObjectRef::Channel { conn, side: 1 },
+                            rights: oxbow_abi::R_IN | oxbow_abi::R_OUT,
+                            badge: 0,
+                        },
+                    )
+                });
+            }
         }
         // The compositor also gets a spawnable Image cap for its Wayland client,
         // so it can launch wlclient and hand it a channel (wlclient's module must

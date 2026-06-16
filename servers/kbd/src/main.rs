@@ -13,8 +13,8 @@
 #![no_main]
 
 use oxbow_abi::{
-    MsgBuf, SysError, BOOT_CONSOLE, BOOT_IRQ, BOOT_KBD_DATA, BOOT_KBD_STATUS, BOOT_TTY, R_IN,
-    TAG_TTY_CHAR,
+    MsgBuf, SysError, BOOT_CONSOLE, BOOT_INPUT_CHAN, BOOT_IRQ, BOOT_KBD_DATA, BOOT_KBD_STATUS,
+    BOOT_TTY, R_IN, TAG_TTY_CHAR,
 };
 use oxbow_rt as rt;
 
@@ -134,6 +134,10 @@ fn drain(mods: &mut Mods) {
                 m.data_len = 1;
                 m.data[0] = c as u64;
                 let _ = rt::sys_send(BOOT_TTY, &m);
+                // §47: also stream the key byte to the compositor over the input
+                // channel, so the graphical environment receives keyboard input
+                // (the serial/text console keeps working via the tty path above).
+                rt::channel::send(BOOT_INPUT_CHAN, &[c], &[]);
             }
         }
     }

@@ -1783,6 +1783,29 @@ accumulating chunks until `more` is 0. Line buffers grew 64→256; the echo /
 type-ahead invariants are preserved (echo once at the first chunk). This is the
 first piece of Direction A (a usable system) — next is persistent storage.
 
+## 47. Keyboard input on screen — wl_seat/wl_keyboard (v1-wl-keyboard)
+
+Keystrokes now reach Wayland clients, the first step toward an on-screen desktop.
+The transport is the only custom glue (Linux's evdev/libinput needs a kernel
+evdev interface oxbow doesn't have); everything above it is the ported standard:
+
+- **Transport:** a kernel-created channel (`channel::create()` at boot) with the
+  `kbd` driver on the send end and `oxcomp` on the receive end, both at
+  `BOOT_INPUT_CHAN`. kbd writes each key byte (alongside its existing tty path, so
+  the serial console still works); the compositor wraps the receive end as an fd
+  and adds it to the **same libwayland event loop** as its clients, so the
+  busy-poll dispatch drains keys for free.
+- **Protocol:** `oxcomp` advertises a `wl_seat` global with the KEYBOARD
+  capability and delivers `wl_keyboard.enter` (focus on first composite) + key
+  press/release via libwayland. weston-simple-shm already binds the seat and has
+  a `wl_keyboard` listener — typing `hello` logs `[cli] key 'h' …'o'`, proving
+  i8042 → kbd → channel → compositor → client end to end.
+
+Arc-1 caveat: the wire value is the kbd driver's ASCII byte, not an evdev
+keycode. The **libxkbcommon** port (real keycodes + an xkb keymap, so modifiers
+and layouts decode properly) is the next step, followed by libvterm + FreeType
+for an actual terminal window.
+
 ## 43. Capability-native identity — users without ambient authority (v1-identity)
 
 oxbow has no uid-based access control and never will: authority is the set of

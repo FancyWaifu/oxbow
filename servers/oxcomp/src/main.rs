@@ -12,7 +12,8 @@
 extern crate oxbow_libc as _;
 
 use oxbow_abi::{
-    Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_IMG_WLCLIENT, BOOT_MEM, FB_MMIO, HANDLE_NULL,
+    Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_IMG_WLCLIENT, BOOT_INPUT_CHAN, BOOT_MEM, FB_MMIO,
+    HANDLE_NULL,
 };
 use oxbow_rt as rt;
 
@@ -34,7 +35,14 @@ pub extern "C" fn ox_now_ms() -> u32 {
 }
 
 extern "C" {
-    fn comp_server_setup(fd: i32, fb: *mut u32, w: i32, h: i32, pitch_words: i32) -> *mut u8;
+    fn comp_server_setup(
+        fd: i32,
+        input_fd: i32,
+        fb: *mut u32,
+        w: i32,
+        h: i32,
+        pitch_words: i32,
+    ) -> *mut u8;
     fn comp_server_pump(d: *mut u8);
     fn comp_server_composited() -> i32;
     /// Wrap a channel capability handle as a stream fd (libc, ox_chan_fd).
@@ -78,8 +86,20 @@ pub extern "C" fn oxbow_main() -> ! {
     w(b"[oxcomp] compositor up; wlclient spawned\n");
 
     // Set up the display on our kept channel end and run the compositing loop.
+    // The keyboard channel (from the kbd driver, §47) becomes a second fd the
+    // event loop watches for input.
     let server_fd = unsafe { ox_chan_fd(srv_end as u32) };
-    let display = unsafe { comp_server_setup(server_fd, FB_MMIO as *mut u32, width as i32, height as i32, (pitch / 4) as i32) };
+    let input_fd = unsafe { ox_chan_fd(BOOT_INPUT_CHAN as u32) };
+    let display = unsafe {
+        comp_server_setup(
+            server_fd,
+            input_fd,
+            FB_MMIO as *mut u32,
+            width as i32,
+            height as i32,
+            (pitch / 4) as i32,
+        )
+    };
     if display.is_null() {
         w(b"[oxcomp] display setup failed\n");
         park();
