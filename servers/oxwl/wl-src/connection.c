@@ -433,6 +433,14 @@ wl_connection_put_fd(struct wl_connection *connection, int32_t fd)
 			return -1;
 	}
 
+	/* oxbow: SCM_RIGHTS transfers a CAPABILITY at flush time, not the file
+	 * lazily like Linux's sendmsg. Clients (e.g. weston-simple-shm) close the fd
+	 * right after marshalling, before the flush — so dup here to keep it live
+	 * until then. close_fds() closes this dup after sending. */
+	fd = wl_os_dupfd_cloexec(fd, 0);
+	if (fd < 0)
+		return -1;
+
 	return ring_buffer_put(&connection->fds_out, &fd, sizeof fd);
 }
 

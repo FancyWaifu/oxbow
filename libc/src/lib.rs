@@ -1065,8 +1065,20 @@ pub unsafe extern "C" fn fcntl(fd: i32, cmd: i32, arg: i64) -> i32 {
     // for the current single-client flow.)
     if cmd == 0 || cmd == 1030 {
         if fd >= 3 && (fd as usize) < MAX_FD {
-            let src = (*addr_of_mut!(FDS))[fd as usize];
+            let mut src = (*addr_of_mut!(FDS))[fd as usize];
             if src.used {
+                // shm fds carry a real capability. libwayland queues the fd then
+                // the client closes its original BEFORE the flush sends it — so the
+                // dup needs its OWN capability (sys_cap_dup), not a shared handle,
+                // or closing the original would invalidate the queued send. Channel
+                // dups (event-loop watches) keep sharing the handle: the original
+                // outlives the dup there, and a channel side has no cap to re-mint.
+                if src.is_shm && src.handle != 0 {
+                    match rt::sys_cap_dup(src.handle) {
+                        Ok(nh) => src.handle = nh,
+                        Err(_) => return -1,
+                    }
+                }
                 let minfd = if arg >= 3 { arg as usize } else { 3 };
                 for i in minfd..MAX_FD {
                     let slot = &mut (*addr_of_mut!(FDS))[i];
@@ -2312,6 +2324,39 @@ pub extern "C" fn tolower(c: i32) -> i32 {
     (c as u8).to_ascii_lowercase() as i32
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn strcasecmp(a: *const u8, b: *const u8) -> i32 {
+    let mut i = 0usize;
+    loop {
+        let ca = (*a.add(i)).to_ascii_lowercase();
+        let cb = (*b.add(i)).to_ascii_lowercase();
+        if ca != cb {
+            return ca as i32 - cb as i32;
+        }
+        if ca == 0 {
+            return 0;
+        }
+        i += 1;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strncasecmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    let mut i = 0usize;
+    while i < n {
+        let ca = (*a.add(i)).to_ascii_lowercase();
+        let cb = (*b.add(i)).to_ascii_lowercase();
+        if ca != cb {
+            return ca as i32 - cb as i32;
+        }
+        if ca == 0 {
+            return 0;
+        }
+        i += 1;
+    }
+    0
+}
+
 // ===========================================================================
 // Phase B: the rest of the surface TinyCC needs.
 // ===========================================================================
@@ -2868,6 +2913,14 @@ pub unsafe extern "C" fn ftruncate(fd: i32, length: i64) -> i32 {
         }
     }
     0
+}
+
+/// Debug log to a console capability inherited at spawn slot 4 (oxcomp grants its
+/// console to the Wayland client there, since a boot-spawned client has no tty
+/// stdout). No-op if no such console is held.
+#[no_mangle]
+pub extern "C" fn ox_clog(p: *const u8, len: usize) {
+    let _ = rt::sys_console_write(4, p, len);
 }
 
 /// Wrap an existing Channel capability `handle` (e.g. one inherited at a spawn

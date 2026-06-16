@@ -11,7 +11,7 @@ use oxbow_abi::{
     SPAWN_DEFAULT_BUDGET, SPAWN_SLOTS, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE,
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
-    SYS_CAP_TYPE, SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_POLL, SYS_CHANNEL_RECV,
+    SYS_CAP_TYPE, SYS_CAP_DUP, SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_POLL, SYS_CHANNEL_RECV,
     SYS_CHANNEL_SEND, SYS_DMA_ALLOC, SYS_SHM_CREATE, SYS_SHM_MAP, CAP_CHANNEL, CAP_OTHER, CAP_SHM,
     SYS_FB_INFO, SYS_FB_MAP, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE,
     SYS_PROTECT, SYS_RECV, SYS_REPLY,
@@ -127,6 +127,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_SHM_CREATE => sys_shm_create(a1, a2),
         SYS_SHM_MAP => sys_shm_map(a1, a2),
         SYS_CAP_TYPE => sys_cap_type(a1),
+        SYS_CAP_DUP => sys_cap_dup(a1),
         SYS_DMA_ALLOC => sys_dma_alloc(a1, a2),
         SYS_PROTECT => sys_protect(a1, a2, a3, a4),
         SYS_UPTIME_MS => SyscallRet { rax: 0, rdx: crate::arch::ticks().wrapping_mul(10) },
@@ -1004,6 +1005,26 @@ fn sys_shm_map(shm: u64, vaddr: u64) -> SyscallRet {
 /// `sys_cap_type(h) -> kind` — report a handle's capability kind (CAP_CHANNEL /
 /// CAP_SHM / CAP_OTHER), so a receiver of a passed fd can reconstruct the right
 /// fd flavor. Errors (bad handle) report CAP_OTHER.
+/// Duplicate a capability: install a fresh handle referring to the SAME object
+/// with the SAME rights. Used by libc F_DUPFD on fd-passing caps (shm) so a
+/// client may close its original fd before the dup is sent — the two handles
+/// have independent lifetimes. Restricted to shm/channel caps (the fd-passing
+/// kinds); badged endpoints etc. must be derived via sys_mint, not blindly cloned.
+fn sys_cap_dup(h: u64) -> SyscallRet {
+    let entry = match proc::with_current(|p| p.get(h as Handle)) {
+        Ok(e) => e,
+        Err(e) => return SyscallRet { rax: e as u64, rdx: 0 },
+    };
+    match entry.obj {
+        ObjectRef::Shm(_) | ObjectRef::Channel { .. } => {}
+        _ => return SyscallRet { rax: SysError::BadType as u64, rdx: 0 },
+    }
+    match proc::with_current_mut(|p| p.alloc_slot(entry)) {
+        Ok(nh) => SyscallRet { rax: 0, rdx: nh as u64 },
+        Err(e) => SyscallRet { rax: e as u64, rdx: 0 },
+    }
+}
+
 fn sys_cap_type(h: u64) -> SyscallRet {
     let kind = proc::with_current(|p| p.get(h as Handle))
         .map(|e| match e.obj {
@@ -1097,7 +1118,7 @@ fn pledge_class(nr: u64) -> u64 {
         | SYS_CHANNEL_RECV | SYS_CHANNEL_CLOSE | SYS_CHANNEL_POLL => PLEDGE_IPC,
         SYS_MAP | SYS_PROTECT | SYS_IMMUTABLE | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC
         | SYS_SHM_CREATE | SYS_SHM_MAP => PLEDGE_MEM,
-        SYS_CAP_TYPE => PLEDGE_IPC,
+        SYS_CAP_TYPE | SYS_CAP_DUP => PLEDGE_IPC,
         SYS_SPAWN | SYS_SPAWN_BYTES => PLEDGE_SPAWN,
         SYS_ATTENUATE => PLEDGE_CAP,
         SYS_IO_IN | SYS_IO_OUT | SYS_PCI_READ | SYS_PCI_WRITE | SYS_PCI_BAR_MAP | SYS_IRQ_BIND

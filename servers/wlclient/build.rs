@@ -6,7 +6,7 @@ fn main() {
     let dir = env!("CARGO_MANIFEST_DIR");
     println!("cargo:rustc-link-arg=-T{dir}/user.ld");
     println!("cargo:rerun-if-changed=user.ld");
-    println!("cargo:rerun-if-changed=src/oxmain.c");
+    println!("cargo:rerun-if-changed=src/simple-shm.c");
 
     let sysroot = String::from_utf8(
         Command::new("rustc").args(["--print", "sysroot"]).output().unwrap().stdout,
@@ -26,6 +26,7 @@ fn main() {
         .flag("-nostdinc")
         .flag("-isystem")
         .flag(&res_inc)
+        .include("include") // weston shims: config.h, shared/, libweston/, linux/
         .include("../oxwl/wl-include")
         .include("../oxffi/ffi-include")
         .include("../../libc/include")
@@ -42,6 +43,7 @@ fn main() {
         "../oxwl/wl-src/connection.c",
         "../oxwl/wl-src/wayland-os.c",
         "../oxwl/wl-src/wayland-protocol.c",
+        "../oxwl/wl-src/xdg-shell-protocol.c",
         "../oxwl/wl-src/wayland-client.c",
     ] {
         b.file(f);
@@ -57,6 +59,6 @@ fn main() {
     ] {
         b.file(f);
     }
-    b.file("src/oxmain.c");
+    b.file("src/simple-shm.c");
     b.compile("wlclient");
 }

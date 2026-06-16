@@ -17,6 +17,8 @@ typedef unsigned long sigset_t;
 #define SA_SIGINFO 0x00000004
 #define SA_NODEFER 0x40000000
 #define SA_RESTART 0x10000000
+#define SA_RESETHAND 0x80000000
+#define SA_ONESHOT SA_RESETHAND
 typedef struct { int si_signo; int si_code; void *si_addr; } siginfo_t;
 struct sigaction {
     void (*sa_handler)(int);

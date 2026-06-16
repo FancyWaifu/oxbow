@@ -573,6 +573,13 @@ pub fn sys_cap_type(h: Handle) -> u64 {
     }
 }
 
+/// Duplicate an fd-passing capability (shm/channel): a fresh handle to the same
+/// object with the same rights, with an independent lifetime.
+pub fn sys_cap_dup(h: Handle) -> SysResult<Handle> {
+    let (rax, rdx) = unsafe { syscall1(oxbow_abi::SYS_CAP_DUP, h as u64) };
+    SysError::from_raw(rax).map(|_| rdx as Handle)
+}
+
 /// Allocate one DMA frame from the `mem` budget, map it writable at `vaddr`, and
 /// return its physical address (§19) — for a driver's ring/buffer pointers.
 pub fn sys_dma_alloc(mem: Handle, vaddr: u64) -> SysResult<u64> {

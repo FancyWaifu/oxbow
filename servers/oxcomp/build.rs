@@ -46,6 +46,7 @@ fn main() {
         "../oxwl/wl-src/connection.c",
         "../oxwl/wl-src/wayland-os.c",
         "../oxwl/wl-src/wayland-protocol.c",
+        "../oxwl/wl-src/xdg-shell-protocol.c",
         "../oxwl/wl-src/event-loop.c",
         "../oxwl/wl-src/wayland-server.c",
         "../oxwl/wl-src/wayland-client.c",

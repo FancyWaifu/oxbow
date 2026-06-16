@@ -60,8 +60,10 @@ pub extern "C" fn oxbow_main() -> ! {
     let mut m = MsgBuf::new(0);
     m.data[0] = 16 * 1024 * 1024; // child Memory budget
     m.data_len = 3; // data[1]/data[2] = empty argv
-    m.handle_count = 1;
+    m.handle_count = 3;
     m.handles[0] = cli_end; // -> child slot 1 (the Wayland socket)
+    m.handles[1] = HANDLE_NULL; // slot 2 (stdout) — unused
+    m.handles[2] = BOOT_CONSOLE; // -> child slot 4: a console for debug logging
     if rt::sys_spawn(BOOT_IMG_WLCLIENT, BOOT_MEM, &m, exit).is_err() {
         w(b"[oxcomp] failed to spawn wlclient\n");
         park();
@@ -75,16 +77,24 @@ pub extern "C" fn oxbow_main() -> ! {
         w(b"[oxcomp] display setup failed\n");
         park();
     }
-    // Pump until the client commits a surface (bounded so a stuck client can't
-    // spin forever), then a few more rounds to settle.
-    let mut settle = 0;
-    for _ in 0..200_000u32 {
+    // Pump the compositor. We busy-poll epoll, so the cross-process client only
+    // makes progress in its own time slices — give it real wall-clock time (a
+    // deadline, not an iteration count), and keep compositing a while after the
+    // first frame so animation settles before a screen capture.
+    let start = rt::sys_uptime_ms();
+    let mut first: u64 = 0;
+    loop {
         unsafe { comp_server_pump(display) };
+        let now = rt::sys_uptime_ms();
         if unsafe { comp_server_composited() } != 0 {
-            settle += 1;
-            if settle > 2000 {
-                break;
+            if first == 0 {
+                first = now;
             }
+            if now - first > 4000 {
+                break; // composited + 4s of frames
+            }
+        } else if now - start > 15000 {
+            break; // give up after 15s
         }
     }
     if unsafe { comp_server_composited() } != 0 {

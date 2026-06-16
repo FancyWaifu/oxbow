@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include "wayland-server.h"
 #include "wayland-server-protocol.h"
+#include "xdg-shell-server-protocol.h"
 
 extern void ox_log(const char *p, unsigned long len);
 static void slog(const char *s)
@@ -20,7 +21,10 @@ static int           g_w, g_h, g_pitch_words;
 static int           g_composited;
 
 struct surf {
-  struct wl_resource *buffer; /* pending/current attached wl_buffer */
+  struct wl_resource *buffer;       /* pending/current attached wl_buffer */
+  struct wl_resource *xdg_surface;  /* the xdg_surface role object, if any */
+  struct wl_resource *xdg_toplevel; /* the xdg_toplevel, if any */
+  int                 configured;   /* have we sent the initial configure? */
 };
 
 /* ---- wl_surface ---------------------------------------------------------- */
@@ -61,11 +65,20 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
 {
   (void)c;
   struct surf *s = wl_resource_get_user_data(res);
-  slog("[oxcomp/srv] commit\n");
-  if (!s->buffer) {
-    slog("[oxcomp/srv] commit: no buffer attached\n");
+  /* xdg_shell handshake: the client's initial commit (no buffer) asks us to
+   * configure it. Reply with a configure; the client acks, draws, and commits
+   * again with a buffer. */
+  if (s->xdg_surface && s->xdg_toplevel && !s->configured) {
+    struct wl_array states;
+    wl_array_init(&states);
+    xdg_toplevel_send_configure(s->xdg_toplevel, 0, 0, &states);
+    wl_array_release(&states);
+    xdg_surface_send_configure(s->xdg_surface, 1);
+    s->configured = 1;
     return;
   }
+  if (!s->buffer)
+    return;
   struct wl_shm_buffer *shm = wl_shm_buffer_get(s->buffer);
   if (!shm) {
     slog("[oxcomp/srv] commit: buffer is not wl_shm\n");
@@ -137,6 +150,96 @@ static const struct wl_region_interface region_impl = {
   region_destroy, region_add, region_subtract
 };
 
+/* ---- xdg_shell: the standard window protocol (so real apps map) ---------- */
+static void noop_destroy(struct wl_client *c, struct wl_resource *r)
+{
+  (void)c;
+  wl_resource_destroy(r);
+}
+
+/* xdg_toplevel: window properties — all no-ops for our single fixed window. */
+static void tl_set_parent(struct wl_client *c, struct wl_resource *r, struct wl_resource *p)
+{ (void)c; (void)r; (void)p; }
+static void tl_set_title(struct wl_client *c, struct wl_resource *r, const char *t)
+{ (void)c; (void)r; (void)t; }
+static void tl_set_app_id(struct wl_client *c, struct wl_resource *r, const char *a)
+{ (void)c; (void)r; (void)a; }
+static void tl_show_window_menu(struct wl_client *c, struct wl_resource *r,
+                                struct wl_resource *seat, uint32_t serial, int32_t x, int32_t y)
+{ (void)c; (void)r; (void)seat; (void)serial; (void)x; (void)y; }
+static void tl_move(struct wl_client *c, struct wl_resource *r, struct wl_resource *seat, uint32_t s)
+{ (void)c; (void)r; (void)seat; (void)s; }
+static void tl_resize(struct wl_client *c, struct wl_resource *r, struct wl_resource *seat,
+                      uint32_t serial, uint32_t edges)
+{ (void)c; (void)r; (void)seat; (void)serial; (void)edges; }
+static void tl_set_max_size(struct wl_client *c, struct wl_resource *r, int32_t w, int32_t h)
+{ (void)c; (void)r; (void)w; (void)h; }
+static void tl_set_min_size(struct wl_client *c, struct wl_resource *r, int32_t w, int32_t h)
+{ (void)c; (void)r; (void)w; (void)h; }
+static void tl_set_maximized(struct wl_client *c, struct wl_resource *r) { (void)c; (void)r; }
+static void tl_unset_maximized(struct wl_client *c, struct wl_resource *r) { (void)c; (void)r; }
+static void tl_set_fullscreen(struct wl_client *c, struct wl_resource *r, struct wl_resource *o)
+{ (void)c; (void)r; (void)o; }
+static void tl_unset_fullscreen(struct wl_client *c, struct wl_resource *r) { (void)c; (void)r; }
+static void tl_set_minimized(struct wl_client *c, struct wl_resource *r) { (void)c; (void)r; }
+static const struct xdg_toplevel_interface toplevel_impl = {
+  noop_destroy, tl_set_parent, tl_set_title, tl_set_app_id, tl_show_window_menu,
+  tl_move, tl_resize, tl_set_max_size, tl_set_min_size, tl_set_maximized,
+  tl_unset_maximized, tl_set_fullscreen, tl_unset_fullscreen, tl_set_minimized,
+};
+
+/* xdg_surface */
+static void xs_get_toplevel(struct wl_client *c, struct wl_resource *res, uint32_t id)
+{
+  struct surf        *s = wl_resource_get_user_data(res);
+  struct wl_resource *tl =
+    wl_resource_create(c, &xdg_toplevel_interface, wl_resource_get_version(res), id);
+  wl_resource_set_implementation(tl, &toplevel_impl, s, NULL);
+  s->xdg_toplevel = tl;
+}
+static void xs_get_popup(struct wl_client *c, struct wl_resource *res, uint32_t id,
+                         struct wl_resource *parent, struct wl_resource *positioner)
+{ (void)c; (void)res; (void)id; (void)parent; (void)positioner; }
+static void xs_set_window_geometry(struct wl_client *c, struct wl_resource *r,
+                                   int32_t x, int32_t y, int32_t w, int32_t h)
+{ (void)c; (void)r; (void)x; (void)y; (void)w; (void)h; }
+static void xs_ack_configure(struct wl_client *c, struct wl_resource *r, uint32_t serial)
+{ (void)c; (void)r; (void)serial; }
+static const struct xdg_surface_interface xdg_surface_impl = {
+  noop_destroy, xs_get_toplevel, xs_get_popup, xs_set_window_geometry, xs_ack_configure,
+};
+
+/* xdg_positioner (popups only; minimal — never driven by a toplevel client) */
+static const struct xdg_positioner_interface positioner_impl = { 0 };
+
+/* xdg_wm_base */
+static void wm_create_positioner(struct wl_client *c, struct wl_resource *res, uint32_t id)
+{
+  struct wl_resource *p =
+    wl_resource_create(c, &xdg_positioner_interface, wl_resource_get_version(res), id);
+  wl_resource_set_implementation(p, &positioner_impl, NULL, NULL);
+}
+static void wm_get_xdg_surface(struct wl_client *c, struct wl_resource *res, uint32_t id,
+                               struct wl_resource *surface)
+{
+  struct surf        *s = wl_resource_get_user_data(surface);
+  struct wl_resource *xs =
+    wl_resource_create(c, &xdg_surface_interface, wl_resource_get_version(res), id);
+  wl_resource_set_implementation(xs, &xdg_surface_impl, s, NULL);
+  s->xdg_surface = xs;
+}
+static void wm_pong(struct wl_client *c, struct wl_resource *r, uint32_t serial)
+{ (void)c; (void)r; (void)serial; }
+static const struct xdg_wm_base_interface wm_base_impl = {
+  noop_destroy, wm_create_positioner, wm_get_xdg_surface, wm_pong,
+};
+static void wm_base_bind(struct wl_client *c, void *data, uint32_t version, uint32_t id)
+{
+  (void)data;
+  struct wl_resource *res = wl_resource_create(c, &xdg_wm_base_interface, version, id);
+  wl_resource_set_implementation(res, &wm_base_impl, NULL, NULL);
+}
+
 /* ---- wl_compositor ------------------------------------------------------- */
 static void compositor_create_surface(struct wl_client *c, struct wl_resource *res, uint32_t id)
 {
@@ -180,6 +283,7 @@ void *comp_server_setup(int fd, unsigned int *fb, int w, int h, int pitch_words)
   if (!d)
     return NULL;
   wl_global_create(d, &wl_compositor_interface, 4, NULL, compositor_bind);
+  wl_global_create(d, &xdg_wm_base_interface, 1, NULL, wm_base_bind);
   if (wl_display_init_shm(d) < 0) {
     wl_display_destroy(d);
     return NULL;
