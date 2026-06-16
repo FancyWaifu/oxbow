@@ -1,15 +1,12 @@
-// oxcomp — the Wayland compositor. Builds the full libwayland (wire + server +
-// client + event loop + wl_shm) from the sibling oxwl crate, libffi from oxffi,
-// and the compositor/client/driver C, all via the clang/libc C-port harness.
+// wlclient — a standalone Wayland client. Builds libwayland (client side) from
+// the oxwl crate + libffi from oxffi + the client main, via the C-port harness.
 use std::process::Command;
 
 fn main() {
     let dir = env!("CARGO_MANIFEST_DIR");
     println!("cargo:rustc-link-arg=-T{dir}/user.ld");
     println!("cargo:rerun-if-changed=user.ld");
-    for f in ["src/comp_server.c", "src/comp_client.c", "src/comp_main.c"] {
-        println!("cargo:rerun-if-changed={f}");
-    }
+    println!("cargo:rerun-if-changed=src/oxmain.c");
 
     let sysroot = String::from_utf8(
         Command::new("rustc").args(["--print", "sysroot"]).output().unwrap().stdout,
@@ -32,7 +29,7 @@ fn main() {
         .include("../oxwl/wl-include")
         .include("../oxffi/ffi-include")
         .include("../../libc/include")
-        .include("../oxwl") // config.h
+        .include("../oxwl")
         .define("HAVE_CONFIG_H", None)
         .flag("-ffreestanding")
         .flag("-fno-stack-protector")
@@ -40,20 +37,15 @@ fn main() {
         .flag("-Wno-everything")
         .opt_level(2);
 
-    // libwayland (incl. wl_shm) + generated protocol.
     for f in [
         "../oxwl/wl-src/wayland-util.c",
         "../oxwl/wl-src/connection.c",
         "../oxwl/wl-src/wayland-os.c",
         "../oxwl/wl-src/wayland-protocol.c",
-        "../oxwl/wl-src/event-loop.c",
-        "../oxwl/wl-src/wayland-server.c",
         "../oxwl/wl-src/wayland-client.c",
-        "../oxwl/wl-src/wayland-shm.c",
     ] {
         b.file(f);
     }
-    // libffi (connection.c marshals via ffi_call).
     for f in [
         "../oxffi/ffi-src/prep_cif.c",
         "../oxffi/ffi-src/types.c",
@@ -65,7 +57,6 @@ fn main() {
     ] {
         b.file(f);
     }
-    // the compositor itself (the client is now a separate spawned program).
-    b.file("src/comp_server.c");
-    b.compile("oxcomp");
+    b.file("src/oxmain.c");
+    b.compile("wlclient");
 }

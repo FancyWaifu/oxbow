@@ -457,6 +457,7 @@ pub const BOOT_IMG_FSTEST: Handle = 30; // fstest — lwext4/ext2 port self-test
 pub const BOOT_IMG_CARES: Handle = 31; // cares-test — c-ares DNS resolver port
 pub const BOOT_IMG_FFI: Handle = 33; // ffi-test — libffi (x86_64 SysV) port
 pub const BOOT_IMG_WL: Handle = 34; // wl-test — libwayland wire-core port
+pub const BOOT_IMG_WLCLIENT: Handle = 35; // wlclient — the compositor's Wayland client
 
 /// The framebuffer capability, granted to the `fb` server at boot. Gates
 /// SYS_FB_INFO (geometry) + SYS_FB_MAP (map the pixels RW). §34 (graphics).

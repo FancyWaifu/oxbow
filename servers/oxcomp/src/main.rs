@@ -1,17 +1,19 @@
-//! oxcomp — a tiny Wayland compositor (§42, the graphics climax). A boot server
-//! that owns the framebuffer capability and runs real libwayland: it advertises
-//! wl_compositor + wl_shm, accepts an in-process client over a socketpair, and on
-//! the client's wl_surface.commit composites the client's shm buffer into the
-//! framebuffer. So a Wayland client's pixels reach the screen through the entire
-//! ported stack (libwayland + libffi + the channel transport + shm/memfd).
+//! oxcomp — a tiny Wayland compositor (§42). A boot server that owns the
+//! framebuffer capability and runs real libwayland: it advertises wl_compositor +
+//! wl_shm, SPAWNS a separate Wayland client (`wlclient`) handing it one end of a
+//! channel as its Wayland socket (the inherited-fd model), and on the client's
+//! wl_surface.commit composites the client's shm buffer into the framebuffer.
 //!
-//! libc's entry is disabled; we supply oxbow_main, map the framebuffer, then hand
-//! a raw pixel pointer to the C compositor driver (comp_main.c).
+//! So a Wayland client's pixels reach the screen through the entire ported stack
+//! (libwayland + libffi + the channel transport + shm/memfd), CROSS-PROCESS — the
+//! way real Wayland works.
 #![no_std]
 #![no_main]
 extern crate oxbow_libc as _;
 
-use oxbow_abi::{BOOT_CONSOLE, BOOT_FB, FB_MMIO};
+use oxbow_abi::{
+    Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_IMG_WLCLIENT, BOOT_MEM, FB_MMIO, HANDLE_NULL,
+};
 use oxbow_rt as rt;
 
 fn w(s: &[u8]) {
@@ -25,10 +27,11 @@ pub extern "C" fn ox_log(p: *const u8, len: usize) {
 }
 
 extern "C" {
-    /// Drive the in-process compositor + client demo, compositing into `fb`
-    /// (a 32-bit BGRX framebuffer, `pitch_words` u32 per scanline). Returns 1 if a
-    /// client surface was composited.
-    fn comp_run(fb: *mut u32, width: i32, height: i32, pitch_words: i32) -> i32;
+    fn comp_server_setup(fd: i32, fb: *mut u32, w: i32, h: i32, pitch_words: i32) -> *mut u8;
+    fn comp_server_pump(d: *mut u8);
+    fn comp_server_composited() -> i32;
+    /// Wrap a channel capability handle as a stream fd (libc, ox_chan_fd).
+    fn ox_chan_fd(handle: u32) -> i32;
 }
 
 #[no_mangle]
@@ -44,9 +47,47 @@ pub extern "C" fn oxbow_main() -> ! {
         w(b"[oxcomp] framebuffer map failed\n");
         park();
     }
-    w(b"[oxcomp] compositor up; running client\n");
-    let ok = unsafe { comp_run(FB_MMIO as *mut u32, width as i32, height as i32, (pitch / 4) as i32) };
-    if ok == 1 {
+
+    // A channel pair: one end becomes the client's Wayland socket, we keep the other.
+    let Some((srv_end, cli_end)) = rt::channel::pair() else {
+        w(b"[oxcomp] channel pair failed\n");
+        park();
+    };
+
+    // Spawn wlclient, handing it `cli_end` at spawn slot 1 (a fresh exit notif so
+    // we can tell when it dies).
+    let exit = rt::sys_notif_create().unwrap_or(HANDLE_NULL);
+    let mut m = MsgBuf::new(0);
+    m.data[0] = 16 * 1024 * 1024; // child Memory budget
+    m.data_len = 3; // data[1]/data[2] = empty argv
+    m.handle_count = 1;
+    m.handles[0] = cli_end; // -> child slot 1 (the Wayland socket)
+    if rt::sys_spawn(BOOT_IMG_WLCLIENT, BOOT_MEM, &m, exit).is_err() {
+        w(b"[oxcomp] failed to spawn wlclient\n");
+        park();
+    }
+    w(b"[oxcomp] compositor up; wlclient spawned\n");
+
+    // Set up the display on our kept channel end and run the compositing loop.
+    let server_fd = unsafe { ox_chan_fd(srv_end as u32) };
+    let display = unsafe { comp_server_setup(server_fd, FB_MMIO as *mut u32, width as i32, height as i32, (pitch / 4) as i32) };
+    if display.is_null() {
+        w(b"[oxcomp] display setup failed\n");
+        park();
+    }
+    // Pump until the client commits a surface (bounded so a stuck client can't
+    // spin forever), then a few more rounds to settle.
+    let mut settle = 0;
+    for _ in 0..200_000u32 {
+        unsafe { comp_server_pump(display) };
+        if unsafe { comp_server_composited() } != 0 {
+            settle += 1;
+            if settle > 2000 {
+                break;
+            }
+        }
+    }
+    if unsafe { comp_server_composited() } != 0 {
         w(b"[oxcomp] composited a client surface\n");
     } else {
         w(b"[oxcomp] no surface composited\n");
@@ -56,10 +97,14 @@ pub extern "C" fn oxbow_main() -> ! {
 
 fn park() -> ! {
     if let Ok(ep) = rt::sys_ep_create() {
-        let mut m = oxbow_abi::MsgBuf::new(0);
+        let mut m = MsgBuf::new(0);
         loop {
             let _ = rt::sys_recv(ep, &mut m);
         }
     }
     loop {}
 }
+
+// Keep these referenced so the handle type is used.
+#[allow(dead_code)]
+fn _t(_: Handle) {}

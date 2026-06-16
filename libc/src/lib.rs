@@ -2870,6 +2870,15 @@ pub unsafe extern "C" fn ftruncate(fd: i32, length: i64) -> i32 {
     0
 }
 
+/// Wrap an existing Channel capability `handle` (e.g. one inherited at a spawn
+/// slot, or the compositor's kept end of a pair) as a stream fd. The Wayland
+/// "WAYLAND_SOCKET inherited fd" model: the compositor passes a channel end to a
+/// spawned client, which turns it into the fd it calls wl_display_connect_to_fd on.
+#[no_mangle]
+pub unsafe extern "C" fn ox_chan_fd(handle: u32) -> i32 {
+    alloc_chan_fd(handle)
+}
+
 /// Adopt a capability received via SCM_RIGHTS as a fresh fd, reconstructing the
 /// right flavor from its kind (channel stream vs shm region).
 unsafe fn alloc_cap_fd(handle: Handle) -> i32 {
