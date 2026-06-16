@@ -473,6 +473,11 @@ pub const BOOT_FB: Handle = 32;
 /// wl_keyboard events (§47, on-screen input). Distinct from BOOT_TTY so the
 /// serial console keeps working alongside the graphical path.
 pub const BOOT_INPUT_CHAN: Handle = 36;
+/// A kernel-created channel that mirrors the tty's console output to the
+/// graphical terminal (oxterm): the `tty` holds the send end, the compositor the
+/// receive end which it passes to oxterm at spawn — so the shell/login text the
+/// tty prints also renders on screen (§53). Handle 41 (37–40 are images).
+pub const BOOT_TERM_CHAN: Handle = 41;
 /// Fixed vaddr where the fb server maps the linear framebuffer.
 pub const FB_MMIO: u64 = 0x5000_0000;
 /// The control-channel badge (distinct from any socket id, which are 1..=N).

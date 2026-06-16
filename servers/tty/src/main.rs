@@ -16,8 +16,8 @@
 #![no_main]
 
 use oxbow_abi::{
-    Handle, MsgBuf, BOOT_CONSOLE, BOOT_TTY, HANDLE_NULL, TAG_TTY_CHAR, TAG_TTY_LINE, TAG_TTY_READ,
-    TAG_TTY_WRITE,
+    Handle, MsgBuf, BOOT_CONSOLE, BOOT_TERM_CHAN, BOOT_TTY, HANDLE_NULL, TAG_TTY_CHAR,
+    TAG_TTY_LINE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -31,6 +31,11 @@ const CHUNK: usize = 48;
 
 fn w(s: &[u8]) {
     let _ = rt::sys_console_write(BOOT_CONSOLE, s.as_ptr(), s.len());
+    // §53: mirror every byte of console output to the graphical terminal
+    // (oxterm) over the terminal channel. Best-effort: if oxterm isn't there the
+    // send just fails. oxterm drains continuously, so this does not block in
+    // practice (the channel buffer dwarfs interactive output).
+    let _ = rt::channel::send(BOOT_TERM_CHAN, s, &[]);
 }
 
 /// Reply one chunk of `line` starting at `off`: data[0] = chunk byte count,

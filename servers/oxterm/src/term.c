@@ -26,11 +26,13 @@
 extern int ox_chan_fd(unsigned int); /* oxbow: inherited Wayland socket */
 
 #include <sys/mman.h>
+#include <fcntl.h>
 #include <xkbcommon/xkbcommon.h>
 #include <vterm.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include "dejavu_mono.h"
+static int g_tty_fd = -1; /* §53: the shell-output mirror channel fd */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -351,15 +353,11 @@ keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
 		xkb_keycode_t kc = key + 8;
 		xkb_state_update_key(d->xkb_state, kc,
 				     state ? XKB_KEY_DOWN : XKB_KEY_UP);
-		if (state) {
-			char buf[16] = {0};
-			int n = xkb_state_key_get_utf8(d->xkb_state, kc, buf, sizeof buf);
-			/* §52: echo the decoded character into the terminal model.
-			 * (Once the shell is wired this goes out the tty channel
-			 * instead, and the shell's echo comes back.) */
-			if (n > 0 && d->vt)
-				vterm_input_write(d->vt, buf, n);
-		}
+		/* §53: input reaches the shell via kbd -> tty; the shell's echo comes
+		 * back over the mirror channel and renders. So we do NOT echo locally
+		 * here (that would double every character). xkb state is still tracked
+		 * for future use (e.g. shortcuts). */
+		(void)kc;
 	}
 
 	if (key == KEY_F11 && state) {
@@ -766,10 +764,12 @@ term_init(struct display *d, int win_w, int win_h)
 	vterm_set_utf8(d->vt, 1);
 	d->vts = vterm_obtain_screen(d->vt);
 	vterm_screen_reset(d->vts, 1);
-	const char *banner =
-		"oxbow terminal -- FreeType + libvterm\r\n"
-		"type to echo; the shell wiring comes next.\r\n\r\n$ ";
-	vterm_input_write(d->vt, banner, strlen(banner));
+	/* §53: the shell's output arrives over the tty-mirror channel (spawn slot 20)
+	 * and is fed to libvterm each frame. Make the fd non-blocking so draining it
+	 * in redraw never stalls. */
+	g_tty_fd = ox_chan_fd(20);
+	if (g_tty_fd >= 0)
+		fcntl(g_tty_fd, F_SETFL, O_NONBLOCK);
 }
 
 /* Alpha-blend one FreeType glyph (grayscale coverage) as fg over bg. */
@@ -842,6 +842,25 @@ redraw(void *data, struct wl_callback *callback, uint32_t time)
 	}
 
 	(void)time;
+	/* §53: drain any pending shell output and feed it to the terminal model
+	 * before rendering this frame. */
+	if (g_tty_fd >= 0 && window->display->vt) {
+		char tbuf[1024];
+		long n;
+		while ((n = read(g_tty_fd, tbuf, sizeof tbuf)) > 0) {
+			/* ONLCR: the console stream uses bare '\n' for newlines (the
+			 * serial terminal cooks it); libvterm needs '\r\n' or the
+			 * cursor staircases. Translate as we feed it. */
+			char out[2100];
+			int  oi = 0;
+			for (long i = 0; i < n; i++) {
+				if (tbuf[i] == '\n')
+					out[oi++] = '\r';
+				out[oi++] = tbuf[i];
+			}
+			vterm_input_write(window->display->vt, out, (size_t)oi);
+		}
+	}
 	render_grid(window->display, (uint32_t *)buffer->shm_data,
 		    window->width, window->height);
 

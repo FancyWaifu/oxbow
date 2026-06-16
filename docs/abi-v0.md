@@ -2006,3 +2006,25 @@ bidirectional channel where the tty forwards the shell's output to oxterm (→
 libvterm) and oxterm sends keystrokes back (→ tty → shell). Then the login prompt
 appears in the window and you type your password into it. The rendering + input
 half is done; that channel is the last piece.
+
+## 53. On-screen login — the shell in the terminal window (v1-on-screen-login)
+
+The terminal now shows the real shell, so you log in on the screen. A
+kernel-created channel (`BOOT_TERM_CHAN`) mirrors the tty's console output: the
+tty's `w()` forwards every byte it prints to the channel, the kernel hands the
+receive end to the compositor, and the compositor passes it to oxterm at spawn
+(slot 20). oxterm drains it each frame and feeds it to libvterm (translating bare
+`\n`→`\r\n`, the ONLCR the host serial terminal normally does), so the login
+prompt, the shell, and command output all render in the window.
+
+Input still flows the existing way — i8042 → kbd → tty → shell — and the shell's
+echo comes back over the mirror channel, so what you type appears in the window
+(oxterm does NOT echo locally, which would double it). The shell, login (§44),
+and isolation (§45) are entirely unchanged; only the tty's output is teed.
+
+Verified by injecting keys: `login: bryson` / `password: bryson` / `Welcome,
+bryson.` / `bryson@oxbow:/$ id` → `uid=1000(bryson) gid=1000(bryson)
+groups=1000(bryson),27(wheel)` — all rendered on screen in DejaVu Sans Mono. You
+type your username and password into a window and get a working shell. The desktop
+loop is closed end to end: keyboard → shell → tty → channel → libvterm → FreeType
+→ wl_shm → compositor → framebuffer.
