@@ -65,6 +65,7 @@ pub fn init() {
         idt[0x2B].set_handler_fn(pci_irq11); // IRQ11 — PCI INTx, e1000 on QEMU q35
         idt[0x2C].set_handler_fn(mouse_irq); // IRQ12 — i8042 PS/2 mouse (bindable)
         idt[0x2F].set_handler_fn(spurious_slave); // IRQ15 spurious: EOI master
+        idt[super::lapic::SPURIOUS_VECTOR].set_handler_fn(lapic_spurious); // §69 LAPIC
         for v in 0x22u8..=0x2E {
             if !matches!(v, 0x24 | 0x25 | 0x27 | 0x29 | 0x2A | 0x2B | 0x2C) {
                 idt[v].set_handler_fn(unexpected_irq);
@@ -122,6 +123,10 @@ extern "x86-interrupt" fn serial_com1(_frame: InterruptStackFrame) {
 
 extern "x86-interrupt" fn spurious_master(_frame: InterruptStackFrame) {
     // IRQ7 spurious interrupt — must NOT be EOI'd.
+}
+
+extern "x86-interrupt" fn lapic_spurious(_frame: InterruptStackFrame) {
+    // §69: LAPIC spurious interrupt — by design, requires no EOI.
 }
 
 extern "x86-interrupt" fn spurious_slave(_frame: InterruptStackFrame) {

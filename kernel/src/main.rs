@@ -157,6 +157,12 @@ extern "C" fn kmain() -> ! {
         println!("[smp] no MP response (single CPU / no Limine MP)");
     }
 
+    // §69 Phase 2a: enable the BSP's LAPIC in virtual-wire mode. The PIT still
+    // drives scheduling through the LAPIC's LINT0 (ExtINT), so nothing changes
+    // yet — this just lights up the LAPIC for the per-CPU timer + IPIs to come.
+    let lapic_id = arch::lapic::enable();
+    println!("[smp] BSP LAPIC enabled (virtual-wire), id={}", lapic_id);
+
     // -- Framebuffer: record geometry + paint a smoke-test pattern -----------
     if let Some(fb) = FRAMEBUFFER_REQUEST.get_response().and_then(|r| r.framebuffers().next()) {
         fb::init(fb.addr() as u64, fb.width() as u32, fb.height() as u32, fb.pitch() as u32, fb.bpp());

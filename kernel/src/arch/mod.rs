@@ -6,6 +6,9 @@
 mod x86_64;
 
 #[cfg(target_arch = "x86_64")]
+pub use x86_64::lapic; // §69 SMP: Local APIC (enable/eoi/timer)
+
+#[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)] // exit_qemu/QemuExit are for the future test harness
 pub use x86_64::{
     breakpoint, console_write_bytes, context_switch, current_cr3, disable_interrupts,

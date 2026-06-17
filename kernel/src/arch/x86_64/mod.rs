@@ -3,6 +3,7 @@
 pub mod context;
 pub mod gdt;
 pub mod idt;
+pub mod lapic;
 pub mod pic;
 pub mod pit;
 pub mod serial;

@@ -306,6 +306,28 @@ pub fn map_mmio_4k_in(pml4_phys: u64, virt: u64, phys: u64) {
     }
 }
 
+/// Like `map_mmio_4k_in` but into the KERNEL higher half (no USER bit) — for
+/// per-CPU device registers (the LAPIC, later the IOAPIC). The HHDM does not cover
+/// MMIO holes, and the higher-half PML4 entries are shared by every address space
+/// (`new_user_pml4` copies 256..512), so the mapping is reachable from interrupt
+/// context in any process. (§69 SMP)
+pub fn map_mmio_kernel_4k_in(pml4_phys: u64, virt: u64, phys: u64) {
+    assert!(virt >= 0xffff_8000_0000_0000, "kernel mmio vaddr must be higher half");
+    let flags = Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE | Flags::NO_CACHE;
+    let hhdm = VirtAddr::new(super::hhdm_offset());
+    let l4: &mut PageTable = unsafe { &mut *(super::phys_to_virt(pml4_phys) as *mut PageTable) };
+    let mut mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
+    let mut falloc = PmmAlloc;
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+    let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys));
+    unsafe {
+        mapper
+            .map_to(page, frame, flags, &mut falloc)
+            .expect("vm: map_mmio_kernel_4k_in")
+            .flush();
+    }
+}
+
 /// Change the protection of already-mapped user pages in `[vaddr, vaddr+pages)`.
 /// The JIT primitive (`mmap` RW → write code → `mprotect` RX): it flips the
 /// WRITABLE / NO_EXECUTE leaf flags. W^X (L4) still holds — `!(writable &&

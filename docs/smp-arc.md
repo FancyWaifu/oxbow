@@ -37,9 +37,18 @@ be re-audited.
   Phase 2 IRQ routing (Limine gives the RSDP via `RsdpRequest` if we need to walk it).
 
 ### Phase 2 — LAPIC + IOAPIC enablement
-- Map the LAPIC MMIO page; enable it on the BSP. Switch IRQ routing from the legacy 8259
-  PICs to the **IOAPIC** (mask the PICs fully, route IRQ1/IRQ12/serial/PCI lines through
-  IOAPIC redirection entries to the BSP's LAPIC for now).
+- **2a — LAPIC enable on the BSP — ✅ DONE (§69).** `arch::lapic::enable()` maps the LAPIC
+  MMIO page into the kernel higher half (`map_mmio_kernel_4k_in`, uncacheable — the HHDM
+  does not cover MMIO holes), software-enables the LAPIC (SVR), and sets **virtual-wire
+  mode** (LINT0=ExtINT, LINT1=NMI) so the 8259 PIC's interrupts still pass through and the
+  PIT keeps driving the scheduler. A 0xFF spurious-vector handler is installed. Verified
+  under `-smp 4`: LAPIC enabled (id 0), full login + `ls` runs — scheduler + IPC + input
+  unaffected.
+- **2b — LAPIC timer (TODO):** calibrate the LAPIC timer against the PIT, then switch the
+  scheduler tick from PIT IRQ0 to the LAPIC timer and retire the PIT. (BSP first.)
+- **2c — IOAPIC (TODO):** Map the LAPIC MMIO page; enable it on the BSP. Switch IRQ routing
+  from the legacy 8259 PICs to the **IOAPIC** (mask the PICs fully, route IRQ1/IRQ12/serial/
+  PCI lines through IOAPIC redirection entries to the BSP's LAPIC for now).
 - Add the **LAPIC timer** (one-shot or periodic, calibrated against the PIT once) as the
   per-CPU scheduler tick — replacing the shared PIT.
 - Risk: medium. Getting IOAPIC redirection + EOI right; keep the PIT path until the LAPIC
