@@ -17,8 +17,11 @@ use crate::println;
 
 const FRAME: u64 = pmm::FRAME_SIZE;
 
-/// Maximum concurrent processes (static pool).
-pub const MAX_PROCS: usize = 12;
+/// Maximum concurrent processes (static pool). Must keep pace with
+/// `thread::MAX_THREADS` — every spawned program is a process, so the desktop
+/// (oxcomp + 3 clients) + servers + user commands need the same headroom, or `ls`
+/// runs out of process slots just like it ran out of TCB slots.
+pub const MAX_PROCS: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PState {

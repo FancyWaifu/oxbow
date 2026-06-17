@@ -24,7 +24,12 @@ fn announce_first_cr3(proc: usize) {
     }
 }
 
-pub const MAX_THREADS: usize = 12;
+// Boot now brings up the desktop (oxcomp + oxterm + wlclient + sysmon) on top of
+// the servers (shell, fs, net, tty, kbd, blk, …), which alone fill ~12 slots — so a
+// user command like `ls` had no slot left ("out of TCB slots"). Give generous
+// headroom for the desktop plus several concurrent user processes / pipelines. Each
+// slot costs a 16 KiB kernel stack + a 512 B FX area (static BSS), so this is cheap.
+pub const MAX_THREADS: usize = 32;
 const KSTACK_SIZE: usize = 16 * 1024;
 /// The boot thread becomes the idle thread; it is never in the Ready set.
 const IDLE: usize = 0;
