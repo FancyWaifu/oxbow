@@ -169,11 +169,24 @@ be re-audited.
   - Verified under `-smp 4`: the handoff runs on every context switch (thousands during boot +
     interactive use); login + fs + pipes + interleaved kbd/mouse all pass, no deadlock, no fault.
     Single-core: `SCHED_LOCK` is uncontended (BSP only), so behavior is unchanged.
-- **Last step before an AP runs user threads:** the syscall fast-path stub still reads the
-  GLOBAL `CURRENT_KSTACK_TOP` / `USER_RSP` — those must become per-CPU (gs-relative, no swapgs
-  needed since oxbow keeps one GS base across the ring boundary) before a user thread can take a
-  syscall on an AP. Then: start each AP's LAPIC timer + have it run `run_idle` so `pick_next` on
-  the AP pulls real work. That enablement is what finally exercises `SCHED_LOCK` under contention.
+- **AP scheduling — ✅ DONE (§72). The payoff: user threads now run on a second core.**
+  - **Per-CPU syscall stack:** the `syscall` stub's `CURRENT_KSTACK_TOP` / `USER_RSP` moved into
+    `PerCpu` (gs:[24]/gs:[32]); the naked stub reads them gs-relative. No swapgs needed — oxbow
+    keeps ONE GS base per CPU across the ring boundary (user can't change it), so `gs:[..]` in the
+    stub resolves to THIS CPU's PerCpu even straight out of ring 3.
+  - **TCB-allocation race fixed:** `spawn()` now runs under `SCHED_LOCK` and publishes `Ready`
+    LAST (after writing the whole TCB), so a scheduler on another core can't grab the same slot
+    or pick a half-initialised thread.
+  - **AP CPU-feature init:** each AP replays the per-CPU half of `arch::init` — the syscall MSRs
+    (EFER.SCE/STAR/LSTAR/SFMask) and SSE (CR0/CR4 + `fninit`) — via `init_ap_cpu()`. (First bug
+    found: a user thread `#UD`'d on the AP because CR4.OSFXSR wasn't set there.)
+  - **AP runs the scheduler:** `ap_main` starts the AP's LAPIC timer (reusing the BSP-cached
+    calibration) and enters `run_idle`; its timer drives `preempt`, pulling Ready threads off the
+    shared run queue under `SCHED_LOCK`. Timekeeping (TICKS, the ~1 Hz tick notif, timed-wait
+    deadlines) stays BSP-only so the clock doesn't run N× fast; every core preempts.
+  - **Verified under `-smp 4`:** serial shows `[smp] AP cpu 1 is now running user threads` — real
+    user work on the second core — and login + fs + pipes + interleaved kbd/mouse all pass with no
+    fault, no deadlock, no corruption. This is the first contended exercise of §70/§71/§72.
 - Audit every `spin::Mutex` user for **lock ordering** (define a global order, e.g.
   proc < cap-table < channel < endpoint < notif < frame-alloc) and never acquire out of
   order → deadlock freedom.

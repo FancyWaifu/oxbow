@@ -15,7 +15,7 @@ pub use x86_64::ioapic; // §69 SMP: I/O APIC (device IRQ routing)
 pub use x86_64::{
     breakpoint, console_write_bytes, context_switch, current_cr3, disable_interrupts,
     enable_interrupts, enter_user, exit_qemu, fxrstor, fxsave, halt, init, io_in, io_out, load_cr3,
-    load_descriptor_tables_ap, pic_unmask, set_kernel_stack, switch_address_space,
+    init_ap_cpu, load_descriptor_tables_ap, pic_unmask, set_kernel_stack, switch_address_space,
     thread_trampoline, ticks, timer_disable, timer_init, wait_for_interrupt, FXSAVE_SIZE,
     QemuExit, _print,
 };

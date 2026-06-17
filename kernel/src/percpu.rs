@@ -25,16 +25,27 @@ pub struct PerCpu {
     /// BSP's is TCB 0; each AP registers its own. Was the hardcoded `thread::IDLE`.
     /// At `gs:[16]`.
     pub idle_tid: usize,
+    /// Kernel stack the `syscall` entry stub switches to — the running thread's
+    /// kernel stack, updated by the scheduler on every context switch (§72; was the
+    /// global `syscall::CURRENT_KSTACK_TOP`). At `gs:[24]` — read directly by the
+    /// naked syscall stub, so this offset is load-bearing.
+    pub kstack_top: u64,
+    /// Scratch for the user `rsp` across the syscall stack switch (was the global
+    /// `syscall::USER_RSP`). Per-CPU so two cores entering `syscall` at once can't
+    /// clobber each other. At `gs:[32]` — read/written by the naked stub.
+    pub user_rsp: u64,
 }
 impl PerCpu {
     const fn new() -> Self {
-        PerCpu { cpu_index: 0, current: 0, idle_tid: 0 }
+        PerCpu { cpu_index: 0, current: 0, idle_tid: 0, kstack_top: 0, user_rsp: 0 }
     }
 }
-// The asm accessors below hardcode these offsets; keep them honest.
+// The asm accessors AND the naked syscall stub hardcode these offsets; keep honest.
 const _: () = assert!(core::mem::offset_of!(PerCpu, cpu_index) == 0);
 const _: () = assert!(core::mem::offset_of!(PerCpu, current) == 8);
 const _: () = assert!(core::mem::offset_of!(PerCpu, idle_tid) == 16);
+const _: () = assert!(core::mem::offset_of!(PerCpu, kstack_top) == 24);
+const _: () = assert!(core::mem::offset_of!(PerCpu, user_rsp) == 32);
 
 static mut PERCPU: [PerCpu; MAX_CPUS] = [const { PerCpu::new() }; MAX_CPUS];
 
@@ -83,6 +94,14 @@ pub fn idle_tid() -> usize {
 #[inline]
 pub fn set_idle_tid(tid: usize) {
     unsafe { core::arch::asm!("mov gs:[16], {}", in(reg) tid, options(nostack, preserves_flags)) };
+}
+
+/// Set the kernel stack the `syscall` stub switches to (the running thread's
+/// kernel stack). Called by the scheduler on every context switch, on the CPU that
+/// will run the thread — so it lands in THAT CPU's PerCpu (gs:[24]).
+#[inline]
+pub fn set_kstack_top(top: u64) {
+    unsafe { core::arch::asm!("mov gs:[24], {}", in(reg) top, options(nostack, preserves_flags)) };
 }
 
 /// True if `tid` is some CPU's idle thread. Scans the PerCpu pool directly (not

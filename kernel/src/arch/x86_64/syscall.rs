@@ -15,20 +15,12 @@ use x86_64::VirtAddr;
 
 use super::gdt;
 
-/// The kernel stack the syscall entry stub switches to — the CURRENT thread's
-/// kernel stack, updated by the scheduler on every context switch (v1). Mirrors
-/// TSS.RSP0 so ring-3 traps and syscalls land on the same per-thread stack.
-static mut CURRENT_KSTACK_TOP: u64 = 0;
-
-/// Scratch slot for the user `rsp` across the stack switch. Safe as a single
-/// static while there is one user thread and the kernel is non-preemptible
-/// (IF=0 in all kernel code). MOVE INTO THE TCB when a second user thread lands.
-static mut USER_RSP: u64 = 0;
-
-/// Set the kernel stack the syscall entry stub switches to (the incoming
-/// thread's kernel stack). Called by the scheduler on every context switch.
+/// Set the kernel stack the syscall entry stub switches to (the incoming thread's
+/// kernel stack). Called by the scheduler on every context switch. §72: this now
+/// lives in the running CPU's PerCpu (gs:[24]) — per-CPU, so the stub reads the
+/// right stack whichever core runs the thread — not a single global.
 pub fn set_kernel_stack_top(top: u64) {
-    unsafe { CURRENT_KSTACK_TOP = top };
+    crate::percpu::set_kstack_top(top);
 }
 
 /// Configure the syscall MSRs. The per-thread kernel stack and TSS.RSP0 are now
@@ -70,10 +62,15 @@ pub fn init() {
 #[unsafe(naked)]
 extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
-        "mov [rip + {user_rsp}], rsp",      // stash user rsp (no GPR clobbered)
-        "mov rsp, [rip + {stack_top}]",     // switch to this thread's kernel stack
+        // §72 SMP: the per-thread kernel stack and user-rsp scratch are PER-CPU,
+        // reached through the GS base (gs:[24]=PerCpu.kstack_top, gs:[32]=user_rsp).
+        // oxbow keeps ONE GS base per CPU across the ring boundary (user can't change
+        // it — no FSGSBASE, no swapgs), so gs:[..] reads THIS CPU's PerCpu even though
+        // we just came from ring 3. Offsets are asserted in percpu.rs.
+        "mov gs:[32], rsp",                 // stash user rsp (no GPR clobbered)
+        "mov rsp, gs:[24]",                 // switch to this thread's kernel stack
         // -- 8 pushes; rsp stays 16-aligned (top is 16-aligned) --
-        "push qword ptr [rip + {user_rsp}]", // user rsp
+        "push qword ptr gs:[32]",            // user rsp
         "push r11",                          // user RFLAGS
         "push rcx",                          // user RIP
         "push rdi",                          // a1
@@ -95,8 +92,6 @@ extern "C" fn syscall_entry() {
         "pop r11",                           // user RFLAGS
         "pop rsp",                           // restore user rsp
         "sysretq",
-        user_rsp = sym USER_RSP,
-        stack_top = sym CURRENT_KSTACK_TOP,
         dispatch = sym crate::syscall::syscall_dispatch,
     );
 }

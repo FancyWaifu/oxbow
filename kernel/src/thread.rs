@@ -192,13 +192,18 @@ fn init_stack(slot: usize, entry: u64, arg1: u64, arg2: u64) -> (u64, u64) {
 }
 
 fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64) -> usize {
+    // §72: under SCHED_LOCK — two cores (a user thread on each) can `sys_spawn`
+    // concurrently, and a scheduler on another core may be scanning for Ready
+    // threads. The lock makes "claim a Free/Exited slot, fill it, publish Ready"
+    // atomic, so no two cores grab the same slot and no scheduler can pick a
+    // half-initialised TCB.
+    sched_lock();
     for slot in 1..MAX_THREADS {
-        // Reuse Exited slots too: an exited thread never resumes (IF=0, single
-        // CPU), and init_stack rebuilds its kernel stack from the top — so the
-        // slot + its static kstack are free for the next spawn.
+        // Reuse Exited slots too: an exited thread never resumes, and init_stack
+        // rebuilds its kernel stack from the top — so the slot + its static kstack
+        // are free for the next spawn.
         if matches!(state(slot), State::Free | State::Exited) {
             let (ctx_rsp, kstack_top) = init_stack(slot, entry, arg1, arg2);
-            set_state(slot, State::Ready); // publish as runnable (atomic)
             unsafe {
                 *addr_of_mut!(TCBS[slot]) = Tcb {
                     ctx_rsp,
@@ -214,9 +219,14 @@ fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64) -> usize {
                     crate::arch::FXSAVE_SIZE,
                 );
             }
+            // Publish as runnable LAST (Release): a scheduler that sees Ready
+            // (Acquire) is then guaranteed to see the fully-written TCB above.
+            set_state(slot, State::Ready);
+            sched_unlock();
             return slot;
         }
     }
+    sched_unlock();
     panic!("thread: out of TCB slots");
 }
 
@@ -233,9 +243,9 @@ pub fn spawn_kernel(entry: extern "C" fn(u64), arg: u64) -> usize {
 /// BSP is parked in the bringup spin-wait, so there is no concurrent TCB allocation
 /// (the slot is then permanently the AP's, skipped by `spawn`'s Free/Exited scan).
 pub fn register_running_idle(kstack_top: u64) -> usize {
+    sched_lock(); // §72: consistent with spawn() — exclusive TCB-slot allocation
     for slot in 1..MAX_THREADS {
         if state(slot) == State::Free {
-            set_state(slot, State::Running); // the AP is already running on this stack
             unsafe {
                 *addr_of_mut!(TCBS[slot]) = Tcb {
                     ctx_rsp: 0,
@@ -245,9 +255,12 @@ pub fn register_running_idle(kstack_top: u64) -> usize {
                     wake_at: 0,
                 };
             }
+            set_state(slot, State::Running); // the AP is already running on this stack
+            sched_unlock();
             return slot;
         }
     }
+    sched_unlock();
     panic!("thread: out of TCB slots (ap idle)");
 }
 
@@ -268,6 +281,9 @@ pub fn register_running_idle(kstack_top: u64) -> usize {
 // before the CPU returns to IF=1 — so the timer IRQ can never fire while a CPU
 // holds it, and there is no lock-order cycle.
 static SCHED_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// One-shot: set the first time an AP context-switches to a user thread (§72 proof).
+static AP_RAN_USER: AtomicBool = AtomicBool::new(false);
 
 fn sched_lock() {
     while SCHED_LOCK
@@ -317,6 +333,13 @@ fn switch_to(next: usize) {
     }
     set_state(next, State::Running);
     crate::percpu::set_current(next);
+    // §72 one-shot proof that an AP actually runs USER work (not just idles).
+    {
+        let cpu = crate::percpu::cpu_index();
+        if cpu != 0 && proc_of(next) != NO_PROC && !AP_RAN_USER.swap(true, Ordering::Relaxed) {
+            println!("[smp] AP cpu {} is now running user threads (proc {})", cpu, proc_of(next));
+        }
+    }
     // Point TSS.RSP0 + the syscall entry stack at the incoming thread's kernel
     // stack BEFORE the switch — safe because IF=0 throughout the kernel, so
     // nothing can trap from ring 3 between this update and the switch.
@@ -503,15 +526,18 @@ fn park_one_tick() {
     disable_interrupts();
 }
 
-/// The idle thread (TCB 0) body — never returns. Parks for ticks; the handler
+/// The idle thread body — never returns. Parks for ticks; the timer handler
 /// reschedules to any Ready thread. We resume here only when nothing else is
-/// runnable. Announces quiescence once every other thread has exited.
+/// runnable on THIS CPU. Run by the BSP (TCB 0) and, since §72, by every AP on
+/// its own idle TCB — so each core pulls Ready work via `preempt`. The quiescence
+/// announcement is BSP-only (cpu 0), to avoid two cores racing on the message.
 pub fn run_idle() -> ! {
+    let is_bsp = crate::percpu::cpu_index() == 0;
     let mut quiescent = false;
     loop {
         if any_active() {
             quiescent = false;
-        } else if !quiescent {
+        } else if !quiescent && is_bsp {
             println!("[idle] system quiescent");
             quiescent = true;
         }

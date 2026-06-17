@@ -74,6 +74,9 @@ extern "C" fn ap_main(index: usize) -> ! {
     // state (GS base) and register its idle thread: the AP IS its idle thread,
     // already running on this dedicated stack, so `current` becomes that TCB.
     crate::arch::load_descriptor_tables_ap(index);
+    // §72: replay the per-CPU CPU-feature init (syscall MSRs + SSE) so a user thread
+    // scheduled here doesn't #UD on its first syscall or SSE instruction.
+    crate::arch::init_ap_cpu();
     crate::percpu::init(index);
     let idle = crate::thread::register_running_idle(ap_stack_top(index));
     crate::percpu::set_idle_tid(idle);
@@ -83,12 +86,14 @@ extern "C" fn ap_main(index: usize) -> ! {
     AP_LAPIC_ID[index].store(lapic_id, Ordering::Release);
     AP_ONLINE[index].store(true, Ordering::Release);
 
-    // Park forever. IF stays 0: this core must not take interrupts (its timer is
-    // unstarted and device IRQs route to the BSP), because the scheduler, IPC, and
-    // frame allocator are not yet SMP-safe. It simply halts — alive, but idle.
-    loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)) };
-    }
+    // §72: this AP now SCHEDULES. Start its LAPIC timer (TIMER_COUNT is already
+    // calibrated by the BSP, so this reuses it — no PIT access from the AP) and
+    // enter the scheduler idle loop. Its timer tick drives `preempt`, which pulls
+    // Ready threads off the shared run queue under SCHED_LOCK (§71) and runs real
+    // user work on this core. The lost-wakeup protocol (§70) + the context-switch
+    // handoff (§71) + per-CPU syscall stacks (§72) make this safe across cores.
+    crate::arch::lapic::start_timer(crate::arch::lapic::TIMER_VECTOR, 100);
+    crate::thread::run_idle();
 }
 
 /// Bring up exactly ONE Application Processor into the idle loop above. Called by

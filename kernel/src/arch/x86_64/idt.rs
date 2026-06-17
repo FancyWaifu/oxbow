@@ -140,12 +140,18 @@ extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
 /// retired. Same work as `timer()` but EOI's the LAPIC (a local interrupt), not
 /// the PIC. EOI before the context switch for the same in-service-bit reason.
 extern "x86-interrupt" fn lapic_timer(frame: InterruptStackFrame) {
-    let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     unsafe { super::lapic::eoi() };
-    if tick % 100 == 0 {
-        crate::notif::fire_tick();
+    // §72: every CPU's LAPIC timer drives preemption, but TIMEKEEPING stays on the
+    // BSP only — otherwise N cores would advance TICKS N× and fire the ~1 Hz tick
+    // notif / timed-wait deadlines N× too fast. The BSP owns the monotonic clock;
+    // APs just preempt.
+    if crate::percpu::cpu_index() == 0 {
+        let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if tick % 100 == 0 {
+            crate::notif::fire_tick();
+        }
+        crate::thread::wake_expired(tick);
     }
-    crate::thread::wake_expired(tick);
     let _ = frame;
     crate::thread::preempt();
 }

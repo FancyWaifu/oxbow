@@ -104,6 +104,18 @@ pub fn load_descriptor_tables_ap(cpu: usize) {
     idt::load_ap();
 }
 
+/// Per-CPU CPU-feature init for an Application Processor (§72): the `syscall` MSRs
+/// (EFER.SCE, STAR, LSTAR, SFMask — all per-CPU model-specific registers) and SSE
+/// (per-CPU CR0/CR4 + `fninit`). Without these, a user thread scheduled onto the AP
+/// would `#UD` on its first `syscall` or SSE instruction. The GDT/IDT-building and
+/// serial half of `init()` is BSP-global; only these per-CPU bits are replayed here
+/// (`syscall::init` reads the already-built GDT selectors). Call after
+/// `load_descriptor_tables_ap` (which provides the selectors + TSS).
+pub fn init_ap_cpu() {
+    syscall::init();
+    enable_sse();
+}
+
 /// Physical address of the live PML4 (CR3).
 pub fn current_cr3() -> u64 {
     use x86_64::registers::control::Cr3;
