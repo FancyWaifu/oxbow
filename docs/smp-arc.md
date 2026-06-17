@@ -108,7 +108,25 @@ be re-audited.
   per-CPU queues + work-stealing later only if contention shows up. Each AP will call
   `percpu::init(k)` at bringup to claim its own slot + GS base.
 
-### Phase 5 — Real locking (the core of the arc)
+### Phase 5 — Real locking (the core of the arc) — STARTED (§69)
+- **Per-CPU TSS + per-CPU idle thread — ✅ DONE** (the prerequisites; no locking yet):
+  - **Per-CPU TSS** (`gdt.rs`): one `TaskStateSegment` per CPU, each with its own RSP0 (ring-0
+    trap/syscall stack) and its own #DF IST stack, plus a distinct TSS descriptor in the GDT
+    (a TSS can only be `ltr`'d on one CPU — loading sets the busy bit). The GDT is resized to
+    `1 + 4 + 2·MAX_CPUS` entries; the BSP appends all TSS descriptors in `init` and `ltr`s its
+    own; each AP `ltr`s its own in `gdt::load_ap(cpu)`. `set_rsp0` now writes the *running*
+    CPU's TSS (via `percpu::cpu_index()`), so two cores scheduling at once can't clobber each
+    other's RSP0.
+  - **Per-CPU idle thread**: `PerCpu` gains `idle_tid` (at `gs:[16]`); the scheduler's
+    hardcoded `IDLE`/`unwrap_or(IDLE)`/`current()!=IDLE` sites now go through
+    `percpu::idle_tid()`. The BSP idles on TCB 0 (unchanged); each AP registers its own idle
+    TCB (`thread::register_running_idle` — adopts the already-running bringup stack, no new
+    frame) and sets `current`/`idle_tid` to it. `any_active` excludes every CPU's idle so an
+    idling AP isn't mistaken for work.
+  - Verified under `-smp 4`: AP comes up on its own TSS + idle TCB, no #GP/#PF/#DF; BSP boots
+    fully and the ring-3 path (login, syscalls, context switches with per-CPU RSP0, interleaved
+    kbd/mouse) all pass. The AP still just idles IF=0 — it does not yet run the scheduler.
+- **Next (the hard part):** the shared-state locking below, then let the AP actually schedule.
 - Audit every `spin::Mutex` user for **lock ordering** (define a global order, e.g.
   proc < cap-table < channel < endpoint < notif < frame-alloc) and never acquire out of
   order → deadlock freedom.

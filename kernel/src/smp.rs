@@ -69,11 +69,16 @@ unsafe extern "C" fn ap_entry(cpu: &Cpu) -> ! {
 
 /// Runs on the AP once it's on the kernel PML4 and its own stack, IF=0.
 extern "C" fn ap_main(index: usize) -> ! {
-    // Point this AP's GDTR/IDTR at the shared tables and reload its segments (no
-    // TSS — see gdt::load_ap), then claim its per-CPU state (GS base) and enable
-    // its LAPIC. enable() reuses the LAPIC MMIO mapping the BSP already made.
-    crate::arch::load_descriptor_tables_ap();
+    // Point this AP's GDTR/IDTR at the shared tables, reload its segments, and `ltr`
+    // its OWN TSS (§69 Phase 5 — its own RSP0 + #DF stack). Then claim its per-CPU
+    // state (GS base) and register its idle thread: the AP IS its idle thread,
+    // already running on this dedicated stack, so `current` becomes that TCB.
+    crate::arch::load_descriptor_tables_ap(index);
     crate::percpu::init(index);
+    let idle = crate::thread::register_running_idle(ap_stack_top(index));
+    crate::percpu::set_idle_tid(idle);
+    crate::percpu::set_current(idle);
+    // Enable this AP's LAPIC (reuses the LAPIC MMIO mapping the BSP already made).
     let lapic_id = crate::arch::lapic::enable();
     AP_LAPIC_ID[index].store(lapic_id, Ordering::Release);
     AP_ONLINE[index].store(true, Ordering::Release);

@@ -137,6 +137,7 @@ pub fn process_of(tid: usize) -> usize {
 pub fn init() {
     set_state(IDLE, State::Running);
     crate::percpu::set_current(IDLE);
+    crate::percpu::set_idle_tid(IDLE); // the BSP idles on TCB 0
     // SSE was enabled + `fninit`'d in arch::init; snapshot that clean FPU state
     // as the template and seed every thread's save area with it, so a thread's
     // first FXRSTOR loads valid state rather than zeros.
@@ -204,6 +205,31 @@ fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64) -> usize {
 #[allow(dead_code)] // scheduler API; kernel-thread demos were retired in arc 3
 pub fn spawn_kernel(entry: extern "C" fn(u64), arg: u64) -> usize {
     spawn(entry as *const () as u64, arg, 0, NO_PROC, 0)
+}
+
+/// Register an idle thread for an AP that is ALREADY executing on `kstack_top` (its
+/// dedicated bringup stack), §69 SMP Phase 5. Unlike `spawn`, it builds NO initial
+/// stack frame — the AP is already running this context — it just claims a TCB slot
+/// and marks it Running. Returns the tid. Called once per AP at bringup, while the
+/// BSP is parked in the bringup spin-wait, so there is no concurrent TCB allocation
+/// (the slot is then permanently the AP's, skipped by `spawn`'s Free/Exited scan).
+pub fn register_running_idle(kstack_top: u64) -> usize {
+    for slot in 1..MAX_THREADS {
+        if state(slot) == State::Free {
+            unsafe {
+                *addr_of_mut!(TCBS[slot]) = Tcb {
+                    state: State::Running,
+                    ctx_rsp: 0,
+                    kstack_top,
+                    proc: NO_PROC,
+                    cr3: 0,
+                    wake_at: 0,
+                };
+            }
+            return slot;
+        }
+    }
+    panic!("thread: out of TCB slots (ap idle)");
 }
 
 /// Round-robin scan for the next Ready thread after CURRENT (never returns
@@ -279,7 +305,7 @@ pub fn kill_current_user() -> ! {
 /// INVARIANT: never called while holding a spin lock (it switches away).
 pub fn block_current() {
     set_state(current(), State::Blocked);
-    let next = pick_next().unwrap_or(IDLE);
+    let next = pick_next().unwrap_or_else(|| crate::percpu::idle_tid());
     switch_to(next);
     // Woken: our waker has already deposited our result (and staging, in IPC).
 }
@@ -327,7 +353,7 @@ pub fn wake_expired(now_tick: u64) {
 pub fn exit_current() -> ! {
     crate::notif::clear_waiter(current()); // defensive: never wake an Exited thread
     set_state(current(), State::Exited);
-    let next = pick_next().unwrap_or(IDLE);
+    let next = pick_next().unwrap_or_else(|| crate::percpu::idle_tid());
     switch_to(next);
     unreachable!("exited thread resumed");
 }
@@ -337,7 +363,7 @@ pub fn exit_current() -> ! {
 /// the handler tail's `iretq`, back where it was interrupted.
 pub fn preempt() {
     if let Some(n) = pick_next() {
-        if current() != IDLE {
+        if current() != crate::percpu::idle_tid() {
             set_state(current(), State::Ready);
         }
         switch_to(n);
@@ -345,9 +371,13 @@ pub fn preempt() {
 }
 
 /// True if any non-idle thread is still Ready, Running, or Blocked. A blocked
-/// thread (e.g. a pinger waiting for its reply) is NOT quiescence.
+/// thread (e.g. a pinger waiting for its reply) is NOT quiescence. Any CPU's idle
+/// thread is excluded — an AP parked on its own idle TCB isn't "work".
 fn any_active() -> bool {
-    (1..MAX_THREADS).any(|s| matches!(state(s), State::Ready | State::Running | State::Blocked))
+    (1..MAX_THREADS).any(|s| {
+        matches!(state(s), State::Ready | State::Running | State::Blocked)
+            && !crate::percpu::is_idle_tid(s)
+    })
 }
 
 /// A thread's parking point: enable interrupts for exactly one `hlt`, so the
