@@ -2051,3 +2051,15 @@ The mouse shares the i8042 with the keyboard, so the `kbd` driver handles both:
 Verified headlessly: `mouse_move` over the QEMU monitor walks the cursor across
 the screen, over the terminal text, intact. Next: `wl_pointer` (deliver motion +
 clicks to clients) and window management (focus, move, multiple windows).
+
+## 55. wl_pointer — the mouse reaches apps (v1-wl-pointer)
+
+The cursor now drives input, following tinywl's pointer model. oxcomp advertises
+`WL_SEAT_CAPABILITY_POINTER`, implements `get_pointer`, and on each mouse packet:
+hit-tests the cursor against the window rectangle (geometry recorded at composite
+time), sends `wl_pointer.enter` on transition + `wl_pointer.motion` (surface-local
+`wl_fixed` coords) while inside, `wl_pointer.leave` on exit, and `wl_pointer.button`
+(evdev `BTN_LEFT = 0x110`) on button edges. Our clients bind `wl_seat` at v1, so no
+`frame` grouping is needed. oxterm binds the pointer and logs enter/button to prove
+delivery. Next: multiple windows (a view list + z-order) so the hit-test picks the
+topmost of several, then window management.

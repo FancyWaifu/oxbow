@@ -79,8 +79,13 @@ static void draw_cursor(void)
   g_cur_drawn = 1;
 }
 static struct wl_resource *g_focus;     /* the surface holding keyboard focus */
+static struct wl_resource *g_pointer;   /* the client's wl_pointer, if bound (§55) */
 static unsigned int        g_serial;    /* event serial counter */
 static int           g_composited;
+/* The (single, for now) window's on-screen geometry, set at composite time. */
+static int g_win_x = 140, g_win_y = 130, g_win_w, g_win_h;
+static int g_ptr_in;   /* is the pointer currently entered on the window? */
+static int g_btn_left; /* last reported left-button state (edge detection) */
 
 struct surf {
   struct wl_resource *buffer;       /* pending/current attached wl_buffer */
@@ -156,7 +161,9 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
   int stride = wl_shm_buffer_get_stride(shm);
   wl_shm_buffer_begin_access(shm);
   unsigned char *data = wl_shm_buffer_get_data(shm);
-  int ox = 140, oy = 130; /* where the window lands on screen */
+  int ox = g_win_x, oy = g_win_y; /* where the window lands on screen */
+  g_win_w = bw;                   /* §55: record geometry for pointer hit-testing */
+  g_win_h = bh;
   erase_cursor(); /* §54: lift the cursor before the window blit... */
   for (int y = 0; y < bh && oy + y < g_h; y++) {
     unsigned int *src = (unsigned int *)(data + (long)y * stride);
@@ -392,9 +399,35 @@ static void seat_get_keyboard(struct wl_client *c, struct wl_resource *res, uint
   send_keymap(k);
   slog("[oxcomp/srv] wl_keyboard bound (keymap sent)\n");
 }
+/* ---- wl_pointer (§55) --------------------------------------------------- */
+static void pointer_set_cursor(struct wl_client *c, struct wl_resource *res, uint32_t serial,
+                               struct wl_resource *surface, int32_t hx, int32_t hy)
+{
+  (void)c; (void)res; (void)serial; (void)surface; (void)hx; (void)hy;
+  /* We draw our own cursor, so ignore client cursor surfaces for now. */
+}
+static void pointer_release(struct wl_client *c, struct wl_resource *res)
+{
+  (void)c;
+  wl_resource_destroy(res);
+}
+static const struct wl_pointer_interface pointer_impl = {
+  pointer_set_cursor, pointer_release
+};
+static void pointer_resource_destroy(struct wl_resource *res)
+{
+  if (g_pointer == res) {
+    g_pointer = NULL;
+    g_ptr_in = 0;
+  }
+}
 static void seat_get_pointer(struct wl_client *c, struct wl_resource *res, uint32_t id)
 {
-  (void)c; (void)res; (void)id;
+  struct wl_resource *p =
+    wl_resource_create(c, &wl_pointer_interface, wl_resource_get_version(res), id);
+  wl_resource_set_implementation(p, &pointer_impl, NULL, pointer_resource_destroy);
+  g_pointer = p;
+  slog("[oxcomp/srv] wl_pointer bound\n");
 }
 static void seat_get_touch(struct wl_client *c, struct wl_resource *res, uint32_t id)
 {
@@ -413,7 +446,41 @@ static void seat_bind(struct wl_client *c, void *data, uint32_t version, uint32_
   (void)data;
   struct wl_resource *res = wl_resource_create(c, &wl_seat_interface, version, id);
   wl_resource_set_implementation(res, &seat_impl, NULL, NULL);
-  wl_seat_send_capabilities(res, WL_SEAT_CAPABILITY_KEYBOARD);
+  wl_seat_send_capabilities(res,
+                            WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_POINTER);
+}
+
+/* §55: track the pointer over the window. tinywl's process_cursor_motion: if the
+ * cursor is over a surface, send enter (on transition) + motion (surface-local);
+ * if it leaves, send leave. Buttons map to evdev codes. One window for now, so
+ * the hit-test is a single rectangle. */
+static void pointer_update(void)
+{
+  if (!g_pointer || !g_focus)
+    return;
+  int over = g_cx >= g_win_x && g_cx < g_win_x + g_win_w && g_cy >= g_win_y &&
+             g_cy < g_win_y + g_win_h;
+  wl_fixed_t sx = wl_fixed_from_int(g_cx - g_win_x);
+  wl_fixed_t sy = wl_fixed_from_int(g_cy - g_win_y);
+  if (over && !g_ptr_in) {
+    wl_pointer_send_enter(g_pointer, ++g_serial, g_focus, sx, sy);
+    g_ptr_in = 1;
+  } else if (!over && g_ptr_in) {
+    wl_pointer_send_leave(g_pointer, ++g_serial, g_focus);
+    g_ptr_in = 0;
+  }
+  if (over)
+    wl_pointer_send_motion(g_pointer, ox_now_ms(), sx, sy);
+}
+
+static void pointer_button(int left)
+{
+  if (!g_pointer || !g_ptr_in)
+    return;
+  /* BTN_LEFT = 0x110 in the Linux evdev button namespace wl_pointer uses. */
+  wl_pointer_send_button(g_pointer, ++g_serial, ox_now_ms(), 0x110,
+                         left ? WL_POINTER_BUTTON_STATE_PRESSED
+                              : WL_POINTER_BUTTON_STATE_RELEASED);
 }
 
 /* Event-loop callback: drain the keyboard channel and deliver each set-1 scancode
@@ -459,13 +526,21 @@ static int on_mouse(int fd, uint32_t mask, void *data)
     int flags = pkt[0];
     int dx = pkt[1] - ((flags & 0x10) ? 256 : 0);
     int dy = pkt[2] - ((flags & 0x20) ? 256 : 0);
-    g_cx += dx;
-    g_cy -= dy;
-    if (g_cx < 0) g_cx = 0;
-    if (g_cx >= g_w) g_cx = g_w - 1;
-    if (g_cy < 0) g_cy = 0;
-    if (g_cy >= g_h) g_cy = g_h - 1;
-    moved = 1;
+    if (dx || dy) {
+      g_cx += dx;
+      g_cy -= dy;
+      if (g_cx < 0) g_cx = 0;
+      if (g_cx >= g_w) g_cx = g_w - 1;
+      if (g_cy < 0) g_cy = 0;
+      if (g_cy >= g_h) g_cy = g_h - 1;
+      moved = 1;
+      pointer_update(); /* §55: deliver motion + enter/leave to the client */
+    }
+    int left = flags & 0x01;
+    if (left != g_btn_left) {
+      g_btn_left = left;
+      pointer_button(left); /* §55: deliver the click */
+    }
   }
   if (moved) {
     erase_cursor();

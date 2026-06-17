@@ -73,6 +73,7 @@ struct display {
 	struct xdg_wm_base *wm_base;
 	struct wl_seat *seat;
 	struct wl_keyboard *keyboard;
+	struct wl_pointer *pointer;
 	struct xkb_context *xkb_ctx;
 	struct xkb_keymap *xkb_keymap;
 	struct xkb_state *xkb_state;
@@ -386,6 +387,37 @@ static const struct wl_keyboard_listener keyboard_listener = {
 	keyboard_handle_modifiers,
 };
 
+/* §55: wl_pointer — for now we just log enter/button to prove delivery; the
+ * window manager arcs will use motion/buttons for move/resize/focus. */
+static void pointer_enter(void *d, struct wl_pointer *p, uint32_t serial,
+			  struct wl_surface *s, wl_fixed_t sx, wl_fixed_t sy)
+{ (void)d;(void)p;(void)serial;(void)s;(void)sx;(void)sy; cl("[cli] ptr enter\n"); }
+static void pointer_leave(void *d, struct wl_pointer *p, uint32_t serial,
+			  struct wl_surface *s)
+{ (void)d;(void)p;(void)serial;(void)s; cl("[cli] ptr leave\n"); }
+static void pointer_motion(void *d, struct wl_pointer *p, uint32_t t,
+			   wl_fixed_t sx, wl_fixed_t sy)
+{ (void)d;(void)p;(void)t;(void)sx;(void)sy; }
+static void pointer_button(void *d, struct wl_pointer *p, uint32_t serial,
+			   uint32_t t, uint32_t button, uint32_t state)
+{
+	(void)d;(void)p;(void)serial;(void)t;(void)button;
+	cl(state ? "[cli] ptr button press\n" : "[cli] ptr button release\n");
+}
+static void pointer_axis(void *d, struct wl_pointer *p, uint32_t t, uint32_t a, wl_fixed_t v)
+{ (void)d;(void)p;(void)t;(void)a;(void)v; }
+static void pointer_frame(void *d, struct wl_pointer *p) { (void)d;(void)p; }
+static void pointer_axis_source(void *d, struct wl_pointer *p, uint32_t s) { (void)d;(void)p;(void)s; }
+static void pointer_axis_stop(void *d, struct wl_pointer *p, uint32_t t, uint32_t a) { (void)d;(void)p;(void)t;(void)a; }
+static void pointer_axis_discrete(void *d, struct wl_pointer *p, uint32_t a, int32_t v) { (void)d;(void)p;(void)a;(void)v; }
+static void pointer_axis_v120(void *d, struct wl_pointer *p, uint32_t a, int32_t v) { (void)d;(void)p;(void)a;(void)v; }
+static void pointer_axis_dir(void *d, struct wl_pointer *p, uint32_t a, uint32_t dir) { (void)d;(void)p;(void)a;(void)dir; }
+static const struct wl_pointer_listener pointer_listener = {
+	pointer_enter, pointer_leave, pointer_motion, pointer_button, pointer_axis,
+	pointer_frame, pointer_axis_source, pointer_axis_stop, pointer_axis_discrete,
+	pointer_axis_v120, pointer_axis_dir,
+};
+
 static void
 seat_handle_capabilities(void *data, struct wl_seat *seat,
 			 enum wl_seat_capability caps)
@@ -398,6 +430,13 @@ seat_handle_capabilities(void *data, struct wl_seat *seat,
 	} else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && d->keyboard) {
 		wl_keyboard_destroy(d->keyboard);
 		d->keyboard = NULL;
+	}
+	if ((caps & WL_SEAT_CAPABILITY_POINTER) && !d->pointer) {
+		d->pointer = wl_seat_get_pointer(seat);
+		wl_pointer_add_listener(d->pointer, &pointer_listener, d);
+	} else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && d->pointer) {
+		wl_pointer_destroy(d->pointer);
+		d->pointer = NULL;
 	}
 }
 
