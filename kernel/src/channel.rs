@@ -271,6 +271,12 @@ pub fn unpark_recv(idx: u8, side: u8, tid: usize) {
     CONNS.lock()[idx as usize].dir[read_dir(side)].readers.remove(tid);
 }
 
+/// Deregister `tid` from `side`'s writer queue — counterpart to `park_send` (§70),
+/// used when a sender made progress and isn't sleeping.
+pub fn unpark_send(idx: u8, side: u8, tid: usize) {
+    CONNS.lock()[idx as usize].dir[side as usize].writers.remove(tid);
+}
+
 /// Close `side`; returns peer tids to wake (they observe EOF). Frees the
 /// connection once both sides are closed.
 pub fn close(idx: u8, side: u8, wake: &mut [usize; QCAP]) -> usize {

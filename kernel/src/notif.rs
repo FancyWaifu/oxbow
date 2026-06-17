@@ -91,8 +91,12 @@ pub fn wait(idx: u8) -> (u64, u64) {
         return (SysError::NoMem as u64, 0);
     }
     n.waiter = Some(me);
+    // §70: commit to Blocked while still holding POOL (the interlock), so a
+    // `signal()` on another CPU — which deposits our return then `wake`s us under
+    // POOL — can't land between here and the sleep and be lost.
+    thread::prepare_block();
     drop(p); // never hold the lock across block_current
-    thread::block_current(); // woken by signal(), which deposited our return
+    thread::block_current(); // sleep only if still Blocked; woken by signal()
     ipc::take_ret(me)
 }
 

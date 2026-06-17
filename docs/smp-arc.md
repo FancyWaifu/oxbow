@@ -126,7 +126,33 @@ be re-audited.
   - Verified under `-smp 4`: AP comes up on its own TSS + idle TCB, no #GP/#PF/#DF; BSP boots
     fully and the ring-3 path (login, syscalls, context switches with per-CPU RSP0, interleaved
     kbd/mouse) all pass. The AP still just idles IF=0 — it does not yet run the scheduler.
-- **Next (the hard part):** the shared-state locking below, then let the AP actually schedule.
+- **Lost-wakeup fix — ✅ DONE (§70).** Implemented the proven sleep/wake protocol from
+  Linux (`set_current_state` + `smp_mb` then re-check; `try_to_wake_up`) and OpenBSD/NetBSD
+  (`sleep_setup`/`sleep_finish(do_sleep)`, the `slock` interlock "wakeup-before-sleep"
+  guarantee). Concretely:
+  - Thread `state` moved into its own atomic array (`STATE: [AtomicU8; N]`) — like Linux's
+    `task->__state` (`READ_ONCE`/`WRITE_ONCE`) and BSD's `p_stat` — so a waker on another CPU
+    and the sleeper never race/tear on it.
+  - Two-phase block: `prepare_block()` = set `Blocked` + `SeqCst` fence (Linux
+    `set_current_state`); the caller then **re-checks the condition**; `block_current()` sleeps
+    **only if still `Blocked`** (OpenBSD `sleep_finish`), so a wake landing in the gap isn't
+    lost — it either makes the condition true (caught by the re-check) or flips us `Ready`
+    (caught by `block_current`). `cancel_block()` backs out when the condition was already true.
+  - `wake()` is now a single atomic CAS `Blocked → Ready` (Linux `try_to_wake_up`'s state CAS),
+    idempotent and safe against concurrent wakers.
+  - Every wait site reordered to **publish-self → prepare_block → re-check → sleep**: IPC
+    send/recv/call (`ipc.rs`), notifications (`notif.rs`), channel send/recv + multi-wait
+    `sys_chan_wait`, and pipe read/write (added `unpark_*` so a non-sleeping waiter frees its
+    queue slot). For the call→reply rendezvous, `prepare_block` is set **before waking the
+    receiver** (it may reply from another CPU the instant it runs).
+  - Verified under `-smp 4`: login + fs commands + file reads (all IPC/channel/tty) pass with
+    no regression, no faults. Single-core behavior is identical (with IF=0 nothing runs in the
+    prepare→sleep gap, so the re-check is a no-op there).
+- **Still TODO before an AP actually runs the scheduler (Linux mechanism B / OpenBSD
+  `mi_switch` handoff):** a thread woken on CPU B must not be resumed there until it has fully
+  context-switched off CPU A — Linux spins on `p->on_cpu` (`smp_cond_load_acquire`),
+  `finish_task_switch` clears it with a release. Needs an `on_cpu` flag + the run-queue/scheduler
+  lock held across `switch_to` and released by the next thread. Not exercised yet (APs idle).
 - Audit every `spin::Mutex` user for **lock ordering** (define a global order, e.g.
   proc < cap-table < channel < endpoint < notif < frame-alloc) and never acquire out of
   order → deadlock freedom.

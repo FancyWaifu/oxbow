@@ -9,7 +9,7 @@
 //! code) — preemption only lands at ring-3 boundaries and `sti; hlt` idle points
 //! — so `CURRENT`/the TCB array are plain globals with no locking (D-T1).
 use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::arch::{
     context_switch, disable_interrupts, enable_interrupts, thread_trampoline, wait_for_interrupt,
@@ -58,12 +58,25 @@ fn fx_area_ptr(slot: usize) -> *mut u8 {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum State {
-    Free,
-    Ready,
-    Running,
-    Blocked,
-    Exited,
+    Free = 0,
+    Ready = 1,
+    Running = 2,
+    Blocked = 3,
+    Exited = 4,
+}
+impl State {
+    #[inline]
+    fn from_u8(v: u8) -> State {
+        match v {
+            0 => State::Free,
+            1 => State::Ready,
+            2 => State::Running,
+            3 => State::Blocked,
+            _ => State::Exited,
+        }
+    }
 }
 
 /// Sentinel for "no owning process" (kernel threads: idle, witness).
@@ -71,7 +84,6 @@ pub const NO_PROC: usize = usize::MAX;
 
 #[derive(Clone, Copy)]
 struct Tcb {
-    state: State,
     ctx_rsp: u64,    // saved stack pointer (the whole context lives on the stack)
     kstack_top: u64,
     proc: usize,     // owning process id, or NO_PROC for kernel threads
@@ -82,7 +94,6 @@ struct Tcb {
 }
 
 static mut TCBS: [Tcb; MAX_THREADS] = [Tcb {
-    state: State::Free,
     ctx_rsp: 0,
     kstack_top: 0,
     proc: NO_PROC,
@@ -90,16 +101,24 @@ static mut TCBS: [Tcb; MAX_THREADS] = [Tcb {
     wake_at: 0,
 }; MAX_THREADS];
 
+// §70 SMP lost-wakeup fix: the thread STATE lives in its own atomic array, NOT in
+// the (plain, struct-copied) Tcb. Making state atomic is what lets the sleep/wake
+// protocol below be correct across cores — a waker on another CPU stores Ready
+// while the sleeper loads its own state, with no torn reads or data race. This is
+// the same separation Linux (task->__state, READ_ONCE/WRITE_ONCE) and the BSDs
+// (p_stat under SCHED_LOCK) rely on. `State::Free` == 0, so the zero-init is Free.
+static STATE: [AtomicU8; MAX_THREADS] = [const { AtomicU8::new(State::Free as u8) }; MAX_THREADS];
+
 // §69 Phase 4: the running thread is PER-CPU — it lives in this CPU's PerCpu
 // (reached via the GS base), not a single global. `current()`/`set_running()`
 // funnel through `crate::percpu`. On one core this is identical to the old global.
 
 // --- TCB field accessors (all access to the static-mut pool funnels here) ---
 fn state(s: usize) -> State {
-    unsafe { (*addr_of!(TCBS[s])).state }
+    State::from_u8(STATE[s].load(Ordering::Acquire))
 }
 fn set_state(s: usize, st: State) {
-    unsafe { (*addr_of_mut!(TCBS[s])).state = st }
+    STATE[s].store(st as u8, Ordering::Release);
 }
 fn ctx_rsp(s: usize) -> u64 {
     unsafe { (*addr_of!(TCBS[s])).ctx_rsp }
@@ -179,9 +198,9 @@ fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64) -> usize {
         // slot + its static kstack are free for the next spawn.
         if matches!(state(slot), State::Free | State::Exited) {
             let (ctx_rsp, kstack_top) = init_stack(slot, entry, arg1, arg2);
+            set_state(slot, State::Ready); // publish as runnable (atomic)
             unsafe {
                 *addr_of_mut!(TCBS[slot]) = Tcb {
-                    state: State::Ready,
                     ctx_rsp,
                     kstack_top,
                     proc,
@@ -216,9 +235,9 @@ pub fn spawn_kernel(entry: extern "C" fn(u64), arg: u64) -> usize {
 pub fn register_running_idle(kstack_top: u64) -> usize {
     for slot in 1..MAX_THREADS {
         if state(slot) == State::Free {
+            set_state(slot, State::Running); // the AP is already running on this stack
             unsafe {
                 *addr_of_mut!(TCBS[slot]) = Tcb {
-                    state: State::Running,
                     ctx_rsp: 0,
                     kstack_top,
                     proc: NO_PROC,
@@ -299,28 +318,69 @@ pub fn kill_current_user() -> ! {
     exit_current();
 }
 
-/// Park the current thread until `wake(tid)`. The caller must already have
-/// published itself wherever its waker will look (an endpoint queue, a Reply).
-/// IF=0 + a single CPU make publish→Blocked→switch atomic, so no wakeup is lost.
-/// INVARIANT: never called while holding a spin lock (it switches away).
-pub fn block_current() {
+/// Phase 1 of going to sleep — the lost-wakeup fix (§70). Mark the current thread
+/// `Blocked` and emit a full barrier, BEFORE the caller does its final readiness
+/// re-check or anything that exposes it to a waker. This is exactly Linux's
+/// `set_current_state()` (a store + `smp_mb`) and OpenBSD's `sleep_setup()`: the
+/// store-load barrier orders our Blocked-store ahead of the condition-load, so it
+/// pairs with the waker (which stores the condition, then loads our state in
+/// `wake`). A waker on ANOTHER CPU therefore can't slip between our check and our
+/// sleep and be lost — it will see `Blocked` and flip us back to `Ready`.
+///
+/// USAGE (the canonical sleep loop, same shape as `wait_event` / `msleep`):
+/// ```ignore
+/// loop {
+///     publish_self_where_the_waker_looks();   // e.g. endpoint queue, notif waiter
+///     thread::prepare_block();                 // set Blocked + barrier
+///     if condition_ready() { thread::cancel_block(); consume(); break; }
+///     thread::block_current();                 // sleep ONLY if still Blocked
+/// }
+/// ```
+pub fn prepare_block() {
     set_state(current(), State::Blocked);
+    core::sync::atomic::fence(Ordering::SeqCst);
+}
+
+/// Undo `prepare_block` without sleeping — the condition came true between phase 1
+/// and now (OpenBSD `sleep_finish` with `do_sleep == 0`). Back to Running.
+pub fn cancel_block() {
+    set_state(current(), State::Running);
+}
+
+/// Phase 2 — actually sleep (OpenBSD `sleep_finish` / Linux `schedule`). Switch
+/// away ONLY if we are still `Blocked`: if a waker on another CPU already flipped
+/// us to `Ready` after `prepare_block`, we must NOT sleep (that wakeup would be
+/// lost) — we just return and the caller re-checks. The caller MUST have called
+/// `prepare_block()` first and dropped any interlock. Never holds a spin lock here.
+pub fn block_current() {
+    if state(current()) != State::Blocked {
+        // A wake raced in after prepare_block — already Ready; don't sleep.
+        set_state(current(), State::Running);
+        return;
+    }
     let next = pick_next().unwrap_or_else(|| crate::percpu::idle_tid());
     switch_to(next);
     // Woken: our waker has already deposited our result (and staging, in IPC).
 }
 
-/// Make a Blocked thread Ready. Does NOT switch — the waker keeps running.
+/// Make a Blocked thread Ready (OpenBSD `setrunnable` / Linux `try_to_wake_up`).
+/// Does NOT switch — the waker keeps running. The waker must have already made the
+/// condition true (deposited the result) BEFORE calling this, so the `Blocked`
+/// it observes is paired with a satisfied condition (the wake-side of the barrier
+/// in `prepare_block`). A single atomic CAS `Blocked → Ready` does the transition.
 ///
-/// Idempotent: waking a thread that is already Ready/Running is a no-op. This
-/// matters for multi-channel waits (sys_chan_wait): a thread parked on several
-/// channels can be drained+woken by one sender and then "woken" again by a second
-/// sender on another channel before it runs to deregister. The first wake makes it
-/// Ready; the rest are harmless.
+/// Idempotent and race-clean: if the thread is Running (hasn't blocked yet, or was
+/// already woken) the CAS fails and we no-op — but because the sleeper re-checks
+/// the condition after `prepare_block`, a wake that lands while it's still Running
+/// is caught by that re-check, not lost. Two wakers racing → one CAS wins. This is
+/// what lets multi-channel `sys_chan_wait` be woken by several senders safely.
 pub fn wake(tid: usize) {
-    if state(tid) == State::Blocked {
-        set_state(tid, State::Ready);
-    }
+    let _ = STATE[tid].compare_exchange(
+        State::Blocked as u8,
+        State::Ready as u8,
+        Ordering::AcqRel,
+        Ordering::Relaxed,
+    );
 }
 
 /// Arm a timer deadline (in ticks) for `tid`; the timer IRQ wakes it once
@@ -343,8 +403,8 @@ pub fn timed_out(tid: usize, now_tick: u64) -> bool {
 pub fn wake_expired(now_tick: u64) {
     for s in 1..MAX_THREADS {
         let d = unsafe { (*addr_of!(TCBS[s])).wake_at };
-        if d != 0 && now_tick >= d && state(s) == State::Blocked {
-            set_state(s, State::Ready);
+        if d != 0 && now_tick >= d {
+            wake(s); // atomic Blocked→Ready CAS (no-op if already runnable)
         }
     }
 }

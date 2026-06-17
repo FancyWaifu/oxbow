@@ -1209,7 +1209,14 @@ fn sys_pipe_read(h: u64, buf: u64, len: u64) -> SyscallRet {
     if want == 0 {
         return SyscallRet { rax: 0, rdx: 0 };
     }
+    let me = crate::thread::current();
     loop {
+        // §70 sleep protocol: publish on the read queue, commit to Blocked (+barrier),
+        // THEN check the buffer. A writer on another CPU that fills the pipe after our
+        // last look either is seen here (Data) or has already flipped us Ready (caught
+        // by block_current) — so its wakeup can't be lost.
+        crate::pipe::park_reader(idx, me);
+        crate::thread::prepare_block();
         let mut kbuf = [0u8; 1024];
         let mut wake = [0usize; 8];
         let (res, nwake) = crate::pipe::try_read(idx, &mut kbuf[..want], &mut wake);
@@ -1218,15 +1225,20 @@ fn sys_pipe_read(h: u64, buf: u64, len: u64) -> SyscallRet {
         }
         match res {
             crate::pipe::ReadOut::Data(n) => {
+                crate::thread::cancel_block();
+                crate::pipe::unpark_reader(idx, me);
                 if usermem::check_user(buf, n, true).is_err() {
                     return SyscallRet::err(SysError::Fault);
                 }
                 unsafe { core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf as *mut u8, n) };
                 return SyscallRet { rax: 0, rdx: n as u64 };
             }
-            crate::pipe::ReadOut::Eof => return SyscallRet { rax: 0, rdx: 0 },
+            crate::pipe::ReadOut::Eof => {
+                crate::thread::cancel_block();
+                crate::pipe::unpark_reader(idx, me);
+                return SyscallRet { rax: 0, rdx: 0 };
+            }
             crate::pipe::ReadOut::WouldBlock => {
-                crate::pipe::park_reader(idx, crate::thread::current());
                 crate::thread::block_current();
                 // resumed by a writer or by EOF — retry the read
             }
@@ -1248,6 +1260,7 @@ fn sys_pipe_write(h: u64, buf: u64, len: u64) -> SyscallRet {
     if usermem::check_user(buf, total, false).is_err() {
         return SyscallRet::err(SysError::Fault);
     }
+    let me = crate::thread::current();
     let mut done = 0usize;
     while done < total {
         let chunk = core::cmp::min(total - done, 1024);
@@ -1257,15 +1270,21 @@ fn sys_pipe_write(h: u64, buf: u64, len: u64) -> SyscallRet {
         };
         let mut off = 0usize;
         while off < chunk {
+            // §70: publish on the write queue, commit to Blocked, THEN try to write —
+            // so a reader on another CPU that frees space can't wake us between the
+            // check and the sleep.
+            crate::pipe::park_writer(idx, me);
+            crate::thread::prepare_block();
             let mut wake = [0usize; 8];
             let (n, nwake) = crate::pipe::try_write(idx, &kbuf[off..chunk], &mut wake);
             for &t in &wake[..nwake] {
                 crate::thread::wake(t);
             }
             if n == 0 {
-                crate::pipe::park_writer(idx, crate::thread::current());
                 crate::thread::block_current();
             } else {
+                crate::thread::cancel_block();
+                crate::pipe::unpark_writer(idx, me);
                 off += n;
             }
         }
@@ -1273,6 +1292,7 @@ fn sys_pipe_write(h: u64, buf: u64, len: u64) -> SyscallRet {
     }
     SyscallRet { rax: 0, rdx: done as u64 }
 }
+
 
 /// `sys_pipe_eof(pipe)` — mark the write side closed; pending/future reads drain
 /// then return EOF.
@@ -1346,6 +1366,7 @@ fn sys_channel_send(h: u64, buf: u64, len: u64, caps_ptr: u64, ncaps: u64) -> Sy
     if total > 0 && usermem::check_user(buf, total, false).is_err() {
         return SyscallRet::err(SysError::Fault);
     }
+    let me = crate::thread::current();
     let mut done = 0usize;
     let mut caps_left = ncaps;
     loop {
@@ -1360,6 +1381,10 @@ fn sys_channel_send(h: u64, buf: u64, len: u64, caps_ptr: u64, ncaps: u64) -> Sy
                 )
             };
         }
+        // §70: publish on the send queue + commit to Blocked BEFORE attempting the
+        // send, so a peer that drains space on another CPU can't wake us in the gap.
+        crate::channel::park_send(conn, side, me);
+        crate::thread::prepare_block();
         let mut wake = [0usize; 8];
         let (n, taken, nwake) =
             crate::channel::try_send(conn, side, &kbuf[..chunk], &caps[..caps_left], &mut wake);
@@ -1368,16 +1393,22 @@ fn sys_channel_send(h: u64, buf: u64, len: u64, caps_ptr: u64, ncaps: u64) -> Sy
         }
         // try_send returns 0,0 if the peer is gone -> EPIPE-ish (stop, report).
         if n == 0 && taken == 0 && chunk > 0 && !crate::channel::peer_open(conn, side) {
+            crate::thread::cancel_block();
+            crate::channel::unpark_send(conn, side, me);
             break;
         }
         done += n;
         caps_left -= taken;
         if done >= total && caps_left == 0 {
+            crate::thread::cancel_block();
+            crate::channel::unpark_send(conn, side, me);
             break;
         }
         if n == 0 && taken == 0 {
-            crate::channel::park_send(conn, side, crate::thread::current());
-            crate::thread::block_current();
+            crate::thread::block_current(); // still full — sleep if still Blocked
+        } else {
+            crate::thread::cancel_block(); // made progress — keep sending
+            crate::channel::unpark_send(conn, side, me);
         }
     }
     SyscallRet { rax: 0, rdx: done as u64 }
@@ -1395,7 +1426,13 @@ fn sys_channel_recv(h: u64, buf: u64, len: u64, caps_out: u64, packed: u64) -> S
     let ncaps_max = ((packed & 0xffff_ffff) as usize).min(8);
     let nonblock = (packed >> 32) & CHAN_NONBLOCK != 0;
     let want = (len as usize).min(1024);
+    let me = crate::thread::current();
     loop {
+        // §70: for a blocking recv, publish on the read queue + commit to Blocked
+        // BEFORE checking, so a sender on another CPU can't wake us in the gap. (A
+        // non-blocking recv never sleeps, but the dance is harmless and uniform.)
+        crate::channel::park_recv(conn, side, me);
+        crate::thread::prepare_block();
         let mut kbuf = [0u8; 1024];
         let mut ents = [HandleEntry { obj: ObjectRef::Console, rights: 0, badge: 0 }; 8];
         let mut wake = [0usize; 8];
@@ -1408,6 +1445,11 @@ fn sys_channel_recv(h: u64, buf: u64, len: u64, caps_out: u64, packed: u64) -> S
         );
         for &t in &wake[..nwake] {
             crate::thread::wake(t);
+        }
+        // Any exit that isn't the sleep path must undo prepare_block + unpark.
+        if !matches!(res, crate::channel::RecvOut::WouldBlock) {
+            crate::thread::cancel_block();
+            crate::channel::unpark_recv(conn, side, me);
         }
         match res {
             crate::channel::RecvOut::Data(n) => {
@@ -1435,10 +1477,12 @@ fn sys_channel_recv(h: u64, buf: u64, len: u64, caps_out: u64, packed: u64) -> S
             crate::channel::RecvOut::Eof => return SyscallRet { rax: 0, rdx: 0 },
             crate::channel::RecvOut::WouldBlock => {
                 if nonblock {
+                    // non-blocking: undo the block-intent we set above, deregister.
+                    crate::thread::cancel_block();
+                    crate::channel::unpark_recv(conn, side, me);
                     return SyscallRet::err(SysError::WouldBlock);
                 }
-                crate::channel::park_recv(conn, side, crate::thread::current());
-                crate::thread::block_current();
+                crate::thread::block_current(); // empty — sleep if still Blocked
             }
         }
     }
@@ -1507,20 +1551,28 @@ fn sys_chan_wait(handles_ptr: u64, count: u64, timeout_ms: u64) -> SyscallRet {
         SyscallRet { rax: 0, rdx: 0 }
     };
     loop {
+        // Publish ourselves on every channel FIRST, then commit to Blocked, then
+        // re-check readiness — the Linux `set_current_state` / OpenBSD `sleep_setup`
+        // order (§70). Setting Blocked (+barrier) before the readiness load means a
+        // sender on another CPU that deposits-then-`wake`s us after we last looked
+        // can't be lost: it either makes a channel `ready` (caught below) or flips
+        // us back to Ready (caught by `block_current`).
         for &(conn, side) in &chans[..nc] {
             crate::channel::park_recv(conn, side, me);
         }
+        crate::thread::prepare_block();
         let ready = chans[..nc]
             .iter()
             .any(|&(conn, side)| crate::channel::poll(conn, side) & 0b001 != 0);
         let expired = timeout_ms > 0 && crate::thread::timed_out(me, crate::arch::ticks());
         if ready || expired {
+            crate::thread::cancel_block(); // condition already true — don't sleep
             for &(conn, side) in &chans[..nc] {
                 crate::channel::unpark_recv(conn, side, me);
             }
             return finish(me);
         }
-        crate::thread::block_current(); // woken by a send OR the timer deadline
+        crate::thread::block_current(); // sleep if still Blocked; woken by send OR deadline
         for &(conn, side) in &chans[..nc] {
             crate::channel::unpark_recv(conn, side, me);
         }

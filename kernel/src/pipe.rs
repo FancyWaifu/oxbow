@@ -33,6 +33,14 @@ impl WaitQ {
         self.n = 0;
         n
     }
+    /// Remove `tid` if present (swap-remove). Used when a parked waiter leaves the
+    /// wait without sleeping (it found the condition true), so its slot is freed.
+    fn remove(&mut self, tid: usize) {
+        if let Some(pos) = self.q[..self.n].iter().position(|&t| t == tid) {
+            self.n -= 1;
+            self.q[pos] = self.q[self.n];
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -140,4 +148,14 @@ pub fn park_reader(idx: u8, tid: usize) {
 /// Park `tid` on the write queue (woken when a reader frees space).
 pub fn park_writer(idx: u8, tid: usize) {
     PIPES.lock()[idx as usize].writers.push(tid);
+}
+
+/// Remove `tid` from the read queue — it found data/EOF and isn't sleeping (§70).
+pub fn unpark_reader(idx: u8, tid: usize) {
+    PIPES.lock()[idx as usize].readers.remove(tid);
+}
+
+/// Remove `tid` from the write queue — it made progress and isn't sleeping (§70).
+pub fn unpark_writer(idx: u8, tid: usize) {
+    PIPES.lock()[idx as usize].writers.remove(tid);
 }

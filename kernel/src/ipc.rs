@@ -311,11 +311,17 @@ pub fn send_or_call(ep_idx: u8, msg: &MsgBuf, msg_uptr: u64, is_call: bool) -> (
             (*slot(r)).ret_rax = 0;
             (*slot(r)).ret_rdx = reply_h as u64;
         }
+        if is_call {
+            unsafe { (*slot(me)).msg_uptr = msg_uptr };
+            // §70: commit to Blocked BEFORE waking the receiver — it may run on
+            // another CPU and `sys_reply` (→ wake us) the instant it wakes. Setting
+            // Blocked+barrier first means that wake can't be lost.
+            thread::prepare_block();
+        }
         thread::wake(r);
 
         if is_call {
-            unsafe { (*slot(me)).msg_uptr = msg_uptr };
-            thread::block_current(); // wait for sys_reply
+            thread::block_current(); // sleep only if still Blocked; wait for sys_reply
             resume_epilogue(me)
         } else {
             (0, HANDLE_NULL as u64) // one-way send delivered
@@ -329,6 +335,8 @@ pub fn send_or_call(ep_idx: u8, msg: &MsgBuf, msg_uptr: u64, is_call: bool) -> (
             (*slot(me)).copy_out = false;
         }
         ep.send_q.push(me);
+        thread::prepare_block(); // §70: set Blocked under the ENDPOINTS interlock,
+                                 // before a receiver can take us off send_q and wake
         drop(eps);
         thread::block_current(); // woken by a receiver (send) or sys_reply (call)
         resume_epilogue(me)
@@ -400,6 +408,8 @@ pub fn recv(ep_idx: u8, msg_uptr: u64) -> (u64, u64) {
         }
         ep.recv_waiter = Some(me);
         unsafe { (*slot(me)).msg_uptr = msg_uptr };
+        thread::prepare_block(); // §70: set Blocked under the ENDPOINTS interlock,
+                                 // before a sender can deposit + wake us
         drop(eps);
         thread::block_current(); // woken by a sender depositing into our staging
         return resume_epilogue(me);
