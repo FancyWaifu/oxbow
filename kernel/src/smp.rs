@@ -96,40 +96,68 @@ extern "C" fn ap_main(index: usize) -> ! {
     crate::thread::run_idle();
 }
 
-/// Bring up exactly ONE Application Processor into the idle loop above. Called by
-/// the BSP from `kmain_stage2`, after it is fully on the kernel PML4 with its own
-/// LAPIC enabled (the AP reuses the LAPIC MMIO mapping). Bounded-spins until the
-/// AP reports in, then logs it. The BSP continues normally regardless.
-pub fn bring_up_one(mp: &MpResponse) {
-    // Publish the kernel PML4 the AP must switch onto.
+/// Bring up EVERY available Application Processor into the scheduler. Called by the
+/// BSP from `kmain_stage2`, after it is fully on the kernel PML4 with its own LAPIC
+/// enabled (each AP reuses the LAPIC MMIO mapping). APs are started one at a time —
+/// launch, bounded-spin until it reports online, then the next — which keeps bringup
+/// serialised (no two cores initialising at once) and bounds the per-AP risk. Each
+/// gets a sequential per-CPU index 1..N; the BSP is 0. Capped at `MAX_CPUS` (the size
+/// of the per-CPU stack/TSS/state pools); any extra cores stay parked by Limine.
+pub fn bring_up_all(mp: &MpResponse) {
+    // Publish the kernel PML4 every AP must switch onto.
     KERNEL_PML4.store(crate::arch::current_cr3(), Ordering::Release);
 
     let bsp = mp.bsp_lapic_id();
-    let Some(cpu) = mp.cpus().iter().copied().find(|c| c.lapic_id != bsp) else {
-        println!("[smp] no AP to bring up (uniprocessor)");
-        return;
-    };
-    let index = 1usize; // BSP holds per-CPU slot 0; the first AP takes slot 1.
+    let mut index = 1usize; // BSP holds per-CPU slot 0; APs take 1, 2, 3, ...
+    let mut online = 0usize;
+    let mut parked = 0usize;
 
-    // Stash the AP's index where ap_entry will read it, then launch. write() does a
-    // SeqCst store that publishes everything above it before the core jumps.
-    cpu.extra.store(index as u64, Ordering::Release);
-    cpu.goto_address.write(ap_entry);
-
-    // Wait (bounded) for the AP to finish its setup. A live second core completes
-    // this in microseconds; the cap just stops us hanging if bringup faults.
-    let mut spins: u64 = 0;
-    while !AP_ONLINE[index].load(Ordering::Acquire) {
-        core::hint::spin_loop();
-        spins += 1;
-        if spins > 500_000_000 {
-            println!("[smp] AP {} did not come online (timeout)", index);
-            return;
+    for cpu in mp.cpus().iter().copied() {
+        if cpu.lapic_id == bsp {
+            continue; // skip the BSP — it's already running this code
         }
+        if index >= MAX_CPUS {
+            parked += 1; // more cores than our per-CPU pools hold; leave parked
+            continue;
+        }
+
+        // Stash this AP's index where ap_entry reads it, then launch. write() does a
+        // SeqCst store that publishes everything above it before the core jumps.
+        cpu.extra.store(index as u64, Ordering::Release);
+        cpu.goto_address.write(ap_entry);
+
+        // Wait (bounded) for THIS AP to finish setup before launching the next, so
+        // bringup is serialised. A live core completes in microseconds; the cap just
+        // stops us hanging if one faults during bringup.
+        let mut spins: u64 = 0;
+        while !AP_ONLINE[index].load(Ordering::Acquire) {
+            core::hint::spin_loop();
+            spins += 1;
+            if spins > 500_000_000 {
+                break;
+            }
+        }
+        if AP_ONLINE[index].load(Ordering::Acquire) {
+            println!(
+                "[smp] AP {} online (lapic_id={}) — scheduling",
+                index,
+                AP_LAPIC_ID[index].load(Ordering::Acquire),
+            );
+            online += 1;
+        } else {
+            println!("[smp] AP {} did not come online (timeout)", index);
+        }
+        index += 1;
     }
-    println!(
-        "[smp] AP {} online (lapic_id={}) — parked in idle on its own core",
-        index,
-        AP_LAPIC_ID[index].load(Ordering::Acquire),
-    );
+
+    if online == 0 && parked == 0 {
+        println!("[smp] no AP to bring up (uniprocessor)");
+    } else {
+        println!(
+            "[smp] {} core(s) scheduling (BSP + {} AP(s)){}",
+            online + 1,
+            online,
+            if parked > 0 { " — extra cores parked (> MAX_CPUS)" } else { "" },
+        );
+    }
 }

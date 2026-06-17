@@ -255,11 +255,13 @@ fn kmain_stage2() -> ! {
     // IRQs still reach the CPU through the PIC's virtual-wire LINT0 (set up in 2a).
     arch::lapic::start_timer(arch::lapic::TIMER_VECTOR, 100);
 
-    // §69 Phase 3: bring up one Application Processor into an idle loop. Proves the
-    // kernel can launch and run code on a second core; the AP touches no shared
-    // mutable state and takes no interrupts until the Phase 5 locking work lands.
+    // §72/§74: bring up EVERY available Application Processor into the scheduler.
+    // Each AP runs the shared run queue under SCHED_LOCK, so user threads are
+    // load-balanced across all cores. Safe now that the lost-wakeup protocol (§70),
+    // the context-switch handoff (§71), per-CPU syscall stacks (§72), and the
+    // lock-ordering audit (§73) are all in place.
     if let Some(mp) = MP_REQUEST.get_response() {
-        smp::bring_up_one(mp);
+        smp::bring_up_all(mp);
     }
 
     // Seed the CSPRNG before any process loads — stack-base ASLR draws from it.

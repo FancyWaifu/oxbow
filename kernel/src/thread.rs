@@ -293,6 +293,18 @@ static SCHED_LOCK: AtomicBool = AtomicBool::new(false);
 /// One-shot: set the first time an AP context-switches to a user thread (§72 proof).
 static AP_RAN_USER: AtomicBool = AtomicBool::new(false);
 
+/// §74 — the `on_cpu` flag (Linux `task->on_cpu`): which CPU each TCB is currently
+/// running on, or -1 if none. Maintained in `switch_to` UNDER SCHED_LOCK (cleared
+/// for the outgoing thread, set for the incoming one). `pick_next` consults it so a
+/// thread that was woken (`Ready`) while STILL executing on its core — the window the
+/// §70 lost-wakeup fix opens between `prepare_block` and the actual context save — is
+/// NOT pickable by another core until it has truly switched off (which clears this
+/// under SCHED_LOCK, after `context_switch` saves its context). Without this, a core
+/// could resume a still-running thread from a stale saved context: the same thread on
+/// two cores at once.
+static RUNNING_ON: [core::sync::atomic::AtomicI8; MAX_THREADS] =
+    [const { core::sync::atomic::AtomicI8::new(-1) }; MAX_THREADS];
+
 fn sched_lock() {
     while SCHED_LOCK
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -323,7 +335,9 @@ fn pick_next() -> Option<usize> {
     let cur = current();
     for off in 1..MAX_THREADS {
         let s = (cur + off) % MAX_THREADS;
-        if state(s) == State::Ready {
+        // Ready AND fully off its previous core (§74 on_cpu): a thread woken while
+        // still running there isn't safe to resume here until its context is saved.
+        if state(s) == State::Ready && RUNNING_ON[s].load(Ordering::Acquire) == -1 {
             return Some(s);
         }
     }
@@ -338,6 +352,19 @@ fn switch_to(next: usize) {
     if prev == next {
         sched_unlock(); // nothing to switch to; release the lock the caller took
         return;
+    }
+    // §74 on_cpu maintenance (under SCHED_LOCK): prev leaves this CPU, next arrives.
+    // Clearing prev here — before `context_switch` saves its context — is safe because
+    // SCHED_LOCK is held across the whole switch, so no other core can `pick_next` prev
+    // until the lock is released (after the save). The `was != -1` check is a cheap
+    // invariant guard: it must never fire (that would be the same thread on two cores).
+    {
+        let cpu = crate::percpu::cpu_index() as i8;
+        RUNNING_ON[prev].store(-1, Ordering::Release);
+        let was = RUNNING_ON[next].swap(cpu, Ordering::AcqRel);
+        if was != -1 {
+            println!("[BUG] double-run: tcb {} was on cpu {}, now cpu {}", next, was, cpu);
+        }
     }
     set_state(next, State::Running);
     crate::percpu::set_current(next);
@@ -494,8 +521,15 @@ pub fn wake_expired(now_tick: u64) {
 /// Terminate the current thread and switch away forever.
 pub fn exit_current() -> ! {
     crate::notif::clear_waiter(current()); // defensive: never wake an Exited thread (drops POOL)
-    set_state(current(), State::Exited);
     sched_lock();
+    // §74: mark Exited UNDER SCHED_LOCK, not before it. Otherwise another core's
+    // `spawn()` (also under SCHED_LOCK) could see this slot Exited and `init_stack`
+    // a fresh frame onto our kernel stack WHILE we are still running `exit_current`
+    // on it — clobbering our return addresses (a #GP with a corrupt rip). Holding
+    // SCHED_LOCK across the Exited-store AND the switch means the slot only becomes
+    // reusable after `switch_to` has carried us off this stack (it releases the lock
+    // from the next thread), so the reuse can't race our last instructions here.
+    set_state(current(), State::Exited);
     let next = pick_next().unwrap_or_else(|| crate::percpu::idle_tid());
     switch_to(next); // never returns to us; the next thread releases SCHED_LOCK
     unreachable!("exited thread resumed");

@@ -215,6 +215,19 @@ be re-audited.
   invariant that lets oxbow use plain `spin::Mutex` everywhere without IRQ-safe variants.
 - ✅ The **"never hold a lock across `block_current`"** rule holds at every wait site (§70):
   each drops its interlock before `block_current` (which takes SCHED_LOCK alone).
+- **All cores + the `on_cpu` fix — ✅ DONE (§74).** `bring_up_all` now starts every available
+  AP (sequentially, capped at `MAX_CPUS`), so all cores schedule. Bringing up >1 AP exposed a
+  real double-run bug the single-AP config hid: the §70 lost-wakeup window leaves a thread
+  `Ready` while it's STILL executing toward `block_current` on its core (a waker CASed it `Ready`
+  before it saved its context), and another core's `pick_next` would resume it from a STALE saved
+  context — the same thread on two cores (caught a `#GP` with a corrupt rip + a direct double-run
+  detector). This is exactly Linux's `p->on_cpu` problem; the SCHED_LOCK handoff does NOT subsume
+  it because the wake is lock-free. **Fix:** a per-TCB `RUNNING_ON` (`on_cpu`) flag maintained in
+  `switch_to` under SCHED_LOCK; `pick_next` skips `Ready` threads still on a core, so a
+  woken-but-still-running thread isn't pickable until it has truly switched off (which clears the
+  flag under SCHED_LOCK, after the context save). Also fixed: `exit_current` now sets `Exited`
+  under SCHED_LOCK (was a separate stack-reuse race). Verified `-smp 4`: 35 s soak + repeated
+  spawn/exit churn + login/fs/pipes, no double-run, no fault.
 - Open (minor, non-blocking): `TCB.wake_at` is a plain `u64` read cross-core in `wake_expired`
   (benign torn-read on x86, but should be `AtomicU64` for strictness); per-CPU run queues +
   work-stealing if contention ever shows (today one global run queue under SCHED_LOCK is fine).
