@@ -115,6 +115,8 @@ struct window {
 	bool maximized;
 	bool fullscreen;
 	bool needs_update_buffer;
+	bool dirty; /* §63: new content drained from the tty but not yet rendered
+	             * (both shm buffers were busy); render when one is released. */
 };
 
 static const struct format shm_formats[] = {
@@ -454,6 +456,7 @@ handle_xdg_surface_configure(void *data, struct xdg_surface *surface,
 	xdg_surface_ack_configure(surface, serial);
 
 	if (window->wait_for_configure) {
+		window->dirty = true; /* §63: force the first paint so the window maps */
 		redraw(window, NULL, 0);
 		window->wait_for_configure = false;
 	}
@@ -486,6 +489,7 @@ handle_xdg_toplevel_configure(void *data, struct xdg_toplevel *xdg_toplevel,
 		}
 	}
 
+	int oldw = window->width, oldh = window->height;
 	if (width > 0 && height > 0) {
 		if (!window->fullscreen && !window->maximized) {
 			window->init_width = width;
@@ -498,7 +502,11 @@ handle_xdg_toplevel_configure(void *data, struct xdg_toplevel *xdg_toplevel,
 		window->height = window->init_height;
 	}
 
-	window->needs_update_buffer = true;
+	/* §63: only reallocate buffers when the size actually changed. Setting this
+	 * unconditionally grew the buffer list on every configure, and each fresh
+	 * buffer needs its own shm allocation — which exhausted the memory budget. */
+	if (window->width != oldw || window->height != oldh)
+		window->needs_update_buffer = true;
 }
 
 static void
@@ -865,59 +873,70 @@ render_grid(struct display *d, uint32_t *buf, int bw, int bh)
 	}
 }
 
+/* §53/§63: drain all pending shell output into the terminal model. Always safe to
+ * call (independent of buffer availability), so tty data is never lost even when we
+ * can't render this instant. Marks the window dirty if anything arrived. */
+static void
+feed_tty(struct window *window)
+{
+	if (g_tty_fd < 0 || !window->display->vt)
+		return;
+	char tbuf[1024];
+	long n;
+	while ((n = read(g_tty_fd, tbuf, sizeof tbuf)) > 0) {
+		/* ONLCR: the console stream uses bare '\n' for newlines (the serial
+		 * terminal cooks it); libvterm needs '\r\n' or the cursor staircases. */
+		char out[2100];
+		int  oi = 0;
+		for (long i = 0; i < n; i++) {
+			if (tbuf[i] == '\n')
+				out[oi++] = '\r';
+			out[oi++] = tbuf[i];
+		}
+		vterm_input_write(window->display->vt, out, (size_t)oi);
+		window->dirty = true;
+	}
+}
+
 static void
 redraw(void *data, struct wl_callback *callback, uint32_t time)
 {
 	struct window *window = data;
 	struct buffer *buffer;
 
-	prune_old_released_buffers(window);
+	(void)time;
+	if (callback)
+		wl_callback_destroy(callback);
 
+	/* Always drain the tty first so no shell output is dropped. */
+	feed_tty(window);
+	if (!window->dirty)
+		return; /* nothing new to show */
+
+	prune_old_released_buffers(window);
 	buffer = window_next_buffer(window);
 	if (!buffer) {
-		fprintf(stderr,
-			!callback ? "Failed to create the first buffer.\n" :
-			"Both buffers busy at redraw(). Server bug?\n");
-		abort();
+		/* §63: both shm buffers are still in flight. Do NOT abort (that killed
+		 * the terminal under fast output). Stay dirty and render later, when a
+		 * buffer-release event frees one — the main loop retries on dirty. */
+		return;
 	}
 
-	(void)time;
-	/* §53: drain any pending shell output and feed it to the terminal model
-	 * before rendering this frame. */
-	if (g_tty_fd >= 0 && window->display->vt) {
-		char tbuf[1024];
-		long n;
-		while ((n = read(g_tty_fd, tbuf, sizeof tbuf)) > 0) {
-			/* ONLCR: the console stream uses bare '\n' for newlines (the
-			 * serial terminal cooks it); libvterm needs '\r\n' or the
-			 * cursor staircases. Translate as we feed it. */
-			char out[2100];
-			int  oi = 0;
-			for (long i = 0; i < n; i++) {
-				if (tbuf[i] == '\n')
-					out[oi++] = '\r';
-				out[oi++] = tbuf[i];
-			}
-			vterm_input_write(window->display->vt, out, (size_t)oi);
-		}
-	}
 	render_grid(window->display, (uint32_t *)buffer->shm_data,
 		    window->width, window->height);
 
 	wl_surface_attach(window->surface, buffer->buffer, 0, 0);
 	wl_surface_damage(window->surface, 0, 0, window->width, window->height);
 
-	if (callback)
-		wl_callback_destroy(callback);
-
 	/* §63: a terminal is NOT an animation — it only changes when the shell writes
 	 * new output. So we DON'T re-arm a frame callback here (which would make the
 	 * client redraw + commit every compositor frame, busy-spinning at idle). The
-	 * main loop instead polls the tty fd and calls redraw() only when there is new
-	 * output to show. (frame_listener is now unused but kept for the type.) */
+	 * main loop polls the tty fd and renders only when there is new output.
+	 * (frame_listener is now unused but kept for the type.) */
 	(void)frame_listener;
 	wl_surface_commit(window->surface);
 	buffer->busy = 1;
+	window->dirty = false;
 }
 
 static const struct wl_callback_listener frame_listener = {
@@ -1173,8 +1192,10 @@ main(int argc, char **argv)
 	wl_surface_damage(window->surface, 0, 0,
 			  window->width, window->height);
 
-	if (!window->wait_for_configure)
+	if (!window->wait_for_configure) {
+		window->dirty = true; /* §63: force the first paint */
 		redraw(window, NULL, 0);
+	}
 
 	/* §63: event-driven main loop. Block on BOTH the Wayland fd (compositor events:
 	 * configure, buffer release, input) and the tty mirror fd (new shell output),
@@ -1184,8 +1205,6 @@ main(int argc, char **argv)
 	 * the tty fd without racing libwayland's internal read. */
 	int wfd = wl_display_get_fd(display->display);
 	while (running) {
-		while (wl_display_prepare_read(display->display) != 0)
-			wl_display_dispatch_pending(display->display);
 		wl_display_flush(display->display);
 
 		struct pollfd pfd[2];
@@ -1197,15 +1216,21 @@ main(int argc, char **argv)
 		}
 		poll(pfd, npfd, -1); /* blocks (libc poll sleeps on the channel fds) */
 
-		if (pfd[0].revents & POLLIN)
-			wl_display_read_events(display->display);
-		else
-			wl_display_cancel_read(display->display);
-		if (wl_display_dispatch_pending(display->display) == -1)
-			break;
+		/* Wayland events ready → dispatch them (may release shm buffers). We only
+		 * call wl_display_dispatch when the fd is readable, so its internal poll
+		 * returns immediately and never blocks (which would ignore the tty fd). */
+		if (pfd[0].revents & POLLIN) {
+			if (wl_display_dispatch(display->display) == -1)
+				break;
+		}
 
-		/* New shell output → render exactly one frame (redraw drains all of it). */
+		/* New shell output → drain it and render. */
 		if (npfd == 2 && (pfd[1].revents & POLLIN))
+			redraw(window, NULL, 0);
+
+		/* §63: a render was deferred because both buffers were busy; a buffer may
+		 * have just been released above, so retry it now. */
+		if (window->dirty)
 			redraw(window, NULL, 0);
 	}
 	(void)ret;

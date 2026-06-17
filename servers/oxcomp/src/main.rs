@@ -75,7 +75,8 @@ pub extern "C" fn oxbow_main() -> ! {
     // we can tell when it dies).
     let exit = rt::sys_notif_create().unwrap_or(HANDLE_NULL);
     let mut m = MsgBuf::new(0);
-    m.data[0] = 24 * 1024 * 1024; // child Memory budget (FreeType + vterm + font)
+    m.data[0] = 36 * 1024 * 1024; // child Memory budget (FreeType + vterm + font +
+                                  // TWO 1.15 MB shm buffers for double-buffering; §63)
     m.data_len = 3; // data[1]/data[2] = empty argv
     m.handle_count = 4;
     m.handles[0] = cli_end; // -> child slot 1 (the Wayland socket)
