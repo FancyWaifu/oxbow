@@ -65,6 +65,7 @@ fn main() {
         .include("../oxwl/wl-include")
         .include("../oxffi/ffi-include")
         .include("../oxxkb/xkb/include") // xkbcommon.h for the client (§48)
+        .include("../oxui/include") // oxui.h (§64 toolkit)
         .include("../../libc/include")
         .include("../oxwl")
         .define("HAVE_CONFIG_H", None)
@@ -95,6 +96,7 @@ fn main() {
     ] {
         b.file(f);
     }
+    b.file("../oxui/oxui.c"); // §64: the UI toolkit boilerplate
     b.file("src/simple-shm.c");
     b.compile("wlclient");
 }

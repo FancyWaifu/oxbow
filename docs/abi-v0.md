@@ -2272,3 +2272,33 @@ nothing animating — the busy-poll is simply gone), and the rings demo's animat
 rate went **38 → 40 fps** while no longer starving input. A continuously-animating client
 (the rings demo) still uses a full core to *render* — that is real work, not a spin, and is
 where multicore (SMP) or frame-rate throttling would help next.
+
+## 64. oxui — a UI toolkit so apps don't reimplement rendering (v1-oxui)
+
+Every GUI client (oxterm, the rings demo) hand-rolled ~1000 lines of identical Wayland
+boilerplate: connect to the compositor, bind globals, create the surface + xdg_toplevel,
+manage a two-buffer shm pool with release tracking, run the prepare/poll/dispatch loop,
+compile the xkb keymap, handle the close box — and each copy re-introduced the same bugs
+(the §63 double-buffer abort, the budget exhaustion, the busy-poll). `oxui` extracts all of
+it into one client library so a program just asks for a window and paints pixels.
+
+API (`servers/oxui/include/oxui.h`):
+- `oxui_window_create(title, w, h)` — connect (inherited fd, slot 1), bind globals, make
+  the surface + xdg_toplevel, allocate the buffer slots.
+- `oxui_run(win, handlers, user)` — the event loop. Blocks in the kernel (no busy-poll,
+  §63) on the Wayland fd plus an optional app fd (`extra_fd`, e.g. a terminal's tty), and
+  calls back: `draw(canvas)` to paint XRGB8888 pixels, `key(keysym, pressed)` (xkb decoded),
+  `closed()`, `fd_ready()`.
+- `oxui_request_redraw()` — mark dirty (event-driven apps). `handlers.animate` — repaint
+  every frame via frame-callback pacing (continuous animation, e.g. the rings).
+- `oxui_quit()`, `oxui_window_destroy()`.
+
+The library owns the §63-correct buffer pool: reuse a released buffer when possible, create
+shm lazily, and on "both buffers busy" **defer** the paint (stay dirty, retry on release)
+instead of aborting. So the fixes are library invariants, not per-app footguns.
+
+Proof: the rings demo (`servers/wlclient/src/simple-shm.c`) was rewritten on oxui and went
+from ~1042 lines to ~64 (just `paint_rings` + four lines of `main`); it renders and animates
+identically. Build: `oxui.c` is compiled into each client by its build.rs (same C-port
+harness, sharing the Wayland/xkb config.h). Next: port oxterm onto oxui (its vterm + tty fd
++ FreeType become the app; all window/buffer/loop plumbing drops to the library).
