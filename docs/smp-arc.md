@@ -226,8 +226,17 @@ be re-audited.
   `switch_to` under SCHED_LOCK; `pick_next` skips `Ready` threads still on a core, so a
   woken-but-still-running thread isn't pickable until it has truly switched off (which clears the
   flag under SCHED_LOCK, after the context save). Also fixed: `exit_current` now sets `Exited`
-  under SCHED_LOCK (was a separate stack-reuse race). Verified `-smp 4`: 35 s soak + repeated
-  spawn/exit churn + login/fs/pipes, no double-run, no fault.
+  under SCHED_LOCK (was a separate stack-reuse race).
+- **⚠️ OPEN BUG — multi-AP hang; capped to 1 AP for now.** The `on_cpu` + exit fixes made the
+  desktop reliable at **1 AP / 2 cores** (verified 6/6), but at **≥3 cores** (2+ APs) heavy
+  boot-time concurrency still hits a residual hang: one core spins on a lock while another is stuck
+  in the page-fault handler (kernel state corrupted) — the desktop never composites (the user's
+  "stuck on the gradient"). So `bring_up_all` is capped at `MAX_APS_TO_START = 1` in `smp.rs` until
+  this is root-caused; `-smp 4` still works, the extra cores just stay parked. (Separately,
+  `[fsd] FATAL: could not mount ext2` is a PRE-EXISTING flaky virtio-blk/ext2 issue — it occurs at
+  `-smp 1` and as far back as §71, does NOT block the desktop, and is unrelated to the SMP work.)
+  Next debugging step: the multi-AP corruption is likely another scheduler/IPC race the 4-core
+  window widens; reproduce with a fault-detail dump (cr2/rip) under `-smp 4` with the cap lifted.
 - Open (minor, non-blocking): `TCB.wake_at` is a plain `u64` read cross-core in `wake_expired`
   (benign torn-read on x86, but should be `AtomicU64` for strictness); per-CPU run queues +
   work-stealing if contention ever shows (today one global run queue under SCHED_LOCK is fine).

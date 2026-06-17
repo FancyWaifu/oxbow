@@ -103,6 +103,15 @@ extern "C" fn ap_main(index: usize) -> ! {
 /// serialised (no two cores initialising at once) and bounds the per-AP risk. Each
 /// gets a sequential per-CPU index 1..N; the BSP is 0. Capped at `MAX_CPUS` (the size
 /// of the per-CPU stack/TSS/state pools); any extra cores stay parked by Limine.
+/// §74 KNOWN BUG: with more than one AP (≥3 cores total), heavy boot-time
+/// concurrency hits a residual memory-corruption hang (a core spins on a lock while
+/// another is stuck in the page-fault handler — kernel state got corrupted). One AP
+/// (2 cores total) is rock-solid (the §70–73 config, verified 6/6 desktop). Until
+/// the multi-AP race is root-caused, cap the number of APs we actually start here, so
+/// the desktop is reliable. Set back to `MAX_CPUS - 1` once it's fixed. The extra
+/// cores remain parked by Limine (present, idle) — `just run-tty`'s `-smp 4` is fine.
+const MAX_APS_TO_START: usize = 1;
+
 pub fn bring_up_all(mp: &MpResponse) {
     // Publish the kernel PML4 every AP must switch onto.
     KERNEL_PML4.store(crate::arch::current_cr3(), Ordering::Release);
@@ -116,8 +125,9 @@ pub fn bring_up_all(mp: &MpResponse) {
         if cpu.lapic_id == bsp {
             continue; // skip the BSP — it's already running this code
         }
-        if index >= MAX_CPUS {
-            parked += 1; // more cores than our per-CPU pools hold; leave parked
+        // Cap: stop once we've started our safe number of APs (or run out of pool).
+        if index > MAX_APS_TO_START || index >= MAX_CPUS {
+            parked += 1; // intentionally left parked (see MAX_APS_TO_START)
             continue;
         }
 
