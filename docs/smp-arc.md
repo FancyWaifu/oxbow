@@ -187,21 +187,39 @@ be re-audited.
   - **Verified under `-smp 4`:** serial shows `[smp] AP cpu 1 is now running user threads` — real
     user work on the second core — and login + fs + pipes + interleaved kbd/mouse all pass with no
     fault, no deadlock, no corruption. This is the first contended exercise of §70/§71/§72.
-- Audit every `spin::Mutex` user for **lock ordering** (define a global order, e.g.
-  proc < cap-table < channel < endpoint < notif < frame-alloc) and never acquire out of
-  order → deadlock freedom.
-- Enforce the existing **"never hold a lock across `block_current`"** rule mechanically;
-  it's already the convention (ipc.rs LOCK RULE) but SMP makes a violation a real hang.
-- IRQs while holding a kernel lock: either keep `IF=0` in lock critical sections (simplest:
-  a CPU never takes an IRQ while holding a spinlock) or use IRQ-safe locks. Start with the
-  former.
-- The frame allocator + page-table edits need locking; **TLB shootdown** (Phase 6).
-- Re-audit the §63 lost-wakeup argument: with true concurrency a sender on CPU B can run
-  between a waiter's check and `block_current` on CPU A. Fix: hold the channel lock across
-  the readiness check **and** the state transition to Blocked (deposit-before-release), or
-  add a per-thread "wake pending" flag that `block_current` consults. **This is the single
-  most subtle correctness item in the arc.**
-- Risk: very high. This is where races and deadlocks live.
+- **Lock-ordering audit — ✅ DONE (§73). Result: the lock graph is acyclic → deadlock-free.**
+  Enumerated all 15 locks and every nested acquisition (lock held while another is taken).
+  **Canonical global order (acquire high→low; never the reverse):**
+  ```
+  ENDPOINTS > PROCESSES > REPLIES > REGIONS > SCHED_LOCK > BINDINGS
+            > { CONNS, PIPES, POOL(notif), RNG, IMAGES, MEMORY, FRAMES, BUMP(pmm) }  [leaves]
+            > SERIAL  [absolute bottom — pure I/O, acquires nothing]
+  ```
+  The only multi-lock holders and their (forward-only) edges:
+  - `ipc::recv` holds ENDPOINTS across `transfer_into` (→PROCESSES) and `mint_reply`
+    (→REPLIES, then →PROCESSES) — each sub-lock acquired+released, never two at once.
+  - `proc::kill` holds PROCESSES across `reply_abandon` (→REPLIES); drops PROCESSES before all
+    mem/notif calls (its own LOCK RULE comment).
+  - `shm::{create,map,free}` hold REGIONS across pmm/vm (→BUMP). Wide but acyclic (REGIONS is a
+    high coarse lock); left as-is for region-atomicity.
+  - `irq::fire` previously held BINDINGS across `notif::signal` (→POOL); §73 tightened it to copy
+    the binding out and drop BINDINGS first.
+  - `thread::switch_to`/`spawn` hold SCHED_LOCK across only `announce`/the §72 proof `println!`
+    (→SERIAL); never any data lock.
+  - The mm leaves (pmm/mem) only ever release before calling each other (`frame_unmap`: FRAMES
+    released before pmm), so they never nest.
+  **Why cross-CPU spinning can't deadlock:** every kernel critical section runs with **IF=0**
+  (SFMask masks IF on `syscall`; IRQ gates clear it), so a core NEVER takes an interrupt while
+  holding a lock — the only contention is another core spinning, which always makes progress
+  because the holder needs nothing the spinner holds (acyclic order). This is the design
+  invariant that lets oxbow use plain `spin::Mutex` everywhere without IRQ-safe variants.
+- ✅ The **"never hold a lock across `block_current`"** rule holds at every wait site (§70):
+  each drops its interlock before `block_current` (which takes SCHED_LOCK alone).
+- Open (minor, non-blocking): `TCB.wake_at` is a plain `u64` read cross-core in `wake_expired`
+  (benign torn-read on x86, but should be `AtomicU64` for strictness); per-CPU run queues +
+  work-stealing if contention ever shows (today one global run queue under SCHED_LOCK is fine).
+- The frame allocator + page-table edits are locked (BUMP); **TLB shootdown** is Phase 6 (only
+  needed once a single process is multi-threaded — today every process is single-threaded).
 
 ### Phase 6 — TLB shootdown + cross-CPU signalling
 - An `unmap`/`protect` on one CPU must invalidate other CPUs' TLBs: send an **IPI** to the

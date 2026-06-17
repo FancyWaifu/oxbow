@@ -36,7 +36,12 @@ pub fn is_bound(line: u8) -> bool {
 /// Called from the IRQ handler (IF=0): signal the bound notification (wake-only,
 /// no block, no switch). The handler has already masked + EOI'd the line.
 pub fn fire(line: u8) {
-    if let Some(idx) = BINDINGS.lock()[line as usize] {
+    // Copy the binding OUT and drop BINDINGS before signalling (§73 lock-order
+    // hygiene): `signal` takes notif POOL, so holding BINDINGS across it would nest
+    // BINDINGS > POOL. It's acyclic, but there's no reason to widen the scope — the
+    // binding is a single byte.
+    let bound = BINDINGS.lock()[line as usize];
+    if let Some(idx) = bound {
         crate::notif::signal(idx);
     }
 }

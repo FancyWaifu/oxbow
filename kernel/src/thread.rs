@@ -280,6 +280,14 @@ pub fn register_running_idle(kstack_top: u64) -> usize {
 // wait sites drop their interlock before `block_current`), and always released
 // before the CPU returns to IF=1 — so the timer IRQ can never fire while a CPU
 // holds it, and there is no lock-order cycle.
+// CANONICAL KERNEL LOCK ORDER (§73 audit — acquire high→low, NEVER the reverse):
+//   ENDPOINTS > PROCESSES > REPLIES > REGIONS > SCHED_LOCK > BINDINGS
+//             > { CONNS, PIPES, POOL, RNG, IMAGES, MEMORY, FRAMES, BUMP }  (leaves)
+//             > SERIAL  (bottom — pure I/O, acquires nothing).
+// The graph is acyclic, so cross-CPU spinning never deadlocks. The deeper reason:
+// every kernel critical section runs IF=0 (SFMask on syscall; IRQ gates), so a core
+// never takes an IRQ while holding a lock — only OTHER cores spin, and they always
+// progress. See docs/smp-arc.md "Lock-ordering audit" for the full edge list.
 static SCHED_LOCK: AtomicBool = AtomicBool::new(false);
 
 /// One-shot: set the first time an AP context-switches to a user thread (§72 proof).
