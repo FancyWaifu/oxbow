@@ -69,16 +69,28 @@ be re-audited.
 - Risk: medium. Getting IOAPIC redirection + EOI right; keep the PIT path until the LAPIC
   timer is proven, then retire it.
 
-### Phase 3 — AP trampoline + bringup
-- Place a 16-bit **trampoline** at a low physical page: real mode → enable protected → load
-  our existing GDT/page tables → long mode → jump to a Rust `ap_main`. (Mirror Limine's own
-  SMP handoff if we use Limine's SMP request — Limine can start APs for us and hand each a
-  stack + entry, which removes most of the hand-written trampoline. **Recommended:** use the
-  Limine SMP feature first; hand-roll INIT-SIPI-SIPI only if we outgrow it.)
-- Each AP: load IDT, enable its LAPIC + LAPIC timer, set up per-CPU state (Phase 4), then
-  enter the scheduler idle loop.
-- Deliverable: all N cores reach `ap_main` and idle; boot log "AP k online".
-- Risk: high. Trampoline/paging bugs triple-fault silently. Bring up **one** AP first.
+### Phase 3 — AP bringup → idle — ✅ DONE (§69, one AP)
+- Used the **Limine MP feature** (no hand-rolled trampoline / INIT-SIPI-SIPI): Limine already
+  started + parked every AP, so bringup is just `cpu.goto_address.write(ap_entry)`. New
+  `kernel/src/smp.rs`.
+- Limine jumps the AP to `ap_entry` on the **bootloader's page tables + a temporary stack**, so
+  `ap_entry` reads the few values it needs (its index from `cpu.extra`, its stack, the kernel
+  PML4) and then **in one asm block** switches RSP onto a dedicated per-CPU `.bss` stack and CR3
+  onto the kernel PML4, then tail-calls `ap_main` — mirroring the BSP's `switch_address_space`.
+  Both the new stack (HHDM) and kernel `.text` are mapped under both page tables, so the switch
+  is seamless.
+- `ap_main`: load the shared GDT/IDT + reload segments (NO `ltr` — one shared TSS, single busy
+  owner; `gdt::load_ap`), claim per-CPU state via `percpu::init(index)` (its own GS base),
+  `lapic::enable()` (reuses the BSP's LAPIC MMIO mapping), publish `AP_ONLINE`, then **`hlt`
+  forever with IF=0**. The BSP bounded-spins on `AP_ONLINE` and logs "AP k online" (the AP never
+  touches the console — not lock-safe yet).
+- **Deliberately minimal & safe:** the AP runs NO scheduler/IPC/allocator code and takes NO
+  interrupts (its LAPIC timer is left unstarted; device IRQs route to the BSP). It shares no
+  mutable state with the BSP, so no locking is needed yet — that's Phase 5.
+- **Verified** under `-smp 4`: serial shows `[smp] AP 1 online (lapic_id=1) — parked in idle on
+  its own core`, and the BSP boots through to a working shell (login + ls + interleaved
+  kbd/mouse all pass) — the spin-wait doesn't stall the BSP.
+- TODO (Phase 5): per-CPU idle thread + TSS, then let the AP actually run the scheduler.
 
 ### Phase 4 — Per-CPU state — STARTED (§69)
 - **`CURRENT` (running tid) → per-CPU — ✅ DONE.** New `kernel/src/percpu.rs`: a `PerCpu`

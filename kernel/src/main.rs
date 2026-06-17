@@ -23,6 +23,7 @@ mod pipe;
 mod proc;
 mod shm;
 mod rng;
+mod smp;
 mod syscall;
 mod thread;
 mod usermem;
@@ -253,6 +254,13 @@ fn kmain_stage2() -> ! {
     // channel 2), NOT the legacy PIT IRQ0 — IRQ0 stays masked. Keyboard/mouse/serial
     // IRQs still reach the CPU through the PIC's virtual-wire LINT0 (set up in 2a).
     arch::lapic::start_timer(arch::lapic::TIMER_VECTOR, 100);
+
+    // §69 Phase 3: bring up one Application Processor into an idle loop. Proves the
+    // kernel can launch and run code on a second core; the AP touches no shared
+    // mutable state and takes no interrupts until the Phase 5 locking work lands.
+    if let Some(mp) = MP_REQUEST.get_response() {
+        smp::bring_up_one(mp);
+    }
 
     // Seed the CSPRNG before any process loads — stack-base ASLR draws from it.
     rng::init();

@@ -101,6 +101,16 @@ pub fn init() {
     pic::mask_all();
 }
 
+/// Load the (already-initialised) IDT on an Application Processor (§69 SMP Phase
+/// 3). The IDT is shared — every CPU uses the same handler table; an AP only needs
+/// to point its IDTR at it.
+pub fn load_ap() {
+    unsafe {
+        let idt_ref: &'static InterruptDescriptorTable = &*addr_of!(IDT);
+        idt_ref.load();
+    }
+}
+
 /// Count of times the timer has preempted ring 3 (user), for the Phase-5
 /// checkpoint message.
 

@@ -96,6 +96,14 @@ pub fn set_kernel_stack(top: u64) {
     syscall::set_kernel_stack_top(top);
 }
 
+/// Load the shared GDT + IDT on an Application Processor and reload its segment
+/// registers (§69 SMP Phase 3). The BSP built both in `init`; an AP just points
+/// its GDTR/IDTR at them. The TSS is intentionally not loaded — see `gdt::load_ap`.
+pub fn load_descriptor_tables_ap() {
+    gdt::load_ap();
+    idt::load_ap();
+}
+
 /// Physical address of the live PML4 (CR3).
 pub fn current_cr3() -> u64 {
     use x86_64::registers::control::Cr3;

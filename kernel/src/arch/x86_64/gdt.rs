@@ -92,6 +92,25 @@ pub fn selectors() -> Selectors {
     unsafe { (*addr_of!(SELECTORS)).expect("gdt::init must run before selectors()") }
 }
 
+/// Load the (already-built) GDT and reload segment registers on an Application
+/// Processor (§69 SMP Phase 3). The BSP built the GDT in `init`; an AP just points
+/// its GDTR at the same table. We deliberately do NOT `ltr` the TSS: `ltr` sets the
+/// busy bit in the TSS descriptor, so a single shared TSS can only be loaded on one
+/// CPU. A minimal idle AP never enters ring 3, so it consults neither RSP0 nor the
+/// IST and needs no TSS of its own (a per-AP TSS arrives with Phase 5 scheduling).
+pub fn load_ap() {
+    unsafe {
+        let sel = selectors();
+        let gdt_ref: &'static GlobalDescriptorTable = &*addr_of!(GDT);
+        gdt_ref.load();
+        use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
+        CS::set_reg(sel.kernel_code);
+        DS::set_reg(sel.kernel_data);
+        ES::set_reg(sel.kernel_data);
+        SS::set_reg(sel.kernel_data);
+    }
+}
+
 /// Repoint TSS.RSP0 (the stack the CPU loads on a ring-3 → ring-0 exception).
 /// Phase 4 moves this off the boot thread's KERNEL_STACK onto the dedicated
 /// syscall entry stack. Safe after `ltr`: the CPU reads RSP0 from the in-memory
