@@ -56,6 +56,10 @@ pub extern "C" fn context_switch(prev_rsp_slot: *mut u64, next_rsp: u64) {
 #[unsafe(naked)]
 pub extern "C" fn thread_trampoline() {
     naked_asm!(
+        // §71: this fresh thread was switched-to with SCHED_LOCK held; release it
+        // here (the trampoline's finish_task_switch). The entry fn + args are in
+        // callee-saved r12/r13/r14, which survive the call.
+        "call {sched_unlock}",
         "mov rdi, r13", // arg1 -> first C argument
         "mov rsi, r14", // arg2 -> second C argument
         "call r12",     // entry(arg1, arg2)
@@ -63,5 +67,6 @@ pub extern "C" fn thread_trampoline() {
         "cli",
         "hlt",
         "jmp 2b",
+        sched_unlock = sym crate::thread::sched_unlock_c,
     );
 }

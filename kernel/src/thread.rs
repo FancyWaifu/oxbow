@@ -251,8 +251,50 @@ pub fn register_running_idle(kstack_top: u64) -> usize {
     panic!("thread: out of TCB slots (ap idle)");
 }
 
+// --- The scheduler lock (§71 SMP mechanism B) -------------------------------
+// A single global spinlock serializing ALL run-queue decisions and the context
+// switch itself — OpenBSD's `SCHED_LOCK` model (simpler than Linux's per-CPU rq
+// locks + `p->on_cpu` spin, and a better fit for this minimal kernel). The lock is
+// held ACROSS `context_switch` and released by whatever thread *resumes* (its own
+// `switch_to` tail, or `thread_trampoline` for a freshly spawned thread) — exactly
+// Linux's `finish_task_switch` / OpenBSD's "the new thread drops SCHED_LOCK"
+// handoff. Because it spans the switch, no other CPU can `pick_next` a thread until
+// that thread's context is fully saved — so a woken thread is never resumed on two
+// cores at once. It is a raw lock (not an RAII guard): acquire and release happen
+// in different stack frames / different threads, so a guard can't model it.
+//
+// Discipline: only ever taken alone (never while holding a per-structure lock; the
+// wait sites drop their interlock before `block_current`), and always released
+// before the CPU returns to IF=1 — so the timer IRQ can never fire while a CPU
+// holds it, and there is no lock-order cycle.
+static SCHED_LOCK: AtomicBool = AtomicBool::new(false);
+
+fn sched_lock() {
+    while SCHED_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        while SCHED_LOCK.load(Ordering::Relaxed) {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+fn sched_unlock() {
+    SCHED_LOCK.store(false, Ordering::Release);
+}
+
+/// Drop `SCHED_LOCK` from the new-thread trampoline (C ABI, called from asm). A
+/// freshly spawned thread is switched-to with the lock held but does NOT resume
+/// inside `switch_to`, so it must release the lock here instead — the trampoline's
+/// equivalent of `finish_task_switch`.
+pub extern "C" fn sched_unlock_c() {
+    sched_unlock();
+}
+
 /// Round-robin scan for the next Ready thread after CURRENT (never returns
 /// CURRENT, never returns the idle thread unless it's explicitly Ready).
+/// MUST be called with `SCHED_LOCK` held.
 fn pick_next() -> Option<usize> {
     let cur = current();
     for off in 1..MAX_THREADS {
@@ -264,11 +306,13 @@ fn pick_next() -> Option<usize> {
     None
 }
 
-/// Save the current context and resume `next`. Caller sets the outgoing
-/// thread's state first (Ready/Exited).
+/// Save the current context and resume `next`. Caller sets the outgoing thread's
+/// state first (Ready/Exited) and MUST hold `SCHED_LOCK`; this function releases it
+/// (after the switch, in the resumed thread — or immediately if there is no switch).
 fn switch_to(next: usize) {
     let prev = current();
     if prev == next {
+        sched_unlock(); // nothing to switch to; release the lock the caller took
         return;
     }
     set_state(next, State::Running);
@@ -295,18 +339,23 @@ fn switch_to(next: usize) {
         crate::arch::fxrstor(fx_area_ptr(next));
     }
     context_switch(ctx_slot(prev), ctx_rsp(next));
+    // We (prev) have just been RESUMED by some future `switch_to(prev)` on some CPU,
+    // which handed us `SCHED_LOCK`. Release it — the finish_task_switch handoff. (A
+    // freshly spawned thread never reaches here; it releases in thread_trampoline.)
+    sched_unlock();
 }
 
 /// Cooperatively yield to the next Ready thread (no-op if none). Unused in this
 /// arc (preemption replaced it) but kept as a scheduler primitive.
 #[allow(dead_code)]
 pub fn yield_now() {
+    sched_lock();
     match pick_next() {
         Some(n) => {
             set_state(current(), State::Ready);
-            switch_to(n);
+            switch_to(n); // releases SCHED_LOCK
         }
-        None => {}
+        None => sched_unlock(),
     }
 }
 
@@ -353,13 +402,15 @@ pub fn cancel_block() {
 /// lost) — we just return and the caller re-checks. The caller MUST have called
 /// `prepare_block()` first and dropped any interlock. Never holds a spin lock here.
 pub fn block_current() {
+    sched_lock();
     if state(current()) != State::Blocked {
         // A wake raced in after prepare_block — already Ready; don't sleep.
         set_state(current(), State::Running);
+        sched_unlock();
         return;
     }
     let next = pick_next().unwrap_or_else(|| crate::percpu::idle_tid());
-    switch_to(next);
+    switch_to(next); // releases SCHED_LOCK (in the resumed thread)
     // Woken: our waker has already deposited our result (and staging, in IPC).
 }
 
@@ -411,10 +462,11 @@ pub fn wake_expired(now_tick: u64) {
 
 /// Terminate the current thread and switch away forever.
 pub fn exit_current() -> ! {
-    crate::notif::clear_waiter(current()); // defensive: never wake an Exited thread
+    crate::notif::clear_waiter(current()); // defensive: never wake an Exited thread (drops POOL)
     set_state(current(), State::Exited);
+    sched_lock();
     let next = pick_next().unwrap_or_else(|| crate::percpu::idle_tid());
-    switch_to(next);
+    switch_to(next); // never returns to us; the next thread releases SCHED_LOCK
     unreachable!("exited thread resumed");
 }
 
@@ -422,11 +474,14 @@ pub fn exit_current() -> ! {
 /// if none, keep running the current one. The preempted thread resumes through
 /// the handler tail's `iretq`, back where it was interrupted.
 pub fn preempt() {
+    sched_lock();
     if let Some(n) = pick_next() {
         if current() != crate::percpu::idle_tid() {
             set_state(current(), State::Ready);
         }
-        switch_to(n);
+        switch_to(n); // releases SCHED_LOCK
+    } else {
+        sched_unlock();
     }
 }
 

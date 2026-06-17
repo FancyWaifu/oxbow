@@ -148,11 +148,32 @@ be re-audited.
   - Verified under `-smp 4`: login + fs commands + file reads (all IPC/channel/tty) pass with
     no regression, no faults. Single-core behavior is identical (with IF=0 nothing runs in the
     prepare→sleep gap, so the re-check is a no-op there).
-- **Still TODO before an AP actually runs the scheduler (Linux mechanism B / OpenBSD
-  `mi_switch` handoff):** a thread woken on CPU B must not be resumed there until it has fully
-  context-switched off CPU A — Linux spins on `p->on_cpu` (`smp_cond_load_acquire`),
-  `finish_task_switch` clears it with a release. Needs an `on_cpu` flag + the run-queue/scheduler
-  lock held across `switch_to` and released by the next thread. Not exercised yet (APs idle).
+- **Mechanism B — the context-switch handoff — ✅ DONE (§71).** A thread woken on CPU B must
+  not be resumed there until it has fully context-switched off CPU A. Implemented OpenBSD's
+  single-`SCHED_LOCK` model (chosen over Linux's per-CPU rq locks + `p->on_cpu` spin — one global
+  lock serializes everything, far simpler and a better fit for this kernel):
+  - A raw spinlock `SCHED_LOCK` (`thread.rs`) is held across the ENTIRE run-queue decision AND
+    `context_switch`, and released by whatever thread **resumes** — its own `switch_to` tail, or
+    `thread_trampoline` for a freshly spawned thread (`sched_unlock_c`, called from the asm).
+    This is exactly Linux's `finish_task_switch` / OpenBSD's "the new thread drops SCHED_LOCK"
+    handoff. Because the lock spans the switch, no other CPU can `pick_next` a thread until its
+    context is fully saved — so a woken thread is never resumed on two cores at once, WITHOUT a
+    separate `on_cpu` flag (the single lock subsumes it).
+  - `block_current`/`preempt`/`exit_current`/`yield_now` acquire `SCHED_LOCK`; `switch_to`
+    releases it (after the switch, in the resumed thread — or immediately when there's no switch).
+    The acquire and release live in different stack frames / different threads, so it's a raw
+    lock, not an RAII guard.
+  - Discipline keeping it deadlock-free: taken alone (never nested under a per-structure lock —
+    wait sites drop their interlock before `block_current`), and always released before the CPU
+    returns to IF=1, so the timer IRQ can never fire while a CPU holds it.
+  - Verified under `-smp 4`: the handoff runs on every context switch (thousands during boot +
+    interactive use); login + fs + pipes + interleaved kbd/mouse all pass, no deadlock, no fault.
+    Single-core: `SCHED_LOCK` is uncontended (BSP only), so behavior is unchanged.
+- **Last step before an AP runs user threads:** the syscall fast-path stub still reads the
+  GLOBAL `CURRENT_KSTACK_TOP` / `USER_RSP` — those must become per-CPU (gs-relative, no swapgs
+  needed since oxbow keeps one GS base across the ring boundary) before a user thread can take a
+  syscall on an AP. Then: start each AP's LAPIC timer + have it run `run_idle` so `pick_next` on
+  the AP pulls real work. That enablement is what finally exercises `SCHED_LOCK` under contention.
 - Audit every `spin::Mutex` user for **lock ordering** (define a global order, e.g.
   proc < cap-table < channel < endpoint < notif < frame-alloc) and never acquire out of
   order → deadlock freedom.
