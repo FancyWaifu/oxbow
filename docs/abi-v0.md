@@ -2152,3 +2152,25 @@ titlebar/cursor draw code that §58 had as standalone helpers is inlined (clippe
 `composite_rect`, so there is one painter and it always respects the damage rect. Future:
 coalesce multiple damage rects per pump into one bounding box, and true vsync via a
 page-flip primitive.
+
+## 60. Motion coalescing — drags glued to the cursor (v1-motion-coalesce)
+
+Damage tracking (§59) made each composite cheap, but the dragged window still **lagged
+behind the cursor** — it slowly crawled toward the pointer and kept moving after you
+stopped. Cause: `on_mouse` recomposited per *packet*. The PS/2 mouse reports ~100
+packets/sec and one `read()` can carry dozens; a fast drag of the large terminal window
+re-blit its whole backing once per packet, the work outpaced the packet rate, packets
+backed up in the channel, and the window trailed the backlog.
+
+Fixed with **motion coalescing**, the standard input-handling discipline: apply every
+packet's delta to the live cursor (and dragged-window) position, but composite ONCE per
+batch. `on_mouse` now drains a larger buffer (256 packets), accumulates motion, and at
+the end of the batch calls `flush_mouse_motion()` — a single `composite_rect` over the
+union of where the batch *started* and *ended*. A button transition bounds a gesture, so
+pending motion is flushed before `pointer_button` runs (and again at batch end). The
+client also receives one coalesced `wl_pointer.motion` per batch instead of dozens, which
+matches how real compositors deliver pointer motion.
+
+Result: a window stays pinned to the cursor during a drag with no trailing, and the
+cursor itself never falls behind regardless of how fast you move. Per-batch compositing
+work drops from O(packets) to O(1).

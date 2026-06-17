@@ -702,15 +702,51 @@ static int on_input(int fd, uint32_t mask, void *data)
 /* §54: drain PS/2 mouse packets and move the cursor. Each packet is 3 bytes:
  * [flags, dx, dy] with 9-bit signed deltas (sign bits in flags). Mouse Y points
  * up, screen Y down, so dy is subtracted. */
+/* §60: flush pending COALESCED motion — composite ONCE for a whole batch of
+ * mouse packets. `ocx/ocy` is the cursor and `ogx/ogy` the dragged window, both
+ * captured when the batch began; g_cx/g_cy (and g_grab->x/y) already hold the
+ * final position. Returns with no pending motion. */
+static void flush_mouse_motion(int ocx, int ocy, int ogx, int ogy)
+{
+  if (g_cursor_mode == MODE_MOVE && g_grab) {
+    /* §57: drag the grabbed window — damage its OLD + NEW area (§59). */
+    int nx0 = ogx < g_grab->x ? ogx : g_grab->x;
+    int ny0 = (ogy < g_grab->y ? ogy : g_grab->y) - TBH;
+    int nx1 = (ogx > g_grab->x ? ogx : g_grab->x) + g_grab->w;
+    int ny1 = (ogy > g_grab->y ? ogy : g_grab->y) + g_grab->h;
+    composite_rect(nx0, ny0, nx1, ny1);
+  } else {
+    pointer_update(); /* §55: deliver motion + enter/leave to the client */
+    /* §59: damage only the cursor's old + new footprint. */
+    int cx0 = ocx < g_cx ? ocx : g_cx, cy0 = ocy < g_cy ? ocy : g_cy;
+    int cx1 = (ocx > g_cx ? ocx : g_cx) + CURW;
+    int cy1 = (ocy > g_cy ? ocy : g_cy) + CURH;
+    composite_rect(cx0, cy0, cx1, cy1);
+  }
+}
+
 static int on_mouse(int fd, uint32_t mask, void *data)
 {
   (void)mask;
   (void)data;
   static unsigned char pkt[3];
   static int           pi = 0;
-  unsigned char        buf[192];
+  /* Drain a generous batch per pump (256 packets) so motion can be coalesced. */
+  unsigned char        buf[768];
   long                 n = read(fd, buf, sizeof buf);
-  int                  moved = 0, recomposited = 0;
+
+  /* §60: COALESCE motion. PS/2 delivers ~100 packets/sec and a single read may
+   * carry dozens; compositing the (large) dragged window once per packet makes
+   * it lag behind the cursor as packets back up in the channel. Instead we apply
+   * every packet's delta to the live cursor/window position but composite ONCE
+   * per batch, against the union of where the batch started and ended. A button
+   * transition bounds a gesture, so we flush the pending motion before acting on
+   * it (and at the end of the batch). */
+  int have_motion = 0;
+  int ocx = g_cx, ocy = g_cy;                 /* cursor at batch start */
+  int ogx = 0, ogy = 0;                       /* dragged window at batch start */
+  if (g_cursor_mode == MODE_MOVE && g_grab) { ogx = g_grab->x; ogy = g_grab->y; }
+
   for (long i = 0; i < n; i++) {
     pkt[pi++] = buf[i];
     if (pi < 3)
@@ -720,42 +756,36 @@ static int on_mouse(int fd, uint32_t mask, void *data)
     int dx = pkt[1] - ((flags & 0x10) ? 256 : 0);
     int dy = pkt[2] - ((flags & 0x20) ? 256 : 0);
     if (dx || dy) {
-      int ocx = g_cx, ocy = g_cy; /* old cursor, for the damage rect */
+      if (!have_motion) {
+        have_motion = 1;
+        ocx = g_cx;
+        ocy = g_cy;
+        if (g_cursor_mode == MODE_MOVE && g_grab) { ogx = g_grab->x; ogy = g_grab->y; }
+      }
       g_cx += dx;
       g_cy -= dy;
       if (g_cx < 0) g_cx = 0;
       if (g_cx >= g_w) g_cx = g_w - 1;
       if (g_cy < 0) g_cy = 0;
       if (g_cy >= g_h) g_cy = g_h - 1;
-      moved = 1;
-      recomposited = 1;
       if (g_cursor_mode == MODE_MOVE && g_grab) {
-        /* §57: drag the grabbed window — damage its OLD + NEW area (§59). */
-        int ogx = g_grab->x, ogy = g_grab->y;
         g_grab->x = g_cx - g_grab_dx;
         g_grab->y = g_cy - g_grab_dy;
-        int nx0 = ogx < g_grab->x ? ogx : g_grab->x;
-        int ny0 = (ogy < g_grab->y ? ogy : g_grab->y) - TBH;
-        int nx1 = (ogx > g_grab->x ? ogx : g_grab->x) + g_grab->w;
-        int ny1 = (ogy > g_grab->y ? ogy : g_grab->y) + g_grab->h;
-        composite_rect(nx0, ny0, nx1, ny1);
-      } else {
-        pointer_update(); /* §55: deliver motion + enter/leave to the client */
-        /* §59: damage only the cursor's old + new footprint. */
-        int cx0 = ocx < g_cx ? ocx : g_cx, cy0 = ocy < g_cy ? ocy : g_cy;
-        int cx1 = (ocx > g_cx ? ocx : g_cx) + CURW;
-        int cy1 = (ocy > g_cy ? ocy : g_cy) + CURH;
-        composite_rect(cx0, cy0, cx1, cy1);
       }
     }
     int left = flags & 0x01;
     if (left != g_btn_left) {
+      /* flush accumulated motion before the button changes the gesture/mode */
+      if (have_motion) {
+        flush_mouse_motion(ocx, ocy, ogx, ogy);
+        have_motion = 0;
+      }
       g_btn_left = left;
       pointer_button(left); /* focus/move/close paths recomposite as needed */
     }
   }
-  (void)moved;
-  (void)recomposited;
+  if (have_motion)
+    flush_mouse_motion(ocx, ocy, ogx, ogy);
   return 0;
 }
 
