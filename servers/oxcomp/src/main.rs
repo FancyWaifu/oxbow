@@ -12,7 +12,8 @@
 extern crate oxbow_libc as _;
 
 use oxbow_abi::{
-    Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_IMG_OXTERM, BOOT_IMG_WLCLIENT, BOOT_INPUT_CHAN,
+    Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_IMG_OXTERM, BOOT_IMG_SYSMON, BOOT_IMG_WLCLIENT,
+    BOOT_INPUT_CHAN,
     BOOT_MEM, BOOT_MOUSE_CHAN, BOOT_TERM_CHAN, FB_MMIO, HANDLE_NULL,
 };
 use oxbow_rt as rt;
@@ -103,7 +104,22 @@ pub extern "C" fn oxbow_main() -> ! {
     } else {
         HANDLE_NULL
     };
-    w(b"[oxcomp] compositor up; two clients spawned\n");
+
+    // §64: a THIRD window — the sysmon oxui app, proving a net-new app drops in.
+    let srv3 = if let Some((s3, c3)) = rt::channel::pair() {
+        let mut m3 = MsgBuf::new(0);
+        m3.data[0] = 24 * 1024 * 1024; // oxui + FreeType + font
+        m3.data_len = 3;
+        m3.handle_count = 3;
+        m3.handles[0] = c3; // slot 1 = Wayland socket
+        m3.handles[1] = HANDLE_NULL;
+        m3.handles[2] = BOOT_CONSOLE; // slot 4 = debug console
+        let _ = rt::sys_spawn(BOOT_IMG_SYSMON, BOOT_MEM, &m3, HANDLE_NULL);
+        s3
+    } else {
+        HANDLE_NULL
+    };
+    w(b"[oxcomp] compositor up; three clients spawned\n");
 
     // Set up the display on our kept channel end and run the compositing loop.
     // The keyboard channel (from the kbd driver, §47) becomes a second fd the
@@ -130,6 +146,11 @@ pub extern "C" fn oxbow_main() -> ! {
     if srv2 != HANDLE_NULL {
         let fd2 = unsafe { ox_chan_fd(srv2 as u32) };
         unsafe { comp_server_add_client(display, fd2) };
+    }
+    // §64: attach the third client (sysmon).
+    if srv3 != HANDLE_NULL {
+        let fd3 = unsafe { ox_chan_fd(srv3 as u32) };
+        unsafe { comp_server_add_client(display, fd3) };
     }
     // Pump the compositor. We busy-poll epoll, so the cross-process client only
     // makes progress in its own time slices — give it real wall-clock time (a

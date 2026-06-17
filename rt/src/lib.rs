@@ -602,6 +602,13 @@ pub fn sys_uptime_ms() -> u64 {
     rdx
 }
 
+/// `(used_kib, total_kib)` of the kernel's managed physical region — ambient, for
+/// a system monitor. Not a capability; every process may read it.
+pub fn sys_meminfo() -> (u64, u64) {
+    let (_, rdx) = unsafe { syscall1(oxbow_abi::SYS_MEMINFO, 0) };
+    (rdx >> 32, rdx & 0xffff_ffff)
+}
+
 /// This program's argument string (the kernel mapped it at SPAWN_ARGV on spawn).
 /// Empty if spawned without an argument.
 pub fn argv() -> &'static [u8] {

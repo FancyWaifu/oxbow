@@ -2311,3 +2311,33 @@ plumbing — and the §63 deferred-redraw/budget fixes that took a session to de
 in the library and cannot regress per-app. Verified: a full on-screen login (`login: bryson`
 → `Welcome, bryson.` → `ls` and its output) renders live, event-driven. New GUI programs (a
 clock, a file viewer) are now a `draw` callback plus a few lines of `main`.
+
+## 65. sysmon — a net-new oxui app, with text + a system data source (v1-sysmon)
+
+The payoff of the toolkit (§64): a brand-new GUI program written from scratch, not ported.
+`sysmon` is a live system monitor — it shows uptime, memory used/total, a usage bar, and a
+sweeping activity strip — and it is essentially one `draw` callback plus four lines of
+`main` (`servers/sysmon/src/sysmon.c`). No Wayland/shm/xkb/event-loop code at all.
+
+Two supporting pieces landed with it:
+
+- **`oxui_text`** (`servers/oxui/oxui_text.{c,h}`): the planned FreeType text helper. An app
+  calls `oxui_text(canvas, x, y, "hello", 0xRRGGBB)` and never touches FreeType — a face is
+  lazily built from the embedded DejaVu Mono font on first use, glyphs are alpha-blended into
+  the canvas. `oxui_text_line_height()` helps lay out lines. Link the FreeType archive + the
+  font include path; that's all an app's build needs.
+- **`SYS_MEMINFO` (syscall 47)**: ambient/unprivileged (PLEDGE_STDIO), returns
+  `rdx = (used_kib << 32) | total_kib` for the kernel's managed physical region. Backed by
+  `pmm::stats()` (bump high-water minus the freed-frame list). A clock already exists
+  (`SYS_UPTIME_MS`); now a monitor can show memory too.
+
+sysmon is a third compositor client: registered as a boot Image (`BOOT_IMG_SYSMON = 44`,
+added to the kernel's image-registration list and granted to oxcomp), spawned + attached by
+oxcomp alongside oxterm and the rings (oxcomp's budget bumped to 108 MiB to fund three
+children). Verified on screen: with the terminal dragged aside, the sysmon window shows
+`uptime 00:00:10`, `memory 24 / 333 MiB`, and updates live (530 px changing across 1.5 s —
+the clock ticks and the strip sweeps). It currently uses oxui `animate` mode to refresh; a
+kernel sleep/timer would let it idle between updates (§63-style) — a clean follow-up.
+
+With oxui + oxui_text in place, the recipe for the next program (a file viewer, a clock, a
+settings panel) is: write a `draw` callback, maybe an `fd_ready`, and four lines of `main`.

@@ -12,6 +12,8 @@ use spin::Mutex;
 pub const FRAME_SIZE: u64 = 4096;
 
 struct Bump {
+    /// Start of the managed region (for stats()).
+    base: u64,
     /// Next free physical address (frame-aligned).
     next: u64,
     /// One past the end of the region.
@@ -44,12 +46,29 @@ pub fn init(memmap: &MemoryMapResponse) -> (u64, u32) {
     }
 
     *BUMP.lock() = Some(Bump {
+        base: best_base,
         next: best_base,
         end: best_base + best_len,
         free_head: 0,
     });
 
     (total, count)
+}
+
+/// `(used_bytes, total_bytes)` for the managed region — for a system monitor.
+/// `used` is the bump high-water minus the frames returned to the free list.
+pub fn stats() -> (u64, u64) {
+    let guard = BUMP.lock();
+    let Some(b) = guard.as_ref() else { return (0, 0) };
+    let total = b.end - b.base;
+    let mut freed = 0u64;
+    let mut f = b.free_head;
+    while f != 0 {
+        freed += FRAME_SIZE;
+        f = unsafe { *(crate::mm::phys_to_virt(f) as *const u64) };
+    }
+    let used = (b.next - b.base).saturating_sub(freed);
+    (used, total)
 }
 
 /// Allocate one zeroed physical frame; `None` when memory is exhausted. Reuses a

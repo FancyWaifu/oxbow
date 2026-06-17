@@ -38,6 +38,7 @@ members = [
     "servers/oxwl",
     "servers/oxcomp",
     "servers/wlclient",
+    "servers/sysmon",
     "servers/drift",
     "servers/cc-hello",
     "servers/tcc",

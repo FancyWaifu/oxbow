@@ -759,6 +759,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sysmon"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

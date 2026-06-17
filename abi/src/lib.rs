@@ -185,6 +185,7 @@ pub const SYS_SHM_MAP: u64 = 43; // (shm, vaddr) -> size. Map all pages RW at va
 pub const SYS_CAP_TYPE: u64 = 44; // (h) -> rdx cap kind (CAP_* below). For fd-passing.
 pub const SYS_CAP_DUP: u64 = 45; // (h) -> a fresh handle to the SAME object (same rights)
 pub const SYS_CHAN_WAIT: u64 = 46; // (handles_ptr, count) -> block until any channel is readable
+pub const SYS_MEMINFO: u64 = 47; // () -> rdx = (used_kib << 32) | total_kib. Ambient/unprivileged.
 /// Capability kinds reported by SYS_CAP_TYPE (so recvmsg can reconstruct the
 /// right fd flavor from a passed handle). 0 = anything else.
 pub const CAP_OTHER: u64 = 0;
@@ -464,6 +465,7 @@ pub const BOOT_IMG_XKB: Handle = 37; // xkb-test — libxkbcommon keymap/keysym 
 pub const BOOT_IMG_VTERM: Handle = 38; // vterm-test — libvterm terminal state machine port
 pub const BOOT_IMG_FT: Handle = 39; // ft-test — FreeType glyph rasterizer port
 pub const BOOT_IMG_OXTERM: Handle = 40; // oxterm — the Wayland terminal client
+pub const BOOT_IMG_SYSMON: Handle = 44; // sysmon — the system-monitor oxui app (§64)
 
 /// The framebuffer capability, granted to the `fb` server at boot. Gates
 /// SYS_FB_INFO (geometry) + SYS_FB_MAP (map the pixels RW). §34 (graphics).

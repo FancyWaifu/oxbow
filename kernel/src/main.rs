@@ -277,7 +277,7 @@ fn kmain_stage2() -> ! {
         // what gives a clean boot straight to the prompt (no demo spam).
         if matches!(
             cmd,
-            b"pong" | b"beta" | b"hello" | b"badge" | b"cat" | b"ls" | b"mkdir" | b"touch" | b"rm" | b"mv" | b"cp" | b"drift" | b"cc-hello" | b"tcc" | b"lua" | b"micropython" | b"qjs" | b"curl" | b"cares-test" | b"ffi-test" | b"wl-test" | b"xkb-test" | b"vterm-test" | b"ft-test" | b"wlclient" | b"oxterm" | b"jail" | b"fstest"
+            b"pong" | b"beta" | b"hello" | b"badge" | b"cat" | b"ls" | b"mkdir" | b"touch" | b"rm" | b"mv" | b"cp" | b"drift" | b"cc-hello" | b"tcc" | b"lua" | b"micropython" | b"qjs" | b"curl" | b"cares-test" | b"ffi-test" | b"wl-test" | b"xkb-test" | b"vterm-test" | b"ft-test" | b"wlclient" | b"oxterm" | b"sysmon" | b"jail" | b"fstest"
         ) {
             image::register(cmd, bytes);
             println!("[mod] image '{}' registered ({} bytes)", name, bytes.len());
@@ -307,7 +307,7 @@ fn kmain_stage2() -> ! {
         } else if cmd == b"fs" {
             16 * 1024 * 1024
         } else if cmd == b"oxcomp" {
-            80 * 1024 * 1024 // libwayland + shm + funds the oxterm child + its image
+            108 * 1024 * 1024 // libwayland + shm + funds the oxterm/rings/sysmon children
         } else {
             mm::mem::BOOT_BUDGET
         };
@@ -457,6 +457,7 @@ fn kmain_stage2() -> ! {
             for (name, handle) in [
                 (b"wlclient".as_slice(), oxbow_abi::BOOT_IMG_WLCLIENT),
                 (b"oxterm".as_slice(), oxbow_abi::BOOT_IMG_OXTERM),
+                (b"sysmon".as_slice(), oxbow_abi::BOOT_IMG_SYSMON),
             ] {
                 if let Some(idx) = image::find(name) {
                     proc::with_proc_mut(pid, |p| {

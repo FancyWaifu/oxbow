@@ -15,7 +15,7 @@ use oxbow_abi::{
     SYS_CHANNEL_SEND, SYS_DMA_ALLOC, SYS_SHM_CREATE, SYS_SHM_MAP, CAP_CHANNEL, CAP_OTHER, CAP_SHM,
     SYS_FB_INFO, SYS_FB_MAP, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE,
     SYS_PROTECT, SYS_RECV, SYS_REPLY,
-    SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_UPTIME_MS,
+    SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_MEMINFO, SYS_UPTIME_MS,
     SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_PIPE_EOF, CHAN_NONBLOCK, PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT,
     R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM, PLEDGE_SPAWN, PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
 };
@@ -132,6 +132,12 @@ pub extern "C" fn syscall_dispatch(
         SYS_DMA_ALLOC => sys_dma_alloc(a1, a2),
         SYS_PROTECT => sys_protect(a1, a2, a3, a4),
         SYS_UPTIME_MS => SyscallRet { rax: 0, rdx: crate::arch::ticks().wrapping_mul(10) },
+        SYS_MEMINFO => {
+            let (used, total) = crate::mm::pmm::stats();
+            let used_kib = (used / 1024) & 0xffff_ffff;
+            let total_kib = (total / 1024) & 0xffff_ffff;
+            SyscallRet { rax: 0, rdx: (used_kib << 32) | total_kib }
+        }
         SYS_CONSOLE_WRITE => sys_console_write(a1, a2, a3),
         SYS_ATTENUATE => sys_attenuate(a1, a2),
         SYS_CLOSE => SyscallRet::from_result(proc::with_current_mut(|p| p.close(a1 as Handle))),
@@ -1140,7 +1146,7 @@ fn sys_getentropy(buf: u64, len: u64) -> SyscallRet {
 fn pledge_class(nr: u64) -> u64 {
     match nr {
         SYS_EXIT | SYS_PLEDGE | SYS_CLOSE => 0,
-        SYS_CONSOLE_WRITE | SYS_GETENTROPY | SYS_UPTIME_MS => PLEDGE_STDIO,
+        SYS_CONSOLE_WRITE | SYS_GETENTROPY | SYS_UPTIME_MS | SYS_MEMINFO => PLEDGE_STDIO,
         SYS_SEND | SYS_RECV | SYS_CALL | SYS_REPLY | SYS_EP_CREATE | SYS_MINT | SYS_PIPE
         | SYS_PIPE_READ | SYS_PIPE_WRITE | SYS_PIPE_EOF | SYS_CHANNEL_PAIR | SYS_CHANNEL_SEND
         | SYS_CHANNEL_RECV | SYS_CHANNEL_CLOSE | SYS_CHANNEL_POLL | SYS_CHAN_WAIT => PLEDGE_IPC,
