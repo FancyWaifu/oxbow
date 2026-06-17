@@ -2371,3 +2371,19 @@ redraws/second of real work (FreeType text + composite), not a spin; a 1 Hz inte
 a few percent. The clock ticks and the activity strip sweeps, and the window still wakes the
 instant it is clicked. This is the §63 discipline extended to *periodic* apps: sleep in the
 kernel, do work only when there is work (or the timer says it is time).
+
+## 67. Window placement — corner anchors instead of a tight cascade (v1-window-spread)
+
+The first-map placement was a tight cascade (`x = 60 + n*48`, `y = 60 + n*40`), so a small
+window mapped after a large one (e.g. sysmon after the 720×400 terminal) landed entirely
+inside it and was invisible until dragged out. Replaced with **corner-anchored placement**:
+the Nth window goes near a different screen anchor — top-left, top-right, bottom-left,
+bottom-right, then center — with a small per-cycle jitter for a 6th+ window, all clamped to
+keep the whole window (titlebar included) on-screen. `g_nviews` (the count of already-mapped
+windows) is the anchor slot, so a window mapped after a close reuses the freed anchor.
+
+Result: the three boot clients land in three different corners (rings top-left, terminal
+top-right, sysmon bottom-left) and are all fully visible at once with no dragging. It is a
+generic heuristic, not role-aware — for many windows the anchors repeat with jitter — but it
+fixes the common "small window buried under a big one" case. (Real tiling / user-driven
+layout remains future work; windows are still freely draggable, §57.)

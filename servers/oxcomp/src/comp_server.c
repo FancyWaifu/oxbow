@@ -355,9 +355,26 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
       memcpy(s->backing + (long)y * bw, data + (long)y * stride, (size_t)bw * 4);
   wl_shm_buffer_end_access(shm);
   if (!s->mapped) {
-    /* First frame: place the window (cascade) and focus it. */
-    s->x = 60 + g_nviews * 48;
-    s->y = 60 + TBH + g_nviews * 40; /* leave room for the titlebar above */
+    /* §67: place each window near a different screen anchor (top-left, top-right,
+     * bottom-left, bottom-right, then center) instead of a tight cascade — so a new
+     * window isn't buried under a previous large one. g_nviews is the count of
+     * already-mapped windows, so it is this window's anchor slot. A per-cycle jitter
+     * keeps a 6th+ window off an exact repeat. Everything is clamped on-screen. */
+    const int M = 40; /* screen-edge margin */
+    int slot = g_nviews;
+    int j = (slot / 5) * 32; /* jitter once we wrap past the 5 anchors */
+    switch (slot % 5) {
+      case 0: s->x = M + j;                  s->y = TBH + M + j; break;             /* TL */
+      case 1: s->x = g_w - s->w - M - j;     s->y = TBH + M + j; break;             /* TR */
+      case 2: s->x = M + j;                  s->y = g_h - s->h - M - j; break;      /* BL */
+      case 3: s->x = g_w - s->w - M - j;     s->y = g_h - s->h - M - j; break;      /* BR */
+      default: s->x = (g_w - s->w) / 2;      s->y = (g_h - s->h) / 2; break;        /* center */
+    }
+    /* keep the whole window (titlebar included) on-screen */
+    if (s->x < 0) s->x = 0;
+    if (s->x + s->w > g_w) s->x = g_w - s->w;
+    if (s->y - TBH < 0) s->y = TBH;
+    if (s->y + s->h > g_h) s->y = g_h - s->h;
     s->mapped = 1;
     views_raise(s);
     g_focus_view = s;
