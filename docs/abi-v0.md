@@ -2063,3 +2063,24 @@ time), sends `wl_pointer.enter` on transition + `wl_pointer.motion` (surface-loc
 `frame` grouping is needed. oxterm binds the pointer and logs enter/button to prove
 delivery. Next: multiple windows (a view list + z-order) so the hit-test picks the
 topmost of several, then window management.
+
+## 56. Multiple windows — a scene with z-order (v1-multi-window)
+
+oxcomp went from "blit one window at a fixed spot" to managing a scene, on
+tinywl's model. Each surface is now a **view** (`struct surf` gained x/y/w/h,
+`mapped`, and a `backing` pixel copy of its last frame). Views live in a z-ordered
+array (last = topmost). On commit a view copies its buffer into its backing store
+and `composite_scene()` repaints everything bottom→top, then the cursor on top —
+so overlapping windows are handled. New windows cascade and take focus.
+
+Input is now per-client: a small seat map records each client's `wl_keyboard` /
+`wl_pointer`. `view_at(x,y)` finds the topmost window under the cursor; pointer
+enter/leave/motion/button route to *that* view's client. `focus_view()` (tinywl)
+raises the clicked window, sends `wl_keyboard.leave`/`enter` to swap keyboard
+focus, and recomposites — so **click-to-focus + raise** works. (The shell keeps
+getting input via kbd→tty regardless, so focus only affects wl_keyboard clients.)
+
+The compositor now spawns TWO clients — the oxterm terminal and the wlclient rings
+demo — on separate channels (`comp_server_add_client`). Verified: both render
+overlapping and cascaded; clicking the rings window raises it above the terminal.
+Next: window decorations (titlebars) + interactive move (Alt+drag / xdg_toplevel.move).

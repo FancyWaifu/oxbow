@@ -12,8 +12,8 @@
 extern crate oxbow_libc as _;
 
 use oxbow_abi::{
-    Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_IMG_OXTERM, BOOT_INPUT_CHAN, BOOT_MEM,
-    BOOT_MOUSE_CHAN, BOOT_TERM_CHAN, FB_MMIO, HANDLE_NULL,
+    Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_IMG_OXTERM, BOOT_IMG_WLCLIENT, BOOT_INPUT_CHAN,
+    BOOT_MEM, BOOT_MOUSE_CHAN, BOOT_TERM_CHAN, FB_MMIO, HANDLE_NULL,
 };
 use oxbow_rt as rt;
 
@@ -45,6 +45,7 @@ extern "C" {
         pitch_words: i32,
     ) -> *mut u8;
     fn comp_server_pump(d: *mut u8);
+    fn comp_server_add_client(d: *mut u8, fd: i32);
     fn comp_server_composited() -> i32;
     /// Wrap a channel capability handle as a stream fd (libc, ox_chan_fd).
     fn ox_chan_fd(handle: u32) -> i32;
@@ -85,7 +86,23 @@ pub extern "C" fn oxbow_main() -> ! {
         w(b"[oxcomp] failed to spawn the terminal\n");
         park();
     }
-    w(b"[oxcomp] compositor up; wlclient spawned\n");
+
+    // §56: a SECOND window — the wlclient rings demo, on its own channel, to
+    // prove multi-window compositing + z-order.
+    let srv2 = if let Some((s2, c2)) = rt::channel::pair() {
+        let mut m2 = MsgBuf::new(0);
+        m2.data[0] = 16 * 1024 * 1024;
+        m2.data_len = 3;
+        m2.handle_count = 3;
+        m2.handles[0] = c2; // slot 1 = Wayland socket
+        m2.handles[1] = HANDLE_NULL;
+        m2.handles[2] = BOOT_CONSOLE; // slot 4 = debug console
+        let _ = rt::sys_spawn(BOOT_IMG_WLCLIENT, BOOT_MEM, &m2, HANDLE_NULL);
+        s2
+    } else {
+        HANDLE_NULL
+    };
+    w(b"[oxcomp] compositor up; two clients spawned\n");
 
     // Set up the display on our kept channel end and run the compositing loop.
     // The keyboard channel (from the kbd driver, §47) becomes a second fd the
@@ -107,6 +124,11 @@ pub extern "C" fn oxbow_main() -> ! {
     if display.is_null() {
         w(b"[oxcomp] display setup failed\n");
         park();
+    }
+    // §56: attach the second client to the display.
+    if srv2 != HANDLE_NULL {
+        let fd2 = unsafe { ox_chan_fd(srv2 as u32) };
+        unsafe { comp_server_add_client(display, fd2) };
     }
     // Pump the compositor. We busy-poll epoll, so the cross-process client only
     // makes progress in its own time slices — give it real wall-clock time (a

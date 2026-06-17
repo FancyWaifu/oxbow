@@ -26,7 +26,6 @@ static void slog(const char *s)
 
 static unsigned int *g_fb;
 static int           g_w, g_h, g_pitch_words;
-static struct wl_resource *g_keyboard;  /* the client's wl_keyboard, if bound */
 
 /* ---- software cursor (§54) ---------------------------------------------- */
 #define CURW 11
@@ -78,22 +77,92 @@ static void draw_cursor(void)
     }
   g_cur_drawn = 1;
 }
-static struct wl_resource *g_focus;     /* the surface holding keyboard focus */
-static struct wl_resource *g_pointer;   /* the client's wl_pointer, if bound (§55) */
 static unsigned int        g_serial;    /* event serial counter */
 static int           g_composited;
-/* The (single, for now) window's on-screen geometry, set at composite time. */
-static int g_win_x = 140, g_win_y = 130, g_win_w, g_win_h;
-static int g_ptr_in;   /* is the pointer currently entered on the window? */
 static int g_btn_left; /* last reported left-button state (edge detection) */
 
 struct surf {
   struct wl_resource *buffer;       /* pending/current attached wl_buffer */
+  struct wl_resource *surface;      /* the wl_surface resource itself */
   struct wl_resource *xdg_surface;  /* the xdg_surface role object, if any */
   struct wl_resource *xdg_toplevel; /* the xdg_toplevel, if any */
   struct wl_resource *frame_cb;     /* pending wl_callback from wl_surface.frame */
   int                 configured;   /* have we sent the initial configure? */
+  /* §56 multi-window: on-screen geometry + a backing copy of the last frame, so
+   * the whole scene can be re-composited in z-order when any window changes. */
+  int                 x, y, w, h, mapped;
+  unsigned int       *backing;
+  long                backing_cap;
 };
+
+/* The scene: views ordered bottom→top (last = topmost/focused). */
+#define MAXVIEWS 8
+static struct surf *g_views[MAXVIEWS];
+static int          g_nviews;
+
+static void views_remove(struct surf *s)
+{
+  int j = 0;
+  for (int i = 0; i < g_nviews; i++)
+    if (g_views[i] != s)
+      g_views[j++] = g_views[i];
+  g_nviews = j;
+}
+/* Raise `s` to the top of the z-order (focus). */
+static void views_raise(struct surf *s)
+{
+  views_remove(s);
+  if (g_nviews < MAXVIEWS)
+    g_views[g_nviews++] = s;
+}
+
+/* Per-client seat resources — several clients each bind the seat (§56). */
+#define MAXSEATS 8
+struct seatc {
+  struct wl_client   *client;
+  struct wl_resource *kbd, *ptr;
+};
+static struct seatc g_seats[MAXSEATS];
+static int          g_nseats;
+static struct seatc *seat_for(struct wl_client *c)
+{
+  for (int i = 0; i < g_nseats; i++)
+    if (g_seats[i].client == c)
+      return &g_seats[i];
+  if (g_nseats < MAXSEATS) {
+    g_seats[g_nseats].client = c;
+    g_seats[g_nseats].kbd = NULL;
+    g_seats[g_nseats].ptr = NULL;
+    return &g_seats[g_nseats++];
+  }
+  return NULL;
+}
+static struct surf *g_focus_view; /* topmost view = keyboard focus */
+static struct surf *g_ptr_view;   /* view currently under the pointer */
+
+/* §56: redraw the whole scene — background, every mapped view bottom→top from its
+ * backing copy, then the cursor on top. Called when any window changes. */
+static void composite_scene(void)
+{
+  erase_cursor();
+  for (long i = 0; i < (long)g_h * g_pitch_words; i++)
+    g_fb[i] = 0x000d3b45; /* deep-teal desktop */
+  for (int v = 0; v < g_nviews; v++) {
+    struct surf *s = g_views[v];
+    if (!s->mapped || !s->backing)
+      continue;
+    for (int y = 0; y < s->h && s->y + y < g_h; y++) {
+      if (s->y + y < 0)
+        continue;
+      for (int x = 0; x < s->w && s->x + x < g_w; x++) {
+        if (s->x + x < 0)
+          continue;
+        g_fb[(long)(s->y + y) * g_pitch_words + (s->x + x)] = s->backing[(long)y * s->w + x];
+      }
+    }
+  }
+  draw_cursor();
+}
 
 /* ---- wl_surface ---------------------------------------------------------- */
 static void surface_destroy(struct wl_client *c, struct wl_resource *res)
@@ -159,30 +228,39 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
   int bw     = wl_shm_buffer_get_width(shm);
   int bh     = wl_shm_buffer_get_height(shm);
   int stride = wl_shm_buffer_get_stride(shm);
+  /* §56: copy the frame into this view's backing store so the whole scene can be
+   * recomposited in z-order (windows may overlap). */
+  long need = (long)bw * bh * 4;
+  if (s->backing_cap < need) {
+    free(s->backing);
+    s->backing = malloc(need);
+    s->backing_cap = s->backing ? need : 0;
+  }
+  s->w = bw;
+  s->h = bh;
   wl_shm_buffer_begin_access(shm);
   unsigned char *data = wl_shm_buffer_get_data(shm);
-  int ox = g_win_x, oy = g_win_y; /* where the window lands on screen */
-  g_win_w = bw;                   /* §55: record geometry for pointer hit-testing */
-  g_win_h = bh;
-  erase_cursor(); /* §54: lift the cursor before the window blit... */
-  for (int y = 0; y < bh && oy + y < g_h; y++) {
-    unsigned int *src = (unsigned int *)(data + (long)y * stride);
-    for (int x = 0; x < bw && ox + x < g_w; x++) {
-      /* shm ARGB8888 and the BGRX framebuffer share byte order — direct copy. */
-      g_fb[(long)(oy + y) * g_pitch_words + (ox + x)] = src[x];
+  if (s->backing)
+    for (int y = 0; y < bh; y++)
+      memcpy(s->backing + (long)y * bw, data + (long)y * stride, (size_t)bw * 4);
+  wl_shm_buffer_end_access(shm);
+  if (!s->mapped) {
+    /* First frame: place the window (cascade) and focus it. */
+    s->x = 60 + g_nviews * 48;
+    s->y = 50 + g_nviews * 40;
+    s->mapped = 1;
+    views_raise(s);
+    g_focus_view = s;
+    struct seatc *sc = seat_for(c);
+    if (sc && sc->kbd) {
+      struct wl_array keys;
+      wl_array_init(&keys);
+      wl_keyboard_send_enter(sc->kbd, ++g_serial, res, &keys);
+      wl_array_release(&keys);
     }
   }
-  draw_cursor(); /* ...and put it back on top */
-  wl_shm_buffer_end_access(shm);
+  composite_scene();
   g_composited = 1;
-  /* Give this surface keyboard focus the first time it shows pixels (§47). */
-  if (g_keyboard && !g_focus) {
-    struct wl_array keys;
-    wl_array_init(&keys);
-    wl_keyboard_send_enter(g_keyboard, ++g_serial, res, &keys);
-    wl_array_release(&keys);
-    g_focus = res;
-  }
   wl_buffer_send_release(s->buffer); /* client may reuse the buffer */
   /* Tell the client this frame is on screen and it may draw the next one. Its
    * frame-callback handler redraws + commits again → the surface animates. */
@@ -218,7 +296,17 @@ static const struct wl_surface_interface surface_impl = {
 
 static void surface_resource_destroy(struct wl_resource *res)
 {
-  free(wl_resource_get_user_data(res));
+  struct surf *s = wl_resource_get_user_data(res);
+  if (s) {
+    views_remove(s);
+    if (g_focus_view == s)
+      g_focus_view = NULL;
+    if (g_ptr_view == s)
+      g_ptr_view = NULL;
+    free(s->backing);
+    free(s);
+  }
+  composite_scene();
 }
 
 /* ---- wl_region (no-op; we don't clip) ------------------------------------ */
@@ -337,6 +425,7 @@ static void compositor_create_surface(struct wl_client *c, struct wl_resource *r
   struct surf        *s = calloc(1, sizeof *s);
   struct wl_resource *sr =
     wl_resource_create(c, &wl_surface_interface, wl_resource_get_version(res), id);
+  s->surface = sr;
   wl_resource_set_implementation(sr, &surface_impl, s, surface_resource_destroy);
 }
 static void compositor_create_region(struct wl_client *c, struct wl_resource *res, uint32_t id)
@@ -364,8 +453,9 @@ static void keyboard_release(struct wl_client *c, struct wl_resource *res)
 static const struct wl_keyboard_interface keyboard_impl = { keyboard_release };
 static void keyboard_resource_destroy(struct wl_resource *res)
 {
-  if (g_keyboard == res)
-    g_keyboard = NULL;
+  for (int i = 0; i < g_nseats; i++)
+    if (g_seats[i].kbd == res)
+      g_seats[i].kbd = NULL;
 }
 /* Hand the client our keymap (§48): stage the keymap string into a memfd and
  * send it as wl_keyboard.keymap. The client mmaps it and builds an xkb_state, so
@@ -395,7 +485,9 @@ static void seat_get_keyboard(struct wl_client *c, struct wl_resource *res, uint
   struct wl_resource *k =
     wl_resource_create(c, &wl_keyboard_interface, wl_resource_get_version(res), id);
   wl_resource_set_implementation(k, &keyboard_impl, NULL, keyboard_resource_destroy);
-  g_keyboard = k;
+  struct seatc *sc = seat_for(c);
+  if (sc)
+    sc->kbd = k;
   send_keymap(k);
   slog("[oxcomp/srv] wl_keyboard bound (keymap sent)\n");
 }
@@ -416,17 +508,18 @@ static const struct wl_pointer_interface pointer_impl = {
 };
 static void pointer_resource_destroy(struct wl_resource *res)
 {
-  if (g_pointer == res) {
-    g_pointer = NULL;
-    g_ptr_in = 0;
-  }
+  for (int i = 0; i < g_nseats; i++)
+    if (g_seats[i].ptr == res)
+      g_seats[i].ptr = NULL;
 }
 static void seat_get_pointer(struct wl_client *c, struct wl_resource *res, uint32_t id)
 {
   struct wl_resource *p =
     wl_resource_create(c, &wl_pointer_interface, wl_resource_get_version(res), id);
   wl_resource_set_implementation(p, &pointer_impl, NULL, pointer_resource_destroy);
-  g_pointer = p;
+  struct seatc *sc = seat_for(c);
+  if (sc)
+    sc->ptr = p;
   slog("[oxcomp/srv] wl_pointer bound\n");
 }
 static void seat_get_touch(struct wl_client *c, struct wl_resource *res, uint32_t id)
@@ -450,37 +543,60 @@ static void seat_bind(struct wl_client *c, void *data, uint32_t version, uint32_
                             WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_POINTER);
 }
 
-/* §55: track the pointer over the window. tinywl's process_cursor_motion: if the
- * cursor is over a surface, send enter (on transition) + motion (surface-local);
- * if it leaves, send leave. Buttons map to evdev codes. One window for now, so
- * the hit-test is a single rectangle. */
-static void pointer_update(void)
+/* The topmost mapped view containing (px,py), or NULL. */
+static struct surf *view_at(int px, int py)
 {
-  if (!g_pointer || !g_focus)
-    return;
-  int over = g_cx >= g_win_x && g_cx < g_win_x + g_win_w && g_cy >= g_win_y &&
-             g_cy < g_win_y + g_win_h;
-  wl_fixed_t sx = wl_fixed_from_int(g_cx - g_win_x);
-  wl_fixed_t sy = wl_fixed_from_int(g_cy - g_win_y);
-  if (over && !g_ptr_in) {
-    wl_pointer_send_enter(g_pointer, ++g_serial, g_focus, sx, sy);
-    g_ptr_in = 1;
-  } else if (!over && g_ptr_in) {
-    wl_pointer_send_leave(g_pointer, ++g_serial, g_focus);
-    g_ptr_in = 0;
+  for (int v = g_nviews - 1; v >= 0; v--) {
+    struct surf *s = g_views[v];
+    if (s->mapped && px >= s->x && px < s->x + s->w && py >= s->y && py < s->y + s->h)
+      return s;
   }
-  if (over)
-    wl_pointer_send_motion(g_pointer, ox_now_ms(), sx, sy);
+  return NULL;
+}
+static struct wl_resource *ptr_of(struct surf *s)
+{
+  if (!s || !s->surface)
+    return NULL;
+  struct seatc *sc = seat_for(wl_resource_get_client(s->surface));
+  return sc ? sc->ptr : NULL;
 }
 
+/* §55/§56: route pointer motion to the topmost view under the cursor — enter on
+ * transition (tinywl process_cursor_motion), leave the previous, motion inside. */
+static void pointer_update(void)
+{
+  struct surf *target = view_at(g_cx, g_cy);
+  if (target != g_ptr_view) {
+    struct wl_resource *op = ptr_of(g_ptr_view);
+    if (op && g_ptr_view && g_ptr_view->surface)
+      wl_pointer_send_leave(op, ++g_serial, g_ptr_view->surface);
+    struct wl_resource *np = ptr_of(target);
+    if (np)
+      wl_pointer_send_enter(np, ++g_serial, target->surface,
+                            wl_fixed_from_int(g_cx - target->x),
+                            wl_fixed_from_int(g_cy - target->y));
+    g_ptr_view = target;
+  }
+  struct wl_resource *p = ptr_of(target);
+  if (p)
+    wl_pointer_send_motion(p, ox_now_ms(), wl_fixed_from_int(g_cx - target->x),
+                           wl_fixed_from_int(g_cy - target->y));
+}
+
+/* Click-to-focus + raise (tinywl focus_view): give the clicked window keyboard
+ * focus and raise it, then forward the button. */
+static void focus_view(struct surf *s);
 static void pointer_button(int left)
 {
-  if (!g_pointer || !g_ptr_in)
-    return;
-  /* BTN_LEFT = 0x110 in the Linux evdev button namespace wl_pointer uses. */
-  wl_pointer_send_button(g_pointer, ++g_serial, ox_now_ms(), 0x110,
-                         left ? WL_POINTER_BUTTON_STATE_PRESSED
-                              : WL_POINTER_BUTTON_STATE_RELEASED);
+  if (left && g_ptr_view && g_ptr_view != g_focus_view) {
+    focus_view(g_ptr_view);
+    composite_scene();
+  }
+  struct wl_resource *p = ptr_of(g_ptr_view);
+  if (p)
+    wl_pointer_send_button(p, ++g_serial, ox_now_ms(), 0x110,
+                           left ? WL_POINTER_BUTTON_STATE_PRESSED
+                                : WL_POINTER_BUTTON_STATE_RELEASED);
 }
 
 /* Event-loop callback: drain the keyboard channel and deliver each set-1 scancode
@@ -488,20 +604,49 @@ static void pointer_button(int left)
  * selects press vs release; the low 7 bits ARE the evdev keycode for the main
  * block, which the client offsets by 8 for xkb. We always read() (even with no
  * focus) so the kbd driver's channel never backs up. */
+/* Move keyboard focus to view `s` (tinywl focus_view): leave the old surface,
+ * raise + enter the new, and route subsequent keys to its client. */
+static void focus_view(struct surf *s)
+{
+  if (!s || s == g_focus_view)
+    return;
+  if (g_focus_view && g_focus_view->surface) {
+    struct seatc *osc = seat_for(wl_resource_get_client(g_focus_view->surface));
+    if (osc && osc->kbd)
+      wl_keyboard_send_leave(osc->kbd, ++g_serial, g_focus_view->surface);
+  }
+  views_raise(s);
+  g_focus_view = s;
+  if (s->surface) {
+    struct seatc *nsc = seat_for(wl_resource_get_client(s->surface));
+    if (nsc && nsc->kbd) {
+      struct wl_array keys;
+      wl_array_init(&keys);
+      wl_keyboard_send_enter(nsc->kbd, ++g_serial, s->surface, &keys);
+      wl_array_release(&keys);
+    }
+  }
+}
+
 static int on_input(int fd, uint32_t mask, void *data)
 {
   (void)mask;
   (void)data;
   unsigned char buf[64];
   long          n = read(fd, buf, sizeof buf);
+  struct wl_resource *kbd = NULL;
+  if (g_focus_view && g_focus_view->surface) {
+    struct seatc *sc = seat_for(wl_resource_get_client(g_focus_view->surface));
+    kbd = sc ? sc->kbd : NULL;
+  }
   for (long i = 0; i < n; i++) {
-    if (!g_keyboard || !g_focus)
+    if (!kbd)
       continue;
     unsigned char sc      = buf[i];
     uint32_t      keycode = sc & 0x7f;
     uint32_t      state   = (sc & 0x80) ? WL_KEYBOARD_KEY_STATE_RELEASED
                                         : WL_KEYBOARD_KEY_STATE_PRESSED;
-    wl_keyboard_send_key(g_keyboard, ++g_serial, ox_now_ms(), keycode, state);
+    wl_keyboard_send_key(kbd, ++g_serial, ox_now_ms(), keycode, state);
   }
   return 0;
 }
@@ -592,6 +737,13 @@ void *comp_server_setup(int fd, int input_fd, int mouse_fd, unsigned int *fb, in
     return NULL;
   }
   return d;
+}
+
+/* §56: attach an additional Wayland client (a second window) on its own fd. */
+void comp_server_add_client(void *d, int fd)
+{
+  if (fd >= 0)
+    wl_client_create((struct wl_display *)d, fd);
 }
 
 void comp_server_pump(void *d)
