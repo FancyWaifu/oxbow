@@ -2084,3 +2084,25 @@ The compositor now spawns TWO clients — the oxterm terminal and the wlclient r
 demo — on separate channels (`comp_server_add_client`). Verified: both render
 overlapping and cascaded; clicking the rings window raises it above the terminal.
 Next: window decorations (titlebars) + interactive move (Alt+drag / xdg_toplevel.move).
+
+## 57. Window management — titlebars, move, close (v1-window-mgmt)
+
+oxcomp now decorates and manages windows (server-side decorations, tinywl's grab
+model). Each view gets a TBH=22px **titlebar** drawn above its content in
+`composite_scene`: brighter blue when focused, grey otherwise, with a red close
+box at the right. New windows cascade with room for the bar.
+
+A cursor-mode state machine (PASSTHROUGH / MOVE) drives interaction. On a left
+press, `pointer_button` hit-tests titlebars topmost-first: a press on the close
+box sends `xdg_toplevel.close` (the client quits → surface destroyed → removed
+from the scene); a press elsewhere on the titlebar focuses + raises the window and
+begins a MOVE grab (recording the cursor offset). While MOVE, motion repositions
+the grabbed window and recomposites; release ends the grab. Presses in window
+content focus the window and forward the button to its client.
+
+Verified by injecting mouse events: titlebars render with focus colour + close
+box; dragging a titlebar moves the window across the desktop and focuses it.
+(Title *text* needs FreeType in the compositor — a future addition; the bars are
+solid for now.) This completes the mouse + window-manager arc: a cursor, multiple
+windows, z-order, click-to-focus, decorations, and drag-to-move — oxbow's own
+desktop, built on libwayland + the tinywl model.

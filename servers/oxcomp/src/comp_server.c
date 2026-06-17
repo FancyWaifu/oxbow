@@ -140,6 +140,35 @@ static struct seatc *seat_for(struct wl_client *c)
 static struct surf *g_focus_view; /* topmost view = keyboard focus */
 static struct surf *g_ptr_view;   /* view currently under the pointer */
 
+/* §57 window management: a titlebar above each window, and a cursor-mode state
+ * machine (tinywl) for interactive move. */
+#define TBH 22 /* titlebar height in px */
+enum { MODE_PASSTHROUGH, MODE_MOVE };
+static int          g_cursor_mode;
+static struct surf *g_grab;        /* view being dragged */
+static int          g_grab_dx, g_grab_dy; /* cursor offset within the window */
+
+/* Draw view `s`'s titlebar (above its content): a bar — brighter when focused —
+ * with a red close box at the right end. */
+static void draw_titlebar(struct surf *s)
+{
+  unsigned int bar = (s == g_focus_view) ? 0x003a6ea5u : 0x00444444u;
+  for (int j = 0; j < TBH; j++) {
+    int y = s->y - TBH + j;
+    if (y < 0 || y >= g_h)
+      continue;
+    for (int i = 0; i < s->w; i++) {
+      int x = s->x + i;
+      if (x < 0 || x >= g_w)
+        continue;
+      /* close box: a red square at the far right, inset by 4px. */
+      int in_close = i >= s->w - TBH && j >= 4 && j < TBH - 4 &&
+                     i >= s->w - TBH + 4 && i < s->w - 4;
+      g_fb[(long)y * g_pitch_words + x] = in_close ? 0x00c04040u : bar;
+    }
+  }
+}
+
 /* §56: redraw the whole scene — background, every mapped view bottom→top from its
  * backing copy, then the cursor on top. Called when any window changes. */
 static void composite_scene(void)
@@ -151,6 +180,7 @@ static void composite_scene(void)
     struct surf *s = g_views[v];
     if (!s->mapped || !s->backing)
       continue;
+    draw_titlebar(s); /* §57 */
     for (int y = 0; y < s->h && s->y + y < g_h; y++) {
       if (s->y + y < 0)
         continue;
@@ -247,7 +277,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
   if (!s->mapped) {
     /* First frame: place the window (cascade) and focus it. */
     s->x = 60 + g_nviews * 48;
-    s->y = 50 + g_nviews * 40;
+    s->y = 60 + TBH + g_nviews * 40; /* leave room for the titlebar above */
     s->mapped = 1;
     views_raise(s);
     g_focus_view = s;
@@ -588,15 +618,47 @@ static void pointer_update(void)
 static void focus_view(struct surf *s);
 static void pointer_button(int left)
 {
-  if (left && g_ptr_view && g_ptr_view != g_focus_view) {
-    focus_view(g_ptr_view);
-    composite_scene();
+  if (left) {
+    /* §57: a press on a titlebar focuses + either closes (close box) or starts a
+     * move drag (tinywl begin_interactive). Topmost titlebar wins. */
+    for (int v = g_nviews - 1; v >= 0; v--) {
+      struct surf *s = g_views[v];
+      if (!s->mapped)
+        continue;
+      if (g_cx >= s->x && g_cx < s->x + s->w && g_cy >= s->y - TBH && g_cy < s->y) {
+        focus_view(s);
+        if (g_cx >= s->x + s->w - TBH + 4 && g_cx < s->x + s->w - 4 && s->xdg_toplevel)
+          xdg_toplevel_send_close(s->xdg_toplevel); /* close box → ask client to quit */
+        else {
+          g_cursor_mode = MODE_MOVE;
+          g_grab = s;
+          g_grab_dx = g_cx - s->x;
+          g_grab_dy = g_cy - s->y;
+        }
+        composite_scene();
+        return;
+      }
+    }
+    /* a press in window content → focus that window, forward the button. */
+    if (g_ptr_view && g_ptr_view != g_focus_view) {
+      focus_view(g_ptr_view);
+      composite_scene();
+    }
+    struct wl_resource *p = ptr_of(g_ptr_view);
+    if (p)
+      wl_pointer_send_button(p, ++g_serial, ox_now_ms(), 0x110,
+                             WL_POINTER_BUTTON_STATE_PRESSED);
+  } else {
+    if (g_cursor_mode == MODE_MOVE) { /* end the drag */
+      g_cursor_mode = MODE_PASSTHROUGH;
+      g_grab = NULL;
+      return;
+    }
+    struct wl_resource *p = ptr_of(g_ptr_view);
+    if (p)
+      wl_pointer_send_button(p, ++g_serial, ox_now_ms(), 0x110,
+                             WL_POINTER_BUTTON_STATE_RELEASED);
   }
-  struct wl_resource *p = ptr_of(g_ptr_view);
-  if (p)
-    wl_pointer_send_button(p, ++g_serial, ox_now_ms(), 0x110,
-                           left ? WL_POINTER_BUTTON_STATE_PRESSED
-                                : WL_POINTER_BUTTON_STATE_RELEASED);
 }
 
 /* Event-loop callback: drain the keyboard channel and deliver each set-1 scancode
@@ -662,7 +724,7 @@ static int on_mouse(int fd, uint32_t mask, void *data)
   static int           pi = 0;
   unsigned char        buf[192];
   long                 n = read(fd, buf, sizeof buf);
-  int                  moved = 0;
+  int                  moved = 0, recomposited = 0;
   for (long i = 0; i < n; i++) {
     pkt[pi++] = buf[i];
     if (pi < 3)
@@ -679,15 +741,24 @@ static int on_mouse(int fd, uint32_t mask, void *data)
       if (g_cy < 0) g_cy = 0;
       if (g_cy >= g_h) g_cy = g_h - 1;
       moved = 1;
-      pointer_update(); /* §55: deliver motion + enter/leave to the client */
+      if (g_cursor_mode == MODE_MOVE && g_grab) {
+        /* §57: drag the grabbed window with the cursor. */
+        g_grab->x = g_cx - g_grab_dx;
+        g_grab->y = g_cy - g_grab_dy;
+        composite_scene();
+        recomposited = 1;
+      } else {
+        pointer_update(); /* §55: deliver motion + enter/leave to the client */
+      }
     }
     int left = flags & 0x01;
     if (left != g_btn_left) {
       g_btn_left = left;
-      pointer_button(left); /* §55: deliver the click */
+      pointer_button(left);
+      recomposited = 1; /* button handlers may recomposite (focus/move/close) */
     }
   }
-  if (moved) {
+  if (moved && !recomposited) {
     erase_cursor();
     draw_cursor();
   }
