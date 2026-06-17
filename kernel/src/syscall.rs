@@ -11,7 +11,7 @@ use oxbow_abi::{
     SPAWN_DEFAULT_BUDGET, SPAWN_SLOTS, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE,
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
-    SYS_CAP_TYPE, SYS_CAP_DUP, SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_POLL, SYS_CHANNEL_RECV,
+    SYS_CAP_TYPE, SYS_CAP_DUP, SYS_CHAN_WAIT, SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_POLL, SYS_CHANNEL_RECV,
     SYS_CHANNEL_SEND, SYS_DMA_ALLOC, SYS_SHM_CREATE, SYS_SHM_MAP, CAP_CHANNEL, CAP_OTHER, CAP_SHM,
     SYS_FB_INFO, SYS_FB_MAP, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE,
     SYS_PROTECT, SYS_RECV, SYS_REPLY,
@@ -124,6 +124,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_CHANNEL_RECV => sys_channel_recv(a1, a2, a3, a4, a5),
         SYS_CHANNEL_CLOSE => sys_channel_close(a1),
         SYS_CHANNEL_POLL => sys_channel_poll(a1),
+        SYS_CHAN_WAIT => sys_chan_wait(a1, a2),
         SYS_SHM_CREATE => sys_shm_create(a1, a2),
         SYS_SHM_MAP => sys_shm_map(a1, a2),
         SYS_CAP_TYPE => sys_cap_type(a1),
@@ -1142,7 +1143,7 @@ fn pledge_class(nr: u64) -> u64 {
         SYS_CONSOLE_WRITE | SYS_GETENTROPY | SYS_UPTIME_MS => PLEDGE_STDIO,
         SYS_SEND | SYS_RECV | SYS_CALL | SYS_REPLY | SYS_EP_CREATE | SYS_MINT | SYS_PIPE
         | SYS_PIPE_READ | SYS_PIPE_WRITE | SYS_PIPE_EOF | SYS_CHANNEL_PAIR | SYS_CHANNEL_SEND
-        | SYS_CHANNEL_RECV | SYS_CHANNEL_CLOSE | SYS_CHANNEL_POLL => PLEDGE_IPC,
+        | SYS_CHANNEL_RECV | SYS_CHANNEL_CLOSE | SYS_CHANNEL_POLL | SYS_CHAN_WAIT => PLEDGE_IPC,
         SYS_MAP | SYS_PROTECT | SYS_IMMUTABLE | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC
         | SYS_SHM_CREATE | SYS_SHM_MAP => PLEDGE_MEM,
         SYS_CAP_TYPE | SYS_CAP_DUP => PLEDGE_IPC,
@@ -1444,6 +1445,64 @@ fn sys_channel_poll(h: u64) -> SyscallRet {
         Err(e) => return SyscallRet::err(e),
     };
     SyscallRet { rax: 0, rdx: crate::channel::poll(conn, side) }
+}
+
+/// `sys_chan_wait(handles_ptr, count)` — block the caller until at least one of
+/// the given channel handles is readable (or at EOF). This is the kernel side of
+/// a blocking `epoll_wait`: userspace passes the handles of the channel fds it is
+/// watching and sleeps here instead of busy-polling `sys_channel_poll`.
+///
+/// Parks the caller on EVERY channel, then checks readiness, then blocks; a send
+/// into any of them drains+wakes us. On wake we deregister from all of them and
+/// return — the caller re-polls to learn which became ready. No timeout (infinite
+/// wait): the compositor dispatches its event loop with timeout -1.
+///
+/// Safe against lost wakeups for the same reason the recv path is: the kernel is
+/// non-preemptible (IF=0, single core), so no sender can run between the park, the
+/// readiness check, and `block_current`.
+fn sys_chan_wait(handles_ptr: u64, count: u64) -> SyscallRet {
+    const MAXW: usize = 16;
+    let n = (count as usize).min(MAXW);
+    if n == 0 {
+        return SyscallRet { rax: 0, rdx: 0 };
+    }
+    if usermem::check_user(handles_ptr, n * 4, false).is_err() {
+        return SyscallRet::err(SysError::Fault);
+    }
+    // Resolve handles to (conn, side). Anything that isn't a readable channel is
+    // silently skipped — it simply contributes no wake source.
+    let mut chans = [(0u8, 0u8); MAXW];
+    let mut nc = 0usize;
+    for i in 0..n {
+        let h = unsafe { core::ptr::read((handles_ptr as *const u32).add(i)) } as u64;
+        if let Ok((conn, side)) = chan_of(h, R_IN) {
+            chans[nc] = (conn, side);
+            nc += 1;
+        }
+    }
+    if nc == 0 {
+        return SyscallRet { rax: 0, rdx: 0 }; // nothing to wait on → caller re-polls
+    }
+    let me = crate::thread::current();
+    loop {
+        for &(conn, side) in &chans[..nc] {
+            crate::channel::park_recv(conn, side, me);
+        }
+        let ready = chans[..nc]
+            .iter()
+            .any(|&(conn, side)| crate::channel::poll(conn, side) & 0b001 != 0);
+        if ready {
+            for &(conn, side) in &chans[..nc] {
+                crate::channel::unpark_recv(conn, side, me);
+            }
+            return SyscallRet { rax: 0, rdx: 0 };
+        }
+        crate::thread::block_current(); // woken by a send into one of the channels
+        for &(conn, side) in &chans[..nc] {
+            crate::channel::unpark_recv(conn, side, me);
+        }
+        // re-loop: re-park + re-check (also handles any spurious wake safely)
+    }
 }
 
 /// `sys_channel_close(h)` — close this end; the peer observes EOF.

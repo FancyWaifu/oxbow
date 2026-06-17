@@ -806,7 +806,30 @@ pub unsafe extern "C" fn epoll_wait(
         if timeout == 0 || rt::sys_uptime_ms() >= deadline {
             return 0;
         }
-        // busy-poll (the timer preempts; a blocking version would await a wake)
+        if timeout < 0 {
+            // Infinite wait: BLOCK in the kernel until a watched channel becomes
+            // readable, instead of busy-polling. Gather the channel handles of the
+            // watched fds and sleep on them (sys_chan_wait). This is the fix that
+            // stops the compositor from spinning a core at 100%.
+            let mut hs = [0u32; EPOLL_WATCH];
+            let mut nh = 0usize;
+            for i in 0..inst.n {
+                let w = inst.w[i];
+                if w.fd >= 3 && (w.fd as usize) < MAX_FD {
+                    let slot = &(*addr_of_mut!(FDS))[w.fd as usize];
+                    if slot.used && slot.is_chan {
+                        hs[nh] = slot.handle as u32;
+                        nh += 1;
+                    }
+                }
+            }
+            if nh > 0 {
+                rt::channel::wait(&hs[..nh]);
+            }
+            // re-loop and re-poll to report which fds are ready.
+        }
+        // finite timeout > 0: busy-poll with the deadline (not a steady-state path;
+        // the compositor's main loop dispatches with timeout -1).
     }
 }
 
@@ -971,24 +994,82 @@ pub extern "C" fn select(nfds: i32, _r: *mut u8, _w: *mut u8, _e: *mut u8, _t: *
     }
 }
 #[no_mangle]
-pub unsafe extern "C" fn poll(fds: *mut u8, nfds: u64, _timeout: i32) -> i32 {
-    // struct pollfd { int fd; short events; short revents; }. Report only normal
-    // readiness — POLLIN|POLLOUT — and NOTHING else: curl maps POLLPRI, POLLNVAL,
-    // POLLERR, and POLLHUP in revents to its error condition (CURL_CSELECT_ERR),
-    // which failed the connect even though the socket was fine.
-    const READY: u16 = 0x001 | 0x004; // POLLIN | POLLOUT
-    let mut ready = 0i32;
-    for i in 0..nfds as usize {
-        let p = fds.add(i * 8);
-        let fd = *(p as *const i32);
-        let events = *(p.add(4) as *const u16);
-        let revents = if fd < 0 { 0 } else { events & READY };
-        *(p.add(6) as *mut u16) = revents;
-        if revents != 0 {
-            ready += 1;
+pub unsafe extern "C" fn poll(fds: *mut u8, nfds: u64, timeout: i32) -> i32 {
+    // struct pollfd { int fd; short events; short revents; }.
+    //
+    // CHANNEL fds (the Wayland socket) get REAL readiness from the kernel, and when
+    // nothing is ready and the caller asked to wait (timeout != 0) we BLOCK on them
+    // (sys_chan_wait) instead of returning a false "ready". This is what stops a
+    // Wayland client (and the terminal) from busy-spinning its dispatch loop at 100%
+    // CPU — and, because the client now blocks after committing, it yields the core
+    // straight to the compositor, killing the per-frame wake latency too.
+    //
+    // SOCKET / other fds keep the old always-ready behaviour: curl/c-ares drive those
+    // with their own retry logic and map spurious POLLERR/HUP to failure, so we report
+    // only POLLIN|POLLOUT and never block on them.
+    const POLLIN: u16 = 0x001;
+    const POLLOUT: u16 = 0x004;
+    const READY: u16 = POLLIN | POLLOUT;
+    let deadline = if timeout < 0 {
+        u64::MAX
+    } else {
+        rt::sys_uptime_ms().wrapping_add(timeout as u64)
+    };
+    loop {
+        let mut ready = 0i32;
+        let mut all_chan = true; // every non-negative fd is a channel
+        let mut hs = [0u32; 16];
+        let mut nh = 0usize;
+        for i in 0..nfds as usize {
+            let p = fds.add(i * 8);
+            let fd = *(p as *const i32);
+            let events = *(p.add(4) as *const u16);
+            let mut revents = 0u16;
+            if fd >= 0 {
+                let slot = if (fd as usize) < MAX_FD {
+                    Some(&(*addr_of_mut!(FDS))[fd as usize])
+                } else {
+                    None
+                };
+                if let Some(s) = slot.filter(|s| s.used && s.is_chan) {
+                    let bits = rt::channel::poll(s.handle);
+                    if events & POLLIN != 0 && bits & 0b001 != 0 {
+                        revents |= POLLIN;
+                    }
+                    if events & POLLOUT != 0 && bits & 0b100 != 0 {
+                        revents |= POLLOUT;
+                    }
+                    if nh < hs.len() {
+                        hs[nh] = s.handle as u32;
+                        nh += 1;
+                    }
+                } else {
+                    // socket / unknown fd: always-ready (preserve curl behaviour)
+                    revents = events & READY;
+                    all_chan = false;
+                }
+            }
+            *(p.add(6) as *mut u16) = revents;
+            if revents != 0 {
+                ready += 1;
+            }
+        }
+        if ready > 0 {
+            return ready;
+        }
+        if timeout == 0 || rt::sys_uptime_ms() >= deadline {
+            return 0;
+        }
+        // Nothing ready and the caller wants to wait. Only block when every fd is a
+        // channel (so a send wakes us); otherwise fall back to returning 0 so socket
+        // callers keep their retry loop.
+        if all_chan && nh > 0 && timeout < 0 {
+            rt::channel::wait(&hs[..nh]);
+            // re-loop and re-check
+        } else {
+            return 0;
         }
     }
-    ready
 }
 
 /// inet_ntop: format an IPv4 `src` (network-order u32) into "a.b.c.d".

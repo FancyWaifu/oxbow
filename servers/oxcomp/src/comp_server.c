@@ -947,7 +947,11 @@ void comp_server_add_client(void *d, int fd)
 void comp_server_pump(void *d)
 {
   struct wl_display *dpy = d;
-  wl_event_loop_dispatch(wl_display_get_event_loop(dpy), 0);
+  /* §63: block (timeout -1) until a client commit, keyboard, or mouse event wakes
+   * the event loop — instead of timeout 0, which spun the CPU at 100%. The blocking
+   * epoll_wait sleeps in the kernel (sys_chan_wait) until a watched channel is
+   * readable, so an idle compositor uses no CPU and clients get the core. */
+  wl_event_loop_dispatch(wl_display_get_event_loop(dpy), -1);
   wl_display_flush_clients(dpy);
 }
 

@@ -1016,9 +1016,10 @@ pub mod tcp {
 /// primitive that local protocols (e.g. Wayland) run over. Both ends are
 /// Channel handles; either can stream bytes and pass capabilities to the peer.
 pub mod channel {
-    use crate::{syscall1, syscall5, Handle};
+    use crate::{syscall1, syscall2, syscall5, Handle};
     use oxbow_abi::{
-        CHAN_NONBLOCK, SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND,
+        CHAN_NONBLOCK, SYS_CHAN_WAIT, SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_RECV,
+        SYS_CHANNEL_SEND,
     };
 
     /// Create a connected pair; returns both ends `(h0, h1)` in this process.
@@ -1080,6 +1081,13 @@ pub mod channel {
     /// Close this end; the peer observes EOF.
     pub fn close(h: Handle) {
         let _ = unsafe { syscall1(SYS_CHANNEL_CLOSE, h as u64) };
+    }
+
+    /// Block until at least one of `handles` (channel caps) is readable or at EOF.
+    /// The kernel parks us on all of them and sleeps; a send into any wakes us. This
+    /// is what a blocking `epoll_wait` sleeps on instead of busy-polling `poll`.
+    pub fn wait(handles: &[u32]) {
+        unsafe { syscall2(SYS_CHAN_WAIT, handles.as_ptr() as u64, handles.len() as u64) };
     }
 
     /// Non-blocking readiness bits: 1=readable, 2=eof, 4=writable (for epoll/poll).

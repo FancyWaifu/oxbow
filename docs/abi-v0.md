@@ -2233,3 +2233,42 @@ went from ~25 commits/s to **0** while hidden (the terminal, on top, kept commit
 and dragging the terminal aside brought the rings' commit counter straight back to life —
 no freeze. The hidden client now uses zero CPU; combined with §61 a window behind an
 opaque one costs essentially nothing until it is shown again.
+
+## 63. Event-driven, not busy-polling — the compositor and clients sleep when idle (v1-block-not-spin, SYS_CHAN_WAIT=46)
+
+The desktop spun a CPU at 100% even when nothing was happening, which on a single core
+starved everything and made windows feel laggy. Two busy-poll loops were to blame:
+
+1. **`epoll_wait`/`poll` in libc never blocked.** `epoll_wait` looped on the non-blocking
+   `SYS_CHANNEL_POLL` and `poll` was a stub that reported every fd ready immediately. So the
+   compositor's `wl_event_loop_dispatch(loop, 0)` and every Wayland client's
+   `wl_display_dispatch` spun as fast as the scheduler would let them.
+2. **oxterm re-armed a frame callback every frame**, committing a new buffer on every
+   compositor tick even at the login prompt — a terminal is not an animation.
+
+The fix makes the whole pipeline event-driven, the way a real compositor/clients work:
+
+- **`SYS_CHAN_WAIT(handles_ptr, count)` (syscall 46):** block the caller until any of a set
+  of channel fds is readable. The kernel parks the thread on every channel (`park_recv`),
+  checks readiness, then `block_current`; a send into any drains+wakes it, and on wake it
+  deregisters from all (`unpark_recv` / `WaitQ::remove`). Safe against lost wakeups because
+  the kernel is non-preemptible (IF=0, single core) — no sender runs between the park, the
+  check, and the block. `thread::wake` is now idempotent (waking an already-Ready thread is
+  a no-op): a thread parked on several channels can legitimately be woken twice before it
+  runs, which the old `debug_assert!(Blocked)` wrongly treated as a bug.
+- **libc `epoll_wait`/`poll`:** on an infinite-timeout wait with nothing ready, gather the
+  watched channel handles and `SYS_CHAN_WAIT` on them instead of spinning. Socket fds keep
+  the old always-ready behaviour (curl/c-ares drive those with their own retry), so only
+  pure-channel waits (Wayland) block.
+- **compositor:** dispatch with timeout `-1` (block) instead of `0` (spin).
+- **oxterm:** drop the self-re-arming frame callback; the main loop blocks on BOTH the
+  Wayland fd and the tty mirror fd (libwayland `prepare_read`/`read_events` idiom) and
+  redraws only when the shell actually writes output.
+
+Crucially, blocking also *removes per-frame latency*: a client that blocks after committing
+yields the core straight to the compositor (cooperative handoff) instead of making the
+woken compositor wait for a timer tick. Measured: idle CPU **100% → ~1.7%** (terminal only,
+nothing animating — the busy-poll is simply gone), and the rings demo's animating frame
+rate went **38 → 40 fps** while no longer starving input. A continuously-animating client
+(the rings demo) still uses a full core to *render* — that is real work, not a spin, and is
+where multicore (SMP) or frame-rate throttling would help next.

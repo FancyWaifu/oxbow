@@ -41,6 +41,19 @@ impl WaitQ {
         self.n = 0;
         n
     }
+    /// Remove a specific `tid` (compaction). Used to deregister a thread that
+    /// parked on several channels at once (sys_chan_wait) when one wakes it.
+    fn remove(&mut self, tid: usize) {
+        let mut i = 0;
+        while i < self.n {
+            if self.q[i] == tid {
+                self.q[i] = self.q[self.n - 1];
+                self.n -= 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 /// One direction of a connection: a byte ring + a capability FIFO.
@@ -250,6 +263,12 @@ pub fn park_recv(idx: u8, side: u8, tid: usize) {
 /// Park `tid` waiting to send on `side` (woken when the peer drains).
 pub fn park_send(idx: u8, side: u8, tid: usize) {
     CONNS.lock()[idx as usize].dir[side as usize].writers.push(tid);
+}
+
+/// Deregister `tid` from `side`'s reader queue — the counterpart to `park_recv`,
+/// used by sys_chan_wait to clean up after parking on several channels at once.
+pub fn unpark_recv(idx: u8, side: u8, tid: usize) {
+    CONNS.lock()[idx as usize].dir[read_dir(side)].readers.remove(tid);
 }
 
 /// Close `side`; returns peer tids to wake (they observe EOF). Frees the

@@ -184,6 +184,7 @@ pub const SYS_SHM_CREATE: u64 = 42; // (mem, pages) -> Shm handle (R_MAP|R_WRITE
 pub const SYS_SHM_MAP: u64 = 43; // (shm, vaddr) -> size. Map all pages RW at vaddr.
 pub const SYS_CAP_TYPE: u64 = 44; // (h) -> rdx cap kind (CAP_* below). For fd-passing.
 pub const SYS_CAP_DUP: u64 = 45; // (h) -> a fresh handle to the SAME object (same rights)
+pub const SYS_CHAN_WAIT: u64 = 46; // (handles_ptr, count) -> block until any channel is readable
 /// Capability kinds reported by SYS_CAP_TYPE (so recvmsg can reconstruct the
 /// right fd flavor from a passed handle). 0 = anything else.
 pub const CAP_OTHER: u64 = 0;

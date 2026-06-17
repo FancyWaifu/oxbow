@@ -273,9 +273,16 @@ pub fn block_current() {
 }
 
 /// Make a Blocked thread Ready. Does NOT switch — the waker keeps running.
+///
+/// Idempotent: waking a thread that is already Ready/Running is a no-op. This
+/// matters for multi-channel waits (sys_chan_wait): a thread parked on several
+/// channels can be drained+woken by one sender and then "woken" again by a second
+/// sender on another channel before it runs to deregister. The first wake makes it
+/// Ready; the rest are harmless.
 pub fn wake(tid: usize) {
-    debug_assert!(state(tid) == State::Blocked, "wake of non-Blocked thread");
-    set_state(tid, State::Ready);
+    if state(tid) == State::Blocked {
+        set_state(tid, State::Ready);
+    }
 }
 
 /// Terminate the current thread and switch away forever.

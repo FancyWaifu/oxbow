@@ -40,6 +40,7 @@ static int g_tty_fd = -1; /* §53: the shell-output mirror channel fd */
 #include <stdbool.h>
 #include <assert.h>
 #include <unistd.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <signal.h>
 #include <errno.h>
@@ -909,8 +910,12 @@ redraw(void *data, struct wl_callback *callback, uint32_t time)
 	if (callback)
 		wl_callback_destroy(callback);
 
-	window->callback = wl_surface_frame(window->surface);
-	wl_callback_add_listener(window->callback, &frame_listener, window);
+	/* §63: a terminal is NOT an animation — it only changes when the shell writes
+	 * new output. So we DON'T re-arm a frame callback here (which would make the
+	 * client redraw + commit every compositor frame, busy-spinning at idle). The
+	 * main loop instead polls the tty fd and calls redraw() only when there is new
+	 * output to show. (frame_listener is now unused but kept for the type.) */
+	(void)frame_listener;
 	wl_surface_commit(window->surface);
 	buffer->busy = 1;
 }
@@ -1171,8 +1176,39 @@ main(int argc, char **argv)
 	if (!window->wait_for_configure)
 		redraw(window, NULL, 0);
 
-	while (running && ret != -1)
-		ret = wl_display_dispatch(display->display);
+	/* §63: event-driven main loop. Block on BOTH the Wayland fd (compositor events:
+	 * configure, buffer release, input) and the tty mirror fd (new shell output),
+	 * and redraw ONLY when shell output actually arrives — so an idle terminal uses
+	 * no CPU instead of committing a frame every compositor tick. Uses the standard
+	 * libwayland prepare_read / read_events idiom so our own poll() can also watch
+	 * the tty fd without racing libwayland's internal read. */
+	int wfd = wl_display_get_fd(display->display);
+	while (running) {
+		while (wl_display_prepare_read(display->display) != 0)
+			wl_display_dispatch_pending(display->display);
+		wl_display_flush(display->display);
+
+		struct pollfd pfd[2];
+		int npfd = 1;
+		pfd[0].fd = wfd; pfd[0].events = POLLIN; pfd[0].revents = 0;
+		if (g_tty_fd >= 0) {
+			pfd[1].fd = g_tty_fd; pfd[1].events = POLLIN; pfd[1].revents = 0;
+			npfd = 2;
+		}
+		poll(pfd, npfd, -1); /* blocks (libc poll sleeps on the channel fds) */
+
+		if (pfd[0].revents & POLLIN)
+			wl_display_read_events(display->display);
+		else
+			wl_display_cancel_read(display->display);
+		if (wl_display_dispatch_pending(display->display) == -1)
+			break;
+
+		/* New shell output → render exactly one frame (redraw drains all of it). */
+		if (npfd == 2 && (pfd[1].revents & POLLIN))
+			redraw(window, NULL, 0);
+	}
+	(void)ret;
 
 	fprintf(stderr, "simple-shm exiting\n");
 
