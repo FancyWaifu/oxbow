@@ -55,10 +55,16 @@ be re-audited.
   wall-clock (calibration accurate). LAPIC enable + timer moved to `kmain_stage2` (after the
   CR3 switch) so the MMIO mapping lives in the kernel PML4 that persists + that user spaces
   copy their higher half from.
-- **2c — IOAPIC (TODO):** Map the LAPIC MMIO page; enable it on the BSP. Switch IRQ routing
-  from the legacy 8259 PICs to the **IOAPIC** (mask the PICs fully, route IRQ1/IRQ12/serial/
-  PCI lines through IOAPIC redirection entries to the BSP's LAPIC for now).
-- Add the **LAPIC timer** (one-shot or periodic, calibrated against the PIT once) as the
+- **2c — IOAPIC — ✅ DONE (§69).** `arch::ioapic` maps the IOAPIC MMIO (0xFEC00000) and
+  programs redirection entries for the **ISA IRQs the system uses** — keyboard (GSI1→0x21),
+  serial (GSI4→0x24), mouse (GSI12→0x2C) — delivering to the BSP's LAPIC, edge/active-high.
+  Those handlers now mask via the IOAPIC + EOI the LAPIC (not the PIC), and `irq::ack` re-arms
+  the IOAPIC for routed lines. The PIC lines stay masked, so each IRQ arrives once. **PCI IRQs
+  (the NIC) deliberately stay on the PIC's virtual wire** — routing PCI INTx→GSI needs the ACPI
+  `_PRT` and is deferred (a clean hybrid; networking is unaffected). Verified under `-smp 4`:
+  login (keyboard) + cursor drag (mouse) work through the IOAPIC, DHCP still leases (PIC NIC
+  path untouched), full desktop unaffected.
+- (legacy notes) Add the **LAPIC timer** (one-shot or periodic, calibrated against the PIT once) as the
   per-CPU scheduler tick — replacing the shared PIT.
 - Risk: medium. Getting IOAPIC redirection + EOI right; keep the PIT path until the LAPIC
   timer is proven, then retire it.

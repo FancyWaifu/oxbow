@@ -231,6 +231,18 @@ fn kmain_stage2() -> ! {
     let lapic_id = arch::lapic::enable();
     println!("[smp] BSP LAPIC enabled (virtual-wire), id={}", lapic_id);
 
+    // §69 Phase 2c: route the ISA device IRQs (keyboard 1, serial 4, mouse 12)
+    // through the IOAPIC to the BSP's LAPIC, on the same vectors their handlers
+    // already use (PIC-remap base 0x20). Those PIC lines stay masked, so each IRQ
+    // arrives once — through the IOAPIC. The drivers unmask via irq::ack, which now
+    // re-arms the IOAPIC for these lines. PCI IRQs (the NIC) keep using the PIC's
+    // virtual wire until PCI INTx→GSI routing lands.
+    arch::ioapic::init();
+    for (gsi, vector) in [(1u8, 0x21u8), (4, 0x24), (12, 0x2C)] {
+        arch::ioapic::route(gsi, vector, lapic_id as u8);
+    }
+    println!("[smp] IOAPIC routing kbd/mouse/serial -> BSP lapic {}", lapic_id);
+
     // §69 Phase 2b: the scheduler tick is the LAPIC timer (calibrated against PIT
     // channel 2), NOT the legacy PIT IRQ0 — IRQ0 stays masked. Keyboard/mouse/serial
     // IRQs still reach the CPU through the PIC's virtual-wire LINT0 (set up in 2a).

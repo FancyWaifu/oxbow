@@ -30,7 +30,19 @@ pci_irq!(pci_irq5, 5);
 pci_irq!(pci_irq9, 9);
 pci_irq!(pci_irq10, 10);
 pci_irq!(pci_irq11, 11);
-pci_irq!(mouse_irq, 12); // IRQ12 — i8042 PS/2 mouse (slave PIC, bindable)
+
+/// §69 Phase 2c: an ISA IRQ delivered through the IOAPIC → LAPIC (not the PIC).
+/// Mask the IOAPIC redirection entry, EOI the LAPIC, then signal the bound notif.
+macro_rules! ioapic_irq {
+    ($name:ident, $line:literal) => {
+        extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
+            super::ioapic::mask($line);
+            unsafe { super::lapic::eoi() };
+            crate::irq::fire($line);
+        }
+    };
+}
+ioapic_irq!(mouse_irq, 12); // IRQ12 — i8042 PS/2 mouse, routed via the IOAPIC
 
 /// Vector the PIT timer (IRQ0) lands on after the PIC remap.
 const TIMER_VECTOR: u8 = 0x20;
@@ -120,19 +132,18 @@ extern "x86-interrupt" fn lapic_timer(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn keyboard(_frame: InterruptStackFrame) {
-    // Mask the line first (so it can't re-fire after EOI), EOI in the kernel at
-    // fire time (never deferred to the driver's ack), then signal the bound
-    // notification (wake-only). The driver drains the i8042 and acks (unmask).
-    pic::mask(1);
-    pic::eoi(1);
+    // §69 Phase 2c: IRQ1 now arrives via the IOAPIC → LAPIC. Mask the IOAPIC
+    // redirection entry (so it can't re-fire), EOI the LAPIC, then signal the
+    // bound notification. The driver drains the i8042 and acks (unmask).
+    super::ioapic::mask(1);
+    unsafe { super::lapic::eoi() };
     crate::irq::fire(1);
 }
 
 extern "x86-interrupt" fn serial_com1(_frame: InterruptStackFrame) {
-    // IRQ4 — COM1 RX. Same discipline as the keyboard: mask, EOI in-kernel, then
-    // signal the bound notification. The user serial driver drains RBR and acks.
-    pic::mask(4);
-    pic::eoi(4);
+    // IRQ4 — COM1 RX, also via the IOAPIC → LAPIC. Mask, EOI the LAPIC, signal.
+    super::ioapic::mask(4);
+    unsafe { super::lapic::eoi() };
     crate::irq::fire(4);
 }
 

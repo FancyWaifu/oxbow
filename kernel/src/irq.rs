@@ -18,9 +18,14 @@ pub fn bind(line: u8, notif_idx: u8) {
 }
 
 /// Ack: re-arm the line (unmask) for the next interrupt. The driver calls this
-/// AFTER draining the device.
+/// AFTER draining the device. §69 Phase 2c: lines routed through the IOAPIC
+/// (keyboard/mouse/serial) are re-armed there; PCI lines stay on the PIC.
 pub fn ack(line: u8) {
-    crate::arch::pic_unmask(line);
+    if crate::arch::ioapic::routed(line) {
+        crate::arch::ioapic::unmask(line);
+    } else {
+        crate::arch::pic_unmask(line);
+    }
 }
 
 /// True if the line has a binding (so `ack` is meaningful).
