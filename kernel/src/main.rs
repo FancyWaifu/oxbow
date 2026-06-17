@@ -157,11 +157,9 @@ extern "C" fn kmain() -> ! {
         println!("[smp] no MP response (single CPU / no Limine MP)");
     }
 
-    // §69 Phase 2a: enable the BSP's LAPIC in virtual-wire mode. The PIT still
-    // drives scheduling through the LAPIC's LINT0 (ExtINT), so nothing changes
-    // yet — this just lights up the LAPIC for the per-CPU timer + IPIs to come.
-    let lapic_id = arch::lapic::enable();
-    println!("[smp] BSP LAPIC enabled (virtual-wire), id={}", lapic_id);
+    // §69 LAPIC enable happens in kmain_stage2, AFTER the switch to the kernel's
+    // own PML4 — otherwise the LAPIC MMIO mapping lands in the soon-discarded
+    // stage-1 page tables and the timer faults once stage 2 is running.
 
     // -- Framebuffer: record geometry + paint a smoke-test pattern -----------
     if let Some(fb) = FRAMEBUFFER_REQUEST.get_response().and_then(|r| r.framebuffers().next()) {
@@ -227,7 +225,16 @@ fn kmain_stage2() -> ! {
     // back. Runs BEFORE the timer is armed, so IF=0 guarantees no trap mid-hop.
     mm::vm::as_hop_selftest();
 
-    arch::timer_init(100); // PIT @ 100 Hz, IRQ0 unmasked (stays on)
+    // §69 Phase 2a: enable the BSP's LAPIC (virtual-wire) now that the kernel's
+    // own PML4 is active — the LAPIC MMIO mapping must live in the page tables
+    // user processes copy their higher half from (every interrupt touches it).
+    let lapic_id = arch::lapic::enable();
+    println!("[smp] BSP LAPIC enabled (virtual-wire), id={}", lapic_id);
+
+    // §69 Phase 2b: the scheduler tick is the LAPIC timer (calibrated against PIT
+    // channel 2), NOT the legacy PIT IRQ0 — IRQ0 stays masked. Keyboard/mouse/serial
+    // IRQs still reach the CPU through the PIC's virtual-wire LINT0 (set up in 2a).
+    arch::lapic::start_timer(arch::lapic::TIMER_VECTOR, 100);
 
     // Seed the CSPRNG before any process loads — stack-base ASLR draws from it.
     rng::init();

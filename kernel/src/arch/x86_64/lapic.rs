@@ -29,6 +29,9 @@ const DELIVERY_EXTINT: u32 = 0b111 << 8;
 
 /// Spurious-interrupt vector we point the LAPIC at; its IDT handler is a no-op.
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
+/// Local vector the LAPIC timer fires on (above the remapped PIC range 0x20-0x2F;
+/// a LOCAL interrupt, not a PIC IRQ). §69 Phase 2b.
+pub const TIMER_VECTOR: u8 = 0x30;
 
 /// Virtual address of the LAPIC MMIO window. Same physical base on every CPU, so
 /// the HHDM mapping is shared — set once on the BSP, reused by the APs.
@@ -75,4 +78,54 @@ pub fn enable() -> u32 {
 #[inline]
 pub unsafe fn eoi() {
     write(REG_EOI, 0);
+}
+
+// --- LAPIC timer (§69 Phase 2b) — the per-CPU scheduler tick ----------------
+const REG_LVT_TIMER: usize = 0x320;
+const REG_TIMER_INIT: usize = 0x380;
+const REG_TIMER_CUR: usize = 0x390;
+const REG_TIMER_DIV: usize = 0x3E0;
+const TIMER_PERIODIC: u32 = 1 << 17;
+const TIMER_MASKED: u32 = 1 << 16;
+const TIMER_DIV_16: u32 = 0b0011; // divide the timer input clock by 16
+
+/// Calibrate the LAPIC timer against PIT channel 2 (polled, no IRQs needed) and
+/// start it in PERIODIC mode at `hz`, delivering on `vector`. Replaces the PIT as
+/// the scheduler tick. The per-CPU count is cached so APs can start their timer
+/// without re-calibrating.
+static mut TIMER_COUNT: u32 = 0;
+
+pub fn start_timer(vector: u8, hz: u32) {
+    use x86_64::instructions::port::Port;
+    unsafe {
+        write(REG_TIMER_DIV, TIMER_DIV_16);
+
+        if TIMER_COUNT == 0 {
+            // --- calibrate: count LAPIC ticks during one polled 10 ms PIT ch2 wait ---
+            let pit_10ms: u16 = (1_193_182u32 / 100) as u16; // ticks in 10 ms
+            let mut p61 = Port::<u8>::new(0x61);
+            // gate on, speaker off
+            let v = p61.read();
+            p61.write((v & 0xFC) | 0x01);
+            Port::<u8>::new(0x43).write(0xB0); // ch2, lo/hi byte, mode 0, binary
+            let mut ch2 = Port::<u8>::new(0x42);
+            ch2.write((pit_10ms & 0xFF) as u8);
+            ch2.write((pit_10ms >> 8) as u8);
+            // Toggle the gate to start the countdown cleanly, then immediately start
+            // the LAPIC counting down from max in one-shot.
+            let g = p61.read() & 0xFE;
+            p61.write(g);
+            p61.write(g | 0x01); // gate high -> ch2 starts counting
+            write(REG_LVT_TIMER, TIMER_MASKED); // one-shot, masked (calibration only)
+            write(REG_TIMER_INIT, 0xFFFF_FFFF);
+            while p61.read() & 0x20 == 0 {} // wait for ch2 OUT high = terminal count
+            // LAPIC ticks in 10 ms == the initial count for a 100 Hz periodic timer.
+            TIMER_COUNT = 0xFFFF_FFFFu32 - read(REG_TIMER_CUR);
+        }
+
+        // The period scales inversely with frequency: count = (count@100Hz) * 100/hz.
+        let count = ((TIMER_COUNT as u64 * 100) / hz.max(1) as u64) as u32;
+        write(REG_LVT_TIMER, TIMER_PERIODIC | vector as u32);
+        write(REG_TIMER_INIT, count.max(1));
+    }
 }

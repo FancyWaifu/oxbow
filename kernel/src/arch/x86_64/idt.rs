@@ -66,6 +66,7 @@ pub fn init() {
         idt[0x2C].set_handler_fn(mouse_irq); // IRQ12 — i8042 PS/2 mouse (bindable)
         idt[0x2F].set_handler_fn(spurious_slave); // IRQ15 spurious: EOI master
         idt[super::lapic::SPURIOUS_VECTOR].set_handler_fn(lapic_spurious); // §69 LAPIC
+        idt[super::lapic::TIMER_VECTOR].set_handler_fn(lapic_timer); // §69 LAPIC timer
         for v in 0x22u8..=0x2E {
             if !matches!(v, 0x24 | 0x25 | 0x27 | 0x29 | 0x2A | 0x2B | 0x2C) {
                 idt[v].set_handler_fn(unexpected_irq);
@@ -100,6 +101,20 @@ extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
     // (Ring-3 preemptibility was proven in the threads arc; the per-preempt
     // trace print is retired — it would otherwise corrupt the serial console,
     // which the shell now shares with kernel output.)
+    let _ = frame;
+    crate::thread::preempt();
+}
+
+/// §69 Phase 2b: the LAPIC timer is the scheduler tick once the PIT (IRQ0) is
+/// retired. Same work as `timer()` but EOI's the LAPIC (a local interrupt), not
+/// the PIC. EOI before the context switch for the same in-service-bit reason.
+extern "x86-interrupt" fn lapic_timer(frame: InterruptStackFrame) {
+    let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    unsafe { super::lapic::eoi() };
+    if tick % 100 == 0 {
+        crate::notif::fire_tick();
+    }
+    crate::thread::wake_expired(tick);
     let _ = frame;
     crate::thread::preempt();
 }

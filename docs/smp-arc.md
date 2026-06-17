@@ -44,8 +44,17 @@ be re-audited.
   PIT keeps driving the scheduler. A 0xFF spurious-vector handler is installed. Verified
   under `-smp 4`: LAPIC enabled (id 0), full login + `ls` runs — scheduler + IPC + input
   unaffected.
-- **2b — LAPIC timer (TODO):** calibrate the LAPIC timer against the PIT, then switch the
-  scheduler tick from PIT IRQ0 to the LAPIC timer and retire the PIT. (BSP first.)
+- **2b — LAPIC timer — ✅ DONE (§69).** `lapic::start_timer(vector, hz)` calibrates the
+  LAPIC timer against **PIT channel 2** (polled, no IRQs) — counts LAPIC ticks during one
+  10 ms PIT countdown — then runs it PERIODIC on local vector 0x30. `kmain` now arms the
+  LAPIC timer instead of the PIT (IRQ0 stays masked); a `lapic_timer` IDT handler does the
+  same TICKS++/wake_expired/preempt work as the old PIT handler but EOI's the LAPIC.
+  Keyboard/mouse/serial still reach the CPU via the PIC's virtual-wire LINT0. The calibrated
+  count is cached so APs can start their own timer without re-measuring. Verified under
+  `-smp 4`: full desktop + login + `ls`, and sysmon's uptime advanced exactly 10 s over 10 s
+  wall-clock (calibration accurate). LAPIC enable + timer moved to `kmain_stage2` (after the
+  CR3 switch) so the MMIO mapping lives in the kernel PML4 that persists + that user spaces
+  copy their higher half from.
 - **2c — IOAPIC (TODO):** Map the LAPIC MMIO page; enable it on the BSP. Switch IRQ routing
   from the legacy 8259 PICs to the **IOAPIC** (mask the PICs fully, route IRQ1/IRQ12/serial/
   PCI lines through IOAPIC redirection entries to the BSP's LAPIC for now).
