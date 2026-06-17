@@ -90,7 +90,9 @@ static mut TCBS: [Tcb; MAX_THREADS] = [Tcb {
     wake_at: 0,
 }; MAX_THREADS];
 
-static mut CURRENT: usize = IDLE;
+// §69 Phase 4: the running thread is PER-CPU — it lives in this CPU's PerCpu
+// (reached via the GS base), not a single global. `current()`/`set_running()`
+// funnel through `crate::percpu`. On one core this is identical to the old global.
 
 // --- TCB field accessors (all access to the static-mut pool funnels here) ---
 fn state(s: usize) -> State {
@@ -115,9 +117,9 @@ fn proc_of(s: usize) -> usize {
     unsafe { (*addr_of!(TCBS[s])).proc }
 }
 
-/// The currently-running TCB slot.
+/// The TCB slot currently running on THIS CPU.
 pub fn current() -> usize {
-    unsafe { *addr_of!(CURRENT) }
+    crate::percpu::current()
 }
 
 /// The process owning the current thread (valid during a syscall — those only
@@ -134,7 +136,7 @@ pub fn process_of(tid: usize) -> usize {
 /// Mark the boot thread (slot 0) as the running idle thread.
 pub fn init() {
     set_state(IDLE, State::Running);
-    unsafe { *addr_of_mut!(CURRENT) = IDLE };
+    crate::percpu::set_current(IDLE);
     // SSE was enabled + `fninit`'d in arch::init; snapshot that clean FPU state
     // as the template and seed every thread's save area with it, so a thread's
     // first FXRSTOR loads valid state rather than zeros.
@@ -225,7 +227,7 @@ fn switch_to(next: usize) {
         return;
     }
     set_state(next, State::Running);
-    unsafe { *addr_of_mut!(CURRENT) = next };
+    crate::percpu::set_current(next);
     // Point TSS.RSP0 + the syscall entry stack at the incoming thread's kernel
     // stack BEFORE the switch — safe because IF=0 throughout the kernel, so
     // nothing can trap from ring 3 between this update and the switch.

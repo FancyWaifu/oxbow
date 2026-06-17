@@ -17,6 +17,7 @@ mod irq;
 mod mm;
 mod notif;
 mod object;
+mod percpu;
 mod pci;
 mod pipe;
 mod proc;
@@ -216,6 +217,11 @@ extern "C" fn kmain() -> ! {
 /// port statics) are correctly mapped in the new address space.
 fn kmain_stage2() -> ! {
     println!("[vm] cr3 switched -- still alive");
+
+    // §69 Phase 4: bring up this (BSP) CPU's per-CPU state and point its GS base at
+    // it BEFORE anything reads `thread::current()` — the running-thread id now lives
+    // in PerCpu (gs:[8]), not a global.
+    percpu::init(0);
 
     // The boot thread becomes the idle thread (TCB 0).
     thread::init();

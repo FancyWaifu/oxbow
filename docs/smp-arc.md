@@ -80,16 +80,21 @@ be re-audited.
 - Deliverable: all N cores reach `ap_main` and idle; boot log "AP k online".
 - Risk: high. Trampoline/paging bugs triple-fault silently. Bring up **one** AP first.
 
-### Phase 4 — Per-CPU state
-- Replace global CPU-local singletons with a per-CPU array indexed by LAPIC id, reachable
-  via `GS` base (`swapgs` on kernel entry, or `KERNEL_GS_BASE`):
-  - `CURRENT` (running tid) → **per-CPU** (the biggest single change).
-  - the idle thread → one per CPU.
-  - LAPIC timer tick counters.
-- Scheduler: a run queue. Start with **one global run queue** under a spinlock (simplest,
-  correct); move to per-CPU queues + work-stealing later only if contention shows up.
-- Risk: high. Every `thread::current()` / `current_proc()` caller must go through the
-  per-CPU accessor. Context switch must save/restore to the right CPU's slot.
+### Phase 4 — Per-CPU state — STARTED (§69)
+- **`CURRENT` (running tid) → per-CPU — ✅ DONE.** New `kernel/src/percpu.rs`: a `PerCpu`
+  struct ({cpu_index, current}) reached through the **GS base**. oxbow uses no `swapgs`
+  (user never touches GS, CR4.FSGSBASE off), so the kernel just points `IA32_GS_BASE` at this
+  CPU's `PerCpu` and accesses fields via the `gs:` prefix (`gs:[0]`=index, `gs:[8]`=current) —
+  fast, no rdmsr on the hot path, valid in interrupt/syscall context. `thread::current()` and
+  the two `CURRENT` writes (init, `switch_to`) now funnel through `percpu`. The BSP calls
+  `percpu::init(0)` at the top of `kmain_stage2` before anything reads `current()`. `PERCPU`
+  lives in the kernel higher half (PML4 256..512), which every user space copies, so `gs:`
+  works from any process's interrupt context. **Verified under `-smp 4`:** login + multiple
+  commands run, scheduler/IPC/syscalls all use the per-CPU current — identical on one core.
+- **Still TODO (with Phase 3):** per-CPU **idle thread** (TCB 0 is global today), and the
+  run queue. Start with **one global run queue** under a spinlock (simplest, correct); move to
+  per-CPU queues + work-stealing later only if contention shows up. Each AP will call
+  `percpu::init(k)` at bringup to claim its own slot + GS base.
 
 ### Phase 5 — Real locking (the core of the arc)
 - Audit every `spin::Mutex` user for **lock ordering** (define a global order, e.g.
