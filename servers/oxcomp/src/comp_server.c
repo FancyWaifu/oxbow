@@ -230,6 +230,50 @@ static void composite_occluded(struct surf *s, int x0, int y0, int x1, int y1)
   for (int r = 0; r < nv; r++) composite_rect(vis[r][0], vis[r][1], vis[r][2], vis[r][3]);
 }
 
+/* §62: is view `s`'s CONTENT area entirely hidden behind opaque views above it?
+ * (The titlebar is compositor-drawn and static, so it doesn't matter here — only
+ * the client's own pixels decide whether the client needs to keep drawing.) Same
+ * rect-subtraction as composite_occluded, on the content rect; nothing surviving
+ * ⟹ fully occluded. */
+static int content_fully_occluded(struct surf *s)
+{
+  int si = -1;
+  for (int v = 0; v < g_nviews; v++) if (g_views[v] == s) { si = v; break; }
+  if (si < 0) return 0;
+  int vis[MAXVISRECTS][4];
+  vis[0][0]=s->x; vis[0][1]=s->y; vis[0][2]=s->x + s->w; vis[0][3]=s->y + s->h;
+  int nv = 1;
+  for (int v = si + 1; v < g_nviews; v++) {
+    struct surf *o = g_views[v];
+    if (!o->mapped || !o->backing) continue;
+    int next[MAXVISRECTS][4], nn = 0;
+    for (int r = 0; r < nv; r++)
+      nn = rect_subtract(vis[r], o->x, o->y - TBH, o->x + o->w, o->y + o->h, next, nn);
+    if (nn >= MAXVISRECTS) return 0; /* overflow → assume visible (keep animating) */
+    memcpy(vis, next, (size_t)nn * 4 * sizeof(int));
+    nv = nn;
+    if (nv == 0) return 1; /* every piece consumed → fully hidden */
+  }
+  return 0;
+}
+
+/* §62: a fully-occluded window is held with its frame callback PENDING (§51 sends
+ * it on commit only when visible), so its client blocks and stops animating — no
+ * CPU for frames nobody sees. When the scene changes (a window above moves, closes,
+ * or this one is raised) and it becomes even partially visible, deliver the held
+ * callback so the client resumes. Cheap: ≤8 views, a few rect ops each. */
+static void wake_unoccluded(void)
+{
+  for (int v = 0; v < g_nviews; v++) {
+    struct surf *s = g_views[v];
+    if (s->mapped && s->frame_cb && !content_fully_occluded(s)) {
+      wl_callback_send_done(s->frame_cb, ox_now_ms());
+      wl_resource_destroy(s->frame_cb);
+      s->frame_cb = NULL;
+    }
+  }
+}
+
 /* ---- wl_surface ---------------------------------------------------------- */
 static void surface_destroy(struct wl_client *c, struct wl_resource *res)
 {
@@ -334,8 +378,11 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
   g_composited = 1;
   wl_buffer_send_release(s->buffer); /* client may reuse the buffer */
   /* Tell the client this frame is on screen and it may draw the next one. Its
-   * frame-callback handler redraws + commits again → the surface animates. */
-  if (s->frame_cb) {
+   * frame-callback handler redraws + commits again → the surface animates.
+   * §62: but if this window is now FULLY hidden behind opaque windows, withhold
+   * the callback — the client blocks, the hidden animation pauses (no wasted CPU),
+   * and wake_unoccluded() re-delivers it when the window becomes visible again. */
+  if (s->frame_cb && !content_fully_occluded(s)) {
     wl_callback_send_done(s->frame_cb, ox_now_ms());
     wl_resource_destroy(s->frame_cb);
     s->frame_cb = NULL;
@@ -378,6 +425,7 @@ static void surface_resource_destroy(struct wl_resource *res)
     free(s);
   }
   composite_scene();
+  wake_unoccluded(); /* §62: closing a window uncovers anything it was hiding */
 }
 
 /* ---- wl_region (no-op; we don't clip) ------------------------------------ */
@@ -729,6 +777,7 @@ static void focus_view(struct surf *s)
       wl_array_release(&keys);
     }
   }
+  wake_unoccluded(); /* §62: raising `s` to the top uncovers whatever it hid */
 }
 
 static int on_input(int fd, uint32_t mask, void *data)
@@ -770,6 +819,7 @@ static void flush_mouse_motion(int ocx, int ocy, int ogx, int ogy)
     int nx1 = (ogx > g_grab->x ? ogx : g_grab->x) + g_grab->w;
     int ny1 = (ogy > g_grab->y ? ogy : g_grab->y) + g_grab->h;
     composite_rect(nx0, ny0, nx1, ny1);
+    wake_unoccluded(); /* §62: dragging this window may have uncovered another */
   } else {
     pointer_update(); /* §55: deliver motion + enter/leave to the client */
     /* §59: damage only the cursor's old + new footprint. */

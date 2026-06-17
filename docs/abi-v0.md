@@ -2203,3 +2203,33 @@ compositor cannot move) and full-rings compositing at ~10.5 ms, which culling cu
 open" now performs close to "terminal closed". The remaining floor is the client's own
 rendering, not the compositor. Future: stop sending frame callbacks to fully-occluded
 surfaces (so a hidden animation pauses), and per-output damage accumulation.
+
+## 62. Frame-callback occlusion gate — hidden animations pause entirely (v1-occluded-frame-skip)
+
+Occlusion culling (§61) stopped the compositor from *drawing* hidden windows, but the
+hidden client kept *rendering* — the rings client behind the terminal still computed a
+256×256 frame, committed it, got its frame callback, and looped, burning ~23 ms of CPU
+per frame on pixels nobody could see. Real compositors gate the frame callback on
+visibility: a Wayland `wl_surface.frame` callback means "now is a good time to draw the
+next frame", and a fully-occluded surface has no good time — so wlroots/Weston withhold
+it until the surface is visible again, and the client (which blocks waiting for it) stops
+animating on its own.
+
+oxbow does the same. `content_fully_occluded(s)` reuses the §61 rect subtraction on the
+window's *content* rect (the titlebar is compositor-drawn, so it doesn't count): nothing
+survives ⟹ fully hidden. On commit, the frame callback is sent only if the window is not
+fully occluded; otherwise it is held (left pending). When the scene later changes so the
+window becomes even partially visible, `wake_unoccluded()` delivers the held callback and
+the client resumes. The wake is fired wherever stacking/geometry can change:
+- a drag (the moving window may uncover another) — `flush_mouse_motion` MODE_MOVE,
+- a raise/focus (`focus_view`),
+- a window close (`surface_resource_destroy`).
+
+These are exactly the events that can reveal a hidden window (a fully-hidden window can't
+be clicked, so it is only ever revealed by something *above* it moving/closing, or by
+itself being raised). A partially-visible window is never gated, so it always keeps
+animating. Verified: with the rings placed fully under the terminal, the rings client
+went from ~25 commits/s to **0** while hidden (the terminal, on top, kept committing),
+and dragging the terminal aside brought the rings' commit counter straight back to life —
+no freeze. The hidden client now uses zero CPU; combined with §61 a window behind an
+opaque one costs essentially nothing until it is shown again.
