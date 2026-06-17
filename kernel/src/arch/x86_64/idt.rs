@@ -93,6 +93,9 @@ extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
         crate::notif::fire_tick();
     }
 
+    // Wake any thread whose timed-wait deadline has elapsed (sys_chan_wait timeout).
+    crate::thread::wake_expired(tick);
+
     // (Ring-3 preemptibility was proven in the threads arc; the per-preempt
     // trace print is retired — it would otherwise corrupt the serial console,
     // which the shell now shares with kernel output.)

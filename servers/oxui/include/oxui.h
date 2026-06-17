@@ -47,6 +47,10 @@ typedef struct {
     /* Keep repainting every frame (continuous animation). 0 = event-driven: only
      * repaint on oxui_request_redraw / resize. */
     int  animate;
+    /* Repaint at most every N milliseconds (a clock/monitor). The loop SLEEPS in
+     * the kernel between repaints — no busy-poll, no per-frame CPU — and still
+     * wakes immediately for input. 0 = off. Ignored when `animate` is set. */
+    int  redraw_interval_ms;
 } oxui_handlers;
 
 /* Create a window (title shown to the WM; w×h content area). NULL on failure. */

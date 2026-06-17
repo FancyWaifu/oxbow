@@ -71,6 +71,9 @@ struct Tcb {
     kstack_top: u64,
     proc: usize,     // owning process id, or NO_PROC for kernel threads
     cr3: u64,        // address-space root to load on switch (0 = keep live CR3)
+    /// Timer deadline in ticks (0 = none). When `TICKS >= wake_at`, the timer IRQ
+    /// wakes this Blocked thread. Used for timed waits (sys_chan_wait timeout).
+    wake_at: u64,
 }
 
 static mut TCBS: [Tcb; MAX_THREADS] = [Tcb {
@@ -79,6 +82,7 @@ static mut TCBS: [Tcb; MAX_THREADS] = [Tcb {
     kstack_top: 0,
     proc: NO_PROC,
     cr3: 0,
+    wake_at: 0,
 }; MAX_THREADS];
 
 static mut CURRENT: usize = IDLE;
@@ -174,6 +178,7 @@ fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64) -> usize {
                     kstack_top,
                     proc,
                     cr3,
+                    wake_at: 0,
                 };
                 // Fresh (or reused) slot: reset its FPU state to the clean template.
                 core::ptr::copy_nonoverlapping(
@@ -282,6 +287,32 @@ pub fn block_current() {
 pub fn wake(tid: usize) {
     if state(tid) == State::Blocked {
         set_state(tid, State::Ready);
+    }
+}
+
+/// Arm a timer deadline (in ticks) for `tid`; the timer IRQ wakes it once
+/// `TICKS >= deadline`. 0 disarms. Used for timed waits (sys_chan_wait timeout).
+pub fn set_wake_at(tid: usize, deadline_tick: u64) {
+    unsafe { (*addr_of_mut!(TCBS[tid])).wake_at = deadline_tick }
+}
+
+/// Has `tid`'s timer deadline passed (and is it armed)?
+pub fn timed_out(tid: usize, now_tick: u64) -> bool {
+    let d = unsafe { (*addr_of!(TCBS[tid])).wake_at };
+    d != 0 && now_tick >= d
+}
+
+/// Timer-IRQ hook: wake every Blocked thread whose deadline has passed. Does NOT
+/// clear `wake_at` — the waiter checks `timed_out()` after waking and clears it
+/// itself (sys_chan_wait's exit). If we cleared it here, the waiter could not tell
+/// a timer wake from a spurious one and would re-block forever. Cheap — one pass
+/// over the small TCB pool, called with IF=0.
+pub fn wake_expired(now_tick: u64) {
+    for s in 1..MAX_THREADS {
+        let d = unsafe { (*addr_of!(TCBS[s])).wake_at };
+        if d != 0 && now_tick >= d && state(s) == State::Blocked {
+            set_state(s, State::Ready);
+        }
     }
 }
 

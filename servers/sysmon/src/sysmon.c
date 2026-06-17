@@ -82,9 +82,9 @@ main(void)
     oxui_window *w = oxui_window_create("system monitor", 360, 200);
     if (!w)
         return 1;
-    /* animate: refresh continuously so uptime ticks (a kernel sleep/timer would
-     * let this be idle-efficient; that's a follow-up). */
-    oxui_handlers h = { .draw = draw, .animate = 1, .extra_fd = -1 };
+    /* §65: refresh ~4x/second so the clock ticks and the strip sweeps, but SLEEP in
+     * the kernel between repaints (no busy-poll) — and still wake instantly for input. */
+    oxui_handlers h = { .draw = draw, .redraw_interval_ms = 250, .extra_fd = -1 };
     oxui_run(w, &h, NULL);
     oxui_window_destroy(w);
     return 0;

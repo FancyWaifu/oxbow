@@ -824,7 +824,7 @@ pub unsafe extern "C" fn epoll_wait(
                 }
             }
             if nh > 0 {
-                rt::channel::wait(&hs[..nh]);
+                rt::channel::wait(&hs[..nh], 0); // 0 = infinite
             }
             // re-loop and re-poll to report which fds are ready.
         }
@@ -1060,12 +1060,23 @@ pub unsafe extern "C" fn poll(fds: *mut u8, nfds: u64, timeout: i32) -> i32 {
         if timeout == 0 || rt::sys_uptime_ms() >= deadline {
             return 0;
         }
-        // Nothing ready and the caller wants to wait. Only block when every fd is a
-        // channel (so a send wakes us); otherwise fall back to returning 0 so socket
-        // callers keep their retry loop.
-        if all_chan && nh > 0 && timeout < 0 {
-            rt::channel::wait(&hs[..nh]);
-            // re-loop and re-check
+        // Nothing ready and the caller wants to wait. Block in the kernel when every
+        // fd is a channel (so a send — or the timer deadline — wakes us); otherwise
+        // fall back to returning 0 so socket callers keep their retry loop.
+        if all_chan && nh > 0 {
+            // timeout < 0 → wait forever (0 = infinite). timeout > 0 → up to the
+            // remaining ms, so a periodic-redraw app (sysmon) sleeps between ticks.
+            let wait_ms = if timeout < 0 {
+                0u64
+            } else {
+                let now = rt::sys_uptime_ms();
+                if now >= deadline {
+                    return 0;
+                }
+                deadline - now
+            };
+            rt::channel::wait(&hs[..nh], wait_ms);
+            // re-loop and re-check readiness / deadline
         } else {
             return 0;
         }

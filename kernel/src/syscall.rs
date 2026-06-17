@@ -124,7 +124,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_CHANNEL_RECV => sys_channel_recv(a1, a2, a3, a4, a5),
         SYS_CHANNEL_CLOSE => sys_channel_close(a1),
         SYS_CHANNEL_POLL => sys_channel_poll(a1),
-        SYS_CHAN_WAIT => sys_chan_wait(a1, a2),
+        SYS_CHAN_WAIT => sys_chan_wait(a1, a2, a3),
         SYS_SHM_CREATE => sys_shm_create(a1, a2),
         SYS_SHM_MAP => sys_shm_map(a1, a2),
         SYS_CAP_TYPE => sys_cap_type(a1),
@@ -1460,13 +1460,18 @@ fn sys_channel_poll(h: u64) -> SyscallRet {
 ///
 /// Parks the caller on EVERY channel, then checks readiness, then blocks; a send
 /// into any of them drains+wakes us. On wake we deregister from all of them and
-/// return — the caller re-polls to learn which became ready. No timeout (infinite
-/// wait): the compositor dispatches its event loop with timeout -1.
+/// return — the caller re-polls to learn which became ready.
+///
+/// `timeout_ms`: 0 = wait forever (the compositor's `-1` dispatch); >0 = wake after
+/// at most that many milliseconds even if no channel becomes readable (a timer fd
+/// equivalent — lets an app sleep between periodic redraws, §65). The timer IRQ
+/// wakes us when the deadline passes (`thread::wake_expired`).
 ///
 /// Safe against lost wakeups for the same reason the recv path is: the kernel is
 /// non-preemptible (IF=0, single core), so no sender can run between the park, the
-/// readiness check, and `block_current`.
-fn sys_chan_wait(handles_ptr: u64, count: u64) -> SyscallRet {
+/// readiness check, and `block_current`. The deadline is armed BEFORE blocking, so
+/// a tick that lands between the check and the block still wakes us.
+fn sys_chan_wait(handles_ptr: u64, count: u64, timeout_ms: u64) -> SyscallRet {
     const MAXW: usize = 16;
     let n = (count as usize).min(MAXW);
     if n == 0 {
@@ -1490,6 +1495,17 @@ fn sys_chan_wait(handles_ptr: u64, count: u64) -> SyscallRet {
         return SyscallRet { rax: 0, rdx: 0 }; // nothing to wait on → caller re-polls
     }
     let me = crate::thread::current();
+    // Arm the timer deadline (ms → 10ms ticks, round up, at least one tick).
+    if timeout_ms > 0 {
+        let deadline = crate::arch::ticks() + ((timeout_ms + 9) / 10).max(1);
+        crate::thread::set_wake_at(me, deadline);
+    }
+    let finish = |me: usize| {
+        if timeout_ms > 0 {
+            crate::thread::set_wake_at(me, 0); // disarm on every exit
+        }
+        SyscallRet { rax: 0, rdx: 0 }
+    };
     loop {
         for &(conn, side) in &chans[..nc] {
             crate::channel::park_recv(conn, side, me);
@@ -1497,17 +1513,18 @@ fn sys_chan_wait(handles_ptr: u64, count: u64) -> SyscallRet {
         let ready = chans[..nc]
             .iter()
             .any(|&(conn, side)| crate::channel::poll(conn, side) & 0b001 != 0);
-        if ready {
+        let expired = timeout_ms > 0 && crate::thread::timed_out(me, crate::arch::ticks());
+        if ready || expired {
             for &(conn, side) in &chans[..nc] {
                 crate::channel::unpark_recv(conn, side, me);
             }
-            return SyscallRet { rax: 0, rdx: 0 };
+            return finish(me);
         }
-        crate::thread::block_current(); // woken by a send into one of the channels
+        crate::thread::block_current(); // woken by a send OR the timer deadline
         for &(conn, side) in &chans[..nc] {
             crate::channel::unpark_recv(conn, side, me);
         }
-        // re-loop: re-park + re-check (also handles any spurious wake safely)
+        // re-loop: re-park + re-check readiness/deadline (also covers spurious wakes)
     }
 }
 

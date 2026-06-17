@@ -335,6 +335,13 @@ int oxui_run(oxui_window *w, const oxui_handlers *h, void *user)
     int efd = h->extra_fd ? h->extra_fd : -1;
     if (!h->extra_fd) efd = -1; /* 0 is stdin; require explicit >0 */
 
+    /* Poll timeout: animate is driven by frame callbacks (block forever, the
+     * callback wakes us); a redraw_interval sleeps that long between repaints;
+     * otherwise pure event-driven (block forever). §65 */
+    int timeout = -1;
+    if (!h->animate && h->redraw_interval_ms > 0)
+        timeout = h->redraw_interval_ms;
+
     while (w->running) {
         present(w); /* paint if dirty and a buffer is free */
         wl_display_flush(w->display);
@@ -343,7 +350,7 @@ int oxui_run(oxui_window *w, const oxui_handlers *h, void *user)
         int n = 1;
         pfd[0].fd = wfd; pfd[0].events = POLLIN; pfd[0].revents = 0;
         if (efd > 0) { pfd[1].fd = efd; pfd[1].events = POLLIN; pfd[1].revents = 0; n = 2; }
-        poll(pfd, n, -1); /* blocks in the kernel — no busy-poll (§63) */
+        int nready = poll(pfd, n, timeout); /* sleeps in the kernel — no busy-poll */
 
         if (pfd[0].revents & POLLIN) {
             if (wl_display_dispatch(w->display) == -1)
@@ -351,6 +358,9 @@ int oxui_run(oxui_window *w, const oxui_handlers *h, void *user)
         }
         if (n == 2 && (pfd[1].revents & POLLIN) && h->fd_ready)
             h->fd_ready(w, w->user);
+        /* timed out (no fd ready) and we have an interval → repaint this tick */
+        if (nready == 0 && timeout > 0)
+            oxui_request_redraw(w);
     }
     return 0;
 }

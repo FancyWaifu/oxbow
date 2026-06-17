@@ -2341,3 +2341,33 @@ kernel sleep/timer would let it idle between updates (§63-style) — a clean fo
 
 With oxui + oxui_text in place, the recipe for the next program (a file viewer, a clock, a
 settings panel) is: write a `draw` callback, maybe an `fd_ready`, and four lines of `main`.
+
+## 66. Kernel sleep/timer — periodic apps idle between updates (v1-timer, SYS_CHAN_WAIT timeout)
+
+sysmon (§65) refreshed via oxui `animate` mode — a continuous redraw that pinned a core
+(~100% CPU) just to tick a clock. The fix is a real kernel timer so a thread can sleep
+until a deadline AND still wake instantly for input, with no busy-poll.
+
+Mechanism:
+- **TCB `wake_at`** (a tick deadline, 0 = none) + a timer-IRQ hook `thread::wake_expired`:
+  on each tick it sets Ready every Blocked thread whose deadline has passed. It does NOT
+  clear `wake_at` — the waiter checks `timed_out()` after waking and clears it itself; if
+  the IRQ cleared it, the waiter couldn't distinguish a timer wake from a spurious one and
+  would re-block forever (the exact bug hit during bring-up).
+- **`SYS_CHAN_WAIT` gains a timeout** (3rd arg): `0` = wait forever (the compositor's `-1`
+  dispatch, unchanged); `N>0` = wake after at most N ms even if no channel becomes readable.
+  The wait arms `wake_at = now + ceil(N/10)` ticks before blocking, so a tick landing between
+  the readiness check and the block still wakes it (same non-preemptible safety as the rest).
+- **libc `poll`/`epoll_wait`** now block with a finite timeout through `SYS_CHAN_WAIT`
+  instead of returning early — so `poll(fds, n, 250)` truly sleeps up to 250 ms, waking on
+  a watched-channel event *or* the deadline.
+- **oxui `redraw_interval_ms`**: a handler field. The loop polls with that timeout and, on a
+  timeout (no fd ready), marks the window dirty and repaints — so a clock/monitor sleeps in
+  the kernel between frames and still reacts to input immediately.
+
+sysmon switched from `animate` to `redraw_interval_ms = 250` (4 Hz). Measured: idle CPU for
+the sysmon path dropped from **~100% to ~12%** (rings off, terminal idle) — the ~12% is four
+redraws/second of real work (FreeType text + composite), not a spin; a 1 Hz interval would be
+a few percent. The clock ticks and the activity strip sweeps, and the window still wakes the
+instant it is clicked. This is the §63 discipline extended to *periodic* apps: sleep in the
+kernel, do work only when there is work (or the timer says it is time).
