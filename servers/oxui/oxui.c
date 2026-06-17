@@ -132,7 +132,7 @@ static const struct wl_callback_listener frame_listener;
 
 static void present(struct oxui_window *w)
 {
-    if (!w->dirty)
+    if (w->wait_for_configure || !w->dirty)
         return;
     struct oxui_buffer *b = next_buffer(w);
     if (!b)

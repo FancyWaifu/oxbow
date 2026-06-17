@@ -2387,3 +2387,29 @@ top-right, sysmon bottom-left) and are all fully visible at once with no draggin
 generic heuristic, not role-aware — for many windows the anchors repeat with jitter — but it
 fixes the common "small window buried under a big one" case. (Real tiling / user-driven
 layout remains future work; windows are still freely draggable, §57.)
+
+## 68. The third window's missing-buffer bug — shm region pool too small (v1-shm-pool)
+
+After §65 added sysmon as a third compositor client, the third window to map would
+intermittently never appear: its program ran fine (the terminal still took input via the
+tty) but no window showed. The window-spread (§67) only made it *visible* — with the old
+overlapping cascade a missing window was hidden under the pile.
+
+Root cause: the kernel's shm region pool was **`NREGIONS = 4`** (`kernel/src/shm.rs`). Every
+oxui client double-buffers, so it needs up to 2 shm regions; 4 was *exactly* enough for two
+clients (terminal + rings), so the third client (sysmon) could not allocate a single buffer.
+Its `create_shm` → `sys_shm_create` → `shm::create` returned `None` (pool full), `next_buffer`
+returned NULL, and `present` deferred **forever** — the window never committed a buffer, so
+it never mapped. It looked like a handshake race (intermittent, load-dependent) because
+whether the pool was full when the third client tried depended on buffer-release timing.
+
+Found by per-client tracing (tagging each oxui log with the window width): the failing client
+logged `CONFIGURE received` then `present DEFER (no buffer)` on an endless loop. Fix:
+`NREGIONS = 4 → 16` (8 double-buffered windows; each region is ~4 KiB of static frame table).
+Verified across **5/5** interactive boots (login + `ls`): all three windows map, no panic.
+
+Two supporting cleanups went in with it:
+- oxui `present()` now refuses to paint before the first xdg configure (the §68 guard). The
+  old premature commit was a protocol quirk the compositor special-cased AND it stranded one
+  shm region per client (the compositor ignores that buffer but the client marks it busy
+  forever). Skipping it is both protocol-correct and one fewer region used.

@@ -10,7 +10,12 @@
 //! ~4 KiB and would overflow the kernel stack, like the channel pool).
 use spin::Mutex;
 
-const NREGIONS: usize = 4;
+// Each double-buffered Wayland client needs 2 shm regions; the desktop has 3
+// clients (terminal, rings, sysmon) = 6, and 4 was exactly enough for 2 clients —
+// so adding the 3rd window left it unable to allocate a buffer and it never mapped.
+// 16 covers 8 double-buffered windows with headroom. (Each region is ~4 KiB of
+// static frame-table, so 16 is 64 KiB.)
+const NREGIONS: usize = 16;
 /// Max pages per region: 512 * 4 KiB = 2 MiB (e.g. a 720x720x4 buffer).
 const MAX_PAGES: usize = 512;
 
