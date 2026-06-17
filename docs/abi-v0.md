@@ -2106,3 +2106,20 @@ box; dragging a titlebar moves the window across the desktop and focuses it.
 solid for now.) This completes the mouse + window-manager arc: a cursor, multiple
 windows, z-order, click-to-focus, decorations, and drag-to-move — oxbow's own
 desktop, built on libwayland + the tinywl model.
+
+## 58. Double-buffering — no more flicker (v1-double-buffer)
+
+The compositor drew straight into the live scanout framebuffer, so while it cleared
+the background and re-blitted windows the display caught half-drawn frames — visible
+flicker/tearing, made worse by the rings client animating (a full recomposite every
+frame). Fixed with classic **double-buffering**: `composite_scene()` now renders the
+whole frame (desktop + windows + titlebars + cursor) into an offscreen back buffer
+(`g_back`, same layout as the framebuffer), then **flips** it to the screen in a
+single `memcpy`. Every frame the display shows is complete; it never sees a partial
+composite.
+
+The software cursor lost its save-under machinery — with a full recomposite per frame
+the cursor is just drawn into the back buffer like everything else (`draw_cursor_back`),
+which is simpler and correct. Any change (window commit, mouse move, focus, drag,
+destroy) goes through the one render-and-flip path. Future: damage tracking to skip
+recompositing when nothing changed, and true vsync if a page-flip primitive lands.

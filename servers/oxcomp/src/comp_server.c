@@ -24,7 +24,8 @@ static void slog(const char *s)
   ox_log(s, n);
 }
 
-static unsigned int *g_fb;
+static unsigned int *g_fb;   /* the live scanout framebuffer */
+static unsigned int *g_back; /* §58: offscreen back buffer (double-buffering) */
 static int           g_w, g_h, g_pitch_words;
 
 /* ---- software cursor (§54) ---------------------------------------------- */
@@ -38,44 +39,22 @@ static const char *const cursor_bits[CURH] = {
   "X.X X..X   ", "XX  X..X   ", "X    X..X  ", "     X..X  ",
   "      XX   ",
 };
-static int          g_cx = 200, g_cy = 200; /* logical cursor position */
-static int          g_cur_drawn = 0, g_cdx, g_cdy; /* last DRAWN position */
-static unsigned int g_cur_save[CURW * CURH];
+static int g_cx = 200, g_cy = 200; /* logical cursor position */
 
-/* Restore the pixels the cursor overwrote (call before any fb change). */
-static void erase_cursor(void)
+/* §58: draw the cursor sprite into the BACK buffer (no save-under needed — every
+ * frame is composited fresh, then flipped to the screen in one pass). */
+static void draw_cursor_back(void)
 {
-  if (!g_cur_drawn)
-    return;
-  for (int j = 0; j < CURH; j++)
-    for (int i = 0; i < CURW; i++) {
-      if (cursor_bits[j][i] == ' ')
-        continue;
-      int x = g_cdx + i, y = g_cdy + j;
-      if (x < 0 || x >= g_w || y < 0 || y >= g_h)
-        continue;
-      g_fb[(long)y * g_pitch_words + x] = g_cur_save[j * CURW + i];
-    }
-  g_cur_drawn = 0;
-}
-
-/* Save the pixels under the cursor + draw it on top (call after any fb change). */
-static void draw_cursor(void)
-{
-  g_cdx = g_cx;
-  g_cdy = g_cy;
   for (int j = 0; j < CURH; j++)
     for (int i = 0; i < CURW; i++) {
       char c = cursor_bits[j][i];
       if (c == ' ')
         continue;
-      int x = g_cdx + i, y = g_cdy + j;
+      int x = g_cx + i, y = g_cy + j;
       if (x < 0 || x >= g_w || y < 0 || y >= g_h)
         continue;
-      g_cur_save[j * CURW + i] = g_fb[(long)y * g_pitch_words + x];
-      g_fb[(long)y * g_pitch_words + x] = (c == 'X') ? 0x00000000u : 0x00ffffffu;
+      g_back[(long)y * g_pitch_words + x] = (c == 'X') ? 0x00000000u : 0x00ffffffu;
     }
-  g_cur_drawn = 1;
 }
 static unsigned int        g_serial;    /* event serial counter */
 static int           g_composited;
@@ -164,18 +143,21 @@ static void draw_titlebar(struct surf *s)
       /* close box: a red square at the far right, inset by 4px. */
       int in_close = i >= s->w - TBH && j >= 4 && j < TBH - 4 &&
                      i >= s->w - TBH + 4 && i < s->w - 4;
-      g_fb[(long)y * g_pitch_words + x] = in_close ? 0x00c04040u : bar;
+      g_back[(long)y * g_pitch_words + x] = in_close ? 0x00c04040u : bar;
     }
   }
 }
 
-/* §56: redraw the whole scene — background, every mapped view bottom→top from its
- * backing copy, then the cursor on top. Called when any window changes. */
+/* §56/§58: redraw the whole scene into the BACK buffer — background, every mapped
+ * view bottom→top from its backing copy, then the cursor — and FLIP it to the
+ * screen in one memcpy. Double-buffering: the display never sees a partial frame,
+ * so windows stop flickering while clients animate. */
 static void composite_scene(void)
 {
-  erase_cursor();
+  if (!g_back)
+    return;
   for (long i = 0; i < (long)g_h * g_pitch_words; i++)
-    g_fb[i] = 0x000d3b45; /* deep-teal desktop */
+    g_back[i] = 0x000d3b45; /* deep-teal desktop */
   for (int v = 0; v < g_nviews; v++) {
     struct surf *s = g_views[v];
     if (!s->mapped || !s->backing)
@@ -187,11 +169,13 @@ static void composite_scene(void)
       for (int x = 0; x < s->w && s->x + x < g_w; x++) {
         if (s->x + x < 0)
           continue;
-        g_fb[(long)(s->y + y) * g_pitch_words + (s->x + x)] = s->backing[(long)y * s->w + x];
+        g_back[(long)(s->y + y) * g_pitch_words + (s->x + x)] = s->backing[(long)y * s->w + x];
       }
     }
   }
-  draw_cursor();
+  draw_cursor_back();
+  /* flip: copy the finished frame to the scanout buffer in one pass. */
+  memcpy(g_fb, g_back, (size_t)g_h * g_pitch_words * 4);
 }
 
 /* ---- wl_surface ---------------------------------------------------------- */
@@ -758,10 +742,8 @@ static int on_mouse(int fd, uint32_t mask, void *data)
       recomposited = 1; /* button handlers may recomposite (focus/move/close) */
     }
   }
-  if (moved && !recomposited) {
-    erase_cursor();
-    draw_cursor();
-  }
+  if (moved && !recomposited)
+    composite_scene(); /* §58: redraw + flip so the cursor moves without tearing */
   return 0;
 }
 
@@ -777,12 +759,10 @@ void *comp_server_setup(int fd, int input_fd, int mouse_fd, unsigned int *fb, in
   g_cx = w / 2;
   g_cy = h / 2;
 
-  /* Paint a desktop background so the screen is self-contained (the client
-   * window then composites on top of it). */
-  for (int y = 0; y < h; y++)
-    for (int x = 0; x < w; x++)
-      fb[(long)y * pitch_words + x] = 0x000d3b45; /* deep teal */
-  draw_cursor(); /* §54: show the cursor from the start */
+  /* §58: allocate the offscreen back buffer (same layout as the framebuffer) and
+   * render the initial frame (empty desktop + cursor) through the flip path. */
+  g_back = malloc((size_t)h * pitch_words * 4);
+  composite_scene();
 
   struct wl_display *d = wl_display_create();
   if (!d)
