@@ -41,21 +41,6 @@ static const char *const cursor_bits[CURH] = {
 };
 static int g_cx = 200, g_cy = 200; /* logical cursor position */
 
-/* §58: draw the cursor sprite into the BACK buffer (no save-under needed — every
- * frame is composited fresh, then flipped to the screen in one pass). */
-static void draw_cursor_back(void)
-{
-  for (int j = 0; j < CURH; j++)
-    for (int i = 0; i < CURW; i++) {
-      char c = cursor_bits[j][i];
-      if (c == ' ')
-        continue;
-      int x = g_cx + i, y = g_cy + j;
-      if (x < 0 || x >= g_w || y < 0 || y >= g_h)
-        continue;
-      g_back[(long)y * g_pitch_words + x] = (c == 'X') ? 0x00000000u : 0x00ffffffu;
-    }
-}
 static unsigned int        g_serial;    /* event serial counter */
 static int           g_composited;
 static int g_btn_left; /* last reported left-button state (edge detection) */
@@ -128,55 +113,69 @@ static struct surf *g_grab;        /* view being dragged */
 static int          g_grab_dx, g_grab_dy; /* cursor offset within the window */
 
 /* Draw view `s`'s titlebar (above its content): a bar — brighter when focused —
- * with a red close box at the right end. */
-static void draw_titlebar(struct surf *s)
-{
-  unsigned int bar = (s == g_focus_view) ? 0x003a6ea5u : 0x00444444u;
-  for (int j = 0; j < TBH; j++) {
-    int y = s->y - TBH + j;
-    if (y < 0 || y >= g_h)
-      continue;
-    for (int i = 0; i < s->w; i++) {
-      int x = s->x + i;
-      if (x < 0 || x >= g_w)
-        continue;
-      /* close box: a red square at the far right, inset by 4px. */
-      int in_close = i >= s->w - TBH && j >= 4 && j < TBH - 4 &&
-                     i >= s->w - TBH + 4 && i < s->w - 4;
-      g_back[(long)y * g_pitch_words + x] = in_close ? 0x00c04040u : bar;
-    }
-  }
-}
-
-/* §56/§58: redraw the whole scene into the BACK buffer — background, every mapped
- * view bottom→top from its backing copy, then the cursor — and FLIP it to the
- * screen in one memcpy. Double-buffering: the display never sees a partial frame,
- * so windows stop flickering while clients animate. */
-static void composite_scene(void)
+ * with a red close box at the right end. (Drawn inline + clipped in composite_rect.)
+ *
+ * §59 damage tracking: recomposite + flip ONLY the rectangle [x0,y0)×[x1,y1) that
+ * actually changed, instead of the whole 1280×800 screen every frame. Renders the
+ * background, every view's titlebar+content clipped to the rect, and the cursor,
+ * into the back buffer, then flips just those rows to the framebuffer. The hot
+ * paths (a client's animation frame, cursor motion) damage only a small area, so
+ * the per-frame cost is bounded by the window/cursor size, not the screen. */
+static void composite_rect(int x0, int y0, int x1, int y1)
 {
   if (!g_back)
     return;
-  for (long i = 0; i < (long)g_h * g_pitch_words; i++)
-    g_back[i] = 0x000d3b45; /* deep-teal desktop */
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 > g_w) x1 = g_w;
+  if (y1 > g_h) y1 = g_h;
+  if (x0 >= x1 || y0 >= y1)
+    return;
+  for (int y = y0; y < y1; y++)
+    for (int x = x0; x < x1; x++)
+      g_back[(long)y * g_pitch_words + x] = 0x000d3b45u; /* desktop bg */
   for (int v = 0; v < g_nviews; v++) {
     struct surf *s = g_views[v];
     if (!s->mapped || !s->backing)
       continue;
-    draw_titlebar(s); /* §57 */
-    for (int y = 0; y < s->h && s->y + y < g_h; y++) {
-      if (s->y + y < 0)
-        continue;
-      for (int x = 0; x < s->w && s->x + x < g_w; x++) {
-        if (s->x + x < 0)
-          continue;
-        g_back[(long)(s->y + y) * g_pitch_words + (s->x + x)] = s->backing[(long)y * s->w + x];
+    unsigned int bar = (s == g_focus_view) ? 0x003a6ea5u : 0x00444444u;
+    /* titlebar rows [s->y-TBH, s->y) clipped to the damage rect */
+    int b0 = (s->y - TBH > y0) ? s->y - TBH : y0;
+    int b1 = (s->y < y1) ? s->y : y1;
+    int a0 = (s->x > x0) ? s->x : x0;
+    int a1 = (s->x + s->w < x1) ? s->x + s->w : x1;
+    for (int y = b0; y < b1; y++) {
+      int j = y - (s->y - TBH);
+      for (int x = a0; x < a1; x++) {
+        int i = x - s->x;
+        int in_close = i >= s->w - TBH + 4 && i < s->w - 4 && j >= 4 && j < TBH - 4;
+        g_back[(long)y * g_pitch_words + x] = in_close ? 0x00c04040u : bar;
       }
     }
+    /* content rows [s->y, s->y+s->h) clipped */
+    int cy0 = (s->y > y0) ? s->y : y0;
+    int cy1 = (s->y + s->h < y1) ? s->y + s->h : y1;
+    for (int y = cy0; y < cy1; y++)
+      for (int x = a0; x < a1; x++)
+        g_back[(long)y * g_pitch_words + x] = s->backing[(long)(y - s->y) * s->w + (x - s->x)];
   }
-  draw_cursor_back();
-  /* flip: copy the finished frame to the scanout buffer in one pass. */
-  memcpy(g_fb, g_back, (size_t)g_h * g_pitch_words * 4);
+  /* cursor on top, clipped */
+  for (int j = 0; j < CURH; j++)
+    for (int i = 0; i < CURW; i++) {
+      char c = cursor_bits[j][i];
+      if (c == ' ')
+        continue;
+      int x = g_cx + i, y = g_cy + j;
+      if (x < x0 || x >= x1 || y < y0 || y >= y1)
+        continue;
+      g_back[(long)y * g_pitch_words + x] = (c == 'X') ? 0u : 0x00ffffffu;
+    }
+  /* flip only the damaged rows. */
+  for (int y = y0; y < y1; y++)
+    memcpy(g_fb + (long)y * g_pitch_words + x0, g_back + (long)y * g_pitch_words + x0,
+           (size_t)(x1 - x0) * 4);
 }
+static void composite_scene(void) { composite_rect(0, 0, g_w, g_h); }
 
 /* ---- wl_surface ---------------------------------------------------------- */
 static void surface_destroy(struct wl_client *c, struct wl_resource *res)
@@ -272,8 +271,11 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
       wl_keyboard_send_enter(sc->kbd, ++g_serial, res, &keys);
       wl_array_release(&keys);
     }
+    composite_scene(); /* new window: place + focus → full recomposite */
+  } else {
+    /* §59: an animation frame only changed THIS window — damage just its area. */
+    composite_rect(s->x, s->y - TBH, s->x + s->w, s->y + s->h);
   }
-  composite_scene();
   g_composited = 1;
   wl_buffer_send_release(s->buffer); /* client may reuse the buffer */
   /* Tell the client this frame is on screen and it may draw the next one. Its
@@ -718,6 +720,7 @@ static int on_mouse(int fd, uint32_t mask, void *data)
     int dx = pkt[1] - ((flags & 0x10) ? 256 : 0);
     int dy = pkt[2] - ((flags & 0x20) ? 256 : 0);
     if (dx || dy) {
+      int ocx = g_cx, ocy = g_cy; /* old cursor, for the damage rect */
       g_cx += dx;
       g_cy -= dy;
       if (g_cx < 0) g_cx = 0;
@@ -725,25 +728,34 @@ static int on_mouse(int fd, uint32_t mask, void *data)
       if (g_cy < 0) g_cy = 0;
       if (g_cy >= g_h) g_cy = g_h - 1;
       moved = 1;
+      recomposited = 1;
       if (g_cursor_mode == MODE_MOVE && g_grab) {
-        /* §57: drag the grabbed window with the cursor. */
+        /* §57: drag the grabbed window — damage its OLD + NEW area (§59). */
+        int ogx = g_grab->x, ogy = g_grab->y;
         g_grab->x = g_cx - g_grab_dx;
         g_grab->y = g_cy - g_grab_dy;
-        composite_scene();
-        recomposited = 1;
+        int nx0 = ogx < g_grab->x ? ogx : g_grab->x;
+        int ny0 = (ogy < g_grab->y ? ogy : g_grab->y) - TBH;
+        int nx1 = (ogx > g_grab->x ? ogx : g_grab->x) + g_grab->w;
+        int ny1 = (ogy > g_grab->y ? ogy : g_grab->y) + g_grab->h;
+        composite_rect(nx0, ny0, nx1, ny1);
       } else {
         pointer_update(); /* §55: deliver motion + enter/leave to the client */
+        /* §59: damage only the cursor's old + new footprint. */
+        int cx0 = ocx < g_cx ? ocx : g_cx, cy0 = ocy < g_cy ? ocy : g_cy;
+        int cx1 = (ocx > g_cx ? ocx : g_cx) + CURW;
+        int cy1 = (ocy > g_cy ? ocy : g_cy) + CURH;
+        composite_rect(cx0, cy0, cx1, cy1);
       }
     }
     int left = flags & 0x01;
     if (left != g_btn_left) {
       g_btn_left = left;
-      pointer_button(left);
-      recomposited = 1; /* button handlers may recomposite (focus/move/close) */
+      pointer_button(left); /* focus/move/close paths recomposite as needed */
     }
   }
-  if (moved && !recomposited)
-    composite_scene(); /* §58: redraw + flip so the cursor moves without tearing */
+  (void)moved;
+  (void)recomposited;
   return 0;
 }
 

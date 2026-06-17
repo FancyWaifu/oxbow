@@ -2123,3 +2123,32 @@ the cursor is just drawn into the back buffer like everything else (`draw_cursor
 which is simpler and correct. Any change (window commit, mouse move, focus, drag,
 destroy) goes through the one render-and-flip path. Future: damage tracking to skip
 recompositing when nothing changed, and true vsync if a page-flip primitive lands.
+
+## 59. Damage tracking — only recomposite what changed (v1-damage-tracking)
+
+Double-buffering (§58) made every frame complete but also made every frame **expensive**:
+each rings-animation commit and each mouse packet recomposited the entire 1280×800 back
+buffer (≈1M background writes + re-blit of every window) and flipped all 4 MB to scanout.
+With the rings client animating continuously this pinned the compositor — the "insanely
+slow" symptom.
+
+Fixed with **damage tracking**, the standard compositor optimization: recomposite and
+flip only the rectangle that actually changed. The core primitive is
+`composite_rect(x0,y0,x1,y1)` — it clips the rect to the screen, repaints the desktop
+background, then for each mapped view repaints only the intersection of that view's
+titlebar/content with the damage rect, draws the cursor if it overlaps, and `memcpy`s
+just those scanlines (`x0..x1` of each row `y0..y1`) to the framebuffer. `composite_scene()`
+is now just `composite_rect(0,0,g_w,g_h)` (used for structural changes — a new window
+mapping, where the whole scene may reshuffle).
+
+Damage is computed at each event site:
+- **animation/content commit** → damage the committing window's rect (`x, y-TBH … x+w, y+h`).
+- **cursor motion** → damage the union of the cursor's old and new footprint (`CURW×CURH`).
+- **window drag (MODE_MOVE)** → damage the union of the window's old and new rect.
+
+Per-event work drops from full-screen to a few-hundred-pixel patch; the rings animate
+fluidly and a window dragging across the screen only touches the band it sweeps. The
+titlebar/cursor draw code that §58 had as standalone helpers is inlined (clipped) into
+`composite_rect`, so there is one painter and it always respects the damage rect. Future:
+coalesce multiple damage rects per pump into one bounding box, and true vsync via a
+page-flip primitive.
