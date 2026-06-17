@@ -2174,3 +2174,32 @@ matches how real compositors deliver pointer motion.
 Result: a window stays pinned to the cursor during a drag with no trailing, and the
 cursor itself never falls behind regardless of how fast you move. Per-batch compositing
 work drops from O(packets) to O(1).
+
+## 61. Occlusion culling — windows behind opaque windows cost only their visible area (v1-occlusion-cull)
+
+With two overlapping windows, an animating window *behind* an opaque one (the rings demo
+behind the terminal) tanked the frame rate: each rings frame repainted the whole rings
+rect and then overpainted most of it with the terminal — pure waste. Closing the terminal
+made it jump back up. This is the classic compositor problem; wlroots (scene graph) and
+Weston (`weston_view_repaint`) solve it with **opaque-region damage subtraction** (pixman
+region difference), and KWin tracks it as a dedicated "skip rendering fully-covered
+surfaces" optimization.
+
+oxbow applies the same idea, rectangle-based. When a window repaints an animation frame,
+`composite_occluded()` subtracts the rects of every mapped view stacked **above** it and
+composites only the surviving (visible) sub-rectangles. The primitive `rect_subtract()`
+returns rect-minus-occluder as up to four strips (top/bottom/left/right); occluders are
+applied in turn over a small rect list, and a fully-hidden window paints nothing. Because
+our renderer copies pixels and never alpha-blends, every mapped view is effectively
+opaque and fully occludes what it covers, so culling is exactly consistent with what
+reaches the screen (no `set_opaque_region` bookkeeping needed). Overflow of the rect list
+falls back to a plain full-rect composite, so it is never incorrect.
+
+Measured on the boot layout (rings ~1/3 visible behind the terminal): **30 → 38 fps**, a
+27% gain from culling alone. The model `1/30 = T_client + T_comp`, `1/38 = T_client +
+T_comp/3` puts the rings client's own per-frame render at ~23 ms (a ~44 fps ceiling the
+compositor cannot move) and full-rings compositing at ~10.5 ms, which culling cuts to
+~3.5 ms — i.e. it recovers essentially all of the terminal-induced overdraw, so "terminal
+open" now performs close to "terminal closed". The remaining floor is the client's own
+rendering, not the compositor. Future: stop sending frame callbacks to fully-occluded
+surfaces (so a hidden animation pauses), and per-output damage accumulation.

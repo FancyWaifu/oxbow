@@ -177,6 +177,59 @@ static void composite_rect(int x0, int y0, int x1, int y1)
 }
 static void composite_scene(void) { composite_rect(0, 0, g_w, g_h); }
 
+/* §61 occlusion culling — the wlroots/Weston technique. When a window repaints
+ * (e.g. an animation frame), the parts of it hidden behind opaque windows stacked
+ * above are wasted work: we'd paint them, then overpaint them. Real compositors
+ * subtract the opaque regions of higher views (pixman region difference) and only
+ * repaint the visible remainder. Our renderer copies pixels and never blends, so
+ * every mapped view is opaque and fully occludes whatever it covers — culling is
+ * exactly consistent with what reaches the screen.
+ *
+ * Rectangle subtraction: rect R minus occluder O yields up to four strips (top,
+ * bottom, left, right) of R that O does not cover. We subtract each higher view in
+ * turn, carrying a small list of surviving rects. */
+#define MAXVISRECTS 64
+static int rect_subtract(const int r[4], int ox0, int oy0, int ox1, int oy1,
+                         int out[][4], int n)
+{
+  int cx0 = ox0 > r[0] ? ox0 : r[0], cy0 = oy0 > r[1] ? oy0 : r[1];
+  int cx1 = ox1 < r[2] ? ox1 : r[2], cy1 = oy1 < r[3] ? oy1 : r[3];
+  if (cx0 >= cx1 || cy0 >= cy1) { /* no overlap → R survives whole */
+    if (n < MAXVISRECTS) { out[n][0]=r[0]; out[n][1]=r[1]; out[n][2]=r[2]; out[n][3]=r[3]; n++; }
+    return n;
+  }
+  if (r[1] < cy0 && n < MAXVISRECTS) { out[n][0]=r[0]; out[n][1]=r[1]; out[n][2]=r[2]; out[n][3]=cy0; n++; } /* top */
+  if (cy1 < r[3] && n < MAXVISRECTS) { out[n][0]=r[0]; out[n][1]=cy1; out[n][2]=r[2]; out[n][3]=r[3]; n++; } /* bottom */
+  if (r[0] < cx0 && n < MAXVISRECTS) { out[n][0]=r[0]; out[n][1]=cy0; out[n][2]=cx0; out[n][3]=cy1; n++; } /* left */
+  if (cx1 < r[2] && n < MAXVISRECTS) { out[n][0]=cx1; out[n][1]=cy0; out[n][2]=r[2]; out[n][3]=cy1; n++; } /* right */
+  return n;
+}
+
+/* Composite the damage rect for view `s`, skipping areas occluded by mapped views
+ * stacked above it. Falls back to a plain composite_rect on rect-list overflow. */
+static void composite_occluded(struct surf *s, int x0, int y0, int x1, int y1)
+{
+  if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > g_w) x1 = g_w; if (y1 > g_h) y1 = g_h;
+  if (x0 >= x1 || y0 >= y1) return;
+  int si = -1;
+  for (int v = 0; v < g_nviews; v++) if (g_views[v] == s) { si = v; break; }
+  int vis[MAXVISRECTS][4];
+  vis[0][0]=x0; vis[0][1]=y0; vis[0][2]=x1; vis[0][3]=y1;
+  int nv = 1;
+  for (int v = si + 1; v < g_nviews; v++) {
+    struct surf *o = g_views[v];
+    if (!o->mapped || !o->backing) continue;
+    int next[MAXVISRECTS][4], nn = 0;
+    for (int r = 0; r < nv; r++)
+      nn = rect_subtract(vis[r], o->x, o->y - TBH, o->x + o->w, o->y + o->h, next, nn);
+    if (nn >= MAXVISRECTS) { composite_rect(x0, y0, x1, y1); return; } /* overflow: be correct */
+    memcpy(vis, next, (size_t)nn * 4 * sizeof(int));
+    nv = nn;
+    if (nv == 0) return; /* fully hidden — nothing reaches the screen */
+  }
+  for (int r = 0; r < nv; r++) composite_rect(vis[r][0], vis[r][1], vis[r][2], vis[r][3]);
+}
+
 /* ---- wl_surface ---------------------------------------------------------- */
 static void surface_destroy(struct wl_client *c, struct wl_resource *res)
 {
@@ -273,8 +326,10 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
     }
     composite_scene(); /* new window: place + focus → full recomposite */
   } else {
-    /* §59: an animation frame only changed THIS window — damage just its area. */
-    composite_rect(s->x, s->y - TBH, s->x + s->w, s->y + s->h);
+    /* §59: an animation frame only changed THIS window — damage just its area.
+     * §61: and skip the parts hidden behind windows above, so a window animating
+     * behind an opaque one costs only its VISIBLE area, not its full size. */
+    composite_occluded(s, s->x, s->y - TBH, s->x + s->w, s->y + s->h);
   }
   g_composited = 1;
   wl_buffer_send_release(s->buffer); /* client may reuse the buffer */
