@@ -2300,5 +2300,14 @@ instead of aborting. So the fixes are library invariants, not per-app footguns.
 Proof: the rings demo (`servers/wlclient/src/simple-shm.c`) was rewritten on oxui and went
 from ~1042 lines to ~64 (just `paint_rings` + four lines of `main`); it renders and animates
 identically. Build: `oxui.c` is compiled into each client by its build.rs (same C-port
-harness, sharing the Wayland/xkb config.h). Next: port oxterm onto oxui (its vterm + tty fd
-+ FreeType become the app; all window/buffer/loop plumbing drops to the library).
+harness, sharing the Wayland/xkb config.h).
+
+**oxterm is now an oxui app too** (`servers/oxterm/src/term.c`): `term.c` dropped from ~1244
+to ~167 lines — only the terminal remains (libvterm + FreeType `render_grid`/`blit_glyph` +
+the tty-mirror fd). It gives oxui three callbacks: `draw` paints the vterm grid into the
+canvas, `fd_ready` (with `extra_fd = the tty fd`) drains shell output into libvterm and calls
+`oxui_request_redraw`, and the default `closed` quits. All the window/buffer/event-loop/xkb
+plumbing — and the §63 deferred-redraw/budget fixes that took a session to debug — now live
+in the library and cannot regress per-app. Verified: a full on-screen login (`login: bryson`
+→ `Welcome, bryson.` → `ls` and its output) renders live, event-driven. New GUI programs (a
+clock, a file viewer) are now a `draw` callback plus a few lines of `main`.

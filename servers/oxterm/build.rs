@@ -85,6 +85,7 @@ fn main() {
         .include("../oxxkb/xkb/include")
         .include("../oxvterm/vterm/include")
         .include("../oxft/ft/include")
+        .include("../oxui/include") // §64: the UI toolkit
         .include("font")
         .include("../oxwl")
         .define("HAVE_CONFIG_H", None);
@@ -97,6 +98,7 @@ fn main() {
     }
     b.file("../oxffi/ffi-src/x86/unix64.S");
     b.file("../oxffi/ffi-src/x86/win64.S");
+    b.file("../oxui/oxui.c"); // §64: window/buffer/loop plumbing
     b.file("src/term.c");
     b.compile("oxterm");
 }
