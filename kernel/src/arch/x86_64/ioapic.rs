@@ -59,7 +59,11 @@ pub fn route(gsi: u8, vector: u8, dest_lapic: u8) {
     }
 }
 
-/// Mask GSI `gsi` (so it can't re-fire while the driver processes it).
+/// Mask GSI `gsi` (so it can't re-fire while the driver processes it). Currently
+/// unused: the IOAPIC-routed ISA lines (i8042, 16550) are level-high-while-buffered
+/// devices on edge-triggered entries, so masking them on fire loses interrupts —
+/// see the `ioapic_irq!` note in idt.rs. Kept as the documented pair of `unmask`.
+#[allow(dead_code)]
 pub fn mask(gsi: u8) {
     unsafe {
         let r = redir_lo(gsi);

@@ -32,11 +32,20 @@ pci_irq!(pci_irq10, 10);
 pci_irq!(pci_irq11, 11);
 
 /// §69 Phase 2c: an ISA IRQ delivered through the IOAPIC → LAPIC (not the PIC).
-/// Mask the IOAPIC redirection entry, EOI the LAPIC, then signal the bound notif.
+/// EOI the LAPIC, then signal the bound notif. We deliberately do NOT mask the
+/// IOAPIC line on fire (unlike the PIC pci_irq! path): the i8042 (and the 16550)
+/// hold their IRQ line HIGH the whole time data is buffered — effectively
+/// level-asserted — but the redirection entries are EDGE-triggered. If we masked
+/// on fire, a byte arriving while masked would leave the line steady-high; the
+/// later unmask produces no fresh low→high edge, so the interrupt is LOST and the
+/// (shared, single-byte) i8042 output buffer wedges — freezing BOTH keyboard and
+/// mouse. The PIC's IRR latched across a mask and hid this; the IOAPIC doesn't.
+/// Not masking is safe here because the driver's drain() empties the entire
+/// buffer every wake (so the line falls low and only a genuinely new byte re-edges
+/// — no storm), and a stuck driver just leaves the line high with no new edges.
 macro_rules! ioapic_irq {
     ($name:ident, $line:literal) => {
         extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
-            super::ioapic::mask($line);
             unsafe { super::lapic::eoi() };
             crate::irq::fire($line);
         }
@@ -132,17 +141,18 @@ extern "x86-interrupt" fn lapic_timer(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn keyboard(_frame: InterruptStackFrame) {
-    // §69 Phase 2c: IRQ1 now arrives via the IOAPIC → LAPIC. Mask the IOAPIC
-    // redirection entry (so it can't re-fire), EOI the LAPIC, then signal the
-    // bound notification. The driver drains the i8042 and acks (unmask).
-    super::ioapic::mask(1);
+    // §69 Phase 2c: IRQ1 arrives via the IOAPIC → LAPIC. EOI the LAPIC, then
+    // signal the bound notif. We do NOT mask the line — see ioapic_irq! above:
+    // the i8042 holds IRQ1 high while the output buffer is full, and masking an
+    // edge-triggered line in that state loses the interrupt and wedges the shared
+    // keyboard/mouse buffer. drain() empties the buffer, so no mask is needed.
     unsafe { super::lapic::eoi() };
     crate::irq::fire(1);
 }
 
 extern "x86-interrupt" fn serial_com1(_frame: InterruptStackFrame) {
-    // IRQ4 — COM1 RX, also via the IOAPIC → LAPIC. Mask, EOI the LAPIC, signal.
-    super::ioapic::mask(4);
+    // IRQ4 — COM1 RX, also via the IOAPIC → LAPIC. EOI the LAPIC, signal. No mask,
+    // for the same level-high-while-buffered reason as the i8042 (see above).
     unsafe { super::lapic::eoi() };
     crate::irq::fire(4);
 }
