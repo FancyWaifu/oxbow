@@ -23,11 +23,18 @@ be re-audited.
 
 ## Phases
 
-### Phase 1 — Topology discovery (ACPI MADT)
-- Parse RSDP → RSDT/XSDT → **MADT** for the CPU count + per-CPU LAPIC IDs, and the IOAPIC
-  base. Limine already gives us the RSDP pointer in its boot info — no real-mode poking.
-- Deliverable: `cpu::topology()` → list of LAPIC IDs; boot log "N CPUs found".
-- Risk: low. Pure table parsing. Cap the count (e.g. 8) initially.
+### Phase 1 — Topology discovery — ✅ DONE (§69)
+- **Used Limine MP instead of hand-parsing the MADT.** The `limine` crate's `MpRequest`
+  has Limine parse the ACPI MADT, start every AP, and PARK it — handing us `mp.cpus()`
+  (each `Cpu { id, lapic_id, goto_address, extra }`) and `mp.bsp_lapic_id()`. This collapses
+  the old Phase 1 (MADT parse) AND most of Phase 3 (AP trampoline / INIT-SIPI-SIPI): to
+  start an AP we just write its `goto_address` and Limine launches it at our Rust entry with
+  its own 64 KiB stack.
+- Done: `MP_REQUEST` static + boot enumeration. Verified under `-smp 4`: "[smp] 4 CPU(s);
+  BSP lapic_id=0" + each AP listed (parked). No behavior change — APs stay parked.
+- `-smp 4` added to the justfile QEMU flags so there are cores to bring up.
+- Still TODO from the old Phase 1: we may still want the **IOAPIC base** from the MADT for
+  Phase 2 IRQ routing (Limine gives the RSDP via `RsdpRequest` if we need to walk it).
 
 ### Phase 2 — LAPIC + IOAPIC enablement
 - Map the LAPIC MMIO page; enable it on the BSP. Switch IRQ routing from the legacy 8259

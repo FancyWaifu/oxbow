@@ -30,7 +30,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 use limine::request::{
     ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest,
-    RequestsEndMarker, RequestsStartMarker,
+    MpRequest, RequestsEndMarker, RequestsStartMarker,
 };
 use limine::BaseRevision;
 
@@ -95,6 +95,15 @@ static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
 #[link_section = ".requests"]
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
+/// §69 SMP — ask Limine to bring up the Application Processors (APs). Limine
+/// parses the ACPI MADT, starts each AP, and parks it; we get a CPU list (LAPIC
+/// IDs) and a `goto_address` per CPU to launch it at a Rust entry with its own
+/// stack — no hand-rolled trampoline or INIT-SIPI-SIPI. Phase 1 only enumerates;
+/// bringup comes later once per-CPU state + locking are in place.
+#[used]
+#[link_section = ".requests"]
+static MP_REQUEST: MpRequest = MpRequest::new();
+
 /// Kernel entry point. Limine jumps here — see `ENTRY(kmain)` in linker.ld —
 /// with a 64-bit, higher-half environment already established.
 #[no_mangle]
@@ -129,6 +138,24 @@ extern "C" fn kmain() -> ! {
         usable / (1024 * 1024),
         regions
     );
+
+    // §69 SMP Phase 1: enumerate the CPUs Limine brought up (the APs are parked,
+    // waiting for a goto_address). We don't start them yet — this just proves the
+    // topology is visible before we build per-CPU state + locking.
+    if let Some(mp) = MP_REQUEST.get_response() {
+        let cpus = mp.cpus();
+        println!(
+            "[smp] {} CPU(s); BSP lapic_id={}",
+            cpus.len(),
+            mp.bsp_lapic_id()
+        );
+        for cpu in cpus {
+            let role = if cpu.lapic_id == mp.bsp_lapic_id() { "BSP" } else { "AP " };
+            println!("[smp]   cpu id={} lapic_id={} ({}, parked)", cpu.id, cpu.lapic_id, role);
+        }
+    } else {
+        println!("[smp] no MP response (single CPU / no Limine MP)");
+    }
 
     // -- Framebuffer: record geometry + paint a smoke-test pattern -----------
     if let Some(fb) = FRAMEBUFFER_REQUEST.get_response().and_then(|r| r.framebuffers().next()) {
