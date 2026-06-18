@@ -102,6 +102,88 @@ unsafe fn cached_read(full: &[u8], off: u64, dst: *mut u8) -> usize {
     n
 }
 
+// --- §94: a write-COALESCING buffer ----------------------------------------
+// TAG_FS_WRITE delivers <=48 bytes per message and oxfs_pwrite is path-based
+// (ext4_fopen+fseek+fwrite+fclose EVERY call, plus a disk flush). Writing a
+// multi-MiB file (a saved document, or tcc's output binary) one 48-byte open+
+// flush at a time is hopeless. Buffer sequential writes into one 4 KiB block and
+// run oxfs_pwrite ONCE per block (a ~85x cut in opens+flushes). Flushed on a
+// block/file change and before any read/open/sync so readers never see stale data.
+static mut W_PATH: [u8; 256] = [0; 256];
+static mut W_PLEN: usize = 0;
+static mut W_BLK: u64 = u64::MAX;
+static mut W_LEN: usize = 0; // valid bytes in W_BUF
+static mut W_DIRTY: bool = false;
+static mut W_BUF: [u8; CBLK] = [0; CBLK];
+
+unsafe fn wbuf_flush() {
+    if W_DIRTY && W_PLEN > 0 && W_LEN > 0 {
+        let mut wr = 0usize;
+        oxfs_pwrite(
+            core::ptr::addr_of!(W_PATH) as *const u8,
+            W_BLK * CBLK as u64,
+            core::ptr::addr_of!(W_BUF) as *const c_void,
+            W_LEN,
+            &mut wr,
+        );
+        oxfs_flush();
+        let _ = wr;
+    }
+    W_DIRTY = false;
+    W_BLK = u64::MAX;
+}
+
+/// Buffer a write of `count` bytes at file offset `off` for NUL-terminated path
+/// `full`. Sequential small writes within one 4 KiB block accumulate; a write to a
+/// different block/file flushes the previous buffer first. Returns bytes accepted.
+unsafe fn wbuf_write(full: &[u8], off: u64, src: *const u8, count: usize) -> usize {
+    let plen = full.iter().position(|&b| b == 0).unwrap_or(full.len());
+    let blk = off / CBLK as u64;
+    let within = (off % CBLK as u64) as usize;
+    if within + count > CBLK {
+        // straddles a block boundary — flush + write straight through (rare).
+        wbuf_flush();
+        let mut wr = 0usize;
+        oxfs_pwrite(full.as_ptr(), off, src as *const c_void, count, &mut wr);
+        oxfs_flush();
+        return wr;
+    }
+    let cp = core::ptr::addr_of!(W_PATH) as *const u8;
+    let same =
+        W_BLK == blk && W_PLEN == plen && core::slice::from_raw_parts(cp, plen) == &full[..plen];
+    if !same {
+        wbuf_flush();
+        W_BLK = blk;
+        W_PLEN = plen;
+        let wp = core::ptr::addr_of_mut!(W_PATH) as *mut u8;
+        core::ptr::copy_nonoverlapping(full.as_ptr(), wp, plen);
+        *wp.add(plen) = 0; // NUL-terminate: oxfs_pwrite takes a C string, not full[..plen]
+        // Preserve any existing bytes in this block (partial overwrite / append).
+        let mut rd = 0usize;
+        oxfs_pread(
+            full.as_ptr(),
+            blk * CBLK as u64,
+            core::ptr::addr_of_mut!(W_BUF) as *mut c_void,
+            CBLK,
+            &mut rd,
+        );
+        W_LEN = rd;
+    }
+    core::ptr::copy_nonoverlapping(src, (core::ptr::addr_of_mut!(W_BUF) as *mut u8).add(within), count);
+    if within + count > W_LEN {
+        W_LEN = within + count;
+    }
+    W_DIRTY = true;
+    count
+}
+
+/// Flush any buffered write to disk (before reads/opens/sync see the file).
+fn sync_writes() {
+    unsafe {
+        wbuf_flush();
+    }
+}
+
 /// Allocate a transfer frame, map it, and hand it to the block service so reads
 /// and writes move whole sectors in one IPC instead of ~13 byte-stream messages.
 fn blk_attach() {
@@ -558,6 +640,7 @@ pub extern "C" fn oxbow_main() -> ! {
 
         match m.tag {
             TAG_FS_OPEN => {
+                sync_writes(); // §94: a buffered write must be on disk before stat
                 let name = msg_name(&m);
                 let mut full = [0u8; 256];
                 let mut relbuf = [0u8; PLEN];
@@ -591,6 +674,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 reply_status(reply, 1);
             }
             TAG_FS_READ => {
+                sync_writes(); // §94: reads must see buffered writes
                 let off = m.data[0];
                 let mut r = MsgBuf::new(0);
                 let mut full = [0u8; 256];
@@ -628,6 +712,7 @@ pub extern "C" fn oxbow_main() -> ! {
             }
             TAG_FS_CREATE => {
                 cache_invalidate(); // §94: keep the read cache from serving stale bytes
+                sync_writes();
                 let name = msg_name(&m);
                 let mut full = [0u8; 256];
                 let mut relbuf = [0u8; PLEN];
@@ -660,21 +745,17 @@ pub extern "C" fn oxbow_main() -> ! {
                 }
             }
             TAG_FS_WRITE => {
-                cache_invalidate(); // §94
+                cache_invalidate(); // §94: read cache may hold blocks we're changing
                 let off = m.data[0];
                 let count = (m.data[1] as usize).min(48);
                 let mut full = [0u8; 256];
                 let mut written = 0usize;
                 if valid && full_path(id, &mut full).is_some() {
                     let src = unsafe { (m.data.as_ptr() as *const u8).add(16) };
-                    let mut wr = 0usize;
-                    unsafe {
-                        oxfs_pwrite(full.as_ptr(), off, src as *const c_void, count, &mut wr)
-                    };
-                    written = wr;
-                    if written > 0 {
-                        flush();
-                    }
+                    // §94: coalesce into 4 KiB blocks instead of open+write+flush
+                    // per 48 bytes — the difference between seconds and minutes for
+                    // a multi-MiB file.
+                    written = unsafe { wbuf_write(&full, off, src, count) };
                 }
                 let mut r = MsgBuf::new(0);
                 r.data[0] = written as u64;
@@ -682,6 +763,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 let _ = rt::sys_reply(reply, &r);
             }
             TAG_FS_MKDIR => {
+                sync_writes(); // §94
                 let name = msg_name(&m);
                 let mut full = [0u8; 256];
                 let mut relbuf = [0u8; PLEN];
@@ -699,6 +781,7 @@ pub extern "C" fn oxbow_main() -> ! {
             }
             TAG_FS_UNLINK => {
                 cache_invalidate(); // §94
+                sync_writes();
                 let name = msg_name(&m);
                 let mut full = [0u8; 256];
                 let mut relbuf = [0u8; PLEN];
@@ -716,6 +799,7 @@ pub extern "C" fn oxbow_main() -> ! {
             }
             TAG_FS_RENAME => {
                 cache_invalidate(); // §94
+                sync_writes();
                 // data = old name NUL, then new name NUL.
                 let bytes = unsafe { core::slice::from_raw_parts(m.data.as_ptr() as *const u8, 64) };
                 let oldlen = bytes.iter().position(|&b| b == 0).unwrap_or(0);
@@ -748,8 +832,9 @@ pub extern "C" fn oxbow_main() -> ! {
                 reply_status(reply, status);
             }
             TAG_FS_SYNC => {
-                // ext2 writes are already durable (write-through to disk); a sync
-                // is a no-op success so the shell's `sync` command still works.
+                // §94: commit any buffered write, then the ext2 write-through has
+                // everything on disk. So `sync` is a real durability barrier.
+                sync_writes();
                 let mut r = MsgBuf::new(0);
                 r.data[0] = 0;
                 r.data[1] = 0;
