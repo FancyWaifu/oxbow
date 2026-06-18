@@ -14,7 +14,8 @@ extern crate oxbow_libc as _;
 use oxbow_abi::{
     Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_GPU_CURSOR, BOOT_GPU_FB, BOOT_IMG_OXTERM,
     BOOT_INPUT_CHAN,
-    BOOT_MEM, BOOT_MOUSE_CHAN, BOOT_TERM_CHAN, FB_MMIO, GPU_FB_H, GPU_FB_W, HANDLE_NULL,
+    BOOT_MEM, BOOT_MOUSE_CHAN, BOOT_SESSION_CHAN, BOOT_TERM_CHAN, FB_MMIO, GPU_FB_H, GPU_FB_W,
+    HANDLE_NULL,
 };
 use oxbow_rt as rt;
 
@@ -75,6 +76,7 @@ extern "C" {
         fd: i32,
         input_fd: i32,
         mouse_fd: i32,
+        session_fd: i32,
         fb: *mut u32,
         w: i32,
         h: i32,
@@ -152,11 +154,15 @@ pub extern "C" fn oxbow_main() -> ! {
     let server_fd = unsafe { ox_chan_fd(srv_end as u32) };
     let input_fd = unsafe { ox_chan_fd(BOOT_INPUT_CHAN as u32) };
     let mouse_fd = unsafe { ox_chan_fd(BOOT_MOUSE_CHAN as u32) };
+    // §92: the session channel to the shell — the greeter relays credentials over
+    // it as a byte stream and watches it for the logout signal.
+    let session_fd = unsafe { ox_chan_fd(BOOT_SESSION_CHAN as u32) };
     let display = unsafe {
         comp_server_setup(
             server_fd,
             input_fd,
             mouse_fd,
+            session_fd,
             FB_MMIO as *mut u32,
             width as i32,
             height as i32,

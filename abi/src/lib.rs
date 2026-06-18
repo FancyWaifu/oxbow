@@ -516,6 +516,15 @@ pub const BOOT_MOUSE_IRQ: Handle = 42;
 /// A kernel-created channel carrying mouse packets from the kbd/i8042 driver
 /// (send) to the compositor (receive), which moves the cursor + emits wl_pointer.
 pub const BOOT_MOUSE_CHAN: Handle = 43;
+/// §92: the SESSION channel — a kernel-created bidirectional channel between the
+/// compositor's graphical greeter (side 0) and the shell (side 1). The greeter
+/// relays the typed `username\npassword` to the shell, which is the sole holder
+/// of the credential store; the shell verifies, mints the user's HOME-directory
+/// capability (the real authority), and replies one byte: `1` ok / `0` fail. On
+/// `logout` the shell sends `L` so the greeter re-appears. So login moves OUT of
+/// the terminal into a graphical screen, and the shell — not the compositor —
+/// remains the credential authority ("greeter asserts, shell grants").
+pub const BOOT_SESSION_CHAN: Handle = 52;
 /// Fixed vaddr where the fb server maps the linear framebuffer.
 pub const FB_MMIO: u64 = 0x5000_0000;
 /// The control-channel badge (distinct from any socket id, which are 1..=N).
@@ -704,3 +713,8 @@ pub const TAG_TTY_CHAR: u64 = 0x52414843; // "CHAR"
 pub const TAG_TTY_READ: u64 = 0x44414552; // "READ"
 pub const TAG_TTY_LINE: u64 = 0x454E494C; // "LINE"
 pub const TAG_TTY_WRITE: u64 = 0x54495257; // "WRIT"
+/// §92: discard any buffered/echoed input the tty holds (line buffer + queued
+/// lines). The shell sends this right after a graphical login so keystrokes the
+/// user typed into the greeter (which the kbd driver also forwarded to the tty)
+/// can't leak into the session as phantom commands.
+pub const TAG_TTY_FLUSH: u64 = 0x53554C46; // "FLUS"

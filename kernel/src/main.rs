@@ -350,6 +350,11 @@ fn kmain_stage2() -> ! {
     // (side 0) to the compositor (side 1), which moves the cursor.
     let mouse_chan = channel::create();
 
+    // §92: the SESSION channel — the graphical greeter (oxcomp, side 0) relays the
+    // typed credentials to the shell (side 1), which verifies + mints the home cap
+    // and replies. Both ends are full-duplex (R_IN|R_OUT) for the request/reply.
+    let session_chan = channel::create();
+
     for file in mods.iter() {
         let bytes: &'static [u8] =
             unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) };
@@ -570,6 +575,18 @@ fn kmain_stage2() -> ! {
                         },
                     );
                 }
+                // §92: side 0 of the session channel — the greeter relays creds
+                // here and reads the shell's verdict.
+                if let Some(conn) = session_chan {
+                    p.install(
+                        oxbow_abi::BOOT_SESSION_CHAN,
+                        object::HandleEntry {
+                            obj: object::ObjectRef::Channel { conn, side: 0 },
+                            rights: oxbow_abi::R_IN | oxbow_abi::R_OUT,
+                            badge: 0,
+                        },
+                    );
+                }
             });
         }
         // The compositor also gets a spawnable Image cap for its Wayland client,
@@ -718,6 +735,18 @@ fn kmain_stage2() -> ! {
                         badge: oxbow_abi::NET_CTL,
                     },
                 );
+                // §92: side 1 of the session channel — the shell receives the
+                // greeter's credential relay here, verifies it, and replies.
+                if let Some(conn) = session_chan {
+                    p.install(
+                        oxbow_abi::BOOT_SESSION_CHAN,
+                        object::HandleEntry {
+                            obj: object::ObjectRef::Channel { conn, side: 1 },
+                            rights: oxbow_abi::R_IN | oxbow_abi::R_OUT,
+                            badge: 0,
+                        },
+                    );
+                }
             });
         }
         // The fs server owns the filesystem endpoint UNBADGED, with full rights:

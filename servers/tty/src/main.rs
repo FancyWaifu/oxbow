@@ -17,7 +17,7 @@
 
 use oxbow_abi::{
     Handle, MsgBuf, BOOT_CONSOLE, BOOT_TERM_CHAN, BOOT_TTY, HANDLE_NULL, TAG_TTY_CHAR,
-    TAG_TTY_LINE, TAG_TTY_READ, TAG_TTY_WRITE,
+    TAG_TTY_FLUSH, TAG_TTY_LINE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -208,6 +208,19 @@ pub extern "C" fn oxbow_main() -> ! {
                     unsafe { core::slice::from_raw_parts(m.data.as_ptr() as *const u8, 64) };
                 let n = bytes.iter().position(|&b| b == 0).unwrap_or(0);
                 w(&bytes[..n]);
+            }
+            // §92: drop all buffered input — the in-progress edit line, the queued
+            // completed lines, and any mid-delivery. Used after a graphical login so
+            // characters typed into the greeter (the kbd driver forwards keystrokes
+            // here too) don't surface as phantom commands in the new session. A
+            // pending reader is left stashed; only the buffered INPUT is discarded.
+            TAG_TTY_FLUSH => {
+                elen = 0;
+                echoed = 0;
+                dhead = 0;
+                dcount = 0;
+                dvlen = 0;
+                dvoff = 0;
             }
             _ => {}
         }

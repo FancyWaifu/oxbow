@@ -14,9 +14,9 @@ extern crate oxbow_libc as _;
 use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA, BOOT_NET_EP,
     BOOT_IMG_CAT, BOOT_IMG_CP, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_MKDIR, BOOT_IMG_MV, BOOT_IMG_PONG,
-    BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_LUA, BOOT_IMG_UPY, BOOT_IMG_QJS, BOOT_IMG_CURL, BOOT_IMG_CARES, BOOT_IMG_FFI, BOOT_IMG_WL, BOOT_IMG_XKB, BOOT_IMG_VTERM, BOOT_IMG_FT, BOOT_IMG_JAIL, BOOT_IMG_FSTEST, BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_TICK, BOOT_TTY,
+    BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_LUA, BOOT_IMG_UPY, BOOT_IMG_QJS, BOOT_IMG_CURL, BOOT_IMG_CARES, BOOT_IMG_FFI, BOOT_IMG_WL, BOOT_IMG_XKB, BOOT_IMG_VTERM, BOOT_IMG_FT, BOOT_IMG_JAIL, BOOT_IMG_FSTEST, BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_SESSION_CHAN, BOOT_TICK, BOOT_TTY,
     HANDLE_NULL, IdentRec, R_GRANT, R_IN, R_OUT, R_RECV,
-    R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
+    R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_FLUSH, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 use blake2::{Blake2b, Digest};
@@ -1838,7 +1838,12 @@ fn run_command(line0: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"groups" => groups_cmd(),
         b"su" => su_cmd(rest, cwd, path),
         b"passwd" => passwd_cmd(),
-        b"logout" | b"exit" => login_gate(cwd, path),
+        b"logout" | b"exit" => {
+            // §92: end the session and return to the graphical greeter — notify it
+            // (it re-appears), then block for the next verified login.
+            let _ = rt::channel::send(BOOT_SESSION_CHAN, b"L", &[]);
+            session_gate(cwd, path);
+        }
         b"help" => {
             tw(b"oxbow shell:  (ls cat mkdir touch are spawned programs)\n");
             tw(b"  echo <text>     print text (echo .. > f redirects to a file)\n");
@@ -2065,10 +2070,67 @@ fn read_secret(line: &mut [u8; 256]) -> usize {
     read_line(line)
 }
 
-/// The login prompt loop. Blocks until a correct name+password, then sets the
-/// identity and home cwd. Re-entered by `logout`.
-fn login_gate(cwd: &mut Handle, path: &mut Path) {
+/// Verify `name`+`pw` against the seeded credential store; returns the account
+/// index on a match. The shell is the SOLE holder of the salts/hashes (§44/§92)
+/// — both the tty login gate and the graphical session gate authenticate here.
+fn verify_credentials(name: &[u8], pw: &[u8]) -> Option<usize> {
     seed_accounts();
+    if let Some(i) = ACCTS.iter().position(|a| a.name == name) {
+        let h = hash_pw(unsafe { &SALTS[i] }, pw);
+        if h == unsafe { HASHES[i] } {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Tell the tty to drop any buffered input (§92) — used after a graphical login
+/// so the username/password the user typed into the greeter (which the kbd driver
+/// also forwards to the tty) can't surface as phantom commands in the session.
+fn tty_flush() {
+    let m = MsgBuf::new(TAG_TTY_FLUSH);
+    let _ = rt::sys_send(BOOT_TTY, &m);
+}
+
+/// §92 — the GRAPHICAL session gate. Instead of prompting on the tty, block on the
+/// session channel for the compositor greeter's `username\npassword` relay,
+/// verify it (we hold the credential store), and reply one byte: `1` ok / `0`
+/// fail. On success adopt the identity + mint the HOME-directory capability (the
+/// real authority that confines the session, §45); the greeter then dismisses and
+/// the desktop appears. Re-entered by `logout`.
+fn session_gate(cwd: &mut Handle, path: &mut Path) {
+    seed_accounts();
+    let mut buf = [0u8; 320];
+    loop {
+        let (n, _) = match rt::channel::recv(BOOT_SESSION_CHAN, &mut buf, &mut [], false) {
+            Some(r) => r,
+            None => continue, // EOF/error — retry rather than spin a bare session
+        };
+        if n == 0 {
+            continue;
+        }
+        // Split the relay on its single newline: username \n password.
+        let line = &buf[..n];
+        let (name, pw): (&[u8], &[u8]) = match line.iter().position(|&b| b == b'\n') {
+            Some(p) => (trim(&line[..p]), trim(&line[p + 1..])),
+            None => (trim(line), b""),
+        };
+        if let Some(i) = verify_credentials(name, pw) {
+            set_ident(i);
+            set_cwd_home(i, cwd, path);
+            let _ = rt::channel::send(BOOT_SESSION_CHAN, b"1", &[]);
+            tty_flush(); // discard the greeter's keystrokes before the first prompt
+            return;
+        }
+        let _ = rt::channel::send(BOOT_SESSION_CHAN, b"0", &[]);
+    }
+}
+
+/// The tty login prompt loop (serial console / no-compositor fallback). Blocks
+/// until a correct name+password, then sets the identity and home cwd. Retained
+/// for headless boots; the graphical path uses [`session_gate`].
+#[allow(dead_code)]
+fn login_gate(cwd: &mut Handle, path: &mut Path) {
     let mut line = [0u8; 256];
     let mut namebuf = [0u8; 64];
     loop {
@@ -2080,16 +2142,13 @@ fn login_gate(cwd: &mut Handle, path: &mut Path) {
         let name = &namebuf[..nl];
         let sn = read_secret(&mut line);
         let pw = trim(&line[..sn]);
-        if let Some(i) = ACCTS.iter().position(|a| a.name == name) {
-            let h = hash_pw(unsafe { &SALTS[i] }, pw);
-            if h == unsafe { HASHES[i] } {
-                set_ident(i);
-                set_cwd_home(i, cwd, path);
-                tw(b"Welcome, ");
-                tw(ACCTS[i].name);
-                tw(b".\n");
-                return;
-            }
+        if let Some(i) = verify_credentials(name, pw) {
+            set_ident(i);
+            set_cwd_home(i, cwd, path);
+            tw(b"Welcome, ");
+            tw(ACCTS[i].name);
+            tw(b".\n");
+            return;
         }
         tw(b"Login incorrect\n");
     }
@@ -2185,9 +2244,11 @@ pub extern "C" fn oxbow_main() -> ! {
     let mut cwd: Handle = BOOT_FS_ROOT;
     let mut path = Path::root();
     let mut line = [0u8; 256];
-    // §44: authenticate before the first prompt. login_gate sets our identity and
-    // switches cwd to the user's home capability.
-    login_gate(&mut cwd, &mut path);
+    // §44/§92: authenticate before the first prompt. The graphical greeter (in the
+    // compositor) collects the credentials and relays them over the session
+    // channel; session_gate verifies them here — the shell is the sole credential
+    // authority — then adopts the identity + the user's home capability.
+    session_gate(&mut cwd, &mut path);
     loop {
         // user@oxbow path-aware prompt, e.g. `bryson@oxbow:/home/bryson$ `.
         tw(cur_name());

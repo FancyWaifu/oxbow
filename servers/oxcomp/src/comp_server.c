@@ -306,12 +306,224 @@ static void draw_overview(void)
  * bar (cheap) and re-arm. */
 static struct wl_event_source *g_clock_timer;
 static void composite_rect(int x0, int y0, int x1, int y1);
+static int g_greeter = 1; /* §92: 1 = login screen shown, desktop hidden+gated */
 static int clock_tick(void *data)
 {
   (void)data;
-  composite_rect(0, 0, g_w, PANEL_H);
+  /* The clock is desktop chrome — don't paint it behind the greeter, but always
+   * re-arm so it resumes once the desktop is revealed. */
+  if (!g_greeter)
+    composite_rect(0, 0, g_w, PANEL_H);
   if (g_clock_timer)
     wl_event_source_timer_update(g_clock_timer, 1000);
+  return 0;
+}
+
+/* ===========================================================================
+ * §92 — the graphical login GREETER. Login moves out of the terminal: the
+ * compositor draws a login screen before the desktop, captures keystrokes into a
+ * username/password, and relays "username\npassword" to the SHELL over the
+ * session channel (BOOT_SESSION_CHAN, wrapped as g_session_fd). The shell is the
+ * sole credential authority — it verifies, mints the user's home capability, and
+ * replies one byte (`1` ok / `0` fail). On `logout` the shell sends `L` and the
+ * greeter re-appears. So the compositor authenticates NOTHING; it only asserts.
+ * =========================================================================== */
+static int  g_session_fd = -1; /* the session-channel byte stream to the shell */
+static char g_user[33];
+static int  g_userlen;
+static char g_pass[64];
+static int  g_passlen;
+static int  g_field;     /* 0 = username, 1 = password */
+static int  g_login_err; /* show "login incorrect" */
+static int  g_shift;     /* greeter modifier state */
+
+/* set-1 scancode (low 7 bits) -> US-ASCII for the greeter's own text input. The
+ * compositor normally forwards raw scancodes to clients (xkb decodes them); the
+ * greeter decodes its own. Unshifted; letters uppercase under shift. */
+static const char kc_ascii[128] = {
+    [0x02] = '1', [0x03] = '2', [0x04] = '3', [0x05] = '4', [0x06] = '5',
+    [0x07] = '6', [0x08] = '7', [0x09] = '8', [0x0a] = '9', [0x0b] = '0',
+    [0x0c] = '-', [0x0d] = '=', [0x10] = 'q', [0x11] = 'w', [0x12] = 'e',
+    [0x13] = 'r', [0x14] = 't', [0x15] = 'y', [0x16] = 'u', [0x17] = 'i',
+    [0x18] = 'o', [0x19] = 'p', [0x1a] = '[', [0x1b] = ']', [0x1e] = 'a',
+    [0x1f] = 's', [0x20] = 'd', [0x21] = 'f', [0x22] = 'g', [0x23] = 'h',
+    [0x24] = 'j', [0x25] = 'k', [0x26] = 'l', [0x27] = ';', [0x28] = '\'',
+    [0x29] = '`', [0x2b] = '\\', [0x2c] = 'z', [0x2d] = 'x', [0x2e] = 'c',
+    [0x2f] = 'v', [0x30] = 'b', [0x31] = 'n', [0x32] = 'm', [0x33] = ',',
+    [0x34] = '.', [0x35] = '/', [0x39] = ' ',
+};
+
+#define GR_BG     0x00101418u
+#define GR_CARD   0x001c2230u
+#define GR_FG     0x00e8e8e8u
+#define GR_DIM    0x00808a94u
+#define GR_FIELD  0x000c1016u
+#define GR_ACCENT 0x003a6ea5u
+#define GR_ERR    0x00d06058u
+
+/* The seeded accounts the greeter offers as clickable hints (purely cosmetic —
+ * the shell holds the real credential table; typing any name also works). */
+static const char *gr_users[] = { "root", "bryson" };
+#define GR_NUSERS 2
+
+/* Card geometry, shared by draw + the username-hint hit-test. */
+static void greeter_card(int *cx, int *cy, int *cw, int *ch)
+{
+  *cw = 460;
+  *ch = 320;
+  *cx = (g_w - *cw) / 2;
+  *cy = (g_h - *ch) / 2;
+}
+
+/* One labelled input box. `mask` renders the content as dots (password). */
+static void draw_field(int lx, int y, int fx, int fw, const char *label,
+                       const char *content, int len, int active, int mask)
+{
+  draw_text(lx, y + 6, label, GR_DIM);
+  fill_rect(fx, y, fx + fw, y + 20, GR_FIELD);
+  unsigned int b = active ? GR_ACCENT : GR_DIM;
+  fill_rect(fx, y, fx + fw, y + 1, b);
+  fill_rect(fx, y + 19, fx + fw, y + 20, b);
+  fill_rect(fx, y, fx + 1, y + 20, b);
+  fill_rect(fx + fw - 1, y, fx + fw, y + 20, b);
+  int tx = fx + 7;
+  if (mask) {
+    for (int i = 0; i < len && tx + i * 10 < fx + fw - 8; i++)
+      fill_rect(tx + i * 10, y + 8, tx + i * 10 + 5, y + 13, GR_FG); /* a dot */
+  } else {
+    draw_text(tx, y + 6, content, GR_FG);
+  }
+  if (active) {
+    int caret = mask ? tx + len * 10 : tx + len * 8;
+    if (caret < fx + fw - 2)
+      fill_rect(caret, y + 4, caret + 1, y + 16, GR_FG); /* blink-less caret */
+  }
+}
+
+/* Paint the whole login screen into the back buffer (clipped via fill_rect/
+ * draw_text to the current damage rect). */
+static void draw_greeter(void)
+{
+  fill_rect(0, 0, g_w, g_h, GR_BG);
+  int cx, cy, cw, ch;
+  greeter_card(&cx, &cy, &cw, &ch);
+  fill_rect(cx, cy, cx + cw, cy + ch, GR_CARD);
+  fill_rect(cx, cy, cx + cw, cy + 4, GR_ACCENT); /* accent stripe */
+  draw_text(cx + (cw - text_width("oxbow")) / 2, cy + 34, "oxbow", GR_FG);
+  /* clickable user hints, centred (selected one brightened) */
+  int total = -24;
+  for (int i = 0; i < GR_NUSERS; i++)
+    total += text_width(gr_users[i]) + 24;
+  int ux = cx + (cw - total) / 2;
+  for (int i = 0; i < GR_NUSERS; i++) {
+    int sel = (g_userlen == (int)__builtin_strlen(gr_users[i])) &&
+              __builtin_memcmp(g_user, gr_users[i], g_userlen) == 0;
+    draw_text(ux, cy + 74, gr_users[i], sel ? GR_FG : GR_DIM);
+    ux += text_width(gr_users[i]) + 24;
+  }
+  int fx = cx + 96, fw = cw - 96 - 40;
+  draw_field(cx + 40, cy + 120, fx, fw, "user", g_user, g_userlen, g_field == 0, 0);
+  draw_field(cx + 40, cy + 160, fx, fw, "pass", g_pass, g_passlen, g_field == 1, 1);
+  if (g_login_err)
+    draw_text(cx + 40, cy + 200, "login incorrect", GR_ERR);
+  draw_text(cx + (cw - text_width("tab switch   enter login")) / 2, cy + ch - 34,
+            "tab switch   enter login", GR_DIM);
+}
+
+/* Re-show the greeter (called on logout): reset fields, gate input, repaint. */
+static void show_greeter(void)
+{
+  g_greeter = 1;
+  g_login_err = 0;
+  g_userlen = 0;
+  g_passlen = 0;
+  g_field = 0;
+  composite_rect(0, 0, g_w, g_h);
+}
+
+/* Relay the typed credentials to the shell and act on its one-byte verdict. */
+static void greeter_submit(void)
+{
+  if (g_userlen == 0 || g_session_fd < 0)
+    return;
+  char msg[100];
+  int k = 0;
+  for (int i = 0; i < g_userlen && k < 98; i++)
+    msg[k++] = g_user[i];
+  msg[k++] = '\n';
+  for (int i = 0; i < g_passlen && k < 99; i++)
+    msg[k++] = g_pass[i];
+  (void)!write(g_session_fd, msg, k);
+  char verdict = 0;
+  /* Block for the shell's reply (auth is instant); the event loop is paused. */
+  while (read(g_session_fd, &verdict, 1) != 1)
+    ;
+  __builtin_memset(g_pass, 0, sizeof g_pass);
+  g_passlen = 0;
+  if (verdict == '1') {
+    g_greeter = 0;
+    g_login_err = 0;
+    composite_rect(0, 0, g_w, g_h); /* reveal the desktop */
+  } else {
+    g_login_err = 1;
+    composite_rect(0, 0, g_w, g_h);
+  }
+}
+
+/* Feed one raw scancode to the greeter (press/release with the 0x80 break bit). */
+static void greeter_key(unsigned char raw)
+{
+  int           release = raw & 0x80;
+  unsigned char kc = raw & 0x7f;
+  if (kc == 0x2a || kc == 0x36) { /* shift */
+    g_shift = !release;
+    return;
+  }
+  if (release)
+    return;
+  if (kc == 0x1c) { /* enter */
+    greeter_submit();
+    return;
+  }
+  if (kc == 0x0f) { /* tab: switch field */
+    g_field = !g_field;
+    composite_rect(0, 0, g_w, g_h);
+    return;
+  }
+  if (kc == 0x0e) { /* backspace */
+    if (g_field == 0 && g_userlen > 0)
+      g_userlen--;
+    else if (g_field == 1 && g_passlen > 0)
+      g_passlen--;
+    composite_rect(0, 0, g_w, g_h);
+    return;
+  }
+  char c = kc_ascii[kc];
+  if (!c)
+    return;
+  if (g_shift && c >= 'a' && c <= 'z')
+    c -= 32;
+  if (g_field == 0) {
+    if (g_userlen < 32)
+      g_user[g_userlen++] = c;
+  } else {
+    if (g_passlen < 63)
+      g_pass[g_passlen++] = c;
+  }
+  composite_rect(0, 0, g_w, g_h);
+}
+
+/* Event-loop callback: a byte on the session channel while the desktop is up means
+ * the shell logged out (`L`) — re-show the greeter. */
+static int on_session(int fd, uint32_t mask, void *data)
+{
+  (void)mask;
+  (void)data;
+  char b[16];
+  long n = read(fd, b, sizeof b);
+  for (long i = 0; i < n; i++)
+    if (b[i] == 'L')
+      show_greeter();
   return 0;
 }
 
@@ -336,6 +548,9 @@ static void composite_rect(int x0, int y0, int x1, int y1)
     return;
   /* Restrict compositor-drawn chrome (panel/overview/text) to this damage rect. */
   g_clip_x0 = x0; g_clip_y0 = y0; g_clip_x1 = x1; g_clip_y1 = y1;
+  if (g_greeter) {
+    draw_greeter(); /* §92: the login screen replaces the desktop entirely */
+  } else {
   for (int y = y0; y < y1; y++)
     for (int x = x0; x < x1; x++)
       g_back[(long)y * g_pitch_words + x] = 0x000d3b45u; /* desktop bg */
@@ -392,6 +607,7 @@ static void composite_rect(int x0, int y0, int x1, int y1)
   if (g_overview)
     draw_overview();
   draw_panel();
+  } /* §92: end of the !g_greeter desktop block */
   if (g_hwcur) {
     /* Hardware cursor: the gpu composites it on the device side; just publish the
      * pointer position for the gpu to read (no painting into the framebuffer). */
@@ -989,6 +1205,31 @@ static void launch_and_attach(int id)
 
 static void pointer_button(int left)
 {
+  if (g_greeter) {
+    /* §92: while the login screen is up the greeter owns the pointer. Clicking a
+     * username hint fills it in and jumps to the password; all else is swallowed. */
+    if (left) {
+      int cx, cy, cw, ch;
+      greeter_card(&cx, &cy, &cw, &ch);
+      int total = -24;
+      for (int i = 0; i < GR_NUSERS; i++)
+        total += text_width(gr_users[i]) + 24;
+      int ux = cx + (cw - total) / 2;
+      for (int i = 0; i < GR_NUSERS; i++) {
+        int wpx = text_width(gr_users[i]);
+        if (g_cx >= ux && g_cx < ux + wpx && g_cy >= cy + 74 && g_cy < cy + 84) {
+          int l = (int)__builtin_strlen(gr_users[i]);
+          __builtin_memcpy(g_user, gr_users[i], l);
+          g_userlen = l;
+          g_field = 1; /* jump to the password field */
+          composite_rect(0, 0, g_w, g_h);
+          return;
+        }
+        ux += wpx + 24;
+      }
+    }
+    return;
+  }
   if (left) {
     /* §91: the GNOME-style shell intercepts clicks on the top bar + overview
      * BEFORE windows. */
@@ -1106,6 +1347,12 @@ static int on_input(int fd, uint32_t mask, void *data)
     kbd = sc ? sc->kbd : NULL;
   }
   for (long i = 0; i < n; i++) {
+    if (g_greeter) {
+      /* §92: the greeter owns the keyboard — decode keystrokes itself and never
+       * forward them to clients while the login screen is up. */
+      greeter_key(buf[i]);
+      continue;
+    }
     if (!kbd)
       continue;
     unsigned char sc      = buf[i];
@@ -1217,14 +1464,15 @@ static int on_mouse(int fd, uint32_t mask, void *data)
 }
 
 /* ---- exported driver entry points --------------------------------------- */
-void *comp_server_setup(int fd, int input_fd, int mouse_fd, unsigned int *fb, int w, int h,
-                        int pitch_words)
+void *comp_server_setup(int fd, int input_fd, int mouse_fd, int session_fd, unsigned int *fb,
+                        int w, int h, int pitch_words)
 {
   g_fb = fb;
   g_w = w;
   g_h = h;
   g_pitch_words = pitch_words;
   g_composited = 0;
+  g_session_fd = session_fd; /* §92: the byte stream to the shell credential gate */
   g_cx = w / 2;
   g_cy = h / 2;
 
@@ -1253,6 +1501,11 @@ void *comp_server_setup(int fd, int input_fd, int mouse_fd, unsigned int *fb, in
   if (mouse_fd >= 0)
     wl_event_loop_add_fd(wl_display_get_event_loop(d), mouse_fd, WL_EVENT_READABLE,
                          on_mouse, d);
+  /* §92: the session channel — a byte from the shell after the desktop is up means
+   * `logout` (`L`); wake and re-show the greeter. */
+  if (session_fd >= 0)
+    wl_event_loop_add_fd(wl_display_get_event_loop(d), session_fd, WL_EVENT_READABLE,
+                         on_session, d);
   /* §91: a 1-second timer to tick the panel clock (recomposite just the top bar). */
   g_clock_timer = wl_event_loop_add_timer(wl_display_get_event_loop(d), clock_tick, NULL);
   if (g_clock_timer)
