@@ -838,9 +838,57 @@ fn kmain_stage2() -> ! {
     thread::run_idle();
 }
 
-/// Bare-metal panic handler: report to serial, then halt. There is no unwinding.
+/// Set the instant any CPU starts panicking, so the NMI handler on the other cores
+/// knows to halt (§75 panic stop). SeqCst — it gates real cross-core safety.
+pub static PANICKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// §75 DEBUG: each NMI-stopped core records the rip it was interrupted at here, so
+/// the core that triggered the stop can print where every core was wedged.
+pub static STOPPED_RIP: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// §75 DEBUG: a spinlock-timeout watchdog detected a likely deadlock — stop every
+/// other core (NMI), then print this core's complaint plus every stopped core's rip
+/// (recorded by their NMI handlers). Turns a silent IF=0 multi-core hang into a
+/// readable "who was stuck where".
+pub fn deadlock_report(lock: &str, waiter: i32, holder: i32) -> ! {
+    use core::sync::atomic::Ordering;
+    if !PANICKED.swap(true, Ordering::SeqCst) {
+        unsafe { arch::lapic::send_nmi_all_but_self() };
+        for _ in 0..8_000_000 {
+            core::hint::spin_loop(); // let the others take the NMI + record their rip
+        }
+    }
+    arch::panic_print(format_args!(
+        "\n[DEADLOCK] cpu {} stuck waiting on {} (held by cpu {})\n",
+        waiter, lock, holder
+    ));
+    for c in 0..8 {
+        let rip = STOPPED_RIP[c].load(Ordering::Acquire);
+        if rip != 0 {
+            arch::panic_print(format_args!("  cpu {} was at rip={:#x}\n", c, rip));
+        }
+    }
+    arch::halt();
+}
+
+/// Bare-metal panic handler. §75: on SMP a fault used to hang silently — the
+/// faulting core's print deadlocked on the console lock another core held. Now we
+/// (1) flag the panic, (2) NMI every other core so it halts in the NMI handler
+/// (FreeBSD `stop_cpus_hard` — NMI reaches cores spinning IF=0 or wedged in a
+/// handler), (3) print via the lock-bypassing console, then halt. So a multi-core
+/// fault produces a readable oops instead of a freeze.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!("\n[PANIC] {}", info);
+    // If we re-enter (a fault while panicking), just halt — don't recurse.
+    if PANICKED.swap(true, Ordering::SeqCst) {
+        arch::halt();
+    }
+    unsafe { arch::lapic::send_nmi_all_but_self() };
+    // Give the other cores a moment to take the NMI and halt before we print.
+    for _ in 0..2_000_000 {
+        core::hint::spin_loop();
+    }
+    arch::panic_print(format_args!("\n[PANIC cpu {}] {}\n", percpu::cpu_index(), info));
     arch::halt();
 }

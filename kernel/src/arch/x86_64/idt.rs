@@ -74,6 +74,7 @@ pub fn init() {
         idt.double_fault
             .set_handler_fn(double_fault)
             .set_stack_index(DOUBLE_FAULT_IST_INDEX);
+        idt.non_maskable_interrupt.set_handler_fn(nmi); // §75 panic stop-CPU IPI
 
         // Hardware IRQ vectors (PIC remapped base 0x20).
         idt[TIMER_VECTOR].set_handler_fn(timer); // IRQ0 — scheduler tick
@@ -211,6 +212,11 @@ extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
     );
 }
 
+/// §75 DEBUG: stop all cores + print full fault info via the lock-bypassing
+/// console, then halt — used to capture the FIRST fault (user OR kernel) under SMP
+/// without the print deadlocking. (Replaces the normal user-kill/kernel-panic
+/// behaviour for the multi-AP debugging run.) Reads only the raw tid (no TCB
+/// deref) in case per-CPU state is itself corrupt.
 extern "x86-interrupt" fn general_protection_fault(frame: InterruptStackFrame, error_code: u64) {
     // A fault from ring 3 kills the offending thread/process; the kernel lives on.
     if frame.code_segment.0 & 3 == 3 {
@@ -222,6 +228,7 @@ extern "x86-interrupt" fn general_protection_fault(frame: InterruptStackFrame, e
         );
         crate::thread::kill_current_user();
     }
+    // §75: a KERNEL #GP is fatal — panic!() now stops the other cores + prints safely.
     panic!(
         "#GP (kernel) error_code={:#x} at rip={:#x}\n{:#?}",
         error_code,
@@ -255,4 +262,22 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: Pag
 
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, error_code: u64) -> ! {
     panic!("#DF error_code={:#x}\n{:#?}", error_code, frame);
+}
+
+/// §75: NMI handler. The panic path on another core broadcasts an NMI to stop every
+/// other core (FreeBSD `stop_cpus_hard`). NMI is non-maskable, so we land here even
+/// while spinning IF=0 or wedged in another handler. If a panic is in progress, halt
+/// FOREVER (don't return — we may be mid-corruption and must touch nothing more). If
+/// no panic is flagged, it's a spurious/hardware NMI: return and carry on.
+extern "x86-interrupt" fn nmi(frame: InterruptStackFrame) {
+    if crate::PANICKED.load(Ordering::Acquire) {
+        // Record where we were wedged so the triggering core can print it, then halt.
+        let cpu = crate::percpu::cpu_index();
+        if cpu < 8 {
+            crate::STOPPED_RIP[cpu].store(frame.instruction_pointer.as_u64(), Ordering::Release);
+        }
+        loop {
+            unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
+        }
+    }
 }

@@ -305,18 +305,33 @@ static AP_RAN_USER: AtomicBool = AtomicBool::new(false);
 static RUNNING_ON: [core::sync::atomic::AtomicI8; MAX_THREADS] =
     [const { core::sync::atomic::AtomicI8::new(-1) }; MAX_THREADS];
 
+/// §75 DEBUG: which CPU currently holds SCHED_LOCK (-1 = free), for the deadlock report.
+static SCHED_HOLDER: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+
 fn sched_lock() {
+    let mut spins: u64 = 0;
     while SCHED_LOCK
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
         while SCHED_LOCK.load(Ordering::Relaxed) {
             core::hint::spin_loop();
+            spins += 1;
+            if spins > 400_000_000 {
+                // §75 watchdog: we've spun far too long — almost certainly a deadlock.
+                crate::deadlock_report(
+                    "SCHED_LOCK",
+                    crate::percpu::cpu_index() as i32,
+                    SCHED_HOLDER.load(Ordering::Relaxed),
+                );
+            }
         }
     }
+    SCHED_HOLDER.store(crate::percpu::cpu_index() as i32, Ordering::Relaxed);
 }
 
 fn sched_unlock() {
+    SCHED_HOLDER.store(-1, Ordering::Relaxed);
     SCHED_LOCK.store(false, Ordering::Release);
 }
 

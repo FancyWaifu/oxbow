@@ -62,3 +62,13 @@ pub fn write_bytes(bytes: &[u8]) {
         send_crlf(&mut port, b);
     }
 }
+
+/// §75: PANIC-path console write that BYPASSES the `SERIAL1` lock. A wedged or
+/// just-NMI-stopped CPU may have died holding the lock, so we `force_unlock` it
+/// first; by the time the panic path runs the other cores are halted, so the lock
+/// is uncontended and this is safe. Used only by the panic handler.
+pub fn panic_write_fmt(args: fmt::Arguments) {
+    use core::fmt::Write;
+    unsafe { SERIAL1.force_unlock() };
+    CrlfWriter(SERIAL1.lock()).write_fmt(args).ok();
+}

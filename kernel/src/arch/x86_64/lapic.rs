@@ -80,6 +80,25 @@ pub unsafe fn eoi() {
     write(REG_EOI, 0);
 }
 
+// --- IPI (§75: stop-other-CPUs-on-panic, mirroring FreeBSD stop_cpus_hard) ---
+const REG_ICR_LOW: usize = 0x300;
+/// Delivery mode NMI in the ICR (bits 8..10 = 0b100).
+const ICR_DELIVERY_NMI: u32 = 0b100 << 8;
+/// Destination shorthand "all excluding self" (bits 18..19 = 0b11).
+const ICR_DEST_ALL_BUT_SELF: u32 = 0b11 << 18;
+
+/// Broadcast an **NMI** to every other CPU. NMI is non-maskable, so it lands even
+/// on a core spinning with IF=0 or wedged in a fault handler — that's the point
+/// (a maskable IPI wouldn't reach a stuck core). Used by the panic path to halt
+/// the other cores before printing, so they can't corrupt more state or hold the
+/// console lock. The vector field is ignored for NMI delivery.
+pub unsafe fn send_nmi_all_but_self() {
+    if LAPIC_VBASE == 0 {
+        return; // LAPIC not up yet (very early boot) — nothing to stop
+    }
+    write(REG_ICR_LOW, ICR_DELIVERY_NMI | ICR_DEST_ALL_BUT_SELF);
+}
+
 // --- LAPIC timer (§69 Phase 2b) — the per-CPU scheduler tick ----------------
 const REG_LVT_TIMER: usize = 0x320;
 const REG_TIMER_INIT: usize = 0x380;

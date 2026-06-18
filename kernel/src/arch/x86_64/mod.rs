@@ -116,6 +116,12 @@ pub fn init_ap_cpu() {
     enable_sse();
 }
 
+/// §75 panic path: write to the console bypassing the `SERIAL1` lock (the other
+/// CPUs have been NMI-stopped, so it's uncontended). For the panic handler only.
+pub fn panic_print(args: core::fmt::Arguments) {
+    serial::panic_write_fmt(args);
+}
+
 /// Physical address of the live PML4 (CR3).
 pub fn current_cr3() -> u64 {
     use x86_64::registers::control::Cr3;
