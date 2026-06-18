@@ -36,6 +36,7 @@ QCODE.update({
     "+": ("shift", "equal"), "*": ("shift", "8"),
     '"': ("shift", "apostrophe"), "_": ("shift", "minus"),
     "!": ("shift", "1"), "|": ("shift", "backslash"),
+    ">": ("shift", "dot"),
 })
 
 
@@ -127,6 +128,11 @@ def main():
             ('print(sqv*sqv)\n', "81"),              # global persisted across lines
             ('for i=1,3 do print(i*100) end\n', "300"),  # single-line control flow
             ('ls\n', "readme"),                      # command layer still works
+            # --- Milestone 2: pipes + sequencing (§81) ---
+            ('ls | cat\n', "readme"),                # ls stdout -> pipe -> cat -> tty
+            ('echo pipemark > pm.txt\n', None),      # set up a known file
+            ('cat pm.txt | cat\n', "pipemark"),      # file -> pipe -> cat stdin -> tty
+            ('echo seqone ; echo seqtwo\n', "seqtwo"),  # ';' sequencing (both run)
         ]
         checks = []
         for text, needle in steps:

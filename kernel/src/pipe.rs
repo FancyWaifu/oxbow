@@ -77,12 +77,20 @@ pub enum ReadOut {
 }
 
 /// Allocate a fresh pipe; returns its pool index or None if the pool is full.
+/// Resets the slot's fields IN PLACE rather than `*p = Pipe::new()` — the latter
+/// materializes a whole `Pipe` (an 8 KiB `buf`) as a temporary on the kernel
+/// stack, which overflowed/clobbered the 32 KiB syscall stack and faulted on
+/// return. `buf` needs no reset: only the live `[head, head+len)` window is read.
 pub fn create() -> Option<u8> {
     let mut pipes = PIPES.lock();
     for (i, p) in pipes.iter_mut().enumerate() {
         if !p.in_use {
-            *p = Pipe::new();
             p.in_use = true;
+            p.head = 0;
+            p.len = 0;
+            p.write_closed = false;
+            p.readers = WaitQ::new();
+            p.writers = WaitQ::new();
             return Some(i as u8);
         }
     }

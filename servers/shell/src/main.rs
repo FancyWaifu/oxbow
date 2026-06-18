@@ -15,7 +15,7 @@ use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA, BOOT_NET_EP,
     BOOT_IMG_CAT, BOOT_IMG_CP, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_MKDIR, BOOT_IMG_MV, BOOT_IMG_PONG,
     BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_LUA, BOOT_IMG_UPY, BOOT_IMG_QJS, BOOT_IMG_CURL, BOOT_IMG_CARES, BOOT_IMG_FFI, BOOT_IMG_WL, BOOT_IMG_XKB, BOOT_IMG_VTERM, BOOT_IMG_FT, BOOT_IMG_JAIL, BOOT_IMG_FSTEST, BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_TICK, BOOT_TTY,
-    HANDLE_NULL, IdentRec, R_GRANT, R_RECV,
+    HANDLE_NULL, IdentRec, R_GRANT, R_IN, R_OUT, R_RECV,
     R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
@@ -1083,14 +1083,221 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         return;
     }
     if let Some(rest) = t.strip_prefix(b"!") {
-        run_command(trim(rest), sp, cwd, path);
+        shell_run(trim(rest), sp, cwd, path);
         return;
     }
     if looks_like_lua(t) {
         lua_eval(t);
         return;
     }
-    run_command(t, sp, cwd, path);
+    shell_run(t, sp, cwd, path);
+}
+
+/// The bash command layer (§81): `;`-sequencing and `|`-pipelines over the command
+/// set. (Quoting/`&&`/`||` are not parsed yet — `;` covers sequencing for now.)
+/// Lua lines never reach here — they're settled in `run` — so a `;`/`|` inside a
+/// Lua statement is the interpreter's, not the shell's.
+fn shell_run(t: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
+    for seg in t.split(|&b| b == b';') {
+        let seg = trim(seg);
+        if seg.is_empty() {
+            continue;
+        }
+        if has_substr(seg, b"&&") || has_substr(seg, b"||") {
+            tw(b"sh: '&&'/'||' not supported yet (use ';' to sequence)\n");
+            continue;
+        }
+        if seg.iter().any(|&b| b == b'|') {
+            run_pipeline(seg, sp, cwd, path);
+        } else {
+            run_command(seg, sp, cwd, path);
+        }
+    }
+}
+
+/// True if `hay` contains the byte sequence `needle`.
+fn has_substr(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Run a `|` pipeline (§81): wire each stage's stdout into the next stage's stdin
+/// through a kernel pipe; the last stage writes to the tty. The pipe's EOF is
+/// EXPLICIT (the kernel only ends a read once `sys_pipe_eof` marks the write side
+/// closed), so the shell waits for each stage to exit IN ORDER and then EOFs that
+/// stage's outgoing pipe — flushing all of a producer's bytes before its consumer
+/// sees end-of-input. Stages are spawned right-to-left so a spawn failure can't
+/// strand an already-running producer with no reader.
+fn run_pipeline(seg: &[u8], sp: &Spawner, cwd: &mut Handle, _path: &mut Path) {
+    const MAXST: usize = 4;
+    let mut stages: [&[u8]; MAXST] = [b""; MAXST];
+    let mut nst = 0;
+    for s in seg.split(|&b| b == b'|') {
+        if nst >= MAXST {
+            tw(b"sh: pipeline too long (max 4 stages)\n");
+            return;
+        }
+        stages[nst] = trim(s);
+        nst += 1;
+    }
+    for st in &stages[..nst] {
+        if st.is_empty() {
+            tw(b"sh: empty pipeline stage\n");
+            return;
+        }
+    }
+    if nst < 2 {
+        run_command(stages[0], sp, cwd, _path);
+        return;
+    }
+
+    // One pipe between each pair of adjacent stages: wend[i]/rend[i] feed stage i+1.
+    let mut wend = [HANDLE_NULL; MAXST];
+    let mut rend = [HANDLE_NULL; MAXST];
+    for i in 0..nst - 1 {
+        let p = match rt::sys_pipe() {
+            Ok(p) => p,
+            Err(_) => {
+                tw(b"sh: pipe creation failed\n");
+                close_ends(&mut wend, &mut rend, MAXST);
+                return;
+            }
+        };
+        wend[i] = rt::sys_attenuate(p, R_OUT | R_GRANT).unwrap_or(HANDLE_NULL);
+        rend[i] = rt::sys_attenuate(p, R_IN | R_GRANT).unwrap_or(HANDLE_NULL);
+        let _ = rt::sys_close(p);
+    }
+
+    // A distinct exit notification per stage, so we can wait for a specific stage.
+    let mut exits = [HANDLE_NULL; MAXST];
+    let mut spawned = [false; MAXST];
+    for i in 0..nst {
+        exits[i] = rt::sys_notif_create().unwrap_or(HANDLE_NULL);
+    }
+    // Right-to-left: consumers exist before their producers.
+    for i in (0..nst).rev() {
+        let stdin_h = if i > 0 { rend[i - 1] } else { HANDLE_NULL };
+        let stdout_h = if i < nst - 1 { wend[i] } else { sp.stdout };
+        spawned[i] = spawn_stage(stages[i], *cwd, sp, stdin_h, stdout_h, exits[i]);
+        if !spawned[i] {
+            break; // stop before launching upstream producers that would block
+        }
+    }
+    // The children hold their own grants now; drop the shell's read-end copies.
+    for i in 0..nst - 1 {
+        if rend[i] != HANDLE_NULL {
+            let _ = rt::sys_close(rend[i]);
+        }
+    }
+    // Wait each stage out in order, EOFing its outgoing pipe once it has exited
+    // (so the next stage drains the full output, then reads end-of-input).
+    for i in 0..nst {
+        if spawned[i] {
+            let _ = rt::sys_notif_wait(exits[i]);
+        }
+        if i < nst - 1 && wend[i] != HANDLE_NULL {
+            let _ = rt::sys_pipe_eof(wend[i]);
+        }
+    }
+    // Release the shell's write-end + notification handles.
+    for i in 0..nst - 1 {
+        if wend[i] != HANDLE_NULL {
+            let _ = rt::sys_close(wend[i]);
+        }
+    }
+    for i in 0..nst {
+        if exits[i] != HANDLE_NULL {
+            let _ = rt::sys_close(exits[i]);
+        }
+    }
+}
+
+/// Close every non-null pipe-end handle in the two arrays (cleanup helper).
+fn close_ends(wend: &mut [Handle], rend: &mut [Handle], n: usize) {
+    for i in 0..n {
+        if wend[i] != HANDLE_NULL {
+            let _ = rt::sys_close(wend[i]);
+            wend[i] = HANDLE_NULL;
+        }
+        if rend[i] != HANDLE_NULL {
+            let _ = rt::sys_close(rend[i]);
+            rend[i] = HANDLE_NULL;
+        }
+    }
+}
+
+/// Spawn ONE pipeline stage WITHOUT waiting, granting it `stdin_h` at SPAWN_STDIN
+/// (slot 4) and `stdout_h` at SPAWN_STDOUT (slot 2), with its own `exit` notifier.
+/// Resolves the stage's verb to a boot image + slot-1 capability the way
+/// `run_command` does. Returns true if the child was spawned. Only spawnable,
+/// stream-friendly verbs are supported in a pipeline; builtins (echo/cd/…) and
+/// unknowns are rejected.
+fn spawn_stage(cmd: &[u8], cwd: Handle, _sp: &Spawner, stdin_h: Handle, stdout_h: Handle, exit: Handle) -> bool {
+    let (verb, rest) = split_cmd(cmd);
+    let mut argbuf = [0u8; 96];
+    let mut arglen = 0usize;
+    // Resolve (image, slot-1 cap, a cap to close after spawn).
+    let (image, cap0, opened): (Handle, Handle, Handle) = match verb {
+        b"ls" => {
+            if rest.is_empty() {
+                (BOOT_IMG_LS, cwd, HANDLE_NULL)
+            } else {
+                let mut m = MsgBuf::new(TAG_FS_OPEN);
+                pack_name(&mut m, rest);
+                if rt::sys_call(cwd, &mut m).is_err() || m.data[0] != 0 || m.data[1] != oxbow_abi::FS_DIR {
+                    tw(b"ls: ");
+                    tw(rest);
+                    tw(b": no such directory\n");
+                    return false;
+                }
+                (BOOT_IMG_LS, m.handles[0], m.handles[0])
+            }
+        }
+        b"cat" => {
+            if rest.is_empty() {
+                // Consumer: read stdin. `cat -` selects stdin mode.
+                argbuf[0] = b'-';
+                arglen = 1;
+                (BOOT_IMG_CAT, HANDLE_NULL, HANDLE_NULL)
+            } else {
+                // Producer: cat <file>.
+                let mut m = MsgBuf::new(TAG_FS_OPEN);
+                pack_name(&mut m, rest);
+                if rt::sys_call(cwd, &mut m).is_err() || m.data[0] != 0 {
+                    tw(b"cat: ");
+                    tw(rest);
+                    tw(b": not found\n");
+                    return false;
+                }
+                (BOOT_IMG_CAT, m.handles[0], m.handles[0])
+            }
+        }
+        _ => {
+            tw(b"sh: ");
+            tw(verb);
+            tw(b": not usable in a pipeline\n");
+            return false;
+        }
+    };
+
+    let mut m = MsgBuf::new(0);
+    m.data[0] = 0; // default budget
+    m.data[1] = argbuf.as_ptr() as u64;
+    m.data[2] = arglen as u64;
+    m.data_len = 3;
+    rt::msg_set_identity(&mut m, cur_ident());
+    m.handle_count = 4;
+    m.handles[0] = cap0; // slot 1 = BOOT_EP (file/dir cap, or NULL for stdin mode)
+    m.handles[1] = stdout_h; // slot 2 = SPAWN_STDOUT (pipe write end or tty)
+    m.handles[2] = stdin_h; // slot 4 = SPAWN_STDIN (pipe read end, or NULL)
+    m.handles[3] = BOOT_NET_EP; // slot 20 = BOOT_NET_EP
+    let ok = rt::sys_spawn(image, BOOT_MEM, &m, exit).is_ok();
+    if opened != HANDLE_NULL {
+        let _ = rt::sys_close(opened);
+    }
+    if !ok {
+        tw(b"sh: pipeline stage spawn failed\n");
+    }
+    ok
 }
 
 fn run_command(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
@@ -1163,6 +1370,9 @@ fn run_command(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"help" => {
             tw(b"oxbow shell:  (ls cat mkdir touch are spawned programs)\n");
             tw(b"  echo <text>     print text (echo .. > f redirects to a file)\n");
+            tw(b"  a | b           pipe a's output into b (e.g. ls | cat, cat f | cat)\n");
+            tw(b"  a ; b           run a then b (command sequencing)\n");
+            tw(b"  lua: if/for/=   Lua control flow & expressions (= expr, ! forces a cmd)\n");
             tw(b"  ls              list the current directory\n");
             tw(b"  cat <file>      print a file\n");
             tw(b"  mkdir <name>    make a directory\n");

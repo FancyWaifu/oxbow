@@ -552,6 +552,14 @@ pub const SPAWN_SLOTS: [Handle; 4] = [1, 2, 4, BOOT_NET_EP];
 /// parent passes it as the 2nd grant so it lands here. Mirrors BOOT_CONSOLE's
 /// number, so programs that printed via BOOT_CONSOLE need no slot change.
 pub const SPAWN_STDOUT: Handle = 2;
+/// A spawned program's standard INPUT (§81 — shell pipelines). Same positional
+/// slot as the 3rd spawn grant (`SPAWN_SLOTS[2]` = 4, otherwise BOOT_TICK): a
+/// pipeline owner grants the pipe's read end (R_IN) here so the consumer reads
+/// its predecessor's output via `rt::stdin_read` (`sys_pipe_read`). A program
+/// only treats slot 4 as stdin when it expects to (e.g. `cat -`); the demo's
+/// tick use of the same slot is unaffected. The spawn MsgBuf is full at
+/// `MSG_HANDLES`=4 grants, so stdin reuses this slot rather than adding a 5th.
+pub const SPAWN_STDIN: Handle = 4;
 /// Child Memory budget if the spawn MsgBuf requests 0 (256 KiB).
 pub const SPAWN_DEFAULT_BUDGET: u64 = 64 * 4096;
 /// The argument string (NUL-terminated, <=55 bytes) rides in the spawn MsgBuf's

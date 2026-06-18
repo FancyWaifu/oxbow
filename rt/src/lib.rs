@@ -18,7 +18,7 @@ pub use oxbow_abi as abi;
 
 use oxbow_abi::{
     Handle, MsgBuf, SysError, SysResult, BOOT_CONSOLE, BOOT_MEM, PROT_READ, PROT_WRITE,
-    SPAWN_STDOUT, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC,
+    SPAWN_STDIN, SPAWN_STDOUT, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC,
     SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND, SYS_MAP, SYS_NOTIF_CREATE,
     SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT, SYS_RECV, SYS_REPLY, SYS_SEND, SYS_EP_CREATE, SYS_MINT,
     SYS_SPAWN, SYS_SPAWN_BYTES, TAG_TTY_WRITE,
@@ -127,9 +127,36 @@ mod heap {
 // `Stdout` implements `core::fmt::Write` over it, so `format_args!` and the
 // `print!`/`println!` macros below Just Work — no manual MsgBuf packing.
 
-/// Write raw bytes to stdout (the granted tty endpoint), chunked into the tty's
-/// <=63-byte TAG_TTY_WRITE messages.
+/// stdout routing mode, resolved on the first write (§81): 0 = unknown, 1 = a tty
+/// endpoint (the normal case — send TAG_TTY_WRITE messages), 2 = a pipe write end
+/// (a pipeline stage — use `sys_pipe_write`). A spawner makes stdout a pipe by
+/// granting a pipe's R_OUT end at SPAWN_STDOUT instead of a tty endpoint.
+static STDOUT_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Write all of `bytes` into pipe handle `pipe`, looping over partial writes. The
+/// kernel blocks the writer while the pipe is full, so this never busy-spins; a
+/// return of 0 means the read end closed (broken pipe) — stop.
+fn pipe_write_all(pipe: Handle, bytes: &[u8]) {
+    let mut off = 0;
+    while off < bytes.len() {
+        let w = sys_pipe_write(pipe, &bytes[off..]);
+        if w == 0 {
+            break;
+        }
+        off += w;
+    }
+}
+
+/// Write raw bytes to stdout. Normally stdout is a tty endpoint and the bytes go
+/// out as <=63-byte TAG_TTY_WRITE messages; but when stdout is a pipe write end
+/// (a `cmd | …` stage), `sys_send` reports BadType and we switch to writing the
+/// pipe — so a program's print path "just works" whether piped or not.
 pub fn stdout_write(bytes: &[u8]) {
+    use core::sync::atomic::Ordering;
+    if STDOUT_MODE.load(Ordering::Relaxed) == 2 {
+        pipe_write_all(SPAWN_STDOUT, bytes);
+        return;
+    }
     let mut off = 0;
     while off < bytes.len() {
         let n = core::cmp::min(63, bytes.len() - off);
@@ -140,9 +167,26 @@ pub fn stdout_write(bytes: &[u8]) {
             *dst.add(n) = 0;
         }
         m.data_len = ((n + 1 + 7) / 8) as u32;
-        let _ = sys_send(SPAWN_STDOUT, &m);
+        match sys_send(SPAWN_STDOUT, &m) {
+            Ok(()) => STDOUT_MODE.store(1, Ordering::Relaxed),
+            Err(SysError::BadType) if STDOUT_MODE.load(Ordering::Relaxed) == 0 => {
+                // stdout is a pipe, not a tty endpoint — write the rest as bytes.
+                STDOUT_MODE.store(2, Ordering::Relaxed);
+                pipe_write_all(SPAWN_STDOUT, &bytes[off..]);
+                return;
+            }
+            Err(_) => return,
+        }
         off += n;
     }
+}
+
+/// Read up to `buf.len()` bytes from stdin (the pipe read end a pipeline owner
+/// granted at SPAWN_STDIN). Returns the byte count, or 0 at end of input (the
+/// write side closed). Blocks while the pipe is empty. A program reads stdin only
+/// when it expects to — e.g. `cat -`.
+pub fn stdin_read(buf: &mut [u8]) -> usize {
+    sys_pipe_read(SPAWN_STDIN, buf)
 }
 
 /// The stdout sink for `core::fmt`.
