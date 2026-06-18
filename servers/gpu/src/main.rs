@@ -14,9 +14,21 @@
 
 mod virtio;
 
-use oxbow_abi::{BOOT_CONSOLE, BOOT_GPU_FB, BOOT_MEM, BOOT_PCI, GPU_DMA, GPU_FB_H, GPU_FB_W, GPU_MMIO};
+use oxbow_abi::{
+    BOOT_CONSOLE, BOOT_GPU_CURSOR, BOOT_GPU_FB, BOOT_MEM, BOOT_PCI, GPU_DMA, GPU_FB_H, GPU_FB_W,
+    GPU_MMIO,
+};
 use oxbow_rt as rt;
 use virtio::{r32, w32, w64, Transport, Vq};
+
+// Cursor-queue command types (§90 Phase 4) + the cursor resource/format.
+const VIRTIO_GPU_CMD_UPDATE_CURSOR: u32 = 0x0300;
+const VIRTIO_GPU_CMD_MOVE_CURSOR: u32 = 0x0301;
+const CURSOR_RES_ID: u32 = 2;
+const VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM: u32 = 1; // cursor needs alpha (transparent bg)
+const CURSORQ_OFF: u64 = 0x3000; // cursor virtqueue rings
+const CURSOR_BK_OFF: u64 = 0x5000; // 64x64x4 cursor image backing (4 pages)
+const CURSOR_STATE_OFF: u64 = 0x20000; // where the gpu maps the shared cursor-state region
 
 // 2D command types.
 const VIRTIO_GPU_CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
@@ -86,6 +98,7 @@ struct Scanout {
 struct Gpu {
     t: Transport,
     ctrlq: Vq,
+    cursorq: Option<Vq>,
     cmd_v: usize,
     cmd_p: u64,
     resp_v: usize,
@@ -116,6 +129,7 @@ impl Gpu {
         Some(Gpu {
             t,
             ctrlq,
+            cursorq: None,
             cmd_v: (GPU_DMA + CMD_OFF) as usize,
             cmd_p,
             resp_v: (GPU_DMA + RESP_OFF) as usize,
@@ -299,6 +313,74 @@ impl Gpu {
             self.submit(48, HDR_LEN as u32) == VIRTIO_GPU_RESP_OK_NODATA
         }
     }
+
+    /// Stand up the HARDWARE cursor (§90 Phase 4): bring up the cursor virtqueue
+    /// (queue 1), create a 64x64 BGRA cursor resource with an arrow drawn into it,
+    /// and UPDATE_CURSOR to bind it. Returns false on any failure.
+    fn setup_cursor(&mut self) -> bool {
+        let ring_p = rt::sys_dma_alloc(BOOT_MEM, GPU_DMA + CURSORQ_OFF).unwrap_or(0);
+        let bk_p = rt::sys_dma_alloc_contig(BOOT_MEM, GPU_DMA + CURSOR_BK_OFF, 4).unwrap_or(0);
+        if ring_p == 0 || bk_p == 0 {
+            return false;
+        }
+        self.cursorq = Some(unsafe { self.t.setup_queue(1, (GPU_DMA + CURSORQ_OFF) as usize, ring_p) });
+        if !(self.create_2d(CURSOR_RES_ID, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, 64, 64)
+            && self.attach_backing(CURSOR_RES_ID, bk_p, 64 * 64 * 4))
+        {
+            return false;
+        }
+        draw_cursor_arrow((GPU_DMA + CURSOR_BK_OFF) as *mut u32);
+        self.transfer(CURSOR_RES_ID, 64, 64);
+        unsafe { self.cursor_cmd(VIRTIO_GPU_CMD_UPDATE_CURSOR, 0, 0, CURSOR_RES_ID) }
+    }
+
+    /// Submit an UPDATE/MOVE cursor command on the cursor queue. UPDATE binds the
+    /// resource + hotspot; MOVE just repositions. Returns false if no cursor queue.
+    unsafe fn cursor_cmd(&mut self, cmd_type: u32, x: u32, y: u32, res: u32) -> bool {
+        let c = self.cmd_v;
+        w32(c, cmd_type);
+        w32(c + 4, 0);
+        w64(c + 8, 0);
+        w32(c + 16, 0);
+        w32(c + 20, 0);
+        // virtio_gpu_cursor_pos: scanout_id, x, y, padding
+        w32(c + 24, 0);
+        w32(c + 28, x);
+        w32(c + 32, y);
+        w32(c + 36, 0);
+        // resource_id, hot_x, hot_y, padding
+        w32(c + 40, res);
+        w32(c + 44, 0);
+        w32(c + 48, 0);
+        w32(c + 52, 0);
+        let (cmd_p, resp_p) = (self.cmd_p, self.resp_p);
+        match self.cursorq.as_mut() {
+            Some(cq) => cq.request(cmd_p, 56, resp_p, HDR_LEN as u32),
+            None => false,
+        }
+    }
+}
+
+/// Draw a classic arrow pointer into a 64x64 BGRA cursor backing (rest stays
+/// transparent — the backing is zeroed). 'X' = black outline, '.' = white fill.
+fn draw_cursor_arrow(buf: *mut u32) {
+    const ARROW: [&[u8]; 17] = [
+        b"X          ", b"XX         ", b"X.X        ", b"X..X       ",
+        b"X...X      ", b"X....X     ", b"X.....X    ", b"X......X   ",
+        b"X.......X  ", b"X........X ", b"X.....XXXXX", b"X..X..X    ",
+        b"X.X X..X   ", b"XX  X..X   ", b"X    X..X  ", b"     X..X  ",
+        b"      XX   ",
+    ];
+    for (j, row) in ARROW.iter().enumerate() {
+        for (i, &c) in row.iter().enumerate() {
+            let px = match c {
+                b'X' => 0xFF00_0000u32, // black, opaque (A,R,G,B = FF,00,00,00)
+                b'.' => 0xFFFF_FFFFu32, // white, opaque
+                _ => continue,          // transparent
+            };
+            unsafe { core::ptr::write_volatile(buf.add(j * 64 + i), px) };
+        }
+    }
 }
 
 /// The gradient color at (x,y): red along x, green along y, constant blue.
@@ -393,10 +475,33 @@ fn present_shared_fb(gpu: &mut Gpu, fb_phys: u64) -> ! {
             core::hint::spin_loop();
         }
     }
+    // Hardware cursor: map the shared cursor-state region oxcomp writes into and
+    // stand up the device cursor, then track it in the present loop.
+    let cursor_state = if rt::sys_shm_map(BOOT_GPU_CURSOR, GPU_DMA + CURSOR_STATE_OFF).is_ok()
+        && gpu.setup_cursor()
+    {
+        w(b"[gpu] hardware cursor enabled\n");
+        Some((GPU_DMA + CURSOR_STATE_OFF) as *const u32)
+    } else {
+        w(b"[gpu] hardware cursor unavailable\n");
+        None
+    };
+
     w(b"[gpu] presenting oxcomp via shared framebuffer\n");
+    let (mut last_x, mut last_y) = (u32::MAX, u32::MAX);
     loop {
         gpu.transfer(RES, GPU_FB_W, GPU_FB_H);
         gpu.flush(RES, GPU_FB_W, GPU_FB_H);
+        // Track the pointer: oxcomp writes its position into the shared region; we
+        // reposition the device's hardware cursor when it changes.
+        if let Some(cs) = cursor_state {
+            let (x, y) = unsafe { (core::ptr::read_volatile(cs), core::ptr::read_volatile(cs.add(1))) };
+            if x != last_x || y != last_y {
+                unsafe { gpu.cursor_cmd(VIRTIO_GPU_CMD_MOVE_CURSOR, x, y, 0) };
+                last_x = x;
+                last_y = y;
+            }
+        }
         frame_delay();
     }
 }

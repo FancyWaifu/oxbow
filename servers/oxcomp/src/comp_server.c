@@ -40,6 +40,11 @@ static const char *const cursor_bits[CURH] = {
   "      XX   ",
 };
 static int g_cx = 200, g_cy = 200; /* logical cursor position */
+/* §90 Phase 4: when set (the gpu's shared cursor-state region), the cursor is a
+ * HARDWARE cursor — we publish g_cx/g_cy here and the gpu composites it, instead
+ * of painting the arrow into the framebuffer. NULL = software cursor. */
+static volatile unsigned int *g_hwcur = 0;
+void comp_server_set_hwcursor(unsigned int *region) { g_hwcur = region; }
 
 static unsigned int        g_serial;    /* event serial counter */
 static int           g_composited;
@@ -159,17 +164,25 @@ static void composite_rect(int x0, int y0, int x1, int y1)
       for (int x = a0; x < a1; x++)
         g_back[(long)y * g_pitch_words + x] = s->backing[(long)(y - s->y) * s->w + (x - s->x)];
   }
-  /* cursor on top, clipped */
-  for (int j = 0; j < CURH; j++)
-    for (int i = 0; i < CURW; i++) {
-      char c = cursor_bits[j][i];
-      if (c == ' ')
-        continue;
-      int x = g_cx + i, y = g_cy + j;
-      if (x < x0 || x >= x1 || y < y0 || y >= y1)
-        continue;
-      g_back[(long)y * g_pitch_words + x] = (c == 'X') ? 0u : 0x00ffffffu;
-    }
+  if (g_hwcur) {
+    /* Hardware cursor: the gpu composites it on the device side; just publish the
+     * pointer position for the gpu to read (no painting into the framebuffer). */
+    g_hwcur[0] = (unsigned int)g_cx;
+    g_hwcur[1] = (unsigned int)g_cy;
+    g_hwcur[2] = 1;
+  } else {
+    /* Software cursor on top, clipped. */
+    for (int j = 0; j < CURH; j++)
+      for (int i = 0; i < CURW; i++) {
+        char c = cursor_bits[j][i];
+        if (c == ' ')
+          continue;
+        int x = g_cx + i, y = g_cy + j;
+        if (x < x0 || x >= x1 || y < y0 || y >= y1)
+          continue;
+        g_back[(long)y * g_pitch_words + x] = (c == 'X') ? 0u : 0x00ffffffu;
+      }
+  }
   /* flip only the damaged rows. */
   for (int y = y0; y < y1; y++)
     memcpy(g_fb + (long)y * g_pitch_words + x0, g_back + (long)y * g_pitch_words + x0,

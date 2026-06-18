@@ -12,7 +12,7 @@
 extern crate oxbow_libc as _;
 
 use oxbow_abi::{
-    Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_GPU_FB, BOOT_IMG_OXTERM, BOOT_IMG_SYSMON, BOOT_IMG_WLCLIENT,
+    Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_GPU_CURSOR, BOOT_GPU_FB, BOOT_IMG_OXTERM, BOOT_IMG_SYSMON, BOOT_IMG_WLCLIENT,
     BOOT_INPUT_CHAN,
     BOOT_MEM, BOOT_MOUSE_CHAN, BOOT_TERM_CHAN, FB_MMIO, GPU_FB_H, GPU_FB_W, HANDLE_NULL,
 };
@@ -48,6 +48,9 @@ extern "C" {
     fn comp_server_pump(d: *mut u8);
     fn comp_server_add_client(d: *mut u8, fd: i32);
     fn comp_server_composited() -> i32;
+    /// §90: publish the cursor position into a shared region for the GPU hardware
+    /// cursor instead of painting it (NULL = software cursor).
+    fn comp_server_set_hwcursor(region: *mut u32);
     /// Wrap a channel capability handle as a stream fd (libc, ox_chan_fd).
     fn ox_chan_fd(handle: u32) -> i32;
 }
@@ -152,6 +155,14 @@ pub extern "C" fn oxbow_main() -> ! {
     if display.is_null() {
         w(b"[oxcomp] display setup failed\n");
         park();
+    }
+    // §90 Phase 4: if the gpu shared a cursor-state region, map it and switch to
+    // the hardware cursor — we publish the pointer position there and the gpu's
+    // device cursor composites it (no software arrow painted into the fb).
+    const CURSOR_VADDR: u64 = 0x5100_0000;
+    if rt::sys_shm_map(BOOT_GPU_CURSOR, CURSOR_VADDR).is_ok() {
+        unsafe { comp_server_set_hwcursor(CURSOR_VADDR as *mut u32) };
+        w(b"[oxcomp] hardware cursor (GPU) enabled\n");
     }
     // §56: attach the second client to the display.
     if srv2 != HANDLE_NULL {

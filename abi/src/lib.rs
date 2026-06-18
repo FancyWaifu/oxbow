@@ -377,6 +377,12 @@ pub const BOOT_GPU_IRQ: Handle = 9;
 pub const BOOT_GPU_FB: Handle = 50;
 pub const GPU_FB_W: u32 = 1280;
 pub const GPU_FB_H: u32 = 800;
+/// A tiny shared CURSOR-STATE region (§90 Phase 4): the kernel reserves one page,
+/// granted to oxcomp (R_MAP|R_WRITE) and the gpu (R_MAP). oxcomp writes the
+/// pointer position as u32 words [x, y, visible]; the gpu reads them and drives
+/// the virtio-gpu HARDWARE cursor (UPDATE/MOVE_CURSOR) — so the cursor is
+/// composited by the device, not painted into the framebuffer.
+pub const BOOT_GPU_CURSOR: Handle = 51;
 
 // --- Block service IPC (§24) ----------------------------------------------
 /// The block driver also serves a SECTOR read/write endpoint (the root of block

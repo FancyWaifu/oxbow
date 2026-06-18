@@ -309,16 +309,18 @@ fn kmain_stage2() -> ! {
     // §90: a CONTIGUOUS framebuffer shared by the gpu driver and oxcomp, so the
     // compositor renders straight into the virtio-gpu scanout. Created only when a
     // gpu device is present; granted to both the `gpu` and `oxcomp` modules below.
-    let gpu_fb = if gpu.is_some() {
+    let (gpu_fb, gpu_cursor) = if gpu.is_some() {
         let pages = (oxbow_abi::GPU_FB_W as usize * oxbow_abi::GPU_FB_H as usize * 4 + 4095) / 4096;
-        let r = crate::shm::create_contig(pages);
-        match r {
+        let fb = crate::shm::create_contig(pages);
+        // A 1-page shared cursor-state region (x,y,visible) for the hardware cursor.
+        let cur = crate::shm::create_contig(1);
+        match fb {
             Some(_) => println!("[gpu] shared framebuffer reserved ({} pages)", pages),
             None => println!("[gpu] WARN could not reserve shared framebuffer"),
         }
-        r
+        (fb, cur)
     } else {
-        None
+        (None, None)
     };
 
     // One process per Limine module, each in its OWN address space (a fresh
@@ -503,11 +505,24 @@ fn kmain_stage2() -> ! {
         }
         // §90: oxcomp also gets the shared GPU framebuffer (R_MAP|R_WRITE) — it maps
         // and composites into it in preference to the Limine fb when a gpu present.
+        // Plus the cursor-state region it writes the pointer position into.
         if cmd == b"oxcomp" {
             if let Some(idx) = gpu_fb {
                 proc::with_proc_mut(pid, |p| {
                     p.install(
                         oxbow_abi::BOOT_GPU_FB,
+                        object::HandleEntry {
+                            obj: object::ObjectRef::Shm(idx),
+                            rights: oxbow_abi::R_MAP | oxbow_abi::R_WRITE,
+                            badge: 0,
+                        },
+                    );
+                });
+            }
+            if let Some(idx) = gpu_cursor {
+                proc::with_proc_mut(pid, |p| {
+                    p.install(
+                        oxbow_abi::BOOT_GPU_CURSOR,
                         object::HandleEntry {
                             obj: object::ObjectRef::Shm(idx),
                             rights: oxbow_abi::R_MAP | oxbow_abi::R_WRITE,
@@ -898,6 +913,20 @@ fn kmain_stage2() -> ! {
                 proc::with_proc_mut(pid, |p| {
                     p.install(
                         oxbow_abi::BOOT_GPU_FB,
+                        object::HandleEntry {
+                            obj: object::ObjectRef::Shm(idx),
+                            rights: oxbow_abi::R_MAP,
+                            badge: 0,
+                        },
+                    );
+                });
+            }
+            // The shared cursor-state region (R_MAP — the gpu reads the position
+            // oxcomp writes and drives the hardware cursor).
+            if let Some(idx) = gpu_cursor {
+                proc::with_proc_mut(pid, |p| {
+                    p.install(
+                        oxbow_abi::BOOT_GPU_CURSOR,
                         object::HandleEntry {
                             obj: object::ObjectRef::Shm(idx),
                             rights: oxbow_abi::R_MAP,
