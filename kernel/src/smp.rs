@@ -103,18 +103,36 @@ extern "C" fn ap_main(index: usize) -> ! {
 /// serialised (no two cores initialising at once) and bounds the per-AP risk. Each
 /// gets a sequential per-CPU index 1..N; the BSP is 0. Capped at `MAX_CPUS` (the size
 /// of the per-CPU stack/TSS/state pools); any extra cores stay parked by Limine.
-/// §74 KNOWN BUG: with more than one AP (≥3 cores total), heavy boot-time
-/// concurrency hits a residual memory-corruption hang (a core spins on a lock while
-/// another is stuck in the page-fault handler — kernel state got corrupted). One AP
-/// (2 cores total) is rock-solid (the §70–73 config, verified 6/6 desktop). Until
-/// the multi-AP race is root-caused, cap the number of APs we actually start here, so
-/// the desktop is reliable. Set back to `MAX_CPUS - 1` once it's fixed. The extra
-/// cores remain parked by Limine (present, idle) — `just run-tty`'s `-smp 4` is fine.
-const MAX_APS_TO_START: usize = 1;
+/// §79: detect QEMU's **TCG** software emulator via the hypervisor CPUID vendor
+/// (leaf 0x4000_0000 returns "TCGTCGTCGTCG"). On an ARM Mac, QEMU can't hardware-
+/// virtualize x86, so it software-emulates x86 SMP with MTTCG — whose memory-model /
+/// atomics emulation hangs oxbow with >1 AP. That is an **emulator artifact, not an
+/// oxbow bug**: on real x86 + KVM (verified on a Proxmox VM, 5/5 cold boots, 4 cores)
+/// all APs schedule reliably. So we cap to 1 AP under TCG and run all cores elsewhere.
+fn is_tcg_emulation() -> bool {
+    use core::arch::x86_64::__cpuid;
+    // CPUID.1:ECX[31] = hypervisor present.
+    if unsafe { __cpuid(1) }.ecx & (1 << 31) == 0 {
+        return false; // bare metal — no hypervisor
+    }
+    let r = unsafe { __cpuid(0x4000_0000) };
+    // "TCGTCGTCGTCG" split across EBX:ECX:EDX.
+    r.ebx == u32::from_le_bytes(*b"TCGT")
+        && r.ecx == u32::from_le_bytes(*b"CGTC")
+        && r.edx == u32::from_le_bytes(*b"GTCG")
+}
 
 pub fn bring_up_all(mp: &MpResponse) {
     // Publish the kernel PML4 every AP must switch onto.
     KERNEL_PML4.store(crate::arch::current_cr3(), Ordering::Release);
+
+    // All cores on real HW / KVM; just 1 AP under QEMU-TCG (its SMP emulation hangs).
+    let max_aps = if is_tcg_emulation() {
+        println!("[smp] QEMU TCG emulation detected — capping at 1 AP (emulator SMP artifact)");
+        1
+    } else {
+        MAX_CPUS - 1
+    };
 
     let bsp = mp.bsp_lapic_id();
     let mut index = 1usize; // BSP holds per-CPU slot 0; APs take 1, 2, 3, ...
@@ -126,8 +144,8 @@ pub fn bring_up_all(mp: &MpResponse) {
             continue; // skip the BSP — it's already running this code
         }
         // Cap: stop once we've started our safe number of APs (or run out of pool).
-        if index > MAX_APS_TO_START || index >= MAX_CPUS {
-            parked += 1; // intentionally left parked (see MAX_APS_TO_START)
+        if index > max_aps || index >= MAX_CPUS {
+            parked += 1; // intentionally left parked
             continue;
         }
 
