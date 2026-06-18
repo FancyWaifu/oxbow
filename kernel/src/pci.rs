@@ -99,13 +99,15 @@ fn probe(bus: u8, dev: u8, func: u8) -> Option<Device> {
     })
 }
 
-/// Enumerate the PCI bus, logging each function, and return (NIC, block device):
-/// the first network controller (class 0x02) and the first virtio-blk device
-/// (vendor 0x1af4, mass-storage class 0x01) — the hardware a net / block driver
+/// Enumerate the PCI bus, logging each function, and return (NIC, block, gpu):
+/// the first network controller (class 0x02), the first virtio-blk device
+/// (vendor 0x1af4, mass-storage class 0x01), and the first virtio-gpu device
+/// (vendor 0x1af4, display class 0x03) — the hardware a net / block / gpu driver
 /// will own.
-pub fn enumerate() -> (Option<Device>, Option<Device>) {
+pub fn enumerate() -> (Option<Device>, Option<Device>, Option<Device>) {
     let mut nic = None;
     let mut blk = None;
+    let mut gpu = None;
     for bus in 0u16..256 {
         for dev in 0u8..32 {
             for func in 0u8..8 {
@@ -120,6 +122,12 @@ pub fn enumerate() -> (Option<Device>, Option<Device>) {
                     if d.vendor == 0x1af4 && d.class == 0x01 && blk.is_none() {
                         blk = Some(d);
                     }
+                    // virtio-gpu (0x1050) presents as a display controller; both
+                    // `virtio-gpu-pci` (subclass 0x80) and `virtio-vga` (subclass
+                    // 0x00, also a legacy-VGA fb for Limine) match class 0x03.
+                    if d.vendor == 0x1af4 && d.class == 0x03 && gpu.is_none() {
+                        gpu = Some(d);
+                    }
                     // func 0 with no multi-function bit: skip funcs 1..8
                     if func == 0 && config_read(bus as u8, dev, 0, 0x0C) & 0x0080_0000 == 0 {
                         break;
@@ -128,5 +136,5 @@ pub fn enumerate() -> (Option<Device>, Option<Device>) {
             }
         }
     }
-    (nic, blk)
+    (nic, blk, gpu)
 }

@@ -272,7 +272,7 @@ fn kmain_stage2() -> ! {
 
     // Enumerate the PCI bus — the kernel is the root of hardware authority and
     // will hand a future net driver a capability to the NIC it finds here.
-    let (nic, blk) = pci::enumerate();
+    let (nic, blk, gpu) = pci::enumerate();
     match nic {
         Some(d) => {
             let (base, size) = d.bar_region(0);
@@ -293,6 +293,13 @@ fn kmain_stage2() -> ! {
             );
         }
         None => println!("[pci] no virtio-blk device found"),
+    }
+    match gpu {
+        Some(d) => println!(
+            "[pci] virtio-gpu {:04x}:{:04x} at {:02x}:{:02x}.{} — IRQ {} (driver walks cfg caps)",
+            d.vendor, d.device, d.bus, d.dev, d.func, d.irq_line()
+        ),
+        None => println!("[pci] no virtio-gpu device found"),
     }
 
     // The timer-driven tick notification (granted to module 0 as BOOT_TICK).
@@ -377,6 +384,8 @@ fn kmain_stage2() -> ! {
             16 * 1024 * 1024
         } else if cmd == b"oxcomp" {
             108 * 1024 * 1024 // libwayland + shm + funds the oxterm/rings/sysmon children
+        } else if cmd == b"gpu" {
+            32 * 1024 * 1024 // virtqueue rings + a full-resolution scanout backing store
         } else {
             mm::mem::BOOT_BUDGET
         };
@@ -826,6 +835,32 @@ fn kmain_stage2() -> ! {
                     },
                 );
             });
+        }
+        if cmd == b"gpu" {
+            // The GPU driver owns the virtio-gpu PCI device: read/write config
+            // (R_IN|R_OUT) to negotiate + map its MMIO BAR (R_MAP), plus a cap to
+            // its interrupt line (R_BIND|R_ACK) for async display events. DMA comes
+            // from its (large) Memory budget.
+            if let Some(d) = gpu {
+                proc::with_proc_mut(pid, |p| {
+                    p.install(
+                        oxbow_abi::BOOT_PCI,
+                        object::HandleEntry {
+                            obj: object::ObjectRef::PciDevice(d.bdf()),
+                            rights: oxbow_abi::R_IN | oxbow_abi::R_OUT | oxbow_abi::R_MAP,
+                            badge: 0,
+                        },
+                    );
+                    p.install(
+                        oxbow_abi::BOOT_GPU_IRQ,
+                        object::HandleEntry {
+                            obj: object::ObjectRef::Irq(d.irq_line()),
+                            rights: oxbow_abi::R_BIND | oxbow_abi::R_ACK,
+                            badge: 0,
+                        },
+                    );
+                });
+            }
         }
         let tcb = thread::spawn_user(pid, as_i, entry, user_rsp);
         println!("[user] {} scheduled as tcb {} (ring 3, IF=1)", name, tcb);

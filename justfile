@@ -8,7 +8,7 @@ ISO        := "oxbow.iso"
 # no display, the isa-debug-exit device so a future test harness can exit QEMU
 # from inside the kernel, and a legacy virtio-blk disk (oxbow-disk.img) for
 # persistent storage. Create the disk once with:  just disk
-qemu_flags := "-M q35 -m 256M -smp 4 -cdrom " + ISO + " -boot d -serial stdio -display none -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04 -netdev user,id=net0 -device e1000,netdev=net0 -drive file=oxbow-disk.img,if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0"
+qemu_flags := "-M q35 -m 256M -smp 4 -cdrom " + ISO + " -boot d -serial stdio -display none -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04 -netdev user,id=net0 -device e1000,netdev=net0 -drive file=oxbow-disk.img,if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0 -device virtio-gpu-pci"
 
 default: run
 
@@ -31,6 +31,7 @@ build-server:
     RUSTFLAGS="-C relocation-model=static" cargo build -p badge
     RUSTFLAGS="-C relocation-model=static" cargo build -p net
     RUSTFLAGS="-C relocation-model=static" cargo build -p blk
+    RUSTFLAGS="-C relocation-model=static" cargo build -p gpu
     RUSTFLAGS="-C relocation-model=static" cargo build -p fb
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p oxcomp
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p wlclient
@@ -99,6 +100,8 @@ _iso:
     -strip -S iso_root/boot/fs.elf
     cp target/x86_64-unknown-none/debug/net iso_root/boot/net.elf
     cp target/x86_64-unknown-none/debug/blk iso_root/boot/blk.elf
+    cp target/x86_64-unknown-none/debug/gpu iso_root/boot/gpu.elf
+    -strip -S iso_root/boot/gpu.elf
     cp target/x86_64-unknown-none/debug/wlclient iso_root/boot/wlclient.elf
     -strip -S iso_root/boot/wlclient.elf
     cp target/x86_64-unknown-none/debug/oxterm iso_root/boot/oxterm.elf

@@ -357,6 +357,16 @@ pub const NET_DMA: u64 = 0x4010_0000;
 pub const BLK_MMIO: u64 = 0x4020_0000;
 pub const BLK_DMA: u64 = 0x4030_0000;
 
+/// GPU driver (virtio-gpu, modern/PCI): the device's PciDevice cap is granted at
+/// `BOOT_PCI` in the gpu server, its interrupt line as an Irq cap at `BOOT_GPU_IRQ`.
+/// It maps the device's (single) virtio BAR at `GPU_MMIO` and allocates DMA pages
+/// (virtqueue rings, command/response buffers, and the scanout backing store) at
+/// `GPU_DMA + n*0x1000`. The gpu module is granted a large Memory budget at boot.
+pub const GPU_MMIO: u64 = 0x4050_0000;
+pub const GPU_DMA: u64 = 0x4060_0000;
+/// The gpu driver's IrqLine capability for the virtio-gpu interrupt (R_BIND|R_ACK).
+pub const BOOT_GPU_IRQ: Handle = 9;
+
 // --- Block service IPC (§24) ----------------------------------------------
 /// The block driver also serves a SECTOR read/write endpoint (the root of block
 /// authority, EP4). It owns this UNBADGED at `BOOT_EP` with R_RECV; the fs server
