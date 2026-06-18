@@ -487,24 +487,31 @@ pub fn block_current() {
     // Woken: our waker has already deposited our result (and staging, in IPC).
 }
 
-/// Make a Blocked thread Ready (OpenBSD `setrunnable` / Linux `try_to_wake_up`).
-/// Does NOT switch — the waker keeps running. The waker must have already made the
-/// condition true (deposited the result) BEFORE calling this, so the `Blocked`
-/// it observes is paired with a satisfied condition (the wake-side of the barrier
-/// in `prepare_block`). A single atomic CAS `Blocked → Ready` does the transition.
-///
-/// Idempotent and race-clean: if the thread is Running (hasn't blocked yet, or was
-/// already woken) the CAS fails and we no-op — but because the sleeper re-checks
-/// the condition after `prepare_block`, a wake that lands while it's still Running
-/// is caught by that re-check, not lost. Two wakers racing → one CAS wins. This is
-/// what lets multi-channel `sys_chan_wait` be woken by several senders safely.
-pub fn wake(tid: usize) {
+/// The CAS at the heart of `wake` (OpenBSD `setrunnable` / Linux `try_to_wake_up`):
+/// `Blocked → Ready`, no switch. MUST be called with `SCHED_LOCK` held. Idempotent —
+/// if the thread isn't Blocked (still running, or already woken) the CAS fails and
+/// no-ops; a wake that lands while the sleeper is still Running is caught by the
+/// post-`prepare_block` condition re-check, not lost.
+fn wake_locked(tid: usize) {
     let _ = STATE[tid].compare_exchange(
         State::Blocked as u8,
         State::Ready as u8,
         Ordering::AcqRel,
         Ordering::Relaxed,
     );
+}
+
+/// Make a Blocked thread Ready. §76: the state transition now runs **under
+/// SCHED_LOCK**, like Linux `ttwu` (state changed under `pi_lock`/`rq_lock`) and
+/// FreeBSD `wakeup` (under the thread/sleepqueue lock) — NOT a lock-free CAS racing
+/// the scheduler. Serializing the wakeup with `pick_next`/`switch_to` removes a
+/// class of cross-core state races the lock-free wake exposed. Lock order: callers
+/// hold either no lock or a structure lock ABOVE SCHED_LOCK (e.g. ENDPOINTS), never
+/// a leaf below it — so `… > SCHED_LOCK` stays acyclic (§73).
+pub fn wake(tid: usize) {
+    sched_lock();
+    wake_locked(tid);
+    sched_unlock();
 }
 
 /// Arm a timer deadline (in ticks) for `tid`; the timer IRQ wakes it once
@@ -525,12 +532,16 @@ pub fn timed_out(tid: usize, now_tick: u64) -> bool {
 /// a timer wake from a spurious one and would re-block forever. Cheap — one pass
 /// over the small TCB pool, called with IF=0.
 pub fn wake_expired(now_tick: u64) {
+    // §76: take SCHED_LOCK ONCE for the whole scan (not per-thread). Called from the
+    // BSP timer IRQ, which is not under SCHED_LOCK, so this is a fresh acquire.
+    sched_lock();
     for s in 1..MAX_THREADS {
         let d = unsafe { (*addr_of!(TCBS[s])).wake_at };
         if d != 0 && now_tick >= d {
-            wake(s); // atomic Blocked→Ready CAS (no-op if already runnable)
+            wake_locked(s);
         }
     }
+    sched_unlock();
 }
 
 /// Terminate the current thread and switch away forever.
