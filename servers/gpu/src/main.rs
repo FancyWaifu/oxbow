@@ -29,8 +29,10 @@ const VIRTIO_GPU_RESP_OK_NODATA: u32 = 0x1100;
 /// matching the Limine framebuffer convention.
 const VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM: u32 = 2;
 /// The scanout backing store (a contiguous DMA region) lives here, past the
-/// rings/cmd/resp pages at GPU_DMA+0..0x2000.
+/// rings/cmd/resp pages at GPU_DMA+0..0x2000. A second backing (for a runtime
+/// modeset to a new resolution) lives at FB_OFF2, past the first (max ~8 MiB).
 const FB_OFF: u64 = 0x10000;
+const FB_OFF2: u64 = 0x810000;
 
 fn w(s: &[u8]) {
     let _ = rt::sys_console_write(BOOT_CONSOLE, s.as_ptr(), s.len());
@@ -222,6 +224,40 @@ impl Gpu {
         }
     }
 
+    /// Copy a SUB-rectangle of the backing to the host resource. `offset` is the
+    /// byte offset of the rect's origin in the backing (= (y*stride_w + x)*4), so
+    /// the device reads the right rows. Dirty-rect transfer — far cheaper than the
+    /// full frame.
+    fn transfer_rect(&mut self, id: u32, x: u32, y: u32, rw: u32, rh: u32, stride_w: u32) -> bool {
+        unsafe {
+            self.put_hdr(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
+            let c = self.cmd_v;
+            w32(c + 24, x);
+            w32(c + 28, y);
+            w32(c + 32, rw);
+            w32(c + 36, rh);
+            w64(c + 40, ((y * stride_w + x) * 4) as u64); // offset into backing
+            w32(c + 48, id);
+            w32(c + 52, 0);
+            self.submit(56, HDR_LEN as u32) == VIRTIO_GPU_RESP_OK_NODATA
+        }
+    }
+
+    /// Flush a SUB-rectangle of the host resource to the display.
+    fn flush_rect(&mut self, id: u32, x: u32, y: u32, rw: u32, rh: u32) -> bool {
+        unsafe {
+            self.put_hdr(VIRTIO_GPU_CMD_RESOURCE_FLUSH);
+            let c = self.cmd_v;
+            w32(c + 24, x);
+            w32(c + 28, y);
+            w32(c + 32, rw);
+            w32(c + 36, rh);
+            w32(c + 40, id);
+            w32(c + 44, 0);
+            self.submit(48, HDR_LEN as u32) == VIRTIO_GPU_RESP_OK_NODATA
+        }
+    }
+
     /// Flush the host resource to the display for the full `w`x`h` rect.
     fn flush(&mut self, id: u32, w: u32, h: u32) -> bool {
         unsafe {
@@ -238,17 +274,80 @@ impl Gpu {
     }
 }
 
-/// Fill the scanout backing with a recognizable test pattern: a red-(x) /
-/// green-(y) gradient with constant blue — confirms format + stride + flush.
+/// The gradient color at (x,y): red along x, green along y, constant blue.
+#[inline]
+fn grad(x: u32, y: u32, w: u32, h: u32) -> u32 {
+    ((x * 255 / w) << 16) | ((y * 255 / h) << 8) | 0x40 // 0x00RRGGBB (B8G8R8X8)
+}
+
+/// Fill the whole backing with the gradient test pattern.
 fn draw_test_pattern(buf: *mut u32, w: u32, h: u32) {
     for y in 0..h {
         for x in 0..w {
-            let r = x * 255 / w;
-            let g = y * 255 / h;
-            let b = 0x40u32;
-            let px = (r << 16) | (g << 8) | b; // 0x00RRGGBB (B8G8R8X8)
-            unsafe { core::ptr::write_volatile(buf.add((y * w + x) as usize), px) };
+            unsafe { core::ptr::write_volatile(buf.add((y * w + x) as usize), grad(x, y, w, h)) };
         }
+    }
+}
+
+/// Repaint the gradient over a rectangle (restores the background under a sprite).
+fn fill_grad_rect(buf: *mut u32, w: u32, h: u32, x0: u32, y0: u32, rw: u32, rh: u32) {
+    for y in y0..(y0 + rh).min(h) {
+        for x in x0..(x0 + rw).min(w) {
+            unsafe { core::ptr::write_volatile(buf.add((y * w + x) as usize), grad(x, y, w, h)) };
+        }
+    }
+}
+
+/// Fill a rectangle with a solid color.
+fn fill_rect(buf: *mut u32, w: u32, h: u32, x0: u32, y0: u32, rw: u32, rh: u32, color: u32) {
+    for y in y0..(y0 + rh).min(h) {
+        for x in x0..(x0 + rw).min(w) {
+            unsafe { core::ptr::write_volatile(buf.add((y * w + x) as usize), color) };
+        }
+    }
+}
+
+/// Crude busy-wait between animation frames (no sleep syscall yet).
+fn frame_delay() {
+    for _ in 0..2_000_000u64 {
+        core::hint::spin_loop();
+    }
+}
+
+/// The display loop (Phase 3): bounce a white sprite across the gradient, doing a
+/// TRANSFER + FLUSH every frame — sustained dynamic submission, the thing a
+/// compositor needs. Dirty-rect: only repaint the sprite's old/new cells on the
+/// CPU; the full-frame transfer is a cheap host-side DMA copy. Never returns.
+fn animate(gpu: &mut Gpu, id: u32, buf: *mut u32, width: u32, height: u32) -> ! {
+    let sz = 80u32;
+    let y0 = height / 2 - sz / 2;
+    let (mut x, mut dx, mut prev) = (0u32, 8i32, 0u32);
+    let mut frame = 0u32;
+    loop {
+        fill_grad_rect(buf, width, height, prev, y0, sz, sz); // erase previous sprite
+        fill_rect(buf, width, height, x, y0, sz, sz, 0x00FF_FFFF); // draw white sprite
+        // Dirty rect = bounding box of the old + new sprite cells; transfer/flush
+        // only that — a compositor's damage region, not the whole frame.
+        let dx0 = prev.min(x);
+        let dw = (prev.max(x) + sz) - dx0;
+        gpu.transfer_rect(id, dx0, y0, dw, sz, width);
+        gpu.flush_rect(id, dx0, y0, dw, sz);
+        if frame % 64 == 0 {
+            w(b"[gpu] frame ");
+            wnum(frame);
+            w(b" x=");
+            wnum(x);
+            w(b"\n");
+        }
+        frame += 1;
+        prev = x;
+        let nx = x as i32 + dx;
+        if nx < 0 || nx as u32 + sz >= width {
+            dx = -dx; // bounce
+        } else {
+            x = nx as u32;
+        }
+        frame_delay();
     }
 }
 
@@ -315,6 +414,30 @@ pub extern "C" fn oxbow_main() -> ! {
         w(b"[gpu] transfer/flush failed\n");
     }
 
+    // --- Phase 3: runtime modeset + a continuous display loop. Switch to a NEW
+    // resolution at runtime (a fresh resource on scanout 0) — something a fixed
+    // Limine framebuffer can't do — then drive a sustained TRANSFER+FLUSH loop. ---
+    const MODE_W: u32 = 1024;
+    const MODE_H: u32 = 768;
+    const RES2_ID: u32 = 2;
+    let mbytes = MODE_W * MODE_H * 4;
+    let mpages = ((mbytes as u64) + 4095) / 4096;
+    let mfb_v = GPU_DMA + FB_OFF2;
+    let mfb_p = rt::sys_dma_alloc_contig(BOOT_MEM, mfb_v, mpages).unwrap_or(0);
+    if mfb_p != 0
+        && gpu.create_2d(RES2_ID, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM, MODE_W, MODE_H)
+        && gpu.attach_backing(RES2_ID, mfb_p, mbytes)
+        && gpu.set_scanout(0, RES2_ID, MODE_W, MODE_H)
+    {
+        w(b"[gpu] modeset to 1024x768 - animating\n");
+        draw_test_pattern(mfb_v as *mut u32, MODE_W, MODE_H);
+        // Push the full gradient to the host resource once; animate() then only
+        // transfers the sprite's dirty rect each frame.
+        gpu.transfer(RES2_ID, MODE_W, MODE_H);
+        gpu.flush(RES2_ID, MODE_W, MODE_H);
+        animate(&mut gpu, RES2_ID, mfb_v as *mut u32, MODE_W, MODE_H);
+    }
+    w(b"[gpu] modeset failed - holding static scanout\n");
     loop {
         core::hint::spin_loop();
     }
