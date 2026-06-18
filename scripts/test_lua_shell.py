@@ -38,6 +38,9 @@ QCODE.update({
     "!": ("shift", "1"), "|": ("shift", "backslash"),
     ">": ("shift", "dot"), "&": ("shift", "7"),
     "<": ("shift", "comma"), "-": "minus",
+    "$": ("shift", "4"), "{": ("shift", "bracket_left"),
+    "}": ("shift", "bracket_right"), "[": "bracket_left",
+    "]": "bracket_right", "'": "apostrophe",
 })
 
 
@@ -171,6 +174,51 @@ def main():
                 break
             time.sleep(0.2)
         checks.append(("< stdin redirect", lt_ok))
+
+        time.sleep(0.3)
+        # --- $VAR / ${VAR} expansion (backed by Lua globals) + quoting (§82) ---
+        # Output markers use brackets so they never collide with the command echo.
+        q.type('gv = "zqv"\n')  # a shell var IS a Lua global
+        time.sleep(0.5)
+        q.type("echo [$gv]\n")
+        checks.append(("$VAR expands", wait_for("[zqv]", 5)))
+        time.sleep(0.3)
+        q.type('echo "$gv-$gv"\n')
+        checks.append(("$VAR in double quotes", wait_for("zqv-zqv", 5)))
+        time.sleep(0.3)
+        q.type("echo ${gv}TAIL\n")
+        checks.append(("${VAR} braces", wait_for("zqvTAIL", 5)))
+        time.sleep(0.3)
+        mark = len(serial())
+        q.type("echo '$gv'\n")  # single quotes: literal, no expansion
+        time.sleep(1)
+        checks.append(("'…' is literal", serial()[mark:].count("zqv") == 0))
+        time.sleep(0.3)
+        # --- globbing (§82) ---
+        q.type("echo gg > guniq.txt\n")
+        time.sleep(0.8)
+        before = serial().count("guniq.txt")  # 1 (the command echo above)
+        q.type("echo guni*\n")  # globs to guniq.txt (cmd echo has 'guni*', not the name)
+        glob_ok = False
+        for _ in range(25):
+            if serial().count("guniq.txt") > before:
+                glob_ok = True
+                break
+            time.sleep(0.2)
+        checks.append(("* glob matches a file", glob_ok))
+        time.sleep(0.3)
+        mark = len(serial())
+        q.type("echo NOMATCHQ*\n")  # no match -> stays literal
+        time.sleep(1)
+        checks.append(("* no-match stays literal", "NOMATCHQ*" in serial()[mark:]))
+        time.sleep(0.3)
+        # --- $(...) command substitution (§82) ---
+        # Brackets make the OUTPUT marker absent from the command echo.
+        q.type("echo [$(echo subval)]\n")  # echo builtin inside $()
+        checks.append(("$() with echo", wait_for("[subval]", 5)))
+        time.sleep(0.3)
+        q.type("echo [$(cat pm.txt)]\n")  # real capture: cat's stdout via a pipe
+        checks.append(("$() captures cmd stdout", wait_for("[pipemark]", 6)))
 
         print("--- serial tail ---"); print(serial()[-1600:])
         print("--- verdict ---")

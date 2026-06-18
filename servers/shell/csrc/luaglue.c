@@ -58,6 +58,27 @@ static int ox_panic(lua_State *L) {
     return 0;
 }
 
+/* Write the string value of Lua global `name` into `out` (capacity `cap`,
+ * NUL-terminated). Returns the length (excluding NUL), or -1 if the global is
+ * nil/undefined. Backs the shell's `$VAR` expansion — a shell "variable" IS a Lua
+ * global, so `x = 5` then `echo $x` prints 5. Numbers/booleans stringify too. */
+int ox_lua_global(lua_State *L, const char *name, char *out, int cap) {
+    lua_getglobal(L, name);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        return -1;
+    }
+    size_t len;
+    const char *s = luaL_tolstring(L, -1, &len); /* pushes a string form */
+    int n = (int)len;
+    if (n > cap - 1) n = cap - 1;
+    if (n < 0) n = 0;
+    for (int i = 0; i < n; i++) out[i] = s[i];
+    out[n] = '\0';
+    lua_pop(L, 2); /* the tolstring result + the original global */
+    return n;
+}
+
 /* Create the shell's persistent Lua state. Returns NULL on OOM. */
 lua_State *ox_lua_new(void) {
     lua_State *L = luaL_newstate();

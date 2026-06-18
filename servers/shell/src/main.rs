@@ -38,11 +38,43 @@ extern "C" {
     /// Evaluate one NUL-terminated line REPL-style (expression prints its value;
     /// statements just run). Errors are reported to the tty inside the glue.
     fn ox_lua_eval(state: *mut c_void, code: *const u8) -> i32;
+    /// Write the string form of Lua global `name` into `out` (cap `cap`); returns
+    /// the length, or -1 if the global is nil. Backs `$VAR` expansion.
+    fn ox_lua_global(state: *mut c_void, name: *const u8, out: *mut u8, cap: i32) -> i32;
 }
 
 /// The shell's persistent Lua interpreter, created on first use. Globals set on
 /// one line are visible on the next; chunk-local `local`s are not (Lua semantics).
 static mut LUA_STATE: *mut c_void = core::ptr::null_mut();
+
+/// The Lua state, lazily created on first use. NULL only if creation OOM'd.
+fn lua_state() -> *mut c_void {
+    unsafe {
+        if LUA_STATE.is_null() {
+            LUA_STATE = ox_lua_new();
+        }
+        LUA_STATE
+    }
+}
+
+/// Look up Lua global `name` (a NUL-free identifier) as a string into `out`.
+/// Returns the byte length, or None if unset/nil. Backs `$VAR` expansion.
+fn lua_global(name: &[u8], out: &mut [u8]) -> Option<usize> {
+    let st = lua_state();
+    if st.is_null() {
+        return None;
+    }
+    let mut nbuf = [0u8; 64];
+    let n = core::cmp::min(name.len(), nbuf.len() - 1);
+    nbuf[..n].copy_from_slice(&name[..n]);
+    nbuf[n] = 0;
+    let r = unsafe { ox_lua_global(st, nbuf.as_ptr(), out.as_mut_ptr(), out.len() as i32) };
+    if r < 0 {
+        None
+    } else {
+        Some(r as usize)
+    }
+}
 
 /// Called from C (luaglue.c) to emit Lua's output to the console the shell owns.
 /// Routes through `tw` (TAG_TTY_WRITE) — the shell has no libc stdout FILE.
@@ -57,20 +89,270 @@ pub extern "C" fn ox_tty_write(p: *const u8, n: usize) {
 /// Evaluate one line of Lua, creating the interpreter on first use. The C API
 /// needs a NUL terminator, so copy into a stack buffer (lines are <=256 bytes).
 fn lua_eval(line: &[u8]) {
-    unsafe {
-        if LUA_STATE.is_null() {
-            LUA_STATE = ox_lua_new();
-            if LUA_STATE.is_null() {
-                tw(b"lua: cannot create interpreter (out of memory)\n");
-                return;
+    let st = lua_state();
+    if st.is_null() {
+        tw(b"lua: cannot create interpreter (out of memory)\n");
+        return;
+    }
+    let mut buf = [0u8; 512];
+    let n = core::cmp::min(line.len(), buf.len() - 1);
+    buf[..n].copy_from_slice(&line[..n]);
+    buf[n] = 0;
+    unsafe { ox_lua_eval(st, buf.as_ptr()) };
+}
+
+/// Word-expansion for a command line (§82), bash-style, in one left-to-right pass:
+///   '...'    literal — no expansion, quotes removed
+///   "..."    grouped — `$VAR` still expands, quotes removed
+///   $name    / ${name}  → the value of Lua global `name` (a shell var IS a Lua
+///                          global); unset → empty
+/// Other bytes copy through. `$(...)` command substitution and `*` globbing are
+/// layered on by the caller. Returns the expanded length written to `out`.
+fn expand(input: &[u8], cwd: Handle, sp: &Spawner, out: &mut [u8]) -> usize {
+    let mut o = 0;
+    let mut i = 0;
+    while i < input.len() {
+        let c = input[i];
+        match c {
+            b'\'' => {
+                // Single quotes: copy verbatim until the closing quote.
+                i += 1;
+                while i < input.len() && input[i] != b'\'' {
+                    pb(out, &mut o, input[i]);
+                    i += 1;
+                }
+                i += 1; // skip closing quote (or run off end)
+            }
+            b'"' => {
+                // Double quotes: copy, but expand `$` inside.
+                i += 1;
+                while i < input.len() && input[i] != b'"' {
+                    if input[i] == b'$' {
+                        i += expand_dollar(&input[i..], cwd, sp, out, &mut o);
+                    } else {
+                        pb(out, &mut o, input[i]);
+                        i += 1;
+                    }
+                }
+                i += 1; // skip closing quote
+            }
+            b'$' => {
+                i += expand_dollar(&input[i..], cwd, sp, out, &mut o);
+            }
+            _ => {
+                pb(out, &mut o, c);
+                i += 1;
             }
         }
-        let mut buf = [0u8; 512];
-        let n = core::cmp::min(line.len(), buf.len() - 1);
-        buf[..n].copy_from_slice(&line[..n]);
-        buf[n] = 0;
-        ox_lua_eval(LUA_STATE, buf.as_ptr());
     }
+    o
+}
+
+/// Append one byte to `out` at `*o`, bounded by capacity.
+fn pb(out: &mut [u8], o: &mut usize, b: u8) {
+    if *o < out.len() {
+        out[*o] = b;
+        *o += 1;
+    }
+}
+
+/// Glob match: does `pat` (with `*` = any run, `?` = any one char) match `name`?
+/// Iterative with `*` backtracking — no recursion, no allocation.
+fn glob_match(pat: &[u8], name: &[u8]) -> bool {
+    let (mut p, mut n) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while n < name.len() {
+        if p < pat.len() && (pat[p] == name[n] || pat[p] == b'?') {
+            p += 1;
+            n += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star = p;
+            mark = n;
+            p += 1;
+        } else if star != usize::MAX {
+            p = star + 1;
+            mark += 1;
+            n = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+/// Filename globbing (§82): expand each space-separated word that contains `*`/`?`
+/// into the matching entries of `cwd` (sorted by directory order, hidden dotfiles
+/// excluded unless the pattern starts with `.`). A pattern that matches nothing is
+/// left literal (bash default). Words without wildcards pass through unchanged.
+fn glob_line(input: &[u8], cwd: Handle, out: &mut [u8]) -> usize {
+    let mut o = 0;
+    let mut first = true;
+    for word in input.split(|&b| b == b' ') {
+        if word.is_empty() {
+            continue;
+        }
+        if !first {
+            pb(out, &mut o, b' ');
+        }
+        first = false;
+        if word.contains(&b'*') || word.contains(&b'?') {
+            let mut matched = 0;
+            let mut idx = 0u64;
+            while let Some((name, _kind)) = rt::fs::readdir(cwd, idx) {
+                idx += 1;
+                if name.first() == Some(&b'.') && word.first() != Some(&b'.') {
+                    continue; // skip dotfiles unless the pattern asks for them
+                }
+                if glob_match(word, &name) {
+                    if matched > 0 {
+                        pb(out, &mut o, b' ');
+                    }
+                    for &b in &name {
+                        pb(out, &mut o, b);
+                    }
+                    matched += 1;
+                }
+            }
+            if matched == 0 {
+                for &b in word {
+                    pb(out, &mut o, b); // no match: keep the literal pattern
+                }
+            }
+        } else {
+            for &b in word {
+                pb(out, &mut o, b);
+            }
+        }
+    }
+    o
+}
+
+/// Full word-expansion for a command: `$VAR`/quoting (`expand`) then `*` globbing
+/// (`glob_line`), in that order. The single entry point the command layer calls.
+fn expand_line(input: &[u8], cwd: Handle, sp: &Spawner, out: &mut [u8]) -> usize {
+    let mut tmp = [0u8; 512];
+    let n = expand(input, cwd, sp, &mut tmp);
+    glob_line(&tmp[..n], cwd, out)
+}
+
+/// Expand a `$` reference at the start of `s` (`$name` or `${name}`), appending
+/// the Lua-global value to `out`. Returns the number of input bytes consumed. A
+/// lone `$` (no name) is copied literally.
+fn expand_dollar(s: &[u8], cwd: Handle, sp: &Spawner, out: &mut [u8], o: &mut usize) -> usize {
+    // $(command) — run it, substitute its stdout (trailing newlines stripped,
+    // internal newlines -> spaces, like an unquoted command substitution).
+    if s.len() >= 2 && s[1] == b'(' {
+        let mut depth = 1;
+        let mut j = 2;
+        while j < s.len() && depth > 0 {
+            match s[j] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let inner = &s[2..j];
+        let consumed = if j < s.len() { j + 1 } else { j };
+        let mut cap = [0u8; 512];
+        let n = capture(inner, cwd, sp, &mut cap);
+        let mut end = n;
+        while end > 0 && cap[end - 1] == b'\n' {
+            end -= 1; // strip trailing newlines
+        }
+        for &b in &cap[..end] {
+            pb(out, o, if b == b'\n' { b' ' } else { b });
+        }
+        return consumed;
+    }
+    let (name, consumed): (&[u8], usize) = if s.len() >= 2 && s[1] == b'{' {
+        // ${name}
+        let mut j = 2;
+        while j < s.len() && s[j] != b'}' {
+            j += 1;
+        }
+        (&s[2..j], if j < s.len() { j + 1 } else { j })
+    } else {
+        // $name — name is [A-Za-z_][A-Za-z0-9_]*
+        let mut j = 1;
+        while j < s.len() && (s[j].is_ascii_alphanumeric() || s[j] == b'_') {
+            j += 1;
+        }
+        (&s[1..j], j)
+    };
+    if name.is_empty() {
+        pb(out, o, b'$'); // a lone `$` is literal
+        return 1;
+    }
+    let mut val = [0u8; 256];
+    if let Some(n) = lua_global(name, &mut val) {
+        for &b in &val[..n] {
+            pb(out, o, b);
+        }
+    }
+    consumed
+}
+
+/// Run `cmd` and capture its stdout into `out` (§82) — the engine behind `$(…)`.
+/// Spawns the command with stdout wired to a pipe, waits for it to exit, then
+/// drains the pipe. `echo` is computed directly (a builtin). Captured output is
+/// bounded by the pipe buffer (~8 KiB) and by `out`. Returns the byte count.
+fn capture(cmd: &[u8], cwd: Handle, sp: &Spawner, out: &mut [u8]) -> usize {
+    let (verb, rest) = split_cmd(trim(cmd));
+    // echo is a builtin: its output is just its (expanded) argument.
+    if verb == b"echo" {
+        return expand_line(rest, cwd, sp, out);
+    }
+    // Spawnable command: pipe its stdout back to us.
+    let pipe = match rt::sys_pipe() {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    let wend = rt::sys_attenuate(pipe, R_OUT | R_GRANT).unwrap_or(HANDLE_NULL);
+    let rend = rt::sys_attenuate(pipe, R_IN).unwrap_or(HANDLE_NULL);
+    let _ = rt::sys_close(pipe);
+    if wend == HANDLE_NULL || rend == HANDLE_NULL {
+        let _ = rt::sys_close(wend);
+        let _ = rt::sys_close(rend);
+        return 0;
+    }
+    // Use sp.exit (the general exit notifier, idle during expansion) — NOT a
+    // pexits[] slot, which a surrounding pipeline stage may be about to use.
+    if !spawn_stage(cmd, cwd, sp, HANDLE_NULL, wend, sp.exit) {
+        let _ = rt::sys_close(wend);
+        let _ = rt::sys_close(rend);
+        return 0;
+    }
+    // The command writes its output into the pipe buffer (assumed < 8 KiB) and
+    // exits; then we mark EOF and drain. (Larger output would block the writer
+    // with no reader — a documented limit on captured size.)
+    let _ = rt::sys_notif_wait(sp.exit);
+    let _ = rt::sys_pipe_eof(wend);
+    let mut o = 0;
+    loop {
+        let mut buf = [0u8; 64];
+        let n = rt::sys_pipe_read(rend, &mut buf);
+        if n == 0 {
+            break;
+        }
+        for &b in &buf[..n] {
+            if o < out.len() {
+                out[o] = b;
+                o += 1;
+            }
+        }
+    }
+    let _ = rt::sys_close(wend);
+    let _ = rt::sys_close(rend);
+    o
 }
 
 /// Decide whether a line is Lua (control flow, `print`, or an assignment) rather
@@ -1309,7 +1591,10 @@ fn close_ends(wend: &mut [Handle], rend: &mut [Handle], n: usize) {
 /// `run_command` does. Returns true if the child was spawned. Only spawnable,
 /// stream-friendly verbs are supported in a pipeline; builtins (echo/cd/…) and
 /// unknowns are rejected.
-fn spawn_stage(cmd: &[u8], cwd: Handle, _sp: &Spawner, stdin_h: Handle, stdout_h: Handle, exit: Handle) -> bool {
+fn spawn_stage(cmd0: &[u8], cwd: Handle, sp: &Spawner, stdin_h: Handle, stdout_h: Handle, exit: Handle) -> bool {
+    let mut ebuf = [0u8; 512];
+    let en = expand_line(cmd0, cwd, sp, &mut ebuf); // $VAR/quoting/glob per stage (§82)
+    let cmd = &ebuf[..en];
     let (verb, rest) = split_cmd(cmd);
     let mut argbuf = [0u8; 96];
     let mut arglen = 0usize;
@@ -1378,8 +1663,14 @@ fn spawn_stage(cmd: &[u8], cwd: Handle, _sp: &Spawner, stdin_h: Handle, stdout_h
     ok
 }
 
-fn run_command(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
+fn run_command(line0: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
     set_status(0); // default success; the spawn paths + the not-found arm override
+    // Word-expansion (§82): $VAR/${VAR} from Lua globals, '…'/"…" quoting, then
+    // `*` globbing. Done here, after operator splitting, so a `$var` holding
+    // `|`/`;` is data, not syntax.
+    let mut ebuf = [0u8; 512];
+    let en = expand_line(line0, *cwd, sp, &mut ebuf);
+    let line = &ebuf[..en];
     // Input redirect: `CMD < FILE` feeds FILE into CMD's stdin — desugar to the
     // pipeline `cat FILE | CMD`, reusing the pipe machinery. (Only stdin-reading
     // consumers like `cat -` actually consume it; others ignore the input.)
@@ -1474,6 +1765,8 @@ fn run_command(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  a ; b           run a then b (command sequencing)\n");
             tw(b"  a && b / a || b run b on success / on failure of a (exit status)\n");
             tw(b"  cmd < file      feed file into cmd's stdin (e.g. cat - < readme.txt)\n");
+            tw(b"  $VAR  ${VAR}    expand a variable (a shell var IS a Lua global)\n");
+            tw(b"  $(cmd)          substitute a command's output; * globs; '..' \"..\" quote\n");
             tw(b"  lua: if/for/=   Lua control flow & expressions (= expr, ! forces a cmd)\n");
             tw(b"  ls              list the current directory\n");
             tw(b"  cat <file>      print a file\n");
