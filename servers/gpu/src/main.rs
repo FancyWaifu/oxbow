@@ -62,8 +62,12 @@ const VIRTIO_GPU_MAX_SCANOUTS: usize = 16;
 // virtio_gpu_config (device cfg): events_read, events_clear, num_scanouts, num_capsets.
 const CFG_NUM_SCANOUTS: usize = 8;
 
-/// Feature bits we accept: only VIRTIO_F_VERSION_1 (bit 32). (EDID/virgl later.)
+/// Feature bits we accept: VIRTIO_F_VERSION_1 (bit 32) + VIRTIO_GPU_F_EDID (bit 1,
+/// for GET_EDID — negotiated if the device offers it). (virgl/3D later.)
 const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+const VIRTIO_GPU_F_EDID: u64 = 1 << 1;
+const VIRTIO_GPU_CMD_GET_EDID: u32 = 0x010a;
+const VIRTIO_GPU_RESP_OK_EDID: u32 = 0x1104;
 
 /// DMA layout within the gpu's reserved GPU_DMA range (one 4 KiB page each):
 const CTRLQ_OFF: u64 = 0x0000; // control virtqueue rings
@@ -94,7 +98,7 @@ impl Gpu {
     fn bring_up() -> Option<Gpu> {
         let t = Transport::probe(BOOT_PCI, GPU_MMIO)?;
         unsafe {
-            if !t.begin(VIRTIO_F_VERSION_1) {
+            if !t.begin(VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID) {
                 w(b"[gpu] device rejected features\n");
                 return None;
             }
@@ -163,6 +167,29 @@ impl Gpu {
                 };
             }
             VIRTIO_GPU_MAX_SCANOUTS
+        }
+    }
+
+    /// GET_EDID for scanout 0 (§90, Phase 5). Returns (edid_size, valid) where
+    /// `valid` checks the standard EDID magic header. None if the device lacks the
+    /// EDID feature. The blob (display capabilities/timings) follows hdr+size+pad.
+    fn get_edid(&mut self) -> Option<(u32, bool)> {
+        unsafe {
+            self.put_hdr(VIRTIO_GPU_CMD_GET_EDID);
+            let c = self.cmd_v;
+            w32(c + 24, 0); // scanout id
+            w32(c + 28, 0); // padding
+            let resp_len = (HDR_LEN + 8 + 1024) as u32; // hdr + size + padding + edid[1024]
+            if self.submit(32, resp_len) != VIRTIO_GPU_RESP_OK_EDID {
+                return None;
+            }
+            let size = r32(self.resp_v + HDR_LEN);
+            // EDID magic: 00 FF FF FF FF FF FF 00 at the blob start.
+            let blob = self.resp_v + HDR_LEN + 8;
+            let valid = virtio::r8(blob) == 0x00
+                && virtio::r8(blob + 1) == 0xFF
+                && virtio::r8(blob + 7) == 0x00;
+            Some((size, valid))
         }
     }
 
@@ -392,6 +419,16 @@ pub extern "C" fn oxbow_main() -> ! {
 
     let mut modes = [Scanout::default(); VIRTIO_GPU_MAX_SCANOUTS];
     let n = gpu.display_info(&mut modes);
+
+    // Phase 5: query the panel's EDID (display capabilities), if the device offers it.
+    match gpu.get_edid() {
+        Some((size, valid)) => {
+            w(b"[gpu] EDID ");
+            wnum(size);
+            w(if valid { b" bytes (valid header)\n" } else { b" bytes (no magic)\n" });
+        }
+        None => w(b"[gpu] EDID not supported by device\n"),
+    }
 
     // Compositor-over-GPU: if the kernel pre-shared a framebuffer (the one oxcomp
     // composites into), set it as the scanout backing and present it forever. The
