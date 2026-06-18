@@ -12,7 +12,7 @@
 extern crate oxbow_libc as _;
 
 use oxbow_abi::{
-    Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_GPU_CURSOR, BOOT_GPU_FB, BOOT_IMG_OXTERM, BOOT_IMG_SYSMON, BOOT_IMG_WLCLIENT,
+    Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_GPU_CURSOR, BOOT_GPU_FB, BOOT_IMG_OXTERM,
     BOOT_INPUT_CHAN,
     BOOT_MEM, BOOT_MOUSE_CHAN, BOOT_TERM_CHAN, FB_MMIO, GPU_FB_H, GPU_FB_W, HANDLE_NULL,
 };
@@ -33,6 +33,41 @@ pub extern "C" fn ox_log(p: *const u8, len: usize) {
 #[no_mangle]
 pub extern "C" fn ox_now_ms() -> u32 {
     rt::sys_uptime_ms() as u32
+}
+
+/// §91: launch an app at runtime when the user clicks it in the Activities
+/// overview. Spawns the image, handing it a fresh Wayland-socket channel; returns
+/// the compositor's end as an fd for `wl_client_create`, or -1 on failure.
+/// app id: 0 = Terminal (oxterm), 1 = Monitor (sysmon), 2 = Rings (wlclient).
+#[no_mangle]
+pub extern "C" fn comp_server_launch_app(app_id: i32) -> i32 {
+    use oxbow_abi::{BOOT_IMG_OXTERM, BOOT_IMG_SYSMON, BOOT_IMG_WLCLIENT, BOOT_TERM_CHAN};
+    let (img, budget): (Handle, u64) = match app_id {
+        0 => (BOOT_IMG_OXTERM, 36 * 1024 * 1024),
+        1 => (BOOT_IMG_SYSMON, 24 * 1024 * 1024),
+        2 => (BOOT_IMG_WLCLIENT, 16 * 1024 * 1024),
+        _ => return -1,
+    };
+    let Some((srv, cli)) = rt::channel::pair() else {
+        return -1;
+    };
+    let mut m = MsgBuf::new(0);
+    m.data[0] = budget;
+    m.data_len = 3;
+    m.handle_count = 4;
+    m.handles[0] = cli; // slot 1: Wayland socket
+    m.handles[1] = HANDLE_NULL; // slot 2: stdout (unused)
+    m.handles[2] = BOOT_CONSOLE; // slot 4: debug console
+    m.handles[3] = if app_id == 0 { BOOT_TERM_CHAN } else { HANDLE_NULL }; // slot 20: tty mirror
+    if rt::sys_spawn(img, BOOT_MEM, &m, HANDLE_NULL).is_ok() {
+        w(b"[oxcomp] launched app from Activities\n");
+        unsafe { ox_chan_fd(srv as u32) }
+    } else {
+        w(b"[oxcomp] launch failed (out of budget?)\n");
+        let _ = rt::sys_close(srv);
+        let _ = rt::sys_close(cli);
+        -1
+    }
 }
 
 extern "C" {
@@ -103,37 +138,13 @@ pub extern "C" fn oxbow_main() -> ! {
         park();
     }
 
-    // §56: a SECOND window — the wlclient rings demo, on its own channel, to
-    // prove multi-window compositing + z-order.
-    let srv2 = if let Some((s2, c2)) = rt::channel::pair() {
-        let mut m2 = MsgBuf::new(0);
-        m2.data[0] = 16 * 1024 * 1024;
-        m2.data_len = 3;
-        m2.handle_count = 3;
-        m2.handles[0] = c2; // slot 1 = Wayland socket
-        m2.handles[1] = HANDLE_NULL;
-        m2.handles[2] = BOOT_CONSOLE; // slot 4 = debug console
-        let _ = rt::sys_spawn(BOOT_IMG_WLCLIENT, BOOT_MEM, &m2, HANDLE_NULL);
-        s2
-    } else {
-        HANDLE_NULL
-    };
-
-    // §64: a THIRD window — the sysmon oxui app, proving a net-new app drops in.
-    let srv3 = if let Some((s3, c3)) = rt::channel::pair() {
-        let mut m3 = MsgBuf::new(0);
-        m3.data[0] = 24 * 1024 * 1024; // oxui + FreeType + font
-        m3.data_len = 3;
-        m3.handle_count = 3;
-        m3.handles[0] = c3; // slot 1 = Wayland socket
-        m3.handles[1] = HANDLE_NULL;
-        m3.handles[2] = BOOT_CONSOLE; // slot 4 = debug console
-        let _ = rt::sys_spawn(BOOT_IMG_SYSMON, BOOT_MEM, &m3, HANDLE_NULL);
-        s3
-    } else {
-        HANDLE_NULL
-    };
-    w(b"[oxcomp] compositor up; three clients spawned\n");
+    // §91: a GNOME-clean start — only the terminal opens at boot; the rest of the
+    // apps (Monitor, Rings, more terminals) are launched on demand from the
+    // Activities overview. That keeps the desktop uncluttered and leaves the
+    // compositor's Memory budget free to fund runtime launches.
+    let srv2 = HANDLE_NULL;
+    let srv3 = HANDLE_NULL;
+    w(b"[oxcomp] compositor up; terminal spawned (launch more from Activities)\n");
 
     // Set up the display on our kept channel end and run the compositing loop.
     // The keyboard channel (from the kbd driver, §47) becomes a second fd the

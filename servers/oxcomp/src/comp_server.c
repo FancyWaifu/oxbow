@@ -50,6 +50,118 @@ static unsigned int        g_serial;    /* event serial counter */
 static int           g_composited;
 static int g_btn_left; /* last reported left-button state (edge detection) */
 
+/* ---- 8x8 bitmap font (§91) — the compositor draws its own chrome (panel clock,
+ * launcher labels, window titles), so it needs to render text. Classic 8x8
+ * glyphs, MSB = leftmost pixel; indexed [c-0x20] for 0x20..0x5F. Lowercase is
+ * mapped to uppercase in draw_char (no lowercase glyphs). Unauthored chars are
+ * blank. */
+static const unsigned char font8x8[64][8] = {
+  {0,0,0,0,0,0,0,0},                                              /* 0x20 space */
+  {0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},          /* ! " # */
+  {0,0,0,0,0,0,0,0},                                              /* $ */
+  {0x62,0x64,0x08,0x10,0x26,0x46,0,0},                            /* % */
+  {0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},          /* & ' ( */
+  {0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},          /* ) * + */
+  {0,0,0,0,0,0x18,0x18,0x30},                                    /* , */
+  {0,0,0,0x7e,0,0,0,0},                                          /* - */
+  {0,0,0,0,0,0x18,0x18,0},                                        /* . */
+  {0x02,0x04,0x08,0x10,0x20,0x40,0x80,0},                         /* / */
+  {0x3c,0x66,0x6e,0x76,0x66,0x66,0x3c,0},                         /* 0 */
+  {0x18,0x38,0x18,0x18,0x18,0x18,0x7e,0},                         /* 1 */
+  {0x3c,0x66,0x06,0x0c,0x18,0x30,0x7e,0},                         /* 2 */
+  {0x3c,0x66,0x06,0x1c,0x06,0x66,0x3c,0},                         /* 3 */
+  {0x0c,0x1c,0x3c,0x6c,0x7e,0x0c,0x0c,0},                         /* 4 */
+  {0x7e,0x60,0x7c,0x06,0x06,0x66,0x3c,0},                         /* 5 */
+  {0x3c,0x66,0x60,0x7c,0x66,0x66,0x3c,0},                         /* 6 */
+  {0x7e,0x66,0x0c,0x18,0x18,0x18,0x18,0},                         /* 7 */
+  {0x3c,0x66,0x66,0x3c,0x66,0x66,0x3c,0},                         /* 8 */
+  {0x3c,0x66,0x66,0x3e,0x06,0x66,0x3c,0},                         /* 9 */
+  {0,0x18,0x18,0,0,0x18,0x18,0},                                  /* : */
+  {0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},          /* ; < = */
+  {0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},          /* > ? @ */
+  {0x3c,0x66,0x66,0x7e,0x66,0x66,0x66,0},                         /* A */
+  {0x7c,0x66,0x66,0x7c,0x66,0x66,0x7c,0},                         /* B */
+  {0x3c,0x66,0x60,0x60,0x60,0x66,0x3c,0},                         /* C */
+  {0x78,0x6c,0x66,0x66,0x66,0x6c,0x78,0},                         /* D */
+  {0x7e,0x60,0x60,0x7c,0x60,0x60,0x7e,0},                         /* E */
+  {0x7e,0x60,0x60,0x7c,0x60,0x60,0x60,0},                         /* F */
+  {0x3c,0x66,0x60,0x6e,0x66,0x66,0x3e,0},                         /* G */
+  {0x66,0x66,0x66,0x7e,0x66,0x66,0x66,0},                         /* H */
+  {0x3c,0x18,0x18,0x18,0x18,0x18,0x3c,0},                         /* I */
+  {0x1e,0x0c,0x0c,0x0c,0x0c,0x6c,0x38,0},                         /* J */
+  {0x66,0x6c,0x78,0x70,0x78,0x6c,0x66,0},                         /* K */
+  {0x60,0x60,0x60,0x60,0x60,0x60,0x7e,0},                         /* L */
+  {0x63,0x77,0x7f,0x6b,0x63,0x63,0x63,0},                         /* M */
+  {0x66,0x76,0x7e,0x7e,0x6e,0x66,0x66,0},                         /* N */
+  {0x3c,0x66,0x66,0x66,0x66,0x66,0x3c,0},                         /* O */
+  {0x7c,0x66,0x66,0x7c,0x60,0x60,0x60,0},                         /* P */
+  {0x3c,0x66,0x66,0x66,0x6e,0x3c,0x06,0},                         /* Q */
+  {0x7c,0x66,0x66,0x7c,0x78,0x6c,0x66,0},                         /* R */
+  {0x3c,0x66,0x60,0x3c,0x06,0x66,0x3c,0},                         /* S */
+  {0x7e,0x18,0x18,0x18,0x18,0x18,0x18,0},                         /* T */
+  {0x66,0x66,0x66,0x66,0x66,0x66,0x3c,0},                         /* U */
+  {0x66,0x66,0x66,0x66,0x66,0x3c,0x18,0},                         /* V */
+  {0x63,0x63,0x63,0x6b,0x7f,0x77,0x63,0},                         /* W */
+  {0x66,0x66,0x3c,0x18,0x3c,0x66,0x66,0},                         /* X */
+  {0x66,0x66,0x66,0x3c,0x18,0x18,0x18,0},                         /* Y */
+  {0x7e,0x06,0x0c,0x18,0x30,0x60,0x7e,0},                         /* Z */
+  {0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},          /* [ \ ] */
+  {0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},                            /* ^ _ */
+};
+
+/* Current clip rectangle (the damage rect being composited). All compositor-drawn
+ * chrome (panel/overview/text) clips to it so only damaged pixels are touched —
+ * the same discipline as the cursor draw. Defaults to the whole screen. */
+static int g_clip_x0, g_clip_y0, g_clip_x1 = 1 << 30, g_clip_y1 = 1 << 30;
+
+/* Fill a rectangle with `color`, clipped to the clip rect + screen. */
+static void fill_rect(int x0, int y0, int x1, int y1, unsigned int color)
+{
+  if (x0 < g_clip_x0) x0 = g_clip_x0;
+  if (y0 < g_clip_y0) y0 = g_clip_y0;
+  if (x1 > g_clip_x1) x1 = g_clip_x1;
+  if (y1 > g_clip_y1) y1 = g_clip_y1;
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 > g_w) x1 = g_w;
+  if (y1 > g_h) y1 = g_h;
+  for (int y = y0; y < y1; y++)
+    for (int x = x0; x < x1; x++)
+      g_back[(long)y * g_pitch_words + x] = color;
+}
+
+/* Draw one glyph at (x,y) in `color`, clipped to the clip rect + screen. */
+static void draw_char(int x, int y, char ch, unsigned int color)
+{
+  unsigned char c = (unsigned char)ch;
+  if (c >= 'a' && c <= 'z') c -= 0x20; /* fold to uppercase */
+  if (c < 0x20 || c > 0x5f) return;
+  const unsigned char *g = font8x8[c - 0x20];
+  for (int row = 0; row < 8; row++) {
+    int py = y + row;
+    if (py < g_clip_y0 || py >= g_clip_y1 || py < 0 || py >= g_h) continue;
+    for (int col = 0; col < 8; col++) {
+      if (!((g[row] >> (7 - col)) & 1)) continue;
+      int px = x + col;
+      if (px < g_clip_x0 || px >= g_clip_x1 || px < 0 || px >= g_w) continue;
+      g_back[(long)py * g_pitch_words + px] = color;
+    }
+  }
+}
+
+/* Draw a NUL-terminated string; returns the x just past the last glyph. */
+static int draw_text(int x, int y, const char *s, unsigned int color)
+{
+  for (; *s; s++) {
+    draw_char(x, y, *s, color);
+    x += 8;
+  }
+  return x;
+}
+
+/* Pixel width of a string at the 8px advance. */
+static int text_width(const char *s) { int n = 0; while (s[n]) n++; return n * 8; }
+
 struct surf {
   struct wl_resource *buffer;       /* pending/current attached wl_buffer */
   struct wl_resource *surface;      /* the wl_surface resource itself */
@@ -117,6 +229,86 @@ static int          g_cursor_mode;
 static struct surf *g_grab;        /* view being dragged */
 static int          g_grab_dx, g_grab_dy; /* cursor offset within the window */
 
+/* ---- §91 GNOME-style shell: a top bar + an Activities app launcher --------- */
+#define PANEL_H 28                 /* top bar height */
+#define PANEL_BG   0x00282828u     /* GNOME-ish dark bar */
+#define PANEL_FG   0x00e8e8e8u     /* bar text */
+#define PANEL_HL   0x00404552u     /* hovered/active button */
+#define OVL_BG     0x00202428u     /* overview backdrop */
+#define CARD_BG    0x00363b42u     /* app card */
+static int   g_overview;           /* is the Activities overview open? */
+static void *g_display;            /* the wl_display, for launching apps at runtime */
+
+/* Launch an app by id (provided by Rust main.rs): 0=terminal, 1=monitor, 2=rings.
+ * Returns a Wayland-socket fd to attach, or -1. */
+extern int comp_server_launch_app(int app_id);
+
+/* The launcher's apps (icon color + label). app id == index. */
+#define NAPPS 3
+static const unsigned int app_icon[NAPPS] = {0x00264f78u, 0x00367a4au, 0x00803050u};
+static const char *const  app_label[NAPPS] = {"TERMINAL", "MONITOR", "RINGS"};
+
+/* Geometry of overview card `i` (centered row). */
+static void app_card_rect(int i, int *cx, int *cy, int *cw, int *ch)
+{
+  int w = 170, h = 130, gap = 28;
+  int total = NAPPS * w + (NAPPS - 1) * gap;
+  *cx = (g_w - total) / 2 + i * (w + gap);
+  *cy = (g_h - h) / 2;
+  *cw = w;
+  *ch = h;
+}
+
+/* Format uptime (no RTC) as HH:MM:SS into `buf` (>=9 bytes) — the panel clock. */
+static void format_clock(char *buf)
+{
+  unsigned int s = ox_now_ms() / 1000u;
+  unsigned int hh = (s / 3600u) % 100u, mm = (s / 60u) % 60u, ss = s % 60u;
+  buf[0] = '0' + hh / 10; buf[1] = '0' + hh % 10; buf[2] = ':';
+  buf[3] = '0' + mm / 10; buf[4] = '0' + mm % 10; buf[5] = ':';
+  buf[6] = '0' + ss / 10; buf[7] = '0' + ss % 10; buf[8] = 0;
+}
+
+/* Draw the top bar (clipped to g_clip): Activities on the left, the clock center. */
+static void draw_panel(void)
+{
+  fill_rect(0, 0, g_w, PANEL_H, PANEL_BG);
+  if (g_overview)
+    fill_rect(0, 0, 8 * 10 + 16, PANEL_H, PANEL_HL); /* Activities highlighted */
+  draw_text(12, (PANEL_H - 8) / 2, "Activities", PANEL_FG);
+  char clk[9];
+  format_clock(clk);
+  draw_text(g_w / 2 - text_width(clk) / 2, (PANEL_H - 8) / 2, clk, PANEL_FG);
+}
+
+/* Draw the Activities overview (clipped to g_clip): a backdrop + a row of app
+ * cards, each an icon swatch with its label. */
+static void draw_overview(void)
+{
+  fill_rect(0, PANEL_H, g_w, g_h, OVL_BG);
+  for (int i = 0; i < NAPPS; i++) {
+    int x, y, w, h;
+    app_card_rect(i, &x, &y, &w, &h);
+    fill_rect(x, y, x + w, y + h, CARD_BG);
+    fill_rect(x + 30, y + 22, x + w - 30, y + h - 40, app_icon[i]); /* icon swatch */
+    int tw = text_width(app_label[i]);
+    draw_text(x + (w - tw) / 2, y + h - 26, app_label[i], PANEL_FG);
+  }
+}
+
+/* The panel clock ticks on a 1-second event-loop timer: recomposite just the top
+ * bar (cheap) and re-arm. */
+static struct wl_event_source *g_clock_timer;
+static void composite_rect(int x0, int y0, int x1, int y1);
+static int clock_tick(void *data)
+{
+  (void)data;
+  composite_rect(0, 0, g_w, PANEL_H);
+  if (g_clock_timer)
+    wl_event_source_timer_update(g_clock_timer, 1000);
+  return 0;
+}
+
 /* Draw view `s`'s titlebar (above its content): a bar — brighter when focused —
  * with a red close box at the right end. (Drawn inline + clipped in composite_rect.)
  *
@@ -136,6 +328,8 @@ static void composite_rect(int x0, int y0, int x1, int y1)
   if (y1 > g_h) y1 = g_h;
   if (x0 >= x1 || y0 >= y1)
     return;
+  /* Restrict compositor-drawn chrome (panel/overview/text) to this damage rect. */
+  g_clip_x0 = x0; g_clip_y0 = y0; g_clip_x1 = x1; g_clip_y1 = y1;
   for (int y = y0; y < y1; y++)
     for (int x = x0; x < x1; x++)
       g_back[(long)y * g_pitch_words + x] = 0x000d3b45u; /* desktop bg */
@@ -164,6 +358,11 @@ static void composite_rect(int x0, int y0, int x1, int y1)
       for (int x = a0; x < a1; x++)
         g_back[(long)y * g_pitch_words + x] = s->backing[(long)(y - s->y) * s->w + (x - s->x)];
   }
+  /* §91: the Activities overview (modal, over the windows) then the top bar — both
+   * always on top of client windows, clipped to the damage rect. */
+  if (g_overview)
+    draw_overview();
+  draw_panel();
   if (g_hwcur) {
     /* Hardware cursor: the gpu composites it on the device side; just publish the
      * pointer position for the gpu to read (no painting into the framebuffer). */
@@ -376,17 +575,18 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
     const int M = 40; /* screen-edge margin */
     int slot = g_nviews;
     int j = (slot / 5) * 32; /* jitter once we wrap past the 5 anchors */
+    int top = PANEL_H + TBH + M; /* §91: anchor below the top bar + titlebar */
     switch (slot % 5) {
-      case 0: s->x = M + j;                  s->y = TBH + M + j; break;             /* TL */
-      case 1: s->x = g_w - s->w - M - j;     s->y = TBH + M + j; break;             /* TR */
+      case 0: s->x = M + j;                  s->y = top + j; break;                 /* TL */
+      case 1: s->x = g_w - s->w - M - j;     s->y = top + j; break;                 /* TR */
       case 2: s->x = M + j;                  s->y = g_h - s->h - M - j; break;      /* BL */
       case 3: s->x = g_w - s->w - M - j;     s->y = g_h - s->h - M - j; break;      /* BR */
       default: s->x = (g_w - s->w) / 2;      s->y = (g_h - s->h) / 2; break;        /* center */
     }
-    /* keep the whole window (titlebar included) on-screen */
+    /* keep the whole window (titlebar included) below the panel + on-screen */
     if (s->x < 0) s->x = 0;
     if (s->x + s->w > g_w) s->x = g_w - s->w;
-    if (s->y - TBH < 0) s->y = TBH;
+    if (s->y - TBH < PANEL_H) s->y = PANEL_H + TBH;
     if (s->y + s->h > g_h) s->y = g_h - s->h;
     s->mapped = 1;
     views_raise(s);
@@ -735,9 +935,43 @@ static void pointer_update(void)
 /* Click-to-focus + raise (tinywl focus_view): give the clicked window keyboard
  * focus and raise it, then forward the button. */
 static void focus_view(struct surf *s);
+/* §91: launch app `id`, attach its Wayland socket to the display, close the
+ * overview. */
+static void launch_and_attach(int id)
+{
+  int fd = comp_server_launch_app(id);
+  if (fd >= 0 && g_display)
+    wl_client_create((struct wl_display *)g_display, fd);
+  g_overview = 0;
+  composite_scene();
+}
+
 static void pointer_button(int left)
 {
   if (left) {
+    /* §91: the GNOME-style shell intercepts clicks on the top bar + overview
+     * BEFORE windows. */
+    if (g_overview) {
+      for (int i = 0; i < NAPPS; i++) {
+        int x, y, w, h;
+        app_card_rect(i, &x, &y, &w, &h);
+        if (g_cx >= x && g_cx < x + w && g_cy >= y && g_cy < y + h) {
+          launch_and_attach(i);
+          return;
+        }
+      }
+      /* click outside any card closes the overview */
+      g_overview = 0;
+      composite_scene();
+      return;
+    }
+    if (g_cy < PANEL_H) {
+      if (g_cx < 8 * 10 + 16) { /* the "Activities" button toggles the overview */
+        g_overview = 1;
+        composite_scene();
+      }
+      return; /* the panel swallows clicks; windows never see them */
+    }
     /* §57: a press on a titlebar focuses + either closes (close box) or starts a
      * move drag (tinywl begin_interactive). Topmost titlebar wins. */
     for (int v = g_nviews - 1; v >= 0; v--) {
@@ -944,6 +1178,7 @@ void *comp_server_setup(int fd, int input_fd, int mouse_fd, unsigned int *fb, in
   struct wl_display *d = wl_display_create();
   if (!d)
     return NULL;
+  g_display = d; /* §91: kept so a launcher click can attach a new client */
   wl_global_create(d, &wl_compositor_interface, 4, NULL, compositor_bind);
   wl_global_create(d, &xdg_wm_base_interface, 1, NULL, wm_base_bind);
   wl_global_create(d, &wl_seat_interface, 5, NULL, seat_bind);
@@ -960,6 +1195,10 @@ void *comp_server_setup(int fd, int input_fd, int mouse_fd, unsigned int *fb, in
   if (mouse_fd >= 0)
     wl_event_loop_add_fd(wl_display_get_event_loop(d), mouse_fd, WL_EVENT_READABLE,
                          on_mouse, d);
+  /* §91: a 1-second timer to tick the panel clock (recomposite just the top bar). */
+  g_clock_timer = wl_event_loop_add_timer(wl_display_get_event_loop(d), clock_tick, NULL);
+  if (g_clock_timer)
+    wl_event_source_timer_update(g_clock_timer, 1000);
   if (!wl_client_create(d, fd)) {
     wl_display_destroy(d);
     return NULL;
