@@ -18,6 +18,20 @@ use oxbow_abi::{BOOT_CONSOLE, BOOT_MEM, BOOT_PCI, GPU_DMA, GPU_MMIO};
 use oxbow_rt as rt;
 use virtio::{r32, w32, w64, Transport, Vq};
 
+// 2D command types.
+const VIRTIO_GPU_CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
+const VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
+const VIRTIO_GPU_CMD_SET_SCANOUT: u32 = 0x0103;
+const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
+const VIRTIO_GPU_CMD_RESOURCE_FLUSH: u32 = 0x0104;
+const VIRTIO_GPU_RESP_OK_NODATA: u32 = 0x1100;
+/// B8G8R8X8: memory byte order B,G,R,X — a u32 pixel is 0x00RRGGBB little-endian,
+/// matching the Limine framebuffer convention.
+const VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM: u32 = 2;
+/// The scanout backing store (a contiguous DMA region) lives here, past the
+/// rings/cmd/resp pages at GPU_DMA+0..0x2000.
+const FB_OFF: u64 = 0x10000;
+
 fn w(s: &[u8]) {
     let _ = rt::sys_console_write(BOOT_CONSOLE, s.as_ptr(), s.len());
 }
@@ -149,6 +163,93 @@ impl Gpu {
             VIRTIO_GPU_MAX_SCANOUTS
         }
     }
+
+    /// Create a host 2D resource (`id`, `fmt`, `w`x`h`).
+    fn create_2d(&mut self, id: u32, fmt: u32, w: u32, h: u32) -> bool {
+        unsafe {
+            self.put_hdr(VIRTIO_GPU_CMD_RESOURCE_CREATE_2D);
+            let c = self.cmd_v;
+            w32(c + 24, id);
+            w32(c + 28, fmt);
+            w32(c + 32, w);
+            w32(c + 36, h);
+            self.submit(40, HDR_LEN as u32) == VIRTIO_GPU_RESP_OK_NODATA
+        }
+    }
+
+    /// Attach a single contiguous backing region (`phys`,`len`) to resource `id`.
+    fn attach_backing(&mut self, id: u32, phys: u64, len: u32) -> bool {
+        unsafe {
+            self.put_hdr(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING);
+            let c = self.cmd_v;
+            w32(c + 24, id);
+            w32(c + 28, 1); // nr_entries = 1 (contiguous, no scatter-gather)
+            w64(c + 32, phys); // virtio_gpu_mem_entry.addr
+            w32(c + 40, len); // .length
+            w32(c + 44, 0); // .padding
+            self.submit(48, HDR_LEN as u32) == VIRTIO_GPU_RESP_OK_NODATA
+        }
+    }
+
+    /// Bind resource `id` to `scanout` covering its full `w`x`h`.
+    fn set_scanout(&mut self, scanout: u32, id: u32, w: u32, h: u32) -> bool {
+        unsafe {
+            self.put_hdr(VIRTIO_GPU_CMD_SET_SCANOUT);
+            let c = self.cmd_v;
+            w32(c + 24, 0); // rect.x
+            w32(c + 28, 0); // rect.y
+            w32(c + 32, w); // rect.width
+            w32(c + 36, h); // rect.height
+            w32(c + 40, scanout);
+            w32(c + 44, id);
+            self.submit(48, HDR_LEN as u32) == VIRTIO_GPU_RESP_OK_NODATA
+        }
+    }
+
+    /// Copy guest backing -> host resource for the full `w`x`h` rect.
+    fn transfer(&mut self, id: u32, w: u32, h: u32) -> bool {
+        unsafe {
+            self.put_hdr(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
+            let c = self.cmd_v;
+            w32(c + 24, 0); // rect.x
+            w32(c + 28, 0); // rect.y
+            w32(c + 32, w); // rect.width
+            w32(c + 36, h); // rect.height
+            w64(c + 40, 0); // offset into backing
+            w32(c + 48, id);
+            w32(c + 52, 0); // padding
+            self.submit(56, HDR_LEN as u32) == VIRTIO_GPU_RESP_OK_NODATA
+        }
+    }
+
+    /// Flush the host resource to the display for the full `w`x`h` rect.
+    fn flush(&mut self, id: u32, w: u32, h: u32) -> bool {
+        unsafe {
+            self.put_hdr(VIRTIO_GPU_CMD_RESOURCE_FLUSH);
+            let c = self.cmd_v;
+            w32(c + 24, 0); // rect.x
+            w32(c + 28, 0); // rect.y
+            w32(c + 32, w); // rect.width
+            w32(c + 36, h); // rect.height
+            w32(c + 40, id);
+            w32(c + 44, 0); // padding
+            self.submit(48, HDR_LEN as u32) == VIRTIO_GPU_RESP_OK_NODATA
+        }
+    }
+}
+
+/// Fill the scanout backing with a recognizable test pattern: a red-(x) /
+/// green-(y) gradient with constant blue — confirms format + stride + flush.
+fn draw_test_pattern(buf: *mut u32, w: u32, h: u32) {
+    for y in 0..h {
+        for x in 0..w {
+            let r = x * 255 / w;
+            let g = y * 255 / h;
+            let b = 0x40u32;
+            let px = (r << 16) | (g << 8) | b; // 0x00RRGGBB (B8G8R8X8)
+            unsafe { core::ptr::write_volatile(buf.add((y * w + x) as usize), px) };
+        }
+    }
 }
 
 #[no_mangle]
@@ -169,17 +270,51 @@ pub extern "C" fn oxbow_main() -> ! {
 
     let mut modes = [Scanout::default(); VIRTIO_GPU_MAX_SCANOUTS];
     let n = gpu.display_info(&mut modes);
-    if n > 0 && modes[0].enabled {
-        w(b"[gpu] scanout0 ");
-        wnum(modes[0].width);
-        w(b"x");
-        wnum(modes[0].height);
-        w(b" (enabled)\n");
+    let (mut width, mut height) = (modes[0].width, modes[0].height);
+    if n == 0 || width == 0 || height == 0 {
+        // No display info — fall back to a common default so we still scan out.
+        width = 1280;
+        height = 800;
+        w(b"[gpu] no display info; defaulting to 1280x800\n");
     } else {
-        w(b"[gpu] scanout0 not enabled (no display attached)\n");
+        w(b"[gpu] scanout0 ");
+        wnum(width);
+        w(b"x");
+        wnum(height);
+        w(b"\n");
     }
 
-    // Phases 2+: create a scanout resource, attach backing, draw, flush.
+    // --- Phase 2: stand up a scanout resource backed by contiguous DMA, draw a
+    // test pattern into it, and flush it to the display. ---
+    const RES_ID: u32 = 1;
+    let bytes = width * height * 4;
+    let pages = ((bytes as u64) + 4095) / 4096;
+    let fb_vaddr = GPU_DMA + FB_OFF;
+    let fb_phys = rt::sys_dma_alloc_contig(BOOT_MEM, fb_vaddr, pages).unwrap_or(0);
+    if fb_phys == 0 {
+        w(b"[gpu] scanout backing alloc failed\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    let ok = gpu.create_2d(RES_ID, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM, width, height)
+        && gpu.attach_backing(RES_ID, fb_phys, bytes)
+        && gpu.set_scanout(0, RES_ID, width, height);
+    if !ok {
+        w(b"[gpu] scanout setup failed\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    draw_test_pattern(fb_vaddr as *mut u32, width, height);
+    if gpu.transfer(RES_ID, width, height) && gpu.flush(RES_ID, width, height) {
+        w(b"[gpu] scanout live - test pattern flushed\n");
+    } else {
+        w(b"[gpu] transfer/flush failed\n");
+    }
+
     loop {
         core::hint::spin_loop();
     }

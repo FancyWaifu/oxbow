@@ -99,6 +99,35 @@ pub fn alloc_frame() -> Option<u64> {
     Some(frame)
 }
 
+/// Allocate `pages` PHYSICALLY CONTIGUOUS frames, returning the base address.
+/// Takes them straight from the bump pointer (the free list holds scattered
+/// frames, so it's bypassed) — a one-way carve, never reclaimed, fine for a GPU
+/// scanout backing store that lives for the system's lifetime. Zeroes the range.
+pub fn alloc_contig(pages: u64) -> Option<u64> {
+    if pages == 0 {
+        return None;
+    }
+    let base = {
+        let mut guard = BUMP.lock();
+        let bump = guard.as_mut()?;
+        let span = pages * FRAME_SIZE;
+        if bump.next + span > bump.end {
+            return None;
+        }
+        let b = bump.next;
+        bump.next += span;
+        b
+    };
+    unsafe {
+        core::ptr::write_bytes(
+            crate::mm::phys_to_virt(base) as *mut u8,
+            0,
+            (pages * FRAME_SIZE) as usize,
+        );
+    }
+    Some(base)
+}
+
 /// Return a frame to the free list (push). The frame's first 8 bytes are
 /// overwritten with the old list head — safe, the frame is no longer in use.
 pub fn free_frame(frame: u64) {

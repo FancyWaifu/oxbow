@@ -12,7 +12,7 @@ use oxbow_abi::{
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_STATUS, SYS_NOTIF_WAIT,
     SYS_CAP_TYPE, SYS_CAP_DUP, SYS_CHAN_WAIT, SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_POLL, SYS_CHANNEL_RECV,
-    SYS_CHANNEL_SEND, SYS_DMA_ALLOC, SYS_SHM_CREATE, SYS_SHM_MAP, CAP_CHANNEL, CAP_OTHER, CAP_SHM,
+    SYS_CHANNEL_SEND, SYS_DMA_ALLOC, SYS_DMA_ALLOC_CONTIG, SYS_SHM_CREATE, SYS_SHM_MAP, CAP_CHANNEL, CAP_OTHER, CAP_SHM,
     SYS_FB_INFO, SYS_FB_MAP, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE,
     SYS_PROTECT, SYS_RECV, SYS_REPLY,
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_MEMINFO, SYS_UPTIME_MS,
@@ -131,6 +131,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_CAP_TYPE => sys_cap_type(a1),
         SYS_CAP_DUP => sys_cap_dup(a1),
         SYS_DMA_ALLOC => sys_dma_alloc(a1, a2),
+        SYS_DMA_ALLOC_CONTIG => sys_dma_alloc_contig(a1, a2, a3),
         SYS_PROTECT => sys_protect(a1, a2, a3, a4),
         SYS_UPTIME_MS => SyscallRet { rax: 0, rdx: crate::arch::ticks().wrapping_mul(10) },
         SYS_MEMINFO => {
@@ -995,6 +996,41 @@ fn sys_dma_alloc(mem: u64, vaddr: u64) -> SyscallRet {
     }
 }
 
+/// `sys_dma_alloc_contig(mem, vaddr, pages) -> phys` — like `sys_dma_alloc` but
+/// allocates `pages` PHYSICALLY CONTIGUOUS frames mapped contiguously at `vaddr`,
+/// returning the physical base. A device that DMAs a large buffer (a GPU scanout
+/// resource) can then be handed ONE address+length instead of a per-page
+/// scatter-gather list. Paid from the Memory budget (R_MAP). Capped at 4096 pages
+/// (16 MiB) per call.
+fn sys_dma_alloc_contig(mem: u64, vaddr: u64, pages: u64) -> SyscallRet {
+    let result = (|| -> SysResult<u64> {
+        let entry = proc::with_current(|p| p.lookup(mem as Handle, ObjType::Memory, R_MAP))?;
+        let ObjectRef::Memory(midx) = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        if pages == 0 || pages > 4096 {
+            return Err(SysError::Msg);
+        }
+        if vaddr & 0xfff != 0 || vaddr >= LOWER_HALF_END {
+            return Err(SysError::Fault);
+        }
+        if !mm::mem::debit(midx, pages * 4096) {
+            return Err(SysError::NoMem);
+        }
+        let phys = mm::pmm::alloc_contig(pages).ok_or(SysError::NoMem)?;
+        let pml4 = mm::vm::current_pml4();
+        mm::vm::probe_user_range(pml4, vaddr, pages).map_err(|_| SysError::Fault)?;
+        for i in 0..pages {
+            mm::vm::map_user_4k_live(pml4, vaddr + i * 4096, phys + i * 4096, true);
+        }
+        Ok(phys)
+    })();
+    match result {
+        Ok(phys) => SyscallRet { rax: 0, rdx: phys },
+        Err(e) => SyscallRet::err(e),
+    }
+}
+
 /// `sys_shm_create(mem, pages) -> Shm handle` — allocate a shared region of
 /// `pages` frames, paid from the Memory budget (R_MAP). The handle is grantable
 /// (passes over a channel) and maps writable — it backs memfd/wl_shm buffers.
@@ -1170,7 +1206,7 @@ fn pledge_class(nr: u64) -> u64 {
         | SYS_PIPE_READ | SYS_PIPE_WRITE | SYS_PIPE_EOF | SYS_CHANNEL_PAIR | SYS_CHANNEL_SEND
         | SYS_CHANNEL_RECV | SYS_CHANNEL_CLOSE | SYS_CHANNEL_POLL | SYS_CHAN_WAIT => PLEDGE_IPC,
         SYS_MAP | SYS_PROTECT | SYS_IMMUTABLE | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC
-        | SYS_SHM_CREATE | SYS_SHM_MAP => PLEDGE_MEM,
+        | SYS_DMA_ALLOC_CONTIG | SYS_SHM_CREATE | SYS_SHM_MAP => PLEDGE_MEM,
         SYS_CAP_TYPE | SYS_CAP_DUP => PLEDGE_IPC,
         SYS_SPAWN | SYS_SPAWN_BYTES => PLEDGE_SPAWN,
         SYS_ATTENUATE => PLEDGE_CAP,

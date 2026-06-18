@@ -631,6 +631,15 @@ pub fn sys_dma_alloc(mem: Handle, vaddr: u64) -> SysResult<u64> {
     SysError::from_raw(rax).map(|_| rdx)
 }
 
+/// Allocate `pages` PHYSICALLY CONTIGUOUS DMA frames mapped at `vaddr`, returning
+/// the physical base — a device handed one (addr,len) instead of a scatter-gather
+/// list. Paid from the Memory budget. See `sys_dma_alloc`.
+pub fn sys_dma_alloc_contig(mem: Handle, vaddr: u64, pages: u64) -> SysResult<u64> {
+    let (rax, rdx) =
+        unsafe { syscall3(oxbow_abi::SYS_DMA_ALLOC_CONTIG, mem as u64, vaddr, pages) };
+    SysError::from_raw(rax).map(|_| rdx)
+}
+
 /// Change the protection of already-mapped pages (§24 / JIT). `prot` may be
 /// PROT_READ|PROT_WRITE or PROT_READ|PROT_EXEC — W^X forbids both at once.
 pub fn sys_protect(mem: Handle, vaddr: u64, len: u64, prot: u64) -> SysResult {
