@@ -23,11 +23,15 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
 
 - **Phase 0 — target + core/alloc.** ✅ DONE. The target spec validates; `core`,
   `compiler_builtins`, `alloc` and a `no_std`+`alloc` test crate build for it.
-- **Phase 1 — minimal `std`, threads stubbed.** Add a `sys/pal/oxbow` backend to
-  the Rust std source (this requires patching rust-lang/rust — see below) with the
-  "green" modules (alloc, stdio, fs, net, time-monotonic, rand, os/path, process)
-  and **stubbed `thread::spawn`** + key-based TLS. Target: a cross-compiled `std`
-  hello-world (`println!`, `File`, `TcpStream`) runs on oxbow.
+- **Phase 1 — minimal `std`.** 🟡 IN PROGRESS — **`std` now COMPILES for oxbow.**
+  Added `os = "oxbow"` support to rust's `library/std/src/sys` (a fork at the pinned
+  nightly commit; patch + backend mirrored in `std-port/`): System allocator →
+  libc malloc/free, `getentropy` randomness, errno/ErrorKind mapping, TLS routed to
+  the single-threaded no-op path. A cross-compiled `std` hello-world builds into a
+  6 MB ELF for `x86_64-unknown-oxbow` (with `#![feature(restricted_std)]`, since the
+  `pal` backend is still `unsupported`). REMAINING to *run* it: a real `sys/pal/oxbow`
+  backend (stdout via tty, exit, args, time) + entry glue (`_start` → `lang_start`
+  → `main`). That removes `restricted_std` and makes std "supported".
 - **Phase 2 — keystones.** In-process threads (`SYS_THREAD_SPAWN` sharing the
   current pml4 + a fresh stack; the SMP/TCB infra already exists), a futex
   (wait-on-address, from `notif` or a new syscall), a real wall clock (CMOS RTC →
