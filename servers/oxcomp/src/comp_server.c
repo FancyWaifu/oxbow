@@ -172,6 +172,10 @@ struct surf {
   /* §56 multi-window: on-screen geometry + a backing copy of the last frame, so
    * the whole scene can be re-composited in z-order when any window changes. */
   int                 x, y, w, h, mapped;
+  int                 bw, bh; /* §91: backing (client buffer) size; w/h is the
+                              * DISPLAY size — the compositor scales bw*bh -> w*h,
+                              * so the user can resize any window even though the
+                              * client renders at a fixed size. */
   unsigned int       *backing;
   long                backing_cap;
   char                title[48]; /* §91: xdg_toplevel.set_title, drawn in the bar */
@@ -225,9 +229,10 @@ static struct surf *g_ptr_view;   /* view currently under the pointer */
 /* §57 window management: a titlebar above each window, and a cursor-mode state
  * machine (tinywl) for interactive move. */
 #define TBH 22 /* titlebar height in px */
-enum { MODE_PASSTHROUGH, MODE_MOVE };
+#define RESIZE_ZONE 18 /* bottom-right corner grip for resize */
+enum { MODE_PASSTHROUGH, MODE_MOVE, MODE_RESIZE };
 static int          g_cursor_mode;
-static struct surf *g_grab;        /* view being dragged */
+static struct surf *g_grab;        /* view being dragged/resized */
 static int          g_grab_dx, g_grab_dy; /* cursor offset within the window */
 
 /* ---- §91 GNOME-style shell: a top bar + an Activities app launcher --------- */
@@ -359,12 +364,28 @@ static void composite_rect(int x0, int y0, int x1, int y1)
       draw_text(s->x + 8, s->y - TBH + (TBH - 8) / 2, s->title, 0x00ffffffu);
       g_clip_x1 = saved;
     }
-    /* content rows [s->y, s->y+s->h) clipped */
+    /* content rows [s->y, s->y+s->h) clipped — scale the bw*bh backing to w*h. */
     int cy0 = (s->y > y0) ? s->y : y0;
     int cy1 = (s->y + s->h < y1) ? s->y + s->h : y1;
-    for (int y = cy0; y < cy1; y++)
-      for (int x = a0; x < a1; x++)
-        g_back[(long)y * g_pitch_words + x] = s->backing[(long)(y - s->y) * s->w + (x - s->x)];
+    if (s->w > 0 && s->h > 0)
+      for (int y = cy0; y < cy1; y++) {
+        int sy = (y - s->y) * s->bh / s->h;
+        if (sy >= s->bh) sy = s->bh - 1;
+        const unsigned int *srow = s->backing + (long)sy * s->bw;
+        for (int x = a0; x < a1; x++) {
+          int sx = (x - s->x) * s->bw / s->w;
+          if (sx >= s->bw) sx = s->bw - 1;
+          g_back[(long)y * g_pitch_words + x] = srow[sx];
+        }
+      }
+    /* §91: a resize grip — 3 diagonal ticks in the bottom-right corner. */
+    for (int t = 1; t <= 3; t++)
+      for (int k = 0; k < 3; k++) {
+        int px = s->x + s->w - 2 - k, py = s->y + s->h - t * 4 + k;
+        if (px >= g_clip_x0 && px < g_clip_x1 && py >= g_clip_y0 && py < g_clip_y1 &&
+            px >= 0 && px < g_w && py >= 0 && py < g_h)
+          g_back[(long)py * g_pitch_words + px] = 0x00b0b6c0u;
+      }
   }
   /* §91: the Activities overview (modal, over the windows) then the top bar — both
    * always on top of client windows, clipped to the damage rect. */
@@ -566,8 +587,8 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
     s->backing = malloc(need);
     s->backing_cap = s->backing ? need : 0;
   }
-  s->w = bw;
-  s->h = bh;
+  s->bw = bw; /* §91: backing size; display w/h is set once (below) then resizable */
+  s->bh = bh;
   wl_shm_buffer_begin_access(shm);
   unsigned char *data = wl_shm_buffer_get_data(shm);
   if (s->backing)
@@ -575,6 +596,8 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
       memcpy(s->backing + (long)y * bw, data + (long)y * stride, (size_t)bw * 4);
   wl_shm_buffer_end_access(shm);
   if (!s->mapped) {
+    s->w = bw; /* first frame: display 1:1 with the buffer */
+    s->h = bh;
     /* §67: place each window near a different screen anchor (top-left, top-right,
      * bottom-left, bottom-right, then center) instead of a tight cascade — so a new
      * window isn't buried under a previous large one. g_nviews is the count of
@@ -1009,6 +1032,15 @@ static void pointer_button(int left)
         composite_scene();
         return;
       }
+      /* §91: a press in the bottom-right corner grip starts a resize drag. */
+      if (g_cx >= s->x + s->w - RESIZE_ZONE && g_cx < s->x + s->w &&
+          g_cy >= s->y + s->h - RESIZE_ZONE && g_cy < s->y + s->h) {
+        focus_view(s);
+        g_cursor_mode = MODE_RESIZE;
+        g_grab = s;
+        composite_scene();
+        return;
+      }
     }
     /* a press in window content → focus that window, forward the button. */
     if (g_ptr_view && g_ptr_view != g_focus_view) {
@@ -1020,7 +1052,7 @@ static void pointer_button(int left)
       wl_pointer_send_button(p, ++g_serial, ox_now_ms(), 0x110,
                              WL_POINTER_BUTTON_STATE_PRESSED);
   } else {
-    if (g_cursor_mode == MODE_MOVE) { /* end the drag */
+    if (g_cursor_mode == MODE_MOVE || g_cursor_mode == MODE_RESIZE) { /* end drag/resize */
       g_cursor_mode = MODE_PASSTHROUGH;
       g_grab = NULL;
       return;
@@ -1102,6 +1134,10 @@ static void flush_mouse_motion(int ocx, int ocy, int ogx, int ogy)
     int ny1 = (ogy > g_grab->y ? ogy : g_grab->y) + g_grab->h;
     composite_rect(nx0, ny0, nx1, ny1);
     wake_unoccluded(); /* §62: dragging this window may have uncovered another */
+  } else if (g_cursor_mode == MODE_RESIZE && g_grab) {
+    /* §91: resizing changes the window extent — full redraw is simplest+correct. */
+    composite_scene();
+    wake_unoccluded();
   } else {
     pointer_update(); /* §55: deliver motion + enter/leave to the client */
     /* §59: damage only the cursor's old + new footprint. */
@@ -1158,6 +1194,10 @@ static int on_mouse(int fd, uint32_t mask, void *data)
       if (g_cursor_mode == MODE_MOVE && g_grab) {
         g_grab->x = g_cx - g_grab_dx;
         g_grab->y = g_cy - g_grab_dy;
+      } else if (g_cursor_mode == MODE_RESIZE && g_grab) {
+        int nw = g_cx - g_grab->x, nh = g_cy - g_grab->y; /* drag the SE corner */
+        g_grab->w = nw < 140 ? 140 : nw;                  /* min window size */
+        g_grab->h = nh < 70 ? 70 : nh;
       }
     }
     int left = flags & 0x01;
