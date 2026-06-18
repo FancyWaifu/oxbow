@@ -5,7 +5,7 @@
 //! block/retry loop with `thread::block_current` + `thread::wake`, mirroring the
 //! endpoint rendezvous; this module owns only the buffer + queue bookkeeping under
 //! a single lock (never held across a block).
-use spin::Mutex;
+use crate::sync::DiagMutex;
 
 const NPIPES: usize = 8;
 const PBUF: usize = 8192;
@@ -67,7 +67,7 @@ impl Pipe {
     }
 }
 
-static PIPES: Mutex<[Pipe; NPIPES]> = Mutex::new([Pipe::new(); NPIPES]);
+static PIPES: DiagMutex<[Pipe; NPIPES]> = DiagMutex::new("PIPES", [Pipe::new(); NPIPES]);
 
 /// The outcome of a non-blocking read attempt.
 pub enum ReadOut {

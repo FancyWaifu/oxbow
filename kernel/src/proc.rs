@@ -7,7 +7,7 @@ use oxbow_abi::{
     Handle, SysError, BOOT_CONSOLE, BOOT_MEM, HANDLE_TABLE_SIZE, R_ATTENUATE, R_GRANT, R_MAP,
     R_WRITE,
 };
-use spin::Mutex;
+use crate::sync::DiagMutex;
 
 use crate::elf::{perm_str, Image};
 use crate::ipc;
@@ -55,7 +55,7 @@ pub struct Process {
 /// Max immutable ranges per process (a runtime locks text + maybe rodata/got).
 const MAX_IMM: usize = 8;
 
-static PROCESSES: Mutex<[Process; MAX_PROCS]> = Mutex::new([Process::new(); MAX_PROCS]);
+static PROCESSES: DiagMutex<[Process; MAX_PROCS]> = DiagMutex::new("PROCESSES", [Process::new(); MAX_PROCS]);
 
 impl Process {
     pub const fn new() -> Self {

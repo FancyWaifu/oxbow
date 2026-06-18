@@ -10,7 +10,7 @@
 //! Module bytes live in BOOTLOADER_RECLAIMABLE memory, which `pmm` never
 //! consumes (it only takes USABLE regions), so these pointers stay valid for the
 //! life of the system.
-use spin::Mutex;
+use crate::sync::DiagMutex;
 
 /// Max distinct spawnable images. Bump alongside the boot module list.
 pub const MAX_IMAGES: usize = 32;
@@ -29,7 +29,7 @@ struct ImageEntry {
 // never frees or hands to the frame allocator; it is read-only after boot.
 unsafe impl Send for ImageEntry {}
 
-static IMAGES: Mutex<[ImageEntry; MAX_IMAGES]> = Mutex::new(
+static IMAGES: DiagMutex<[ImageEntry; MAX_IMAGES]> = DiagMutex::new("IMAGES", 
     [ImageEntry {
         in_use: false,
         name: [0; 16],

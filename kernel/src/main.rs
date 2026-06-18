@@ -24,6 +24,7 @@ mod proc;
 mod shm;
 mod rng;
 mod smp;
+mod sync;
 mod syscall;
 mod thread;
 mod usermem;

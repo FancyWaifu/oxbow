@@ -314,17 +314,19 @@ fn sched_lock() {
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
+        // §78: count EVERY failed CAS (outer loop), so a LIVELOCK — where the lock is
+        // briefly free each retry so the inner load-spin never accumulates — is also
+        // caught, not just a held-forever deadlock.
+        spins += 1;
+        if spins > 400_000_000 {
+            crate::deadlock_report(
+                "SCHED_LOCK",
+                crate::percpu::cpu_index() as i32,
+                SCHED_HOLDER.load(Ordering::Relaxed),
+            );
+        }
         while SCHED_LOCK.load(Ordering::Relaxed) {
             core::hint::spin_loop();
-            spins += 1;
-            if spins > 400_000_000 {
-                // §75 watchdog: we've spun far too long — almost certainly a deadlock.
-                crate::deadlock_report(
-                    "SCHED_LOCK",
-                    crate::percpu::cpu_index() as i32,
-                    SCHED_HOLDER.load(Ordering::Relaxed),
-                );
-            }
         }
     }
     SCHED_HOLDER.store(crate::percpu::cpu_index() as i32, Ordering::Relaxed);

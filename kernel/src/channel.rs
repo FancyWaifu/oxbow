@@ -13,7 +13,7 @@
 //! a block); the syscall layer drives block/retry with thread::block_current +
 //! thread::wake.
 use crate::object::HandleEntry;
-use spin::Mutex;
+use crate::sync::DiagMutex;
 
 const NCONN: usize = 8;
 const CBUF: usize = 8192; // bytes per direction
@@ -95,7 +95,7 @@ impl Conn {
     }
 }
 
-static CONNS: Mutex<[Conn; NCONN]> = Mutex::new([Conn::new(); NCONN]);
+static CONNS: DiagMutex<[Conn; NCONN]> = DiagMutex::new("CONNS", [Conn::new(); NCONN]);
 
 /// Reset a direction's bookkeeping in place (NOT the 8 KiB buffer — leaving it
 /// uncleared is safe since `len`/`clen` go to 0). Done in place to avoid building

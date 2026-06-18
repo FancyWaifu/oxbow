@@ -7,7 +7,7 @@
 //! 32 bytes of keystream OVERWRITE the key (so past output can't be recovered
 //! from a later state capture — forward secrecy), the remaining 32 bytes are the
 //! random output.
-use spin::Mutex;
+use crate::sync::DiagMutex;
 
 const CHACHA_CONST: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
 
@@ -149,7 +149,7 @@ impl Csprng {
     }
 }
 
-static RNG: Mutex<Csprng> = Mutex::new(Csprng::new());
+static RNG: DiagMutex<Csprng> = DiagMutex::new("RNG", Csprng::new());
 
 /// Seed the CSPRNG from hardware entropy. Call once early at boot.
 pub fn init() {

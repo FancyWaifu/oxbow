@@ -16,7 +16,7 @@
 use core::mem::size_of;
 use core::ptr::addr_of_mut;
 use oxbow_abi::{Handle, MsgBuf, SysError, SysResult, HANDLE_NULL, MSG_DATA_WORDS, MSG_HANDLES};
-use spin::Mutex;
+use crate::sync::DiagMutex;
 
 use crate::object::{HandleEntry, ObjectRef};
 use crate::thread::{self, MAX_THREADS};
@@ -78,7 +78,7 @@ struct Endpoint {
     recv_waiter: Option<usize>, // one receiver per EP in arc 3
 }
 
-static ENDPOINTS: Mutex<[Endpoint; EP_POOL]> = Mutex::new(
+static ENDPOINTS: DiagMutex<[Endpoint; EP_POOL]> = DiagMutex::new("ENDPOINTS",
     [Endpoint {
         in_use: false,
         send_q: WaitQ::new(),
@@ -134,7 +134,7 @@ struct Reply {
     caller_tid: usize,
 }
 
-static REPLIES: Mutex<[Reply; REPLY_POOL]> = Mutex::new([Reply {
+static REPLIES: DiagMutex<[Reply; REPLY_POOL]> = DiagMutex::new("REPLIES", [Reply {
     in_use: false,
     caller_tid: 0,
 }; REPLY_POOL]);

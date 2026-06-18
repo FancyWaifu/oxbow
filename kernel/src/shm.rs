@@ -8,7 +8,7 @@
 //! Frames need not be physically contiguous; the page tables give a contiguous
 //! virtual view. Regions are reset in place (never built by value — a Region is
 //! ~4 KiB and would overflow the kernel stack, like the channel pool).
-use spin::Mutex;
+use crate::sync::DiagMutex;
 
 // Each double-buffered Wayland client needs 2 shm regions; the desktop has 3
 // clients (terminal, rings, sysmon) = 6, and 4 was exactly enough for 2 clients —
@@ -31,7 +31,7 @@ impl Region {
     }
 }
 
-static REGIONS: Mutex<[Region; NREGIONS]> = Mutex::new([Region::new(); NREGIONS]);
+static REGIONS: DiagMutex<[Region; NREGIONS]> = DiagMutex::new("REGIONS", [Region::new(); NREGIONS]);
 
 /// Allocate a region of `npages` frames. Returns its pool index, or None if the
 /// pool is full, `npages` is out of range, or the PMM is exhausted (any frames

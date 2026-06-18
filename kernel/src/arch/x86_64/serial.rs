@@ -1,11 +1,11 @@
 //! 16550 UART serial console on COM1. x86-specific (port-mapped I/O).
 use core::fmt;
-use spin::Mutex;
+use crate::sync::DiagMutex;
 use uart_16550::SerialPort;
 
 /// COM1. `SerialPort::new` is a `const unsafe fn`; 0x3F8 is the standard COM1
 /// I/O base. Wrapped in a spinlock so prints from anywhere are serialized.
-pub static SERIAL1: Mutex<SerialPort> = Mutex::new(unsafe { SerialPort::new(0x3F8) });
+pub static SERIAL1: DiagMutex<SerialPort> = DiagMutex::new("SERIAL", unsafe { SerialPort::new(0x3F8) });
 
 /// Initialize the UART (line/FIFO/IRQ setup). Call once, early.
 ///

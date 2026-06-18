@@ -49,6 +49,17 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, user_rsp) == 32);
 
 static mut PERCPU: [PerCpu; MAX_CPUS] = [const { PerCpu::new() }; MAX_CPUS];
 
+/// §78: true once a CPU's GS base is set, so `cpu_index()`/`current()` (gs-relative)
+/// are safe. Gates `DiagMutex` instrumentation off during early BSP boot (before
+/// `init`) where the GS base is still 0 and a `gs:` read would fault.
+static PERCPU_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Is per-CPU GS state set up (so `gs:`-relative reads are safe)? See `PERCPU_READY`.
+#[inline]
+pub fn ready() -> bool {
+    PERCPU_READY.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Point this CPU's GS base at `PERCPU[index]` and stamp its index. Called once per
 /// CPU — the BSP in stage 2, each AP at bringup (Phase 3).
 pub fn init(index: usize) {
@@ -58,6 +69,9 @@ pub fn init(index: usize) {
         p.current = 0;
         Msr::new(IA32_GS_BASE).write(p as *mut PerCpu as u64);
     }
+    // The BSP (init(0), in stage 2) makes gs: reads safe for all subsequent code;
+    // each AP has its own GS set before it touches any DiagMutex.
+    PERCPU_READY.store(true, core::sync::atomic::Ordering::Release);
 }
 
 /// This CPU's index (0 = BSP).

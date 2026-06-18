@@ -6,7 +6,7 @@
 //! through the HHDM, so they're safe to use directly as page tables.
 use limine::memory_map::EntryType;
 use limine::response::MemoryMapResponse;
-use spin::Mutex;
+use crate::sync::DiagMutex;
 
 /// 4 KiB frame.
 pub const FRAME_SIZE: u64 = 4096;
@@ -24,7 +24,7 @@ struct Bump {
     free_head: u64,
 }
 
-static BUMP: Mutex<Option<Bump>> = Mutex::new(None);
+static BUMP: DiagMutex<Option<Bump>> = DiagMutex::new("BUMP", None);
 
 /// Scan the Limine memory map, pick the largest usable region to bump-allocate
 /// from, and return `(total usable bytes, usable region count)` for reporting.

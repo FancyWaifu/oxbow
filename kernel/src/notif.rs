@@ -9,7 +9,7 @@
 //! `block_current` already relies on.
 use core::sync::atomic::{AtomicU8, Ordering};
 use oxbow_abi::SysError;
-use spin::Mutex;
+use crate::sync::DiagMutex;
 
 use crate::{ipc, thread};
 
@@ -40,7 +40,7 @@ struct Notif {
     waiter: Option<usize>, // tid of the (single) blocked waiter
 }
 
-static POOL: Mutex<[Notif; POOL_SIZE]> = Mutex::new(
+static POOL: DiagMutex<[Notif; POOL_SIZE]> = DiagMutex::new("POOL", 
     [Notif {
         in_use: false,
         count: 0,

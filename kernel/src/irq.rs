@@ -6,10 +6,10 @@
 //! EOI-in-kernel is mandatory — an in-service ISR bit held across a context
 //! switch blocks all equal/lower lines machine-wide. Mask-on-fire means a
 //! never-acking driver can't storm the CPU.
-use spin::Mutex;
+use crate::sync::DiagMutex;
 
 /// Line number → bound notification pool index.
-static BINDINGS: Mutex<[Option<u8>; 16]> = Mutex::new([None; 16]);
+static BINDINGS: DiagMutex<[Option<u8>; 16]> = DiagMutex::new("BINDINGS", [None; 16]);
 
 /// Bind IRQ `line` to notification `notif_idx`. Does NOT unmask — the first
 /// `ack` arms the line.

@@ -5,7 +5,7 @@
 //! the caller presented (ABI law L6: no allocation without an authorizing cap).
 //! A `Frame` object names one physical frame so it can be mapped — and, because
 //! handles transfer over IPC, shared — between address spaces.
-use spin::Mutex;
+use crate::sync::DiagMutex;
 
 // One Memory-object slot per live process (boot servers + each running spawn).
 // Boot now starts 8 servers (…+ fb), so 8 left zero headroom for runtime spawns
@@ -23,7 +23,7 @@ struct MemObj {
     remaining: u64,
 }
 
-static MEMORY: Mutex<[MemObj; MEM_POOL]> = Mutex::new(
+static MEMORY: DiagMutex<[MemObj; MEM_POOL]> = DiagMutex::new("MEMORY",
     [MemObj {
         in_use: false,
         remaining: 0,
@@ -40,7 +40,7 @@ struct FrameObj {
     maps: u32,
 }
 
-static FRAMES: Mutex<[FrameObj; FRAME_POOL]> = Mutex::new(
+static FRAMES: DiagMutex<[FrameObj; FRAME_POOL]> = DiagMutex::new("FRAMES",
     [FrameObj {
         in_use: false,
         phys: 0,
