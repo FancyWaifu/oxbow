@@ -35,6 +35,73 @@ const READ_CHUNK: usize = 56;
 const FSD_XFER: usize = 0x3F00_0000;
 static mut SHARED_OK: bool = false;
 
+// --- §94: a one-block READ CACHE --------------------------------------------
+// FS_READ serves 56 bytes per IPC, but `oxfs_pread` is PATH-based: each call
+// re-resolves the path through lwext4 AND re-reads the 4 KiB ext2 block holding
+// the offset. Loading a 100 KiB program (~1800 reads) or linking the 1.8 MiB
+// libc (~32000 reads) therefore re-reads each block ~73 times — minutes for a
+// compile. Cache the LAST 4 KiB block (keyed by path + block index): consecutive
+// 56-byte reads of the same block then cost ONE path-resolved disk read, the rest
+// are memcpys. Invalidated on any write so it never serves stale data.
+const CBLK: usize = 4096;
+const CWAYS: usize = 64; // 64 * 4 KiB = 256 KiB of cached blocks for ONE file
+static mut C_PATH: [u8; 256] = [0; 256];
+static mut C_PLEN: usize = 0;
+static mut C_BLK: [u64; CWAYS] = [u64::MAX; CWAYS]; // block idx per way (MAX = empty)
+static mut C_LEN: [usize; CWAYS] = [0; CWAYS]; // valid bytes per way
+static mut C_NEXT: usize = 0; // round-robin eviction cursor
+static mut C_BUF: [[u8; CBLK]; CWAYS] = [[0; CBLK]; CWAYS];
+
+fn cache_invalidate() {
+    unsafe {
+        C_BLK = [u64::MAX; CWAYS];
+        C_PLEN = 0;
+    }
+}
+
+/// Serve up to `READ_CHUNK` bytes at `off` of the file at NUL-terminated path
+/// `full` from an N-way block cache holding ONE file's 4 KiB blocks. Reads of a
+/// single file (loading a program, tcc linking an archive) then re-read each block
+/// from disk at most once instead of ~73 times; switching files flushes. `dst`
+/// receives the bytes; returns the count.
+unsafe fn cached_read(full: &[u8], off: u64, dst: *mut u8) -> usize {
+    let blk = off / CBLK as u64;
+    let plen = full.iter().position(|&b| b == 0).unwrap_or(full.len());
+    let cp = core::ptr::addr_of!(C_PATH) as *const u8;
+    // A different file than the cache currently holds → flush and adopt it.
+    if !(C_PLEN == plen && core::slice::from_raw_parts(cp, plen) == &full[..plen]) {
+        C_BLK = [u64::MAX; CWAYS];
+        C_PLEN = plen;
+        core::ptr::copy_nonoverlapping(full.as_ptr(), core::ptr::addr_of_mut!(C_PATH) as *mut u8, plen);
+    }
+    // Find the block among the ways; on a miss, read it into the next slot.
+    let way = match (0..CWAYS).find(|&i| C_BLK[i] == blk) {
+        Some(i) => i,
+        None => {
+            let i = C_NEXT;
+            C_NEXT = (C_NEXT + 1) % CWAYS;
+            let mut rd = 0usize;
+            oxfs_pread(
+                full.as_ptr(),
+                blk * CBLK as u64,
+                core::ptr::addr_of_mut!(C_BUF[i]) as *mut c_void,
+                CBLK,
+                &mut rd,
+            );
+            C_BLK[i] = blk;
+            C_LEN[i] = rd;
+            i
+        }
+    };
+    let within = (off % CBLK as u64) as usize;
+    if within >= C_LEN[way] {
+        return 0;
+    }
+    let n = core::cmp::min(C_LEN[way] - within, READ_CHUNK);
+    core::ptr::copy_nonoverlapping((core::ptr::addr_of!(C_BUF[way]) as *const u8).add(within), dst, n);
+    n
+}
+
 /// Allocate a transfer frame, map it, and hand it to the block service so reads
 /// and writes move whole sectors in one IPC instead of ~13 byte-stream messages.
 fn blk_attach() {
@@ -530,11 +597,9 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut count = 0usize;
                 if valid && full_path(id, &mut full).is_some() {
                     let dst = unsafe { (r.data.as_mut_ptr() as *mut u8).add(8) };
-                    let mut rd = 0usize;
-                    unsafe {
-                        oxfs_pread(full.as_ptr(), off, dst as *mut c_void, READ_CHUNK, &mut rd)
-                    };
-                    count = rd;
+                    // §94: served from the one-block cache — collapses the ~73
+                    // path-resolved disk reads per 4 KiB into one.
+                    count = unsafe { cached_read(&full, off, dst) };
                 }
                 r.data[0] = count as u64;
                 r.data_len = 8;
@@ -562,6 +627,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 let _ = rt::sys_reply(reply, &r);
             }
             TAG_FS_CREATE => {
+                cache_invalidate(); // §94: keep the read cache from serving stale bytes
                 let name = msg_name(&m);
                 let mut full = [0u8; 256];
                 let mut relbuf = [0u8; PLEN];
@@ -594,6 +660,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 }
             }
             TAG_FS_WRITE => {
+                cache_invalidate(); // §94
                 let off = m.data[0];
                 let count = (m.data[1] as usize).min(48);
                 let mut full = [0u8; 256];
@@ -631,6 +698,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 reply_status(reply, status);
             }
             TAG_FS_UNLINK => {
+                cache_invalidate(); // §94
                 let name = msg_name(&m);
                 let mut full = [0u8; 256];
                 let mut relbuf = [0u8; PLEN];
@@ -647,6 +715,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 reply_status(reply, status);
             }
             TAG_FS_RENAME => {
+                cache_invalidate(); // §94
                 // data = old name NUL, then new name NUL.
                 let bytes = unsafe { core::slice::from_raw_parts(m.data.as_ptr() as *const u8, 64) };
                 let oldlen = bytes.iter().position(|&b| b == 0).unwrap_or(0);
