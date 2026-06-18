@@ -16,8 +16,10 @@ use crate::sync::DiagMutex;
 // 16 covers 8 double-buffered windows with headroom. (Each region is ~4 KiB of
 // static frame-table, so 16 is 64 KiB.)
 const NREGIONS: usize = 16;
-/// Max pages per region: 512 * 4 KiB = 2 MiB (e.g. a 720x720x4 buffer).
-const MAX_PAGES: usize = 512;
+/// Max pages per region: 1024 * 4 KiB = 4 MiB — enough for a 1280x800x4 shared
+/// framebuffer (1000 pages), the gpu/oxcomp scanout buffer, as well as client
+/// wl_shm buffers.
+const MAX_PAGES: usize = 1024;
 
 #[derive(Clone, Copy)]
 struct Region {
@@ -58,6 +60,40 @@ pub fn create(npages: usize) -> Option<u8> {
     r.in_use = true;
     r.npages = npages;
     Some(idx as u8)
+}
+
+/// Allocate a region of `npages` PHYSICALLY CONTIGUOUS frames (§90). Unlike
+/// `create`, the frames form one contiguous run (carved off the bump pointer), so
+/// `phys_base` names the whole region with a single address — exactly what a GPU
+/// scanout backing needs for RESOURCE_ATTACH_BACKING with one mem-entry. Returns
+/// the pool index, or None if the pool is full / out of range / PMM exhausted.
+pub fn create_contig(npages: usize) -> Option<u8> {
+    if npages == 0 || npages > MAX_PAGES {
+        return None;
+    }
+    let mut regs = REGIONS.lock();
+    let idx = regs.iter().position(|r| !r.in_use)?;
+    let base = crate::mm::pmm::alloc_contig(npages as u64)?;
+    let r = &mut regs[idx];
+    for i in 0..npages {
+        r.frames[i] = base + (i as u64) * 4096;
+    }
+    r.in_use = true;
+    r.npages = npages;
+    Some(idx as u8)
+}
+
+/// Physical base address of region `idx`'s first frame. Meaningful as the whole
+/// region's base only for a `create_contig` region; for a scattered region it's
+/// just the first page. 0 if the region is free.
+pub fn phys_base(idx: u8) -> u64 {
+    let regs = REGIONS.lock();
+    let r = &regs[idx as usize];
+    if r.in_use {
+        r.frames[0]
+    } else {
+        0
+    }
 }
 
 /// Total byte size of region `idx` (npages * 4096), or 0 if free.

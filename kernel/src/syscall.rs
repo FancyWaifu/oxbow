@@ -12,7 +12,7 @@ use oxbow_abi::{
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
     SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_STATUS, SYS_NOTIF_WAIT,
     SYS_CAP_TYPE, SYS_CAP_DUP, SYS_CHAN_WAIT, SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_POLL, SYS_CHANNEL_RECV,
-    SYS_CHANNEL_SEND, SYS_DMA_ALLOC, SYS_DMA_ALLOC_CONTIG, SYS_SHM_CREATE, SYS_SHM_MAP, CAP_CHANNEL, CAP_OTHER, CAP_SHM,
+    SYS_CHANNEL_SEND, SYS_DMA_ALLOC, SYS_DMA_ALLOC_CONTIG, SYS_SHM_CREATE, SYS_SHM_MAP, SYS_SHM_PHYS, CAP_CHANNEL, CAP_OTHER, CAP_SHM,
     SYS_FB_INFO, SYS_FB_MAP, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE,
     SYS_PROTECT, SYS_RECV, SYS_REPLY,
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_MEMINFO, SYS_UPTIME_MS,
@@ -128,6 +128,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_CHAN_WAIT => sys_chan_wait(a1, a2, a3),
         SYS_SHM_CREATE => sys_shm_create(a1, a2),
         SYS_SHM_MAP => sys_shm_map(a1, a2),
+        SYS_SHM_PHYS => sys_shm_phys(a1),
         SYS_CAP_TYPE => sys_cap_type(a1),
         SYS_CAP_DUP => sys_cap_dup(a1),
         SYS_DMA_ALLOC => sys_dma_alloc(a1, a2),
@@ -1091,6 +1092,25 @@ fn sys_shm_map(shm: u64, vaddr: u64) -> SyscallRet {
     }
 }
 
+/// `sys_shm_phys(shm) -> phys` — the physical base of a CONTIGUOUS shm region
+/// (§90). A driver holding the Shm cap (R_MAP) can hand this address to its device
+/// as a DMA backing — e.g. the gpu uses the shared framebuffer's base as the
+/// virtio-gpu scanout backing. Meaningless for a scattered region (returns just
+/// the first page); the caller knows which it created.
+fn sys_shm_phys(shm: u64) -> SyscallRet {
+    let result = (|| -> SysResult<u64> {
+        let entry = proc::with_current(|p| p.lookup(shm as Handle, ObjType::Shm, R_MAP))?;
+        let ObjectRef::Shm(idx) = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        Ok(crate::shm::phys_base(idx))
+    })();
+    match result {
+        Ok(phys) => SyscallRet { rax: 0, rdx: phys },
+        Err(e) => SyscallRet::err(e),
+    }
+}
+
 /// `sys_cap_type(h) -> kind` — report a handle's capability kind (CAP_CHANNEL /
 /// CAP_SHM / CAP_OTHER), so a receiver of a passed fd can reconstruct the right
 /// fd flavor. Errors (bad handle) report CAP_OTHER.
@@ -1206,7 +1226,7 @@ fn pledge_class(nr: u64) -> u64 {
         | SYS_PIPE_READ | SYS_PIPE_WRITE | SYS_PIPE_EOF | SYS_CHANNEL_PAIR | SYS_CHANNEL_SEND
         | SYS_CHANNEL_RECV | SYS_CHANNEL_CLOSE | SYS_CHANNEL_POLL | SYS_CHAN_WAIT => PLEDGE_IPC,
         SYS_MAP | SYS_PROTECT | SYS_IMMUTABLE | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC
-        | SYS_DMA_ALLOC_CONTIG | SYS_SHM_CREATE | SYS_SHM_MAP => PLEDGE_MEM,
+        | SYS_DMA_ALLOC_CONTIG | SYS_SHM_CREATE | SYS_SHM_MAP | SYS_SHM_PHYS => PLEDGE_MEM,
         SYS_CAP_TYPE | SYS_CAP_DUP => PLEDGE_IPC,
         SYS_SPAWN | SYS_SPAWN_BYTES => PLEDGE_SPAWN,
         SYS_ATTENUATE => PLEDGE_CAP,

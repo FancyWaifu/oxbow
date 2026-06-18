@@ -607,6 +607,13 @@ pub fn sys_shm_map(shm: Handle, vaddr: u64) -> SysResult<u64> {
     SysError::from_raw(rax).map(|_| rdx)
 }
 
+/// Physical base of a CONTIGUOUS shm region (§90) — a driver hands this to its
+/// device as a DMA backing (e.g. the gpu's shared-framebuffer scanout backing).
+pub fn sys_shm_phys(shm: Handle) -> SysResult<u64> {
+    let (rax, rdx) = unsafe { syscall1(oxbow_abi::SYS_SHM_PHYS, shm as u64) };
+    SysError::from_raw(rax).map(|_| rdx)
+}
+
 /// Report a handle's capability kind (CAP_CHANNEL / CAP_SHM / CAP_OTHER).
 pub fn sys_cap_type(h: Handle) -> u64 {
     let (rax, rdx) = unsafe { syscall1(oxbow_abi::SYS_CAP_TYPE, h as u64) };

@@ -306,6 +306,21 @@ fn kmain_stage2() -> ! {
     let tick_idx = notif::create().expect("tick notif");
     notif::arm_tick(tick_idx);
 
+    // §90: a CONTIGUOUS framebuffer shared by the gpu driver and oxcomp, so the
+    // compositor renders straight into the virtio-gpu scanout. Created only when a
+    // gpu device is present; granted to both the `gpu` and `oxcomp` modules below.
+    let gpu_fb = if gpu.is_some() {
+        let pages = (oxbow_abi::GPU_FB_W as usize * oxbow_abi::GPU_FB_H as usize * 4 + 4095) / 4096;
+        let r = crate::shm::create_contig(pages);
+        match r {
+            Some(_) => println!("[gpu] shared framebuffer reserved ({} pages)", pages),
+            None => println!("[gpu] WARN could not reserve shared framebuffer"),
+        }
+        r
+    } else {
+        None
+    };
+
     // One process per Limine module, each in its OWN address space (a fresh
     // PML4 sharing the kernel upper half). Both binaries link at 0x200000 but
     // never collide — that's the point.
@@ -485,6 +500,22 @@ fn kmain_stage2() -> ! {
                     },
                 )
             });
+        }
+        // §90: oxcomp also gets the shared GPU framebuffer (R_MAP|R_WRITE) — it maps
+        // and composites into it in preference to the Limine fb when a gpu present.
+        if cmd == b"oxcomp" {
+            if let Some(idx) = gpu_fb {
+                proc::with_proc_mut(pid, |p| {
+                    p.install(
+                        oxbow_abi::BOOT_GPU_FB,
+                        object::HandleEntry {
+                            obj: object::ObjectRef::Shm(idx),
+                            rights: oxbow_abi::R_MAP | oxbow_abi::R_WRITE,
+                            badge: 0,
+                        },
+                    );
+                });
+            }
         }
         // §47: the compositor gets the RECEIVE end of the keyboard channel; its
         // event loop watches this fd and turns key bytes into wl_keyboard events.
@@ -856,6 +887,20 @@ fn kmain_stage2() -> ! {
                         object::HandleEntry {
                             obj: object::ObjectRef::Irq(d.irq_line()),
                             rights: oxbow_abi::R_BIND | oxbow_abi::R_ACK,
+                            badge: 0,
+                        },
+                    );
+                });
+            }
+            // The shared framebuffer (R_MAP, to query its phys for the scanout
+            // backing — the gpu never writes pixels, oxcomp does).
+            if let Some(idx) = gpu_fb {
+                proc::with_proc_mut(pid, |p| {
+                    p.install(
+                        oxbow_abi::BOOT_GPU_FB,
+                        object::HandleEntry {
+                            obj: object::ObjectRef::Shm(idx),
+                            rights: oxbow_abi::R_MAP,
                             badge: 0,
                         },
                     );

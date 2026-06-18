@@ -12,9 +12,9 @@
 extern crate oxbow_libc as _;
 
 use oxbow_abi::{
-    Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_IMG_OXTERM, BOOT_IMG_SYSMON, BOOT_IMG_WLCLIENT,
+    Handle, MsgBuf, BOOT_CONSOLE, BOOT_FB, BOOT_GPU_FB, BOOT_IMG_OXTERM, BOOT_IMG_SYSMON, BOOT_IMG_WLCLIENT,
     BOOT_INPUT_CHAN,
-    BOOT_MEM, BOOT_MOUSE_CHAN, BOOT_TERM_CHAN, FB_MMIO, HANDLE_NULL,
+    BOOT_MEM, BOOT_MOUSE_CHAN, BOOT_TERM_CHAN, FB_MMIO, GPU_FB_H, GPU_FB_W, HANDLE_NULL,
 };
 use oxbow_rt as rt;
 
@@ -54,17 +54,28 @@ extern "C" {
 
 #[no_mangle]
 pub extern "C" fn oxbow_main() -> ! {
-    let (width, height, pitch, bpp) = match rt::sys_fb_info(BOOT_FB) {
-        Ok(g) => g,
-        Err(_) => {
-            w(b"[oxcomp] no framebuffer capability\n");
-            park();
-        }
-    };
-    if bpp != 32 || rt::sys_fb_map(BOOT_FB, FB_MMIO).is_err() {
-        w(b"[oxcomp] framebuffer map failed\n");
-        park();
-    }
+    // Compositor-over-GPU (§90): prefer the kernel-shared GPU framebuffer — map it
+    // at FB_MMIO and composite straight into it; the gpu driver scans it out. So
+    // the virtio-gpu is the real display, no Limine framebuffer needed. Fall back
+    // to the Limine fb (BOOT_FB) when no GPU is present.
+    let (width, height, pitch): (u32, u32, u32) =
+        if rt::sys_shm_map(BOOT_GPU_FB, FB_MMIO).is_ok() {
+            w(b"[oxcomp] compositing into the GPU shared framebuffer\n");
+            (GPU_FB_W, GPU_FB_H, GPU_FB_W * 4)
+        } else {
+            let (width, height, pitch, bpp) = match rt::sys_fb_info(BOOT_FB) {
+                Ok(g) => g,
+                Err(_) => {
+                    w(b"[oxcomp] no framebuffer capability\n");
+                    park();
+                }
+            };
+            if bpp != 32 || rt::sys_fb_map(BOOT_FB, FB_MMIO).is_err() {
+                w(b"[oxcomp] framebuffer map failed\n");
+                park();
+            }
+            (width, height, pitch)
+        };
 
     // A channel pair: one end becomes the client's Wayland socket, we keep the other.
     let Some((srv_end, cli_end)) = rt::channel::pair() else {

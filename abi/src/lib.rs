@@ -188,6 +188,7 @@ pub const SYS_CHAN_WAIT: u64 = 46; // (handles_ptr, count) -> block until any ch
 pub const SYS_MEMINFO: u64 = 47; // () -> rdx = (used_kib << 32) | total_kib. Ambient/unprivileged.
 pub const SYS_NOTIF_STATUS: u64 = 48; // (notif) -> rdx = last exit code (§81). needs R_WAIT
 pub const SYS_DMA_ALLOC_CONTIG: u64 = 49; // (mem, vaddr, pages) -> contiguous phys. needs R_MAP
+pub const SYS_SHM_PHYS: u64 = 50; // (shm) -> rdx = physical base of a CONTIGUOUS shm. needs R_MAP
 /// Capability kinds reported by SYS_CAP_TYPE (so recvmsg can reconstruct the
 /// right fd flavor from a passed handle). 0 = anything else.
 pub const CAP_OTHER: u64 = 0;
@@ -367,6 +368,15 @@ pub const GPU_MMIO: u64 = 0x4050_0000;
 pub const GPU_DMA: u64 = 0x4060_0000;
 /// The gpu driver's IrqLine capability for the virtio-gpu interrupt (R_BIND|R_ACK).
 pub const BOOT_GPU_IRQ: Handle = 9;
+/// Compositor-over-GPU (§90): the kernel pre-shares ONE contiguous framebuffer
+/// (an Shm region of GPU_FB_W x GPU_FB_H x4) at boot, granting this cap to BOTH
+/// the gpu and oxcomp. oxcomp maps it and composites into it; the gpu queries its
+/// physical base (SYS_SHM_PHYS), sets it as the virtio-gpu scanout backing, and
+/// presents it in a flush loop. So the virtio-gpu is the real display path — no
+/// Limine framebuffer required. Fixed dimensions both agree on without IPC.
+pub const BOOT_GPU_FB: Handle = 50;
+pub const GPU_FB_W: u32 = 1280;
+pub const GPU_FB_H: u32 = 800;
 
 // --- Block service IPC (§24) ----------------------------------------------
 /// The block driver also serves a SECTOR read/write endpoint (the root of block

@@ -14,7 +14,7 @@
 
 mod virtio;
 
-use oxbow_abi::{BOOT_CONSOLE, BOOT_MEM, BOOT_PCI, GPU_DMA, GPU_MMIO};
+use oxbow_abi::{BOOT_CONSOLE, BOOT_GPU_FB, BOOT_MEM, BOOT_PCI, GPU_DMA, GPU_FB_H, GPU_FB_W, GPU_MMIO};
 use oxbow_rt as rt;
 use virtio::{r32, w32, w64, Transport, Vq};
 
@@ -351,6 +351,29 @@ fn animate(gpu: &mut Gpu, id: u32, buf: *mut u32, width: u32, height: u32) -> ! 
     }
 }
 
+/// Present the kernel-shared framebuffer (§90): bind it as the scanout backing,
+/// then loop TRANSFER + FLUSH so whatever oxcomp composites into it reaches the
+/// display. The gpu owns no pixels here — the compositor does. Never returns.
+fn present_shared_fb(gpu: &mut Gpu, fb_phys: u64) -> ! {
+    const RES: u32 = 1;
+    let bytes = GPU_FB_W * GPU_FB_H * 4;
+    if !(gpu.create_2d(RES, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM, GPU_FB_W, GPU_FB_H)
+        && gpu.attach_backing(RES, fb_phys, bytes)
+        && gpu.set_scanout(0, RES, GPU_FB_W, GPU_FB_H))
+    {
+        w(b"[gpu] shared-fb scanout setup failed\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    w(b"[gpu] presenting oxcomp via shared framebuffer\n");
+    loop {
+        gpu.transfer(RES, GPU_FB_W, GPU_FB_H);
+        gpu.flush(RES, GPU_FB_W, GPU_FB_H);
+        frame_delay();
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn oxbow_main() -> ! {
     w(b"[gpu] virtio-gpu init\n");
@@ -369,6 +392,17 @@ pub extern "C" fn oxbow_main() -> ! {
 
     let mut modes = [Scanout::default(); VIRTIO_GPU_MAX_SCANOUTS];
     let n = gpu.display_info(&mut modes);
+
+    // Compositor-over-GPU: if the kernel pre-shared a framebuffer (the one oxcomp
+    // composites into), set it as the scanout backing and present it forever. The
+    // gpu never draws — it just pushes oxcomp's pixels to the display.
+    if let Ok(fb_phys) = rt::sys_shm_phys(BOOT_GPU_FB) {
+        if fb_phys != 0 {
+            present_shared_fb(&mut gpu, fb_phys);
+        }
+    }
+    w(b"[gpu] no shared framebuffer - standalone demo\n");
+
     let (mut width, mut height) = (modes[0].width, modes[0].height);
     if n == 0 || width == 0 || height == 0 {
         // No display info — fall back to a common default so we still scan out.
