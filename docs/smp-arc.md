@@ -227,16 +227,21 @@ be re-audited.
   woken-but-still-running thread isn't pickable until it has truly switched off (which clears the
   flag under SCHED_LOCK, after the context save). Also fixed: `exit_current` now sets `Exited`
   under SCHED_LOCK (was a separate stack-reuse race).
-- **⚠️ OPEN BUG — multi-AP hang; capped to 1 AP for now.** The `on_cpu` + exit fixes made the
-  desktop reliable at **1 AP / 2 cores** (verified 6/6), but at **≥3 cores** (2+ APs) heavy
-  boot-time concurrency still hits a residual hang: one core spins on a lock while another is stuck
-  in the page-fault handler (kernel state corrupted) — the desktop never composites (the user's
-  "stuck on the gradient"). So `bring_up_all` is capped at `MAX_APS_TO_START = 1` in `smp.rs` until
-  this is root-caused; `-smp 4` still works, the extra cores just stay parked. (Separately,
-  `[fsd] FATAL: could not mount ext2` is a PRE-EXISTING flaky virtio-blk/ext2 issue — it occurs at
-  `-smp 1` and as far back as §71, does NOT block the desktop, and is unrelated to the SMP work.)
-  Next debugging step: the multi-AP corruption is likely another scheduler/IPC race the 4-core
-  window widens; reproduce with a fault-detail dump (cr2/rip) under `-smp 4` with the cap lifted.
+- **✅ RESOLVED (§79) — the multi-AP "hang" was a QEMU emulator artifact, not an oxbow bug.**
+  The `on_cpu` + exit fixes made 1 AP rock-solid, but ≥3 cores hung *on the Mac*. An exhaustive
+  hunt (§75–78) ruled out every kernel-side cause: every lock (all 14 structure mutexes + SERIAL +
+  SCHED_LOCK) was wrapped in a holder-tracking, timeout-firing watchdog and **none ever fired**; no
+  exception was ever taken (IST fault stacks + a stop-the-cores oops path confirmed the handler was
+  never reached); cr3/PML4 were always valid. That profile — frozen with no deadlock, no livelock,
+  no fault — pointed at the emulator. **Decisive test: deployed to a real Proxmox KVM VM (host
+  192.168.50.39, VM 110) with 4 cores — it boots reliably, all 3 APs scheduling, shell ready, DHCP,
+  no hang (5/5 then 3/3 cold boots).** The Mac can't hardware-virtualize x86 (ARM host), so QEMU
+  software-emulates x86 SMP with **MTTCG**, whose memory-model/atomics emulation stalls oxbow >1 AP.
+  **Fix:** `is_tcg_emulation()` reads the hypervisor CPUID vendor (leaf 0x4000_0000 == "TCGTCGTCGTCG")
+  and caps to 1 AP **only under TCG**; real HW / KVM run all cores. One build: Mac QEMU → 2 cores
+  (desktop 4/4), Proxmox KVM → 4 cores (shell-ready 3/3). **oxbow runs multi-core on real hardware.**
+  (Separately, `[fsd] FATAL: could not mount ext2` is a PRE-EXISTING flaky virtio-blk/ext2 issue —
+  at `-smp 1` and back to §71 — unrelated to SMP and harmless to the desktop.)
 - Open (minor, non-blocking): `TCB.wake_at` is a plain `u64` read cross-core in `wake_expired`
   (benign torn-read on x86, but should be `AtomicU64` for strictness); per-CPU run queues +
   work-stealing if contention ever shows (today one global run queue under SCHED_LOCK is fine).
