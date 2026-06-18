@@ -27,13 +27,18 @@ struct ext4_blockdev *oxblk_get(void)
 	return &oxblk;
 }
 
-/* Format the device as ext2 (1 KiB blocks, no journal). */
+/* Format the device as ext2 with 4 KiB blocks, no journal. §94: 1 KiB blocks
+ * put any file over ~268 KiB into ext2 double-indirect blocks, where lwext4's
+ * allocation truncated large writes (c.a stopped at ~1.15 MiB). With 4 KiB blocks
+ * the single-indirect range alone covers ~4 MiB, so files up to a few MiB never
+ * touch double-indirect — large-file writes (the libc archive, saved documents)
+ * persist whole. 4 KiB also matches the fsd read-cache + ext2 block sizes. */
 int oxfs_mkfs_ext2(struct ext4_blockdev *bd)
 {
 	struct ext4_fs fs;
 	struct ext4_mkfs_info info;
 	memset(&info, 0, sizeof info);
-	info.block_size = 1024;
+	info.block_size = 4096;
 	info.journal = false;
 	return ext4_mkfs(&fs, bd, &info, F_SET_EXT2);
 }
