@@ -786,60 +786,78 @@ unsafe fn read_all(cap: Handle, buf: &mut [u8]) -> usize {
     off
 }
 
-/// `exec <path> [args]`: read the ELF at `path` from the filesystem into a
-/// buffer and launch it as a fresh process via exec-from-fs (ABI §33). Unlike
-/// `ls`/`cat`/`tcc` — which spawn fixed boot-granted images — this runs an
-/// ARBITRARY program loaded from disk: the foundation for running compiled
-/// binaries. The program is granted the cwd dir cap (slot 1) and stdout
-/// (slot 2), with the remaining tokens passed as its argv.
-fn exec_cmd(cwd: Handle, path: &Path, arg_line: &[u8], sp: &Spawner) {
-    let (pathname, rest) = split_cmd(arg_line);
-    if pathname.is_empty() {
-        tw(b"exec: usage: exec <path> [args]\n");
-        return;
-    }
-    // Resolve relative to the SESSION root (§45) — a user can only exec programs
-    // within their own home subtree; root resolves from the fs root.
-    let mut target = *path;
-    target.apply(pathname);
+/// §94: the `/bin` directory capability — the system tool set, reachable by EVERY
+/// logged-in user. The shell opens it once from the broad root authority
+/// (`BOOT_FS_ROOT`, the login machinery it still holds) and uses it to resolve
+/// bare command names. It is independent of `session_root()`: a confined user's
+/// namespace can't name `/bin` (leading `/` collapses onto their home), so the
+/// shell holds this cap on everyone's behalf. Programs OUTSIDE /bin + outside the
+/// user's home stay unreachable — that's the "not every program for everyone"
+/// half, enforced purely by which capabilities exist, no permission bits.
+static mut BIN_DIR: Handle = HANDLE_NULL;
+
+fn bin_dir() -> Handle {
+    unsafe { BIN_DIR }
+}
+
+/// Open `/bin` from the root authority once at startup and cache the dir cap.
+fn open_bin_dir() {
     let mut m = MsgBuf::new(TAG_FS_OPEN);
-    pack_name(&mut m, target.as_bytes());
-    if rt::sys_call(session_root(), &mut m).is_err() || m.data[0] != 0 {
-        tw(b"exec: ");
-        tw(pathname);
-        tw(b": not found\n");
-        return;
+    pack_name(&mut m, b"/bin");
+    if rt::sys_call(BOOT_FS_ROOT, &mut m).is_ok()
+        && m.data[0] == 0
+        && m.data[1] == oxbow_abi::FS_DIR
+    {
+        unsafe {
+            BIN_DIR = m.handles[0];
+        }
+    }
+}
+
+/// Read the ELF named `name` relative to the directory cap `dir` and run it as a
+/// fresh process (exec-from-fs, ABI §33): the program gets the cwd dir cap
+/// (slot 1), stdout (slot 2), the net cap (slot 20), and our identity. Returns
+/// `true` once `name` resolves to a regular FILE (the command was handled — the
+/// exit status is set, and a bad ELF reports an error); returns `false` if `name`
+/// does not exist as a file under `dir`, so a PATH search can try the next dir.
+fn exec_from(dir: Handle, name: &[u8], cwd: Handle, args: &[u8], sp: &Spawner) -> bool {
+    if dir == HANDLE_NULL {
+        return false;
+    }
+    let mut m = MsgBuf::new(TAG_FS_OPEN);
+    pack_name(&mut m, name);
+    if rt::sys_call(dir, &mut m).is_err() || m.data[0] != 0 {
+        return false; // not found in this directory
     }
     let file_cap = m.handles[0];
     if m.data[1] != oxbow_abi::FS_FILE {
-        tw(b"exec: ");
-        tw(pathname);
-        tw(b": not a file\n");
-        let _ = rt::sys_close(file_cap);
-        return;
+        let _ = rt::sys_close(file_cap); // a directory of that name — not executable
+        return false;
     }
     let len = unsafe {
-        let buf = core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(ELF_BUF) as *mut u8, ELF_BUF_CAP);
+        let buf = core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(ELF_BUF) as *mut u8,
+            ELF_BUF_CAP,
+        );
         read_all(file_cap, buf)
     };
     let _ = rt::sys_close(file_cap);
     if len == 0 {
         tw(b"exec: empty or unreadable file\n");
-        return;
+        set_status(126);
+        return true;
     }
-    // Build the spawn MsgBuf: budget default, argv from `rest` by (ptr, len),
-    // cwd at slot 1, stdout at slot 2 — then hand the ELF bytes to the kernel.
     let mut sm = MsgBuf::new(0);
     sm.data[0] = 0;
-    sm.data[1] = rest.as_ptr() as u64;
-    sm.data[2] = rest.len() as u64;
+    sm.data[1] = args.as_ptr() as u64;
+    sm.data[2] = args.len() as u64;
     sm.data_len = 3;
-    rt::msg_set_identity(&mut sm, cur_ident()); // §44: exec'd program inherits our identity
+    rt::msg_set_identity(&mut sm, cur_ident()); // §44: program inherits our identity
     sm.handle_count = 4;
     sm.handles[0] = cwd;
     sm.handles[1] = sp.stdout;
     sm.handles[2] = HANDLE_NULL; // slot 4 (unused)
-    sm.handles[3] = BOOT_NET_EP; // slot 20 = BOOT_NET_EP (network access)
+    sm.handles[3] = BOOT_NET_EP; // slot 20 = network access
     let elf = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(ELF_BUF) as *const u8, len) };
     match rt::sys_spawn_bytes(elf, BOOT_MEM, &sm, sp.exit) {
         Ok(_) => {
@@ -847,11 +865,51 @@ fn exec_cmd(cwd: Handle, path: &Path, arg_line: &[u8], sp: &Spawner) {
             set_status(rt::sys_notif_status(sp.exit));
         }
         Err(_) => {
-            tw(b"exec: not a valid program (spawn rejected, ");
-            tw_dec_u32(len as u32);
-            tw(b" bytes read)\n");
-            set_status(127);
+            tw(b"exec: not a valid program (spawn rejected)\n");
+            set_status(126);
         }
+    }
+    true
+}
+
+/// §94: resolve a non-builtin command to an executable file and run it. A name
+/// containing `/` is a PATH resolved in the user's session namespace; a bare name
+/// is searched in `/bin` (system tools, all users) then `bin/` in the user's home
+/// (per-user programs). Returns `false` only if nothing matched (→ "not found").
+fn path_exec(cmd: &[u8], rest: &[u8], cwd: Handle, path: &Path, sp: &Spawner) -> bool {
+    if cmd.contains(&b'/') {
+        // An explicit path: resolve within the session root (§45 confinement).
+        let mut target = *path;
+        target.apply(cmd);
+        return exec_from(session_root(), target.as_bytes(), cwd, rest, sp);
+    }
+    // /bin — the shared system tools every user can run.
+    if exec_from(bin_dir(), cmd, cwd, rest, sp) {
+        return true;
+    }
+    // ~/bin — programs the user keeps in their own home (session-confined).
+    let mut name = [0u8; 4 + 64];
+    name[..4].copy_from_slice(b"bin/");
+    let n = core::cmp::min(cmd.len(), 64);
+    name[4..4 + n].copy_from_slice(&cmd[..n]);
+    exec_from(session_root(), &name[..4 + n], cwd, rest, sp)
+}
+
+/// `exec <path> [args]`: explicitly run an ELF from the filesystem (exec-from-fs,
+/// ABI §33). Equivalent to just typing the path — kept for clarity and scripts.
+fn exec_cmd(cwd: Handle, path: &Path, arg_line: &[u8], sp: &Spawner) {
+    let (pathname, rest) = split_cmd(arg_line);
+    if pathname.is_empty() {
+        tw(b"exec: usage: exec <path> [args]\n");
+        return;
+    }
+    let mut target = *path;
+    target.apply(pathname);
+    if !exec_from(session_root(), target.as_bytes(), cwd, rest, sp) {
+        tw(b"exec: ");
+        tw(pathname);
+        tw(b": not found\n");
+        set_status(127);
     }
 }
 
@@ -1810,6 +1868,10 @@ fn run_command(line0: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"mv" => spawn_with(BOOT_IMG_MV, *cwd, rest, sp),
         b"cp" => spawn_with(BOOT_IMG_CP, *cwd, rest, sp),
         b"cd" => cd(rest, cwd, path),
+        b"pwd" => {
+            tw(path.as_bytes());
+            tw(b"\n");
+        }
         b"dns" => dns_cmd(rest),
         b"http" => http_cmd(rest),
         b"drift" => spawn_with(BOOT_IMG_DRIFT, HANDLE_NULL, rest, sp),
@@ -1885,10 +1947,14 @@ fn run_command(line0: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  help            this list\n");
         }
         _ => {
-            tw(b"oxbow: ");
-            tw(cmd);
-            tw(b": command not found\n");
-            set_status(127);
+            // §94: not a builtin — resolve it as a program on the filesystem
+            // (/bin for system tools, ~/bin or an explicit path for user programs).
+            if !path_exec(cmd, rest, *cwd, path, sp) {
+                tw(b"oxbow: ");
+                tw(cmd);
+                tw(b": command not found\n");
+                set_status(127);
+            }
         }
     }
 }
@@ -2249,6 +2315,10 @@ pub extern "C" fn oxbow_main() -> ! {
     // channel; session_gate verifies them here — the shell is the sole credential
     // authority — then adopts the identity + the user's home capability.
     session_gate(&mut cwd, &mut path);
+    // §94: cache the /bin directory cap so bare command names resolve to system
+    // tools on the filesystem (reachable by every user, independent of the
+    // session's home confinement).
+    open_bin_dir();
     loop {
         // user@oxbow path-aware prompt, e.g. `bryson@oxbow:/home/bryson$ `.
         tw(cur_name());

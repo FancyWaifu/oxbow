@@ -158,8 +158,15 @@ _iso:
     # (with llvm-strip — Apple strip can't touch ELF) shrinks 3.4 MB -> ~115 KB so
     # the shell's 56-byte FS_READ loop slurps it quickly.
     mkdir -p build/initrd/bin
-    cp target/x86_64-unknown-none/debug/hello build/initrd/bin/hello
-    $(find $(rustc --print sysroot) -name llvm-strip | head -1) --strip-all build/initrd/bin/hello
+    # §94: the coreutils ship as FILES in /bin, not baked-in boot images — so a
+    # user can add/delete programs and `make their own thing`. The shell resolves
+    # bare command names here (PATH), reachable by every logged-in user. Stripped
+    # (llvm-strip; Apple strip can't touch ELF) so the 56-byte FS_READ loop is quick.
+    STRIP=$(find $(rustc --print sysroot) -name llvm-strip | head -1); \
+    for t in hello ls cat mkdir touch rm mv cp; do \
+      cp target/x86_64-unknown-none/debug/$t build/initrd/bin/$t; \
+      "$STRIP" --strip-all build/initrd/bin/$t; \
+    done
     # Self-hosting (§35): liboxbow_libc.a staged at /lib/c.a — the C library
     # archive tcc statically links to produce a standalone binary on oxbow.
     # `cc src.c -o out` expands to `tcc -static src.c -o out /lib/c.a`. Built with
