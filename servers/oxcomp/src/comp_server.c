@@ -174,6 +174,7 @@ struct surf {
   int                 x, y, w, h, mapped;
   unsigned int       *backing;
   long                backing_cap;
+  char                title[48]; /* §91: xdg_toplevel.set_title, drawn in the bar */
 };
 
 /* The scene: views ordered bottom→top (last = topmost/focused). */
@@ -350,6 +351,13 @@ static void composite_rect(int x0, int y0, int x1, int y1)
         int in_close = i >= s->w - TBH + 4 && i < s->w - 4 && j >= 4 && j < TBH - 4;
         g_back[(long)y * g_pitch_words + x] = in_close ? 0x00c04040u : bar;
       }
+    }
+    /* §91: the window title in the bar, clipped short of the close box. */
+    if (s->title[0]) {
+      int saved = g_clip_x1;
+      if (g_clip_x1 > s->x + s->w - TBH - 2) g_clip_x1 = s->x + s->w - TBH - 2;
+      draw_text(s->x + 8, s->y - TBH + (TBH - 8) / 2, s->title, 0x00ffffffu);
+      g_clip_x1 = saved;
     }
     /* content rows [s->y, s->y+s->h) clipped */
     int cy0 = (s->y > y0) ? s->y : y0;
@@ -689,7 +697,17 @@ static void noop_destroy(struct wl_client *c, struct wl_resource *r)
 static void tl_set_parent(struct wl_client *c, struct wl_resource *r, struct wl_resource *p)
 { (void)c; (void)r; (void)p; }
 static void tl_set_title(struct wl_client *c, struct wl_resource *r, const char *t)
-{ (void)c; (void)r; (void)t; }
+{
+  (void)c;
+  struct surf *s = wl_resource_get_user_data(r);
+  if (!s || !t)
+    return;
+  int i = 0;
+  for (; t[i] && i < (int)sizeof(s->title) - 1; i++)
+    s->title[i] = t[i];
+  s->title[i] = 0;
+  composite_scene(); /* §91: redraw the bar with the new title */
+}
 static void tl_set_app_id(struct wl_client *c, struct wl_resource *r, const char *a)
 { (void)c; (void)r; (void)a; }
 static void tl_show_window_menu(struct wl_client *c, struct wl_resource *r,
