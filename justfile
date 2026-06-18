@@ -144,14 +144,17 @@ _iso:
     -strip -S iso_root/boot/vterm-test.elf
     cp target/x86_64-unknown-none/debug/ft-test iso_root/boot/ft-test.elf
     -strip -S iso_root/boot/ft-test.elf
-    # Stage the filesystem: the FHS skeleton (servers/fs/initrd) plus the live
-    # oxbow source under /usr/src/oxbow so it is browsable on oxbow itself.
+    # Stage the filesystem: the FHS skeleton (servers/fs/initrd) plus a small
+    # on-device source browse under /usr/src/oxbow.
+    # §94: the fs is a 256-NODE ramfs. Copying the whole kernel+servers source
+    # (~160 nodes) exhausted the node table, so /bin's programs couldn't be indexed
+    # and bare commands hit "command not found". Ship just the design docs +
+    # manifests as the "source on device" gesture (the full tree lives in git); a
+    # bigger/writable fs is the next arc.
     rm -rf build/initrd
     mkdir -p build/initrd build/initrd/usr/src/oxbow
     cp -R servers/fs/initrd/. build/initrd/
-    cp -R kernel abi rt docs build/initrd/usr/src/oxbow/
-    mkdir -p build/initrd/usr/src/oxbow/servers
-    for d in servers/*/src; do s=$(basename $(dirname $d)); mkdir -p build/initrd/usr/src/oxbow/servers/$s; cp -R $d build/initrd/usr/src/oxbow/servers/$s/; done
+    cp -R docs build/initrd/usr/src/oxbow/
     cp Cargo.toml justfile limine.conf build/initrd/usr/src/oxbow/ 2>/dev/null || true
     # exec-from-fs demo (§33): a STRIPPED copy of `hello` placed on the fs at
     # /bin/hello, so `exec /bin/hello` loads + runs an ELF from disk. Stripping

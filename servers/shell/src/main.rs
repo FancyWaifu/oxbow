@@ -13,8 +13,8 @@ extern crate oxbow_libc as _;
 
 use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA, BOOT_NET_EP,
-    BOOT_IMG_CAT, BOOT_IMG_CP, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_MKDIR, BOOT_IMG_MV, BOOT_IMG_PONG,
-    BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_LUA, BOOT_IMG_UPY, BOOT_IMG_QJS, BOOT_IMG_CURL, BOOT_IMG_CARES, BOOT_IMG_FFI, BOOT_IMG_WL, BOOT_IMG_XKB, BOOT_IMG_VTERM, BOOT_IMG_FT, BOOT_IMG_JAIL, BOOT_IMG_FSTEST, BOOT_IMG_RM, BOOT_IMG_TOUCH, BOOT_MEM, BOOT_SESSION_CHAN, BOOT_TICK, BOOT_TTY,
+    BOOT_IMG_HELLO, BOOT_IMG_PONG,
+    BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_LUA, BOOT_IMG_UPY, BOOT_IMG_QJS, BOOT_IMG_CURL, BOOT_IMG_CARES, BOOT_IMG_FFI, BOOT_IMG_WL, BOOT_IMG_XKB, BOOT_IMG_VTERM, BOOT_IMG_FT, BOOT_IMG_JAIL, BOOT_IMG_FSTEST, BOOT_MEM, BOOT_SESSION_CHAN, BOOT_TICK, BOOT_TTY,
     HANDLE_NULL, IdentRec, R_GRANT, R_IN, R_OUT, R_RECV,
     R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_FLUSH, TAG_TTY_READ, TAG_TTY_WRITE,
 };
@@ -377,7 +377,9 @@ fn capture(cmd: &[u8], cwd: Handle, sp: &Spawner, out: &mut [u8]) -> usize {
     }
     // Use sp.exit (the general exit notifier, idle during expansion) — NOT a
     // pexits[] slot, which a surrounding pipeline stage may be about to use.
-    if !spawn_stage(cmd, cwd, sp, HANDLE_NULL, wend, sp.exit) {
+    // $() substitution has no Path handle; resolve from the session root (bare
+    // /bin names are the common case here, which don't consult it).
+    if !spawn_stage(cmd, cwd, &Path::root(), sp, HANDLE_NULL, wend, sp.exit) {
         let _ = rt::sys_close(wend);
         let _ = rt::sys_close(rend);
         return 0;
@@ -704,56 +706,6 @@ fn cc_cmd(cwd: Handle, rest: &[u8], sp: &Spawner) {
     spawn_with_budget(BOOT_IMG_TCC, cwd, &arg[..p], 48 * 1024 * 1024, sp);
 }
 
-/// `ls [path]`: with no arg, list `dir`; with a path, OPEN it (must be a
-/// directory) and hand that capability to a spawned `ls`.
-fn ls_cmd(dir: Handle, path: &[u8], sp: &Spawner) {
-    if path.is_empty() {
-        spawn_with(BOOT_IMG_LS, dir, b"", sp);
-        return;
-    }
-    let mut m = MsgBuf::new(TAG_FS_OPEN);
-    pack_name(&mut m, path);
-    if rt::sys_call(dir, &mut m).is_err() || m.data[0] != 0 {
-        tw(b"ls: ");
-        tw(path);
-        tw(b": no such directory\n");
-        set_status(1);
-        return;
-    }
-    let cap = m.handles[0];
-    if m.data[1] != oxbow_abi::FS_DIR {
-        tw(b"ls: ");
-        tw(path);
-        tw(b": not a directory\n");
-        set_status(1);
-    } else {
-        spawn_with(BOOT_IMG_LS, cap, b"", sp);
-    }
-    let _ = rt::sys_close(cap);
-}
-
-/// `cat <name>`: resolve the name relative to `dir` (the shell holds the dir cap),
-/// then hand the resulting FILE capability to a freshly-spawned `cat` program —
-/// which reads exactly that one file and nothing else.
-fn cat_cmd(dir: Handle, name: &[u8], sp: &Spawner) {
-    if name.is_empty() {
-        tw(b"cat: usage: cat <file>\n");
-        set_status(1);
-        return;
-    }
-    let mut m = MsgBuf::new(TAG_FS_OPEN);
-    pack_name(&mut m, name);
-    if rt::sys_call(dir, &mut m).is_err() || m.data[0] != 0 {
-        tw(b"cat: ");
-        tw(name);
-        tw(b": not found\n");
-        set_status(1);
-        return;
-    }
-    let file_cap = m.handles[0];
-    spawn_with(BOOT_IMG_CAT, file_cap, b"", sp); // cat reads the file cap, prints, exits
-    let _ = rt::sys_close(file_cap); // cat holds its own copy
-}
 
 /// Scratch buffer holding an ELF read off the filesystem for `exec` (§33). Sized
 /// for a stripped no_std binary with headroom; a larger image truncates safely
@@ -814,25 +766,22 @@ fn open_bin_dir() {
     }
 }
 
-/// Read the ELF named `name` relative to the directory cap `dir` and run it as a
-/// fresh process (exec-from-fs, ABI §33): the program gets the cwd dir cap
-/// (slot 1), stdout (slot 2), the net cap (slot 20), and our identity. Returns
-/// `true` once `name` resolves to a regular FILE (the command was handled — the
-/// exit status is set, and a bad ELF reports an error); returns `false` if `name`
-/// does not exist as a file under `dir`, so a PATH search can try the next dir.
-fn exec_from(dir: Handle, name: &[u8], cwd: Handle, args: &[u8], sp: &Spawner) -> bool {
+/// Open `name` relative to directory cap `dir`; if it is a regular FILE, slurp it
+/// into ELF_BUF and return its byte length. Returns `None` if `name` is absent,
+/// is a directory, or is empty — so a PATH search can fall through to the next dir.
+fn slurp_program(dir: Handle, name: &[u8]) -> Option<usize> {
     if dir == HANDLE_NULL {
-        return false;
+        return None;
     }
     let mut m = MsgBuf::new(TAG_FS_OPEN);
     pack_name(&mut m, name);
     if rt::sys_call(dir, &mut m).is_err() || m.data[0] != 0 {
-        return false; // not found in this directory
+        return None;
     }
     let file_cap = m.handles[0];
     if m.data[1] != oxbow_abi::FS_FILE {
-        let _ = rt::sys_close(file_cap); // a directory of that name — not executable
-        return false;
+        let _ = rt::sys_close(file_cap);
+        return None;
     }
     let len = unsafe {
         let buf = core::slice::from_raw_parts_mut(
@@ -843,10 +792,36 @@ fn exec_from(dir: Handle, name: &[u8], cwd: Handle, args: &[u8], sp: &Spawner) -
     };
     let _ = rt::sys_close(file_cap);
     if len == 0 {
-        tw(b"exec: empty or unreadable file\n");
-        set_status(126);
-        return true;
+        None
+    } else {
+        Some(len)
     }
+}
+
+/// §94: resolve a command `verb` to a program FILE and slurp it into ELF_BUF.
+/// A name containing `/` is a path resolved in the user's session namespace; a
+/// bare name searches `/bin` (system tools, every user) then `bin/` in the user's
+/// own home (per-user programs). Returns the ELF length, or `None` if unresolved.
+fn find_program(verb: &[u8], path: &Path) -> Option<usize> {
+    if verb.contains(&b'/') {
+        let mut t = *path;
+        t.apply(verb);
+        return slurp_program(session_root(), t.as_bytes());
+    }
+    if let Some(l) = slurp_program(bin_dir(), verb) {
+        return Some(l);
+    }
+    let mut name = [0u8; 4 + 64];
+    name[..4].copy_from_slice(b"bin/");
+    let n = core::cmp::min(verb.len(), 64);
+    name[4..4 + n].copy_from_slice(&verb[..n]);
+    slurp_program(session_root(), &name[..4 + n])
+}
+
+/// Run the program currently in `ELF_BUF[..len]` to completion (exec-from-fs, ABI
+/// §33): cwd dir cap at slot 1, stdout at slot 2, the net cap at slot 20, argv =
+/// `args`, and our identity. The exit status flows into `$?`.
+fn run_program(len: usize, cwd: Handle, args: &[u8], sp: &Spawner) {
     let mut sm = MsgBuf::new(0);
     sm.data[0] = 0;
     sm.data[1] = args.as_ptr() as u64;
@@ -856,7 +831,7 @@ fn exec_from(dir: Handle, name: &[u8], cwd: Handle, args: &[u8], sp: &Spawner) -
     sm.handle_count = 4;
     sm.handles[0] = cwd;
     sm.handles[1] = sp.stdout;
-    sm.handles[2] = HANDLE_NULL; // slot 4 (unused)
+    sm.handles[2] = HANDLE_NULL; // slot 4 (stdin) unused outside a pipeline
     sm.handles[3] = BOOT_NET_EP; // slot 20 = network access
     let elf = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(ELF_BUF) as *const u8, len) };
     match rt::sys_spawn_bytes(elf, BOOT_MEM, &sm, sp.exit) {
@@ -869,30 +844,18 @@ fn exec_from(dir: Handle, name: &[u8], cwd: Handle, args: &[u8], sp: &Spawner) -
             set_status(126);
         }
     }
-    true
 }
 
-/// §94: resolve a non-builtin command to an executable file and run it. A name
-/// containing `/` is a PATH resolved in the user's session namespace; a bare name
-/// is searched in `/bin` (system tools, all users) then `bin/` in the user's home
-/// (per-user programs). Returns `false` only if nothing matched (→ "not found").
+/// §94: resolve a non-builtin command to a program file and run it. Returns
+/// `false` only if nothing matched (so the caller prints "command not found").
 fn path_exec(cmd: &[u8], rest: &[u8], cwd: Handle, path: &Path, sp: &Spawner) -> bool {
-    if cmd.contains(&b'/') {
-        // An explicit path: resolve within the session root (§45 confinement).
-        let mut target = *path;
-        target.apply(cmd);
-        return exec_from(session_root(), target.as_bytes(), cwd, rest, sp);
+    match find_program(cmd, path) {
+        Some(len) => {
+            run_program(len, cwd, rest, sp);
+            true
+        }
+        None => false,
     }
-    // /bin — the shared system tools every user can run.
-    if exec_from(bin_dir(), cmd, cwd, rest, sp) {
-        return true;
-    }
-    // ~/bin — programs the user keeps in their own home (session-confined).
-    let mut name = [0u8; 4 + 64];
-    name[..4].copy_from_slice(b"bin/");
-    let n = core::cmp::min(cmd.len(), 64);
-    name[4..4 + n].copy_from_slice(&cmd[..n]);
-    exec_from(session_root(), &name[..4 + n], cwd, rest, sp)
 }
 
 /// `exec <path> [args]`: explicitly run an ELF from the filesystem (exec-from-fs,
@@ -903,9 +866,7 @@ fn exec_cmd(cwd: Handle, path: &Path, arg_line: &[u8], sp: &Spawner) {
         tw(b"exec: usage: exec <path> [args]\n");
         return;
     }
-    let mut target = *path;
-    target.apply(pathname);
-    if !exec_from(session_root(), target.as_bytes(), cwd, rest, sp) {
+    if !path_exec(pathname, rest, cwd, path, sp) {
         tw(b"exec: ");
         tw(pathname);
         tw(b": not found\n");
@@ -1627,7 +1588,7 @@ fn run_pipeline_or_cmd(cmd: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Pa
 /// stage's outgoing pipe — flushing all of a producer's bytes before its consumer
 /// sees end-of-input. Stages are spawned right-to-left so a spawn failure can't
 /// strand an already-running producer with no reader.
-fn run_pipeline(seg: &[u8], sp: &Spawner, cwd: &mut Handle, _path: &mut Path) {
+fn run_pipeline(seg: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
     const MAXST: usize = 4;
     let mut stages: [&[u8]; MAXST] = [b""; MAXST];
     let mut nst = 0;
@@ -1646,7 +1607,7 @@ fn run_pipeline(seg: &[u8], sp: &Spawner, cwd: &mut Handle, _path: &mut Path) {
         }
     }
     if nst < 2 {
-        run_command(stages[0], sp, cwd, _path);
+        run_command(stages[0], sp, cwd, path);
         return;
     }
 
@@ -1675,7 +1636,7 @@ fn run_pipeline(seg: &[u8], sp: &Spawner, cwd: &mut Handle, _path: &mut Path) {
     for i in (0..nst).rev() {
         let stdin_h = if i > 0 { rend[i - 1] } else { HANDLE_NULL };
         let stdout_h = if i < nst - 1 { wend[i] } else { sp.stdout };
-        spawned[i] = spawn_stage(stages[i], *cwd, sp, stdin_h, stdout_h, exits[i]);
+        spawned[i] = spawn_stage(stages[i], *cwd, path, sp, stdin_h, stdout_h, exits[i]);
         if !spawned[i] {
             break; // stop before launching upstream producers that would block
         }
@@ -1730,72 +1691,41 @@ fn close_ends(wend: &mut [Handle], rend: &mut [Handle], n: usize) {
 /// `run_command` does. Returns true if the child was spawned. Only spawnable,
 /// stream-friendly verbs are supported in a pipeline; builtins (echo/cd/…) and
 /// unknowns are rejected.
-fn spawn_stage(cmd0: &[u8], cwd: Handle, sp: &Spawner, stdin_h: Handle, stdout_h: Handle, exit: Handle) -> bool {
+fn spawn_stage(
+    cmd0: &[u8],
+    cwd: Handle,
+    path: &Path,
+    sp: &Spawner,
+    stdin_h: Handle,
+    stdout_h: Handle,
+    exit: Handle,
+) -> bool {
     let mut ebuf = [0u8; 512];
     let en = expand_line(cmd0, cwd, sp, &mut ebuf); // $VAR/quoting/glob per stage (§82)
     let cmd = &ebuf[..en];
     let (verb, rest) = split_cmd(cmd);
-    let mut argbuf = [0u8; 96];
-    let mut arglen = 0usize;
-    // Resolve (image, slot-1 cap, a cap to close after spawn).
-    let (image, cap0, opened): (Handle, Handle, Handle) = match verb {
-        b"ls" => {
-            if rest.is_empty() {
-                (BOOT_IMG_LS, cwd, HANDLE_NULL)
-            } else {
-                let mut m = MsgBuf::new(TAG_FS_OPEN);
-                pack_name(&mut m, rest);
-                if rt::sys_call(cwd, &mut m).is_err() || m.data[0] != 0 || m.data[1] != oxbow_abi::FS_DIR {
-                    tw(b"ls: ");
-                    tw(rest);
-                    tw(b": no such directory\n");
-                    return false;
-                }
-                (BOOT_IMG_LS, m.handles[0], m.handles[0])
-            }
-        }
-        b"cat" => {
-            // A stage with a stdin pipe (or no file arg) is the consumer — read
-            // stdin (`cat -`). Otherwise it's a producer reading the named file.
-            if stdin_h != HANDLE_NULL || rest.is_empty() || rest == b"-" {
-                argbuf[0] = b'-';
-                arglen = 1;
-                (BOOT_IMG_CAT, HANDLE_NULL, HANDLE_NULL)
-            } else {
-                let mut m = MsgBuf::new(TAG_FS_OPEN);
-                pack_name(&mut m, rest);
-                if rt::sys_call(cwd, &mut m).is_err() || m.data[0] != 0 {
-                    tw(b"cat: ");
-                    tw(rest);
-                    tw(b": not found\n");
-                    return false;
-                }
-                (BOOT_IMG_CAT, m.handles[0], m.handles[0])
-            }
-        }
-        _ => {
-            tw(b"sh: ");
-            tw(verb);
-            tw(b": not usable in a pipeline\n");
-            return false;
-        }
+    // §94: a pipeline stage is just a /bin (or ~/bin / path) program FILE — the
+    // same PATH resolution as a plain command. Each stage gets the cwd dir cap at
+    // slot 1 and resolves its own path args; cat with no file arg reads stdin.
+    let Some(len) = find_program(verb, path) else {
+        tw(b"sh: ");
+        tw(verb);
+        tw(b": not found\n");
+        return false;
     };
-
     let mut m = MsgBuf::new(0);
     m.data[0] = 0; // default budget
-    m.data[1] = argbuf.as_ptr() as u64;
-    m.data[2] = arglen as u64;
+    m.data[1] = rest.as_ptr() as u64; // argv = rest (the program opens its own paths)
+    m.data[2] = rest.len() as u64;
     m.data_len = 3;
     rt::msg_set_identity(&mut m, cur_ident());
     m.handle_count = 4;
-    m.handles[0] = cap0; // slot 1 = BOOT_EP (file/dir cap, or NULL for stdin mode)
+    m.handles[0] = cwd; // slot 1 = cwd dir cap (ls/cat resolve names against it)
     m.handles[1] = stdout_h; // slot 2 = SPAWN_STDOUT (pipe write end or tty)
     m.handles[2] = stdin_h; // slot 4 = SPAWN_STDIN (pipe read end, or NULL)
     m.handles[3] = BOOT_NET_EP; // slot 20 = BOOT_NET_EP
-    let ok = rt::sys_spawn(image, BOOT_MEM, &m, exit).is_ok();
-    if opened != HANDLE_NULL {
-        let _ = rt::sys_close(opened);
-    }
+    let elf = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(ELF_BUF) as *const u8, len) };
+    let ok = rt::sys_spawn_bytes(elf, BOOT_MEM, &m, exit).is_ok();
     if !ok {
         tw(b"sh: pipeline stage spawn failed\n");
     }
@@ -1860,13 +1790,9 @@ fn run_command(line0: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
                 _ => tw(b"run: no such program\n"),
             }
         }
-        b"ls" => ls_cmd(*cwd, rest, sp),
-        b"cat" => cat_cmd(*cwd, rest, sp),
-        b"mkdir" => spawn_with(BOOT_IMG_MKDIR, *cwd, rest, sp),
-        b"touch" => spawn_with(BOOT_IMG_TOUCH, *cwd, rest, sp),
-        b"rm" => spawn_with(BOOT_IMG_RM, *cwd, rest, sp),
-        b"mv" => spawn_with(BOOT_IMG_MV, *cwd, rest, sp),
-        b"cp" => spawn_with(BOOT_IMG_CP, *cwd, rest, sp),
+        // §94: ls/cat/mkdir/touch/rm/mv/cp are NOT builtins — they're files in
+        // /bin, resolved by the PATH fallback below (delete /bin/ls and `ls` is
+        // gone). cd/pwd stay builtins: they mutate the shell's own cwd state.
         b"cd" => cd(rest, cwd, path),
         b"pwd" => {
             tw(path.as_bytes());
