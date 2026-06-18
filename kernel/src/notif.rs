@@ -13,7 +13,11 @@ use crate::sync::DiagMutex;
 
 use crate::{ipc, thread};
 
-const POOL_SIZE: usize = 8;
+// NOTE: pooled notifications are not freed when their last handle closes (the
+// handle table just drops the entry — there is no object refcount yet), so a
+// program that creates one per operation leaks pool slots. The shell therefore
+// reuses a fixed set; this size gives boot servers + that set comfortable room.
+const POOL_SIZE: usize = 24;
 
 /// The notification the timer handler signals (a free ~1 Hz user clock, and the
 /// permanent proof that IRQ-context signalling works). `NO_TICK` = unarmed.
@@ -38,13 +42,17 @@ struct Notif {
     in_use: bool,
     count: u64,
     waiter: Option<usize>, // tid of the (single) blocked waiter
+    /// Last exit code delivered by `signal_exit` (an exit notification, §81). Read
+    /// with `status` after waiting, so a shell can do `cmd1 && cmd2`. 0 otherwise.
+    exit_code: i32,
 }
 
-static POOL: DiagMutex<[Notif; POOL_SIZE]> = DiagMutex::new("POOL", 
+static POOL: DiagMutex<[Notif; POOL_SIZE]> = DiagMutex::new("POOL",
     [Notif {
         in_use: false,
         count: 0,
         waiter: None,
+        exit_code: 0,
     }; POOL_SIZE],
 );
 
@@ -57,6 +65,7 @@ pub fn create() -> Option<u8> {
                 in_use: true,
                 count: 0,
                 waiter: None,
+                exit_code: 0,
             };
             return Some(i as u8);
         }
@@ -76,6 +85,23 @@ pub fn signal(idx: u8) {
         ipc::deposit_ret(tid, 0, c); // rax = OK, rdx = count
         thread::wake(tid);
     }
+}
+
+/// Signal AND record an exit code (§81): like `signal`, but stores `code` so a
+/// waiter can read it via `status` after waking. Called from `proc::kill` so a
+/// shell can branch on a child's exit status (`cmd1 && cmd2`).
+pub fn signal_exit(idx: u8, code: i32) {
+    {
+        let mut p = POOL.lock();
+        p[idx as usize].exit_code = code;
+    }
+    signal(idx);
+}
+
+/// The last exit code recorded on a notification (0 if none). Non-blocking; a
+/// shell reads it right after `wait` returns for the child it spawned.
+pub fn status(idx: u8) -> i32 {
+    POOL.lock()[idx as usize].exit_code
 }
 
 /// Wait: drain a latched count immediately, else block until signalled. Returns

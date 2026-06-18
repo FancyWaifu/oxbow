@@ -199,7 +199,7 @@ pub fn set_lifecycle(id: usize, exit_notif: Option<u8>, mem_idx: u8, parent_mem:
 /// paid, and signals the exit notification. The address space is NOT freed here
 /// (it may be the live CR3 — the dying thread is still running on it); its frames
 /// are reclaimed when the slot is reused (`create`). The slot becomes `Dead`.
-pub fn kill(id: usize) {
+pub fn kill(id: usize, code: i32) {
     let (exit_notif, mem_idx, parent_mem, cost) = {
         let mut procs = PROCESSES.lock();
         procs[id].for_each_reply(|idx| ipc::reply_abandon(idx as usize));
@@ -223,7 +223,10 @@ pub fn kill(id: usize) {
         }
     }
     if let Some(en) = exit_notif {
-        crate::notif::signal(en);
+        // §81: deliver the exit code so a waiting parent (the shell) can branch on
+        // it for `&&`/`||`. A clean exit passes its sys_exit code; a fault/pledge
+        // death passes a nonzero sentinel.
+        crate::notif::signal_exit(en, code);
     }
 }
 

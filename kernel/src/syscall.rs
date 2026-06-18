@@ -10,7 +10,7 @@ use oxbow_abi::{
     PROT_READ, PROT_WRITE, R_ATTENUATE, R_GRANT, R_MAP, R_RECV, R_SEND, R_SIGNAL, R_WAIT, R_WRITE,
     SPAWN_DEFAULT_BUDGET, SPAWN_SLOTS, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE,
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
-    SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT,
+    SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_STATUS, SYS_NOTIF_WAIT,
     SYS_CAP_TYPE, SYS_CAP_DUP, SYS_CHAN_WAIT, SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_POLL, SYS_CHANNEL_RECV,
     SYS_CHANNEL_SEND, SYS_DMA_ALLOC, SYS_SHM_CREATE, SYS_SHM_MAP, CAP_CHANNEL, CAP_OTHER, CAP_SHM,
     SYS_FB_INFO, SYS_FB_MAP, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE,
@@ -85,7 +85,7 @@ pub extern "C" fn syscall_dispatch(
             crate::thread::current_proc(),
             nr
         );
-        proc::kill(crate::thread::current_proc());
+        proc::kill(crate::thread::current_proc(), 159); // 128 + SIGSYS: pledge violation
         crate::thread::exit_current(); // diverges; the machine lives on
     }
     match nr {
@@ -99,6 +99,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_NOTIF_CREATE => sys_notif_create(),
         SYS_NOTIF_SIGNAL => sys_notif_signal(a1),
         SYS_NOTIF_WAIT => sys_notif_wait(a1),
+        SYS_NOTIF_STATUS => sys_notif_status(a1),
         SYS_IO_IN => sys_io_in(a1, a2),
         SYS_IO_OUT => sys_io_out(a1, a2, a3),
         SYS_IRQ_BIND => sys_irq_bind(a1, a2),
@@ -142,7 +143,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_ATTENUATE => sys_attenuate(a1, a2),
         SYS_CLOSE => SyscallRet::from_result(proc::with_current_mut(|p| p.close(a1 as Handle))),
         SYS_EXIT => {
-            proc::kill(crate::thread::current_proc()); // close handles, mark Dead
+            proc::kill(crate::thread::current_proc(), a1 as i32); // exit code → parent
             if crate::verbose() {
                 println!("[proc] server exited ({})", a1);
             }
@@ -303,6 +304,24 @@ fn sys_notif_wait(notif_h: u64) -> SyscallRet {
             let (rax, rdx) = notif::wait(idx);
             SyscallRet { rax, rdx }
         }
+        Err(e) => SyscallRet::err(e),
+    }
+}
+
+/// `sys_notif_status(notif)` — read the last exit code delivered to this
+/// notification (§81), non-blocking. A shell calls it right after `sys_notif_wait`
+/// returns for a child it spawned, to branch on success for `&&`/`||`. rdx = code.
+fn sys_notif_status(notif_h: u64) -> SyscallRet {
+    let validated = (|| -> SysResult<u8> {
+        let entry =
+            proc::with_current(|p| p.lookup(notif_h as Handle, ObjType::Notification, R_WAIT))?;
+        let ObjectRef::Notification(idx) = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        Ok(idx)
+    })();
+    match validated {
+        Ok(idx) => SyscallRet { rax: 0, rdx: notif::status(idx) as i64 as u64 },
         Err(e) => SyscallRet::err(e),
     }
 }
@@ -1157,7 +1176,7 @@ fn pledge_class(nr: u64) -> u64 {
         SYS_ATTENUATE => PLEDGE_CAP,
         SYS_IO_IN | SYS_IO_OUT | SYS_PCI_READ | SYS_PCI_WRITE | SYS_PCI_BAR_MAP | SYS_IRQ_BIND
         | SYS_IRQ_ACK | SYS_FB_INFO | SYS_FB_MAP => PLEDGE_IO,
-        SYS_NOTIF_CREATE | SYS_NOTIF_SIGNAL | SYS_NOTIF_WAIT => PLEDGE_NOTIF,
+        SYS_NOTIF_CREATE | SYS_NOTIF_SIGNAL | SYS_NOTIF_WAIT | SYS_NOTIF_STATUS => PLEDGE_NOTIF,
         _ => 0, // unknown number: let the dispatch return E_NOSYS, don't kill
     }
 }

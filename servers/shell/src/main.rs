@@ -198,6 +198,11 @@ struct Spawner {
     exit: Handle,
     /// A spare endpoint used to wire up child↔child IPC (e.g. pong↔beta).
     ep: Handle,
+    /// Reusable per-stage exit notifications for pipelines (§81). Created once so
+    /// the shell never churns the kernel notif pool — that pool isn't freed on
+    /// close, so a create-per-pipeline would leak it dry after a few commands.
+    /// One per possible pipeline stage; pipelines wait on them and drain them.
+    pexits: [Handle; 4],
 }
 
 /// Write a byte string to the console via the tty. Chunks into <=63-byte,
@@ -300,11 +305,15 @@ fn spawn_with_budget(image: Handle, cap0: Handle, arg: &[u8], budget: u64, sp: &
     m.handles[2] = HANDLE_NULL; // slot 4 = BOOT_TICK (unused here)
     m.handles[3] = BOOT_NET_EP; // slot 20 = BOOT_NET_EP (network access)
     match rt::sys_spawn(image, BOOT_MEM, &m, sp.exit) {
-        Ok(_) => wait_exits(sp, 1),
+        Ok(_) => {
+            wait_exits(sp, 1);
+            set_status(rt::sys_notif_status(sp.exit)); // child's exit code → $?
+        }
         Err(e) => {
             tw(b"run: spawn failed (err ");
             tw_dec(e as u8);
             tw(b")\n");
+            set_status(127);
         }
     }
 }
@@ -349,6 +358,7 @@ fn ls_cmd(dir: Handle, path: &[u8], sp: &Spawner) {
         tw(b"ls: ");
         tw(path);
         tw(b": no such directory\n");
+        set_status(1);
         return;
     }
     let cap = m.handles[0];
@@ -356,6 +366,7 @@ fn ls_cmd(dir: Handle, path: &[u8], sp: &Spawner) {
         tw(b"ls: ");
         tw(path);
         tw(b": not a directory\n");
+        set_status(1);
     } else {
         spawn_with(BOOT_IMG_LS, cap, b"", sp);
     }
@@ -368,6 +379,7 @@ fn ls_cmd(dir: Handle, path: &[u8], sp: &Spawner) {
 fn cat_cmd(dir: Handle, name: &[u8], sp: &Spawner) {
     if name.is_empty() {
         tw(b"cat: usage: cat <file>\n");
+        set_status(1);
         return;
     }
     let mut m = MsgBuf::new(TAG_FS_OPEN);
@@ -376,6 +388,7 @@ fn cat_cmd(dir: Handle, name: &[u8], sp: &Spawner) {
         tw(b"cat: ");
         tw(name);
         tw(b": not found\n");
+        set_status(1);
         return;
     }
     let file_cap = m.handles[0];
@@ -470,11 +483,15 @@ fn exec_cmd(cwd: Handle, path: &Path, arg_line: &[u8], sp: &Spawner) {
     sm.handles[3] = BOOT_NET_EP; // slot 20 = BOOT_NET_EP (network access)
     let elf = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(ELF_BUF) as *const u8, len) };
     match rt::sys_spawn_bytes(elf, BOOT_MEM, &sm, sp.exit) {
-        Ok(_) => wait_exits(sp, 1),
+        Ok(_) => {
+            wait_exits(sp, 1);
+            set_status(rt::sys_notif_status(sp.exit));
+        }
         Err(_) => {
             tw(b"exec: not a valid program (spawn rejected, ");
             tw_dec_u32(len as u32);
             tw(b" bytes read)\n");
+            set_status(127);
         }
     }
 }
@@ -1093,31 +1110,93 @@ fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
     shell_run(t, sp, cwd, path);
 }
 
-/// The bash command layer (§81): `;`-sequencing and `|`-pipelines over the command
-/// set. (Quoting/`&&`/`||` are not parsed yet — `;` covers sequencing for now.)
-/// Lua lines never reach here — they're settled in `run` — so a `;`/`|` inside a
-/// Lua statement is the interpreter's, not the shell's.
+/// The exit status of the last command the shell ran ($? in bash, §81). Set by
+/// the spawn paths from the child's real exit code, and by builtins (0 = success,
+/// 127 = not found). `&&`/`||` branch on it. Read with `last_status`.
+static mut LAST_STATUS: i32 = 0;
+fn set_status(s: i32) {
+    unsafe { LAST_STATUS = s };
+}
+fn last_status() -> i32 {
+    unsafe { LAST_STATUS }
+}
+
+/// A short-circuit conditional operator between commands.
+#[derive(Clone, Copy)]
+enum CondOp {
+    And, // &&  run the next command only if the previous succeeded (status 0)
+    Or,  // ||  run the next command only if the previous failed (status != 0)
+}
+
+/// Find the FIRST top-level `&&` or `||`, returning (before, op, after). A single
+/// `|` (a pipe) is not an operator here — only the doubled form is. No quote
+/// tracking yet.
+fn split_cond(s: &[u8]) -> Option<(&[u8], CondOp, &[u8])> {
+    let mut i = 0;
+    while i + 1 < s.len() {
+        if s[i] == b'&' && s[i + 1] == b'&' {
+            return Some((&s[..i], CondOp::And, &s[i + 2..]));
+        }
+        if s[i] == b'|' && s[i + 1] == b'|' {
+            return Some((&s[..i], CondOp::Or, &s[i + 2..]));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The bash command layer (§81): `;`-sequencing, then `&&`/`||` short-circuiting,
+/// then `|`-pipelines (matching bash precedence: `;` < `&&`/`||` < `|`). Lua lines
+/// never reach here — they're settled in `run` — so a `;`/`|`/`&&` inside a Lua
+/// statement is the interpreter's, not the shell's.
 fn shell_run(t: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
     for seg in t.split(|&b| b == b';') {
         let seg = trim(seg);
-        if seg.is_empty() {
-            continue;
-        }
-        if has_substr(seg, b"&&") || has_substr(seg, b"||") {
-            tw(b"sh: '&&'/'||' not supported yet (use ';' to sequence)\n");
-            continue;
-        }
-        if seg.iter().any(|&b| b == b'|') {
-            run_pipeline(seg, sp, cwd, path);
-        } else {
-            run_command(seg, sp, cwd, path);
+        if !seg.is_empty() {
+            run_conditional(seg, sp, cwd, path);
         }
     }
 }
 
-/// True if `hay` contains the byte sequence `needle`.
-fn has_substr(hay: &[u8], needle: &[u8]) -> bool {
-    hay.windows(needle.len()).any(|w| w == needle)
+/// Evaluate one `&&`/`||` chain left to right, short-circuiting on `$?`. Each
+/// command in the chain may itself be a `|` pipeline.
+fn run_conditional(seg: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
+    let mut rest = seg;
+    let mut op: Option<CondOp> = None; // operator BEFORE the current command (None = first)
+    loop {
+        let (cmd, next_op, remainder) = match split_cond(rest) {
+            Some((c, o, r)) => (trim(c), Some(o), r),
+            None => (trim(rest), None, &b""[..]),
+        };
+        let do_run = match op {
+            None => true,
+            Some(CondOp::And) => last_status() == 0,
+            Some(CondOp::Or) => last_status() != 0,
+        };
+        if do_run {
+            if cmd.is_empty() {
+                set_status(0);
+            } else {
+                run_pipeline_or_cmd(cmd, sp, cwd, path);
+            }
+        }
+        match next_op {
+            None => break,
+            Some(o) => {
+                op = Some(o);
+                rest = remainder;
+            }
+        }
+    }
+}
+
+/// Run a single chain element: a `|` pipeline or a lone command. Both set $?.
+fn run_pipeline_or_cmd(cmd: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
+    if cmd.iter().any(|&b| b == b'|') {
+        run_pipeline(cmd, sp, cwd, path);
+    } else {
+        run_command(cmd, sp, cwd, path);
+    }
 }
 
 /// Run a `|` pipeline (§81): wire each stage's stdout into the next stage's stdin
@@ -1167,12 +1246,10 @@ fn run_pipeline(seg: &[u8], sp: &Spawner, cwd: &mut Handle, _path: &mut Path) {
         let _ = rt::sys_close(p);
     }
 
-    // A distinct exit notification per stage, so we can wait for a specific stage.
-    let mut exits = [HANDLE_NULL; MAXST];
+    // Reuse the Spawner's per-stage exit notifications (never create/close per
+    // pipeline — the kernel notif pool isn't freed on close, so that would leak).
+    let exits = &sp.pexits;
     let mut spawned = [false; MAXST];
-    for i in 0..nst {
-        exits[i] = rt::sys_notif_create().unwrap_or(HANDLE_NULL);
-    }
     // Right-to-left: consumers exist before their producers.
     for i in (0..nst).rev() {
         let stdin_h = if i > 0 { rend[i - 1] } else { HANDLE_NULL };
@@ -1198,15 +1275,16 @@ fn run_pipeline(seg: &[u8], sp: &Spawner, cwd: &mut Handle, _path: &mut Path) {
             let _ = rt::sys_pipe_eof(wend[i]);
         }
     }
-    // Release the shell's write-end + notification handles.
+    // A pipeline's status is its LAST stage's exit code (bash semantics).
+    set_status(if spawned[nst - 1] {
+        rt::sys_notif_status(exits[nst - 1])
+    } else {
+        127
+    });
+    // Release the shell's write-end handles (the reusable exit notifs stay open).
     for i in 0..nst - 1 {
         if wend[i] != HANDLE_NULL {
             let _ = rt::sys_close(wend[i]);
-        }
-    }
-    for i in 0..nst {
-        if exits[i] != HANDLE_NULL {
-            let _ = rt::sys_close(exits[i]);
         }
     }
 }
@@ -1253,13 +1331,13 @@ fn spawn_stage(cmd: &[u8], cwd: Handle, _sp: &Spawner, stdin_h: Handle, stdout_h
             }
         }
         b"cat" => {
-            if rest.is_empty() {
-                // Consumer: read stdin. `cat -` selects stdin mode.
+            // A stage with a stdin pipe (or no file arg) is the consumer — read
+            // stdin (`cat -`). Otherwise it's a producer reading the named file.
+            if stdin_h != HANDLE_NULL || rest.is_empty() || rest == b"-" {
                 argbuf[0] = b'-';
                 arglen = 1;
                 (BOOT_IMG_CAT, HANDLE_NULL, HANDLE_NULL)
             } else {
-                // Producer: cat <file>.
                 let mut m = MsgBuf::new(TAG_FS_OPEN);
                 pack_name(&mut m, rest);
                 if rt::sys_call(cwd, &mut m).is_err() || m.data[0] != 0 {
@@ -1301,6 +1379,28 @@ fn spawn_stage(cmd: &[u8], cwd: Handle, _sp: &Spawner, stdin_h: Handle, stdout_h
 }
 
 fn run_command(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
+    set_status(0); // default success; the spawn paths + the not-found arm override
+    // Input redirect: `CMD < FILE` feeds FILE into CMD's stdin — desugar to the
+    // pipeline `cat FILE | CMD`, reusing the pipe machinery. (Only stdin-reading
+    // consumers like `cat -` actually consume it; others ignore the input.)
+    if let Some(lt) = line.iter().position(|&b| b == b'<') {
+        let cmdpart = trim(&line[..lt]);
+        let (file, _) = split_cmd(trim(&line[lt + 1..]));
+        if file.is_empty() {
+            tw(b"sh: redirect needs a file name\n");
+            set_status(1);
+            return;
+        }
+        let mut buf = [0u8; 256];
+        let mut n = 0;
+        for part in [b"cat ".as_slice(), file, b" | ", cmdpart] {
+            let take = core::cmp::min(part.len(), buf.len() - n);
+            buf[n..n + take].copy_from_slice(&part[..take]);
+            n += take;
+        }
+        run_pipeline(&buf[..n], sp, cwd, path);
+        return;
+    }
     // Output redirect: `echo TEXT > FILE` (truncate) or `>> FILE` (append).
     if let Some(gt) = line.iter().position(|&b| b == b'>') {
         let append = gt + 1 < line.len() && line[gt + 1] == b'>';
@@ -1372,6 +1472,8 @@ fn run_command(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  echo <text>     print text (echo .. > f redirects to a file)\n");
             tw(b"  a | b           pipe a's output into b (e.g. ls | cat, cat f | cat)\n");
             tw(b"  a ; b           run a then b (command sequencing)\n");
+            tw(b"  a && b / a || b run b on success / on failure of a (exit status)\n");
+            tw(b"  cmd < file      feed file into cmd's stdin (e.g. cat - < readme.txt)\n");
             tw(b"  lua: if/for/=   Lua control flow & expressions (= expr, ! forces a cmd)\n");
             tw(b"  ls              list the current directory\n");
             tw(b"  cat <file>      print a file\n");
@@ -1406,6 +1508,7 @@ fn run_command(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"oxbow: ");
             tw(cmd);
             tw(b": command not found\n");
+            set_status(127);
         }
     }
 }
@@ -1696,6 +1799,12 @@ pub extern "C" fn oxbow_main() -> ! {
         stdout: rt::sys_attenuate(BOOT_TTY, R_SEND | R_GRANT).unwrap_or(HANDLE_NULL),
         exit: rt::sys_notif_create().unwrap_or(HANDLE_NULL),
         ep: rt::sys_ep_create().unwrap_or(HANDLE_NULL),
+        pexits: [
+            rt::sys_notif_create().unwrap_or(HANDLE_NULL),
+            rt::sys_notif_create().unwrap_or(HANDLE_NULL),
+            rt::sys_notif_create().unwrap_or(HANDLE_NULL),
+            rt::sys_notif_create().unwrap_or(HANDLE_NULL),
+        ],
     };
     // The current-directory capability + its path string (starts at the root).
     let mut cwd: Handle = BOOT_FS_ROOT;

@@ -452,7 +452,7 @@ pub fn yield_now() {
 /// handles, mark it Dead), then switch away. Same move as `exit_current`; the
 /// kernel and every other thread continue.
 pub fn kill_current_user() -> ! {
-    crate::proc::kill(current_proc());
+    crate::proc::kill(current_proc(), 139); // 128 + SIGSEGV: faulted in ring 3
     exit_current();
 }
 

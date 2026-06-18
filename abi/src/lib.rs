@@ -186,6 +186,7 @@ pub const SYS_CAP_TYPE: u64 = 44; // (h) -> rdx cap kind (CAP_* below). For fd-p
 pub const SYS_CAP_DUP: u64 = 45; // (h) -> a fresh handle to the SAME object (same rights)
 pub const SYS_CHAN_WAIT: u64 = 46; // (handles_ptr, count) -> block until any channel is readable
 pub const SYS_MEMINFO: u64 = 47; // () -> rdx = (used_kib << 32) | total_kib. Ambient/unprivileged.
+pub const SYS_NOTIF_STATUS: u64 = 48; // (notif) -> rdx = last exit code (§81). needs R_WAIT
 /// Capability kinds reported by SYS_CAP_TYPE (so recvmsg can reconstruct the
 /// right fd flavor from a passed handle). 0 = anything else.
 pub const CAP_OTHER: u64 = 0;

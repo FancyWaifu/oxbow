@@ -36,7 +36,8 @@ QCODE.update({
     "+": ("shift", "equal"), "*": ("shift", "8"),
     '"': ("shift", "apostrophe"), "_": ("shift", "minus"),
     "!": ("shift", "1"), "|": ("shift", "backslash"),
-    ">": ("shift", "dot"),
+    ">": ("shift", "dot"), "&": ("shift", "7"),
+    "<": ("shift", "comma"), "-": "minus",
 })
 
 
@@ -143,6 +144,33 @@ def main():
             ok = wait_for(needle, 6)
             checks.append((text.strip(), ok))
             time.sleep(0.3)
+
+        # --- && / || short-circuit on exit status (§81) ---
+        q.type("echo andA && echo andB\n")
+        checks.append(("&& both run", wait_for("andB", 5) and "andA" in serial()))
+        time.sleep(0.3)
+        q.type("nocmd_xyz || echo orRECOV\n")
+        checks.append(("|| runs after failure", wait_for("orRECOV", 5)))
+        time.sleep(0.3)
+        mark = len(serial())
+        q.type("nocmd_xyz && echo andSKIP ; echo afterAND\n")
+        ran = wait_for("afterAND", 5)
+        # "andSKIP" appears once as the typed-command echo; if the skipped `echo`
+        # had actually run it would appear a SECOND time as output. So count == 1.
+        checks.append(("&& skips after failure", ran and serial()[mark:].count("andSKIP") == 1))
+        time.sleep(0.3)
+        # --- < stdin redirect (desugars to `cat pm.txt | cat -`) ---
+        # "pipemark" is already in the buffer from earlier, so assert a NEW
+        # occurrence appears (the typed command "cat - < pm.txt" contains none).
+        before = serial().count("pipemark")
+        q.type("cat - < pm.txt\n")
+        lt_ok = False
+        for _ in range(25):
+            if serial().count("pipemark") > before:
+                lt_ok = True
+                break
+            time.sleep(0.2)
+        checks.append(("< stdin redirect", lt_ok))
 
         print("--- serial tail ---"); print(serial()[-1600:])
         print("--- verdict ---")

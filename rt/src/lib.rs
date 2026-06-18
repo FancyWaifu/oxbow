@@ -20,7 +20,7 @@ use oxbow_abi::{
     Handle, MsgBuf, SysError, SysResult, BOOT_CONSOLE, BOOT_MEM, PROT_READ, PROT_WRITE,
     SPAWN_STDIN, SPAWN_STDOUT, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC,
     SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND, SYS_MAP, SYS_NOTIF_CREATE,
-    SYS_NOTIF_SIGNAL, SYS_NOTIF_WAIT, SYS_RECV, SYS_REPLY, SYS_SEND, SYS_EP_CREATE, SYS_MINT,
+    SYS_NOTIF_SIGNAL, SYS_NOTIF_STATUS, SYS_NOTIF_WAIT, SYS_RECV, SYS_REPLY, SYS_SEND, SYS_EP_CREATE, SYS_MINT,
     SYS_SPAWN, SYS_SPAWN_BYTES, TAG_TTY_WRITE,
 };
 
@@ -728,6 +728,18 @@ pub fn sys_notif_signal(notif: Handle) -> SysResult {
 pub fn sys_notif_wait(notif: Handle) -> SysResult<u64> {
     let (rax, rdx) = unsafe { syscall1(SYS_NOTIF_WAIT, notif as u64) };
     SysError::from_raw(rax).map(|_| rdx)
+}
+
+/// Read the last exit code delivered to `notif` (§81), non-blocking. Call right
+/// after `sys_notif_wait` returns for a child you spawned, to branch on its exit
+/// status (the shell's `&&`/`||`). Returns 0 if nothing recorded.
+pub fn sys_notif_status(notif: Handle) -> i32 {
+    let (rax, rdx) = unsafe { syscall1(SYS_NOTIF_STATUS, notif as u64) };
+    if SysError::from_raw(rax).is_ok() {
+        rdx as i32
+    } else {
+        0
+    }
 }
 
 pub fn sys_io_in(ioport: Handle, port: u16) -> SysResult<u8> {
