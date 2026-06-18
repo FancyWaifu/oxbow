@@ -702,7 +702,9 @@ name = "shell"
 version = "0.0.0"
 dependencies = [
  "blake2",
+ "cc",
  "oxbow-abi",
+ "oxbow-libc",
  "oxbow-rt",
 ]
 

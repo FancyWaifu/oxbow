@@ -15,3 +15,14 @@ oxbow-rt = { path = "../../rt" }
 oxbow-abi = { path = "../../abi" }
 # Password hashing for the login gate (§44) — integer-only, no_std, no SSE.
 blake2 = { version = "0.10", default-features = false }
+# The C runtime (malloc/string/setjmp/snprintf/math) that the embedded Lua 5.4
+# interpreter links against — `default-features = false` drops libc's own
+# `_start`/`oxbow_main` entry so the shell keeps ITS entry; malloc still works
+# (rt's allocator maps lazily from BOOT_MEM). This is what lets the shell host a
+# real scripting language in-process (bash-style commands + Lua control flow).
+oxbow-libc = { path = "../../libc", default-features = false }
+
+[build-dependencies]
+# Compiles the Lua 5.4 C core + safe libraries (shared with servers/lua) into the
+# shell binary, plus the C glue that bridges Lua to the shell's tty output.
+cc = "1"

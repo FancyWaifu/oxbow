@@ -6,6 +6,11 @@
 #![no_std]
 #![no_main]
 
+// Force-link oxbow-libc: the embedded Lua C archive references its symbols
+// (malloc/setjmp/frexp/strncmp/…), but the shell's Rust never names a libc item,
+// so without this the rlib is dropped and those symbols go undefined at link.
+extern crate oxbow_libc as _;
+
 use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA, BOOT_NET_EP,
     BOOT_IMG_CAT, BOOT_IMG_CP, BOOT_IMG_HELLO, BOOT_IMG_LS, BOOT_IMG_MKDIR, BOOT_IMG_MV, BOOT_IMG_PONG,
@@ -18,6 +23,112 @@ use blake2::{Blake2b, Digest};
 use blake2::digest::consts::U32;
 /// Blake2b with a 32-byte digest — our password KDF primitive.
 type Blake2b256 = Blake2b<U32>;
+
+use core::ffi::c_void;
+
+// ===========================================================================
+// Embedded Lua 5.4 (csrc/luaglue.c). The shell is a hybrid: bash-style commands
+// and pipelines run as today, while Lua syntax (control flow, expressions,
+// assignments) runs in an in-process interpreter. The C glue owns the Lua state;
+// Rust drives it one line at a time and lends it the tty via `ox_tty_write`.
+// ===========================================================================
+extern "C" {
+    /// Create the persistent Lua state (opens the oxbow-safe libraries). NULL on OOM.
+    fn ox_lua_new() -> *mut c_void;
+    /// Evaluate one NUL-terminated line REPL-style (expression prints its value;
+    /// statements just run). Errors are reported to the tty inside the glue.
+    fn ox_lua_eval(state: *mut c_void, code: *const u8) -> i32;
+}
+
+/// The shell's persistent Lua interpreter, created on first use. Globals set on
+/// one line are visible on the next; chunk-local `local`s are not (Lua semantics).
+static mut LUA_STATE: *mut c_void = core::ptr::null_mut();
+
+/// Called from C (luaglue.c) to emit Lua's output to the console the shell owns.
+/// Routes through `tw` (TAG_TTY_WRITE) — the shell has no libc stdout FILE.
+#[no_mangle]
+pub extern "C" fn ox_tty_write(p: *const u8, n: usize) {
+    if p.is_null() || n == 0 {
+        return;
+    }
+    tw(unsafe { core::slice::from_raw_parts(p, n) });
+}
+
+/// Evaluate one line of Lua, creating the interpreter on first use. The C API
+/// needs a NUL terminator, so copy into a stack buffer (lines are <=256 bytes).
+fn lua_eval(line: &[u8]) {
+    unsafe {
+        if LUA_STATE.is_null() {
+            LUA_STATE = ox_lua_new();
+            if LUA_STATE.is_null() {
+                tw(b"lua: cannot create interpreter (out of memory)\n");
+                return;
+            }
+        }
+        let mut buf = [0u8; 512];
+        let n = core::cmp::min(line.len(), buf.len() - 1);
+        buf[..n].copy_from_slice(&line[..n]);
+        buf[n] = 0;
+        ox_lua_eval(LUA_STATE, buf.as_ptr());
+    }
+}
+
+/// Decide whether a line is Lua (control flow, `print`, or an assignment) rather
+/// than a bash-style command. Conservative: commands are `verb args`, Lua
+/// assignments are `lvalue = rvalue` — the `=` right after an identifier is the
+/// discriminator, and a leading keyword settles the rest.
+fn looks_like_lua(line: &[u8]) -> bool {
+    let t = trim(line);
+    if t.is_empty() {
+        return false;
+    }
+    let (w, _) = split_cmd(t);
+    if matches!(
+        w,
+        b"local"
+            | b"if"
+            | b"for"
+            | b"while"
+            | b"function"
+            | b"repeat"
+            | b"return"
+            | b"do"
+            | b"end"
+            | b"else"
+            | b"elseif"
+            | b"until"
+            | b"goto"
+            | b"break"
+    ) {
+        return true;
+    }
+    if t.starts_with(b"print(") || t.starts_with(b"print\"") || t.starts_with(b"print ") {
+        return true;
+    }
+    is_assignment(t)
+}
+
+/// True for `name = ...` / `t.k = ...` / `a[i] = ...` (a Lua assignment), but not
+/// for comparisons (`==`, `~=`, `<=`, `>=`) or commands (`verb arg`).
+fn is_assignment(t: &[u8]) -> bool {
+    if t.is_empty() || !(t[0].is_ascii_alphabetic() || t[0] == b'_') {
+        return false;
+    }
+    let mut i = 0;
+    while i < t.len() {
+        let c = t[i];
+        if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'[' | b']' | b'"' | b'\'') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    while i < t.len() && t[i] == b' ' {
+        i += 1;
+    }
+    // Must be a single '=' (assignment), not '==' (comparison).
+    i < t.len() && t[i] == b'=' && (i + 1 >= t.len() || t[i + 1] != b'=')
+}
 
 /// The current-directory path string, tracked alongside the cwd capability so
 /// the prompt can show it (a Unix shell shows where you are).
@@ -959,7 +1070,30 @@ fn cd(name: &[u8], cwd: &mut Handle, path: &mut Path) {
     *path = target;
 }
 
+/// Top-level line dispatch (§80): decide between the embedded Lua interpreter and
+/// the bash-style command layer. Lua owns control flow / expressions / assignments;
+/// the command layer owns program launch, builtins, redirects, and (next) pipes.
+///   `= <expr>`   force Lua: evaluate and print an expression
+///   `! <cmd>`    force the command layer (escape a name that looks like Lua)
+///   otherwise    Lua if it looks like Lua, else a command
 fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
+    let t = trim(line);
+    if let Some(rest) = t.strip_prefix(b"=") {
+        lua_eval(trim(rest));
+        return;
+    }
+    if let Some(rest) = t.strip_prefix(b"!") {
+        run_command(trim(rest), sp, cwd, path);
+        return;
+    }
+    if looks_like_lua(t) {
+        lua_eval(t);
+        return;
+    }
+    run_command(t, sp, cwd, path);
+}
+
+fn run_command(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
     // Output redirect: `echo TEXT > FILE` (truncate) or `>> FILE` (append).
     if let Some(gt) = line.iter().position(|&b| b == b'>') {
         let append = gt + 1 < line.len() && line[gt + 1] == b'>';

@@ -24,7 +24,8 @@ build-server:
     RUSTFLAGS="-C relocation-model=static" cargo build -p beta
     RUSTFLAGS="-C relocation-model=static" cargo build -p kbd
     RUSTFLAGS="-C relocation-model=static" cargo build -p tty
-    RUSTFLAGS="-C relocation-model=static" cargo build -p shell
+    # SSE on: the shell embeds Lua 5.4, whose C does double arithmetic (// % ^ /).
+    RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p shell
     RUSTFLAGS="-C relocation-model=static" cargo build -p serial
     RUSTFLAGS="-C relocation-model=static" cargo build -p hello
     RUSTFLAGS="-C relocation-model=static" cargo build -p badge
