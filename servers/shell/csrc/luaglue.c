@@ -19,6 +19,34 @@
 /* Implemented in Rust (src/main.rs): write `n` bytes to the shell's console. */
 extern void ox_tty_write(const unsigned char *p, size_t n);
 
+/* Implemented in Rust (src/main.rs): the Lua<->shell bridge (§83).
+ * ox_shell_run runs a command line (output to the tty) and returns its exit
+ * status; ox_shell_capture runs it and writes its stdout into `out` (cap bytes),
+ * returning the length. Both use the shell's current Spawner + cwd. */
+extern int ox_shell_run(const char *s, size_t n);
+extern int ox_shell_capture(const char *s, size_t n, char *out, int cap);
+
+/* Lua: sh("cmd") -> run a command line, return its exit status (0 = success). */
+static int ox_sh(lua_State *L) {
+    size_t n;
+    const char *s = luaL_checklstring(L, 1, &n);
+    lua_pushinteger(L, ox_shell_run(s, n));
+    return 1;
+}
+
+/* Lua: sh_out("cmd") -> run a command, return its stdout as a string (trailing
+ * newline trimmed). Output is bounded by the capture buffer below. */
+static int ox_sh_out(lua_State *L) {
+    size_t n;
+    const char *s = luaL_checklstring(L, 1, &n);
+    char buf[2048];
+    int len = ox_shell_capture(s, n, buf, (int)sizeof(buf));
+    if (len < 0) len = 0;
+    while (len > 0 && buf[len - 1] == '\n') len--; /* trim trailing newline */
+    lua_pushlstring(L, buf, (size_t)len);
+    return 1;
+}
+
 void ox_lua_write(const char *s, size_t n) {
     if (s && n) ox_tty_write((const unsigned char *)s, n);
 }
@@ -85,6 +113,9 @@ lua_State *ox_lua_new(void) {
     if (L == NULL) return NULL;
     lua_atpanic(L, ox_panic);
     ox_openlibs(L);
+    // §83: the Lua<->shell bridge — run/capture shell commands from Lua.
+    lua_register(L, "sh", ox_sh);
+    lua_register(L, "sh_out", ox_sh_out);
     return L;
 }
 

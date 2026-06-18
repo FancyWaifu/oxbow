@@ -219,6 +219,20 @@ def main():
         time.sleep(0.3)
         q.type("echo [$(cat pm.txt)]\n")  # real capture: cat's stdout via a pipe
         checks.append(("$() captures cmd stdout", wait_for("[pipemark]", 6)))
+        time.sleep(0.3)
+        # --- M4: Lua <-> shell interop (sh / sh_out) (§83) ---
+        # sh() in a Lua loop: control flow drives shell commands. "lc2" is built
+        # by concatenation, so it's absent from the command echo.
+        q.type('for i=1,2 do sh("echo lc"..i) end\n')
+        checks.append(("sh() from a Lua loop", wait_for("lc2", 6)))
+        time.sleep(0.3)
+        # sh_out() captures a command's stdout into a Lua string.
+        q.type('v = sh_out("echo capval") ; print("<"..v..">")\n')
+        checks.append(("sh_out() captures into Lua", wait_for("<capval>", 6)))
+        time.sleep(0.3)
+        # exit status is sh()'s return value.
+        q.type('if sh("echo ok")==0 then print("STATZERO") end\n')
+        checks.append(("sh() returns exit status", wait_for("STATZERO", 6)))
 
         print("--- serial tail ---"); print(serial()[-1600:])
         print("--- verdict ---")

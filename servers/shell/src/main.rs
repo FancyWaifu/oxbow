@@ -76,6 +76,57 @@ fn lua_global(name: &[u8], out: &mut [u8]) -> Option<usize> {
     }
 }
 
+/// The live shell context (Spawner + cwd + path), published before each Lua eval
+/// so the Lua→shell bridge (`sh`/`sh_out`) can run commands. Valid only during a
+/// synchronous `lua_eval` call; the shell is single-threaded so raw pointers into
+/// `oxbow_main`'s locals are safe for that window.
+struct ShellCtx {
+    sp: *const Spawner,
+    cwd: *mut Handle,
+    path: *mut Path,
+}
+static mut SHELL_CTX: ShellCtx = ShellCtx {
+    sp: core::ptr::null(),
+    cwd: core::ptr::null_mut(),
+    path: core::ptr::null_mut(),
+};
+
+/// Lua `sh("cmd")` (§83): run a command line through the full command layer
+/// (pipes/operators/expansion, output to the tty) and return its exit status.
+#[no_mangle]
+pub extern "C" fn ox_shell_run(s: *const u8, n: usize) -> i32 {
+    if s.is_null() {
+        return 127;
+    }
+    let cmd = unsafe { core::slice::from_raw_parts(s, n) };
+    unsafe {
+        let ctx = &*core::ptr::addr_of!(SHELL_CTX);
+        if ctx.sp.is_null() {
+            return 127;
+        }
+        shell_run(cmd, &*ctx.sp, &mut *ctx.cwd, &mut *ctx.path);
+    }
+    last_status()
+}
+
+/// Lua `sh_out("cmd")` (§83): run a command and return its captured stdout length,
+/// writing the bytes into `out` (capacity `cap`). -1 on no context.
+#[no_mangle]
+pub extern "C" fn ox_shell_capture(s: *const u8, n: usize, out: *mut u8, cap: i32) -> i32 {
+    if s.is_null() || out.is_null() || cap <= 0 {
+        return -1;
+    }
+    let cmd = unsafe { core::slice::from_raw_parts(s, n) };
+    unsafe {
+        let ctx = &*core::ptr::addr_of!(SHELL_CTX);
+        if ctx.sp.is_null() {
+            return -1;
+        }
+        let outbuf = core::slice::from_raw_parts_mut(out, cap as usize);
+        capture(cmd, *ctx.cwd, &*ctx.sp, outbuf) as i32
+    }
+}
+
 /// Called from C (luaglue.c) to emit Lua's output to the console the shell owns.
 /// Routes through `tw` (TAG_TTY_WRITE) — the shell has no libc stdout FILE.
 #[no_mangle]
@@ -384,10 +435,36 @@ fn looks_like_lua(line: &[u8]) -> bool {
     ) {
         return true;
     }
-    if t.starts_with(b"print(") || t.starts_with(b"print\"") || t.starts_with(b"print ") {
+    if is_lua_call(t) {
         return true;
     }
     is_assignment(t)
+}
+
+/// True for a Lua function-call line: `name(...)` (any function — commands never
+/// use `(`), or a known Lua function called with a bare string literal —
+/// `sh "ls"`, `print "hi"`. The known-function gate keeps `echo "hi"` a command.
+fn is_lua_call(t: &[u8]) -> bool {
+    if t.is_empty() || !(t[0].is_ascii_alphabetic() || t[0] == b'_') {
+        return false;
+    }
+    let mut i = 0;
+    while i < t.len() && (t[i].is_ascii_alphanumeric() || t[i] == b'_') {
+        i += 1;
+    }
+    let ident = &t[..i];
+    if i < t.len() && t[i] == b'(' {
+        return true; // name( … ) — a call
+    }
+    // known Lua fn + whitespace + a string literal (Lua's `f "str"` sugar)
+    let mut j = i;
+    while j < t.len() && t[j] == b' ' {
+        j += 1;
+    }
+    if j > i && j < t.len() && (t[j] == b'"' || t[j] == b'\'') {
+        return matches!(ident, b"sh" | b"sh_out" | b"print");
+    }
+    false
 }
 
 /// True for `name = ...` / `t.k = ...` / `a[i] = ...` (a Lua assignment), but not
@@ -1376,6 +1453,10 @@ fn cd(name: &[u8], cwd: &mut Handle, path: &mut Path) {
 ///   `! <cmd>`    force the command layer (escape a name that looks like Lua)
 ///   otherwise    Lua if it looks like Lua, else a command
 fn run(line: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
+    // Publish the live context so Lua's sh()/sh_out() can drive the command layer.
+    unsafe {
+        SHELL_CTX = ShellCtx { sp: sp as *const Spawner, cwd: cwd as *mut Handle, path: path as *mut Path };
+    }
     let t = trim(line);
     if let Some(rest) = t.strip_prefix(b"=") {
         lua_eval(trim(rest));
@@ -1768,6 +1849,7 @@ fn run_command(line0: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  $VAR  ${VAR}    expand a variable (a shell var IS a Lua global)\n");
             tw(b"  $(cmd)          substitute a command's output; * globs; '..' \"..\" quote\n");
             tw(b"  lua: if/for/=   Lua control flow & expressions (= expr, ! forces a cmd)\n");
+            tw(b"  sh\"cmd\"         from Lua: run a command (returns status); sh_out\"cmd\" captures\n");
             tw(b"  ls              list the current directory\n");
             tw(b"  cat <file>      print a file\n");
             tw(b"  mkdir <name>    make a directory\n");
