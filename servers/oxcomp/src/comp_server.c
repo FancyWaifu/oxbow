@@ -361,12 +361,7 @@ static const char kc_ascii[128] = {
 #define GR_ACCENT 0x003a6ea5u
 #define GR_ERR    0x00d06058u
 
-/* The seeded accounts the greeter offers as clickable hints (purely cosmetic —
- * the shell holds the real credential table; typing any name also works). */
-static const char *gr_users[] = { "root", "bryson" };
-#define GR_NUSERS 2
-
-/* Card geometry, shared by draw + the username-hint hit-test. */
+/* Card geometry (centred login box). */
 static void greeter_card(int *cx, int *cy, int *cw, int *ch)
 {
   *cw = 460;
@@ -409,18 +404,8 @@ static void draw_greeter(void)
   greeter_card(&cx, &cy, &cw, &ch);
   fill_rect(cx, cy, cx + cw, cy + ch, GR_CARD);
   fill_rect(cx, cy, cx + cw, cy + 4, GR_ACCENT); /* accent stripe */
-  draw_text(cx + (cw - text_width("oxbow")) / 2, cy + 34, "oxbow", GR_FG);
-  /* clickable user hints, centred (selected one brightened) */
-  int total = -24;
-  for (int i = 0; i < GR_NUSERS; i++)
-    total += text_width(gr_users[i]) + 24;
-  int ux = cx + (cw - total) / 2;
-  for (int i = 0; i < GR_NUSERS; i++) {
-    int sel = (g_userlen == (int)__builtin_strlen(gr_users[i])) &&
-              __builtin_memcmp(g_user, gr_users[i], g_userlen) == 0;
-    draw_text(ux, cy + 74, gr_users[i], sel ? GR_FG : GR_DIM);
-    ux += text_width(gr_users[i]) + 24;
-  }
+  draw_text(cx + (cw - text_width("oxbow")) / 2, cy + 40, "oxbow", GR_FG);
+  draw_text(cx + (cw - text_width("sign in")) / 2, cy + 70, "sign in", GR_DIM);
   int fx = cx + 96, fw = cw - 96 - 40;
   draw_field(cx + 40, cy + 120, fx, fw, "user", g_user, g_userlen, g_field == 0, 0);
   draw_field(cx + 40, cy + 160, fx, fw, "pass", g_pass, g_passlen, g_field == 1, 1);
@@ -1205,31 +1190,8 @@ static void launch_and_attach(int id)
 
 static void pointer_button(int left)
 {
-  if (g_greeter) {
-    /* §92: while the login screen is up the greeter owns the pointer. Clicking a
-     * username hint fills it in and jumps to the password; all else is swallowed. */
-    if (left) {
-      int cx, cy, cw, ch;
-      greeter_card(&cx, &cy, &cw, &ch);
-      int total = -24;
-      for (int i = 0; i < GR_NUSERS; i++)
-        total += text_width(gr_users[i]) + 24;
-      int ux = cx + (cw - total) / 2;
-      for (int i = 0; i < GR_NUSERS; i++) {
-        int wpx = text_width(gr_users[i]);
-        if (g_cx >= ux && g_cx < ux + wpx && g_cy >= cy + 74 && g_cy < cy + 84) {
-          int l = (int)__builtin_strlen(gr_users[i]);
-          __builtin_memcpy(g_user, gr_users[i], l);
-          g_userlen = l;
-          g_field = 1; /* jump to the password field */
-          composite_rect(0, 0, g_w, g_h);
-          return;
-        }
-        ux += wpx + 24;
-      }
-    }
-    return;
-  }
+  if (g_greeter)
+    return; /* §92: the login screen is keyboard-driven — swallow all pointer input */
   if (left) {
     /* §91: the GNOME-style shell intercepts clicks on the top bar + overview
      * BEFORE windows. */
