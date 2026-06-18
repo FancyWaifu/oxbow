@@ -10,7 +10,7 @@ use oxbow_abi::{
     PROT_READ, PROT_WRITE, R_ATTENUATE, R_GRANT, R_MAP, R_RECV, R_SEND, R_SIGNAL, R_WAIT, R_WRITE,
     SPAWN_DEFAULT_BUDGET, SPAWN_SLOTS, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE,
     SYS_EXIT, SYS_FRAME_ALLOC, SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND,
-    SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_SIGNAL, SYS_NOTIF_STATUS, SYS_NOTIF_WAIT,
+    SYS_EP_CREATE, SYS_MAP, SYS_MINT, SYS_NOTIF_CREATE, SYS_NOTIF_POLL, SYS_NOTIF_SIGNAL, SYS_NOTIF_STATUS, SYS_NOTIF_WAIT,
     SYS_CAP_TYPE, SYS_CAP_DUP, SYS_CHAN_WAIT, SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_POLL, SYS_CHANNEL_RECV,
     SYS_CHANNEL_SEND, SYS_DMA_ALLOC, SYS_DMA_ALLOC_CONTIG, SYS_SHM_CREATE, SYS_SHM_MAP, SYS_SHM_PHYS, CAP_CHANNEL, CAP_OTHER, CAP_SHM,
     SYS_FB_INFO, SYS_FB_MAP, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE,
@@ -100,6 +100,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_NOTIF_SIGNAL => sys_notif_signal(a1),
         SYS_NOTIF_WAIT => sys_notif_wait(a1),
         SYS_NOTIF_STATUS => sys_notif_status(a1),
+        SYS_NOTIF_POLL => sys_notif_poll(a1),
         SYS_IO_IN => sys_io_in(a1, a2),
         SYS_IO_OUT => sys_io_out(a1, a2, a3),
         SYS_IRQ_BIND => sys_irq_bind(a1, a2),
@@ -306,6 +307,24 @@ fn sys_notif_wait(notif_h: u64) -> SyscallRet {
             let (rax, rdx) = notif::wait(idx);
             SyscallRet { rax, rdx }
         }
+        Err(e) => SyscallRet::err(e),
+    }
+}
+
+/// `sys_notif_poll(notif) -> count` — NON-BLOCKING drain of the latched signal
+/// count (0 if none). A driver polls this from a loop it can't park (the gpu's
+/// present loop checking for a config-change IRQ). rdx = count.
+fn sys_notif_poll(notif_h: u64) -> SyscallRet {
+    let validated = (|| -> SysResult<u8> {
+        let entry =
+            proc::with_current(|p| p.lookup(notif_h as Handle, ObjType::Notification, R_WAIT))?;
+        let ObjectRef::Notification(idx) = entry.obj else {
+            return Err(SysError::BadType);
+        };
+        Ok(idx)
+    })();
+    match validated {
+        Ok(idx) => SyscallRet { rax: 0, rdx: notif::poll(idx) },
         Err(e) => SyscallRet::err(e),
     }
 }
@@ -1232,7 +1251,9 @@ fn pledge_class(nr: u64) -> u64 {
         SYS_ATTENUATE => PLEDGE_CAP,
         SYS_IO_IN | SYS_IO_OUT | SYS_PCI_READ | SYS_PCI_WRITE | SYS_PCI_BAR_MAP | SYS_IRQ_BIND
         | SYS_IRQ_ACK | SYS_FB_INFO | SYS_FB_MAP => PLEDGE_IO,
-        SYS_NOTIF_CREATE | SYS_NOTIF_SIGNAL | SYS_NOTIF_WAIT | SYS_NOTIF_STATUS => PLEDGE_NOTIF,
+        SYS_NOTIF_CREATE | SYS_NOTIF_SIGNAL | SYS_NOTIF_WAIT | SYS_NOTIF_STATUS | SYS_NOTIF_POLL => {
+            PLEDGE_NOTIF
+        }
         _ => 0, // unknown number: let the dispatch return E_NOSYS, don't kill
     }
 }

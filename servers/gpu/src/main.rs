@@ -15,8 +15,8 @@
 mod virtio;
 
 use oxbow_abi::{
-    BOOT_CONSOLE, BOOT_GPU_CURSOR, BOOT_GPU_FB, BOOT_MEM, BOOT_PCI, GPU_DMA, GPU_FB_H, GPU_FB_W,
-    GPU_MMIO,
+    BOOT_CONSOLE, BOOT_GPU_CURSOR, BOOT_GPU_FB, BOOT_GPU_IRQ, BOOT_MEM, BOOT_PCI, GPU_DMA, GPU_FB_H,
+    GPU_FB_W, GPU_MMIO,
 };
 use oxbow_rt as rt;
 use virtio::{r32, w32, w64, Transport, Vq};
@@ -40,6 +40,11 @@ const VIRTIO_GPU_RESP_OK_NODATA: u32 = 0x1100;
 /// B8G8R8X8: memory byte order B,G,R,X — a u32 pixel is 0x00RRGGBB little-endian,
 /// matching the Limine framebuffer convention.
 const VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM: u32 = 2;
+/// virtio-gpu async event: the host display configuration changed (resize/hotplug).
+const VIRTIO_GPU_EVENT_DISPLAY: u32 = 1 << 0;
+/// virtio_pci_isr_status bit: the device configuration changed (not a queue event).
+const VIRTIO_PCI_ISR_CONFIG: u8 = 1 << 1;
+
 /// The scanout backing store (a contiguous DMA region) lives here, past the
 /// rings/cmd/resp pages at GPU_DMA+0..0x2000. A second backing (for a runtime
 /// modeset to a new resolution) lives at FB_OFF2, past the first (max ~8 MiB).
@@ -247,6 +252,35 @@ impl Gpu {
             w32(c + 44, id);
             self.submit(48, HDR_LEN as u32) == VIRTIO_GPU_RESP_OK_NODATA
         }
+    }
+
+    /// Handle a device config-change interrupt (§90): read the ISR (clears it),
+    /// and if a DISPLAY event is pending, clear it, re-query the display geometry,
+    /// and re-bind the scanout (the shared fb stays its fixed size; the device
+    /// scales). Returns true if a display change was handled.
+    fn handle_config_change(&mut self) -> bool {
+        unsafe {
+            let isr = virtio::r8(self.t.isr); // read-to-clear
+            if isr & VIRTIO_PCI_ISR_CONFIG == 0 {
+                return false;
+            }
+            let events = r32(self.t.device); // virtio_gpu_config.events_read
+            if events & VIRTIO_GPU_EVENT_DISPLAY == 0 {
+                return false;
+            }
+            w32(self.t.device + 4, events); // events_clear — ack the event
+        }
+        let mut modes = [Scanout::default(); VIRTIO_GPU_MAX_SCANOUTS];
+        self.display_info(&mut modes);
+        w(b"[gpu] config-change: scanout0 ");
+        wnum(modes[0].width);
+        w(b"x");
+        wnum(modes[0].height);
+        w(b"\n");
+        // Re-bind the scanout (host may have invalidated it). The compositor still
+        // renders GPU_FB_W x GPU_FB_H; the device scales to the new display.
+        self.set_scanout(0, 1, GPU_FB_W, GPU_FB_H);
+        true
     }
 
     /// Copy guest backing -> host resource for the full `w`x`h` rect.
@@ -487,11 +521,34 @@ fn present_shared_fb(gpu: &mut Gpu, fb_phys: u64) -> ! {
         None
     };
 
+    // Config-change IRQ path: suppress queue-completion interrupts (we poll the
+    // used ring), then bind the device interrupt to a notification so an async
+    // config-change (display resize/hotplug) wakes us — checked non-blocking each
+    // present so the loop never stalls.
+    unsafe {
+        gpu.ctrlq.suppress_interrupts();
+        if let Some(cq) = gpu.cursorq.as_ref() {
+            cq.suppress_interrupts();
+        }
+    }
+    let irq_notif = rt::sys_notif_create().unwrap_or(oxbow_abi::HANDLE_NULL);
+    let irq_armed = irq_notif != oxbow_abi::HANDLE_NULL
+        && rt::sys_irq_bind(BOOT_GPU_IRQ, irq_notif).is_ok()
+        && rt::sys_irq_ack(BOOT_GPU_IRQ).is_ok();
+    if irq_armed {
+        w(b"[gpu] config-change IRQ bound\n");
+    }
+
     w(b"[gpu] presenting oxcomp via shared framebuffer\n");
     let (mut last_x, mut last_y) = (u32::MAX, u32::MAX);
     loop {
         gpu.transfer(RES, GPU_FB_W, GPU_FB_H);
         gpu.flush(RES, GPU_FB_W, GPU_FB_H);
+        // Async config-change (display resize/hotplug): non-blocking check.
+        if irq_armed && rt::sys_notif_poll(irq_notif) > 0 {
+            gpu.handle_config_change();
+            let _ = rt::sys_irq_ack(BOOT_GPU_IRQ); // re-arm the line
+        }
         // Track the pointer: oxcomp writes its position into the shared region; we
         // reposition the device's hardware cursor when it changes.
         if let Some(cs) = cursor_state {

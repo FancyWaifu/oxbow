@@ -228,6 +228,13 @@ pub struct Vq {
 }
 
 impl Vq {
+    /// Ask the device NOT to raise an interrupt when it consumes this queue's
+    /// buffers (VIRTQ_AVAIL_F_NO_INTERRUPT) — we poll the used ring for command
+    /// completion, so the only interrupt we want is the device config-change.
+    pub unsafe fn suppress_interrupts(&self) {
+        w16(self.qv + AVAIL_OFF, 1);
+    }
+
     /// Submit a request→response pair: descriptor 0 = `req` bytes (device reads),
     /// descriptor 1 = `resp` bytes (device writes). Both are physical addresses of
     /// DMA buffers. Notifies the device and spins the used ring until completion.

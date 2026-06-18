@@ -126,6 +126,15 @@ pub fn wait(idx: u8) -> (u64, u64) {
     ipc::take_ret(me)
 }
 
+/// Non-blocking drain: take and return the latched count (0 if none), never
+/// blocking. A driver polls this from a loop it can't park (the gpu's present
+/// loop), to learn an async IRQ fired (a virtio-gpu config-change) without
+/// stalling on `wait`.
+pub fn poll(idx: u8) -> u64 {
+    let mut p = POOL.lock();
+    core::mem::take(&mut p[idx as usize].count)
+}
+
 /// Clear `tid` from any waiter slot (on thread exit), so a later signal can't
 /// wake an Exited thread.
 pub fn clear_waiter(tid: usize) {

@@ -746,6 +746,14 @@ pub fn sys_notif_wait(notif: Handle) -> SysResult<u64> {
     SysError::from_raw(rax).map(|_| rdx)
 }
 
+/// Non-blocking drain of `notif`'s latched signal count (0 if none) — for a loop
+/// that can't park on `sys_notif_wait` (the gpu's present loop polling for a
+/// virtio-gpu config-change IRQ).
+pub fn sys_notif_poll(notif: Handle) -> u64 {
+    let (rax, rdx) = unsafe { syscall1(oxbow_abi::SYS_NOTIF_POLL, notif as u64) };
+    SysError::from_raw(rax).map(|_| rdx).unwrap_or(0)
+}
+
 /// Read the last exit code delivered to `notif` (§81), non-blocking. Call right
 /// after `sys_notif_wait` returns for a child you spawned, to branch on its exit
 /// status (the shell's `&&`/`||`). Returns 0 if nothing recorded.
