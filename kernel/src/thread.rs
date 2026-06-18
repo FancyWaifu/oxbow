@@ -401,6 +401,20 @@ fn switch_to(next: usize) {
     // touches becomes unmapped. IF=0 means nothing interrupts mid-switch.
     let next_cr3 = cr3_of(next);
     if next_cr3 != 0 && next_cr3 != crate::arch::current_cr3() {
+        // §77 DEBUG: catch a CORRUPT cr3 BEFORE loading it — a bad PML4 root triple-
+        // faults the instant we MOV it into CR3 (the fault handler is then unmapped,
+        // so it hangs silently). Check (a) the root is a sane phys addr, and (b) the
+        // PML4 actually maps the kernel higher half (entry 256 PRESENT) — if not, the
+        // PML4 is stale/freed/uninitialised (a use-after-free or new_user_pml4 race).
+        let bad_addr = next_cr3 & 0xfff != 0 || next_cr3 >= 0x2000_0000;
+        let entry256 = if bad_addr {
+            0
+        } else {
+            unsafe { core::ptr::read_volatile((crate::mm::phys_to_virt(next_cr3) as *const u64).add(256)) }
+        };
+        if bad_addr || entry256 & 1 == 0 {
+            crate::cr3_bug(next, next_cr3, proc_of(next), current(), entry256);
+        }
         announce_first_cr3(proc_of(next));
         crate::arch::load_cr3(next_cr3);
     }

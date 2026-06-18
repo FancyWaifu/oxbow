@@ -69,8 +69,14 @@ pub fn init() {
         idt.divide_error.set_handler_fn(divide_error);
         idt.breakpoint.set_handler_fn(breakpoint);
         idt.invalid_opcode.set_handler_fn(invalid_opcode);
-        idt.general_protection_fault.set_handler_fn(general_protection_fault);
-        idt.page_fault.set_handler_fn(page_fault);
+        // §77: #PF/#GP run on a dedicated IST stack so the handler survives a
+        // corrupted thread kernel stack (otherwise it re-faults silently).
+        idt.general_protection_fault
+            .set_handler_fn(general_protection_fault)
+            .set_stack_index(super::gdt::FAULT_IST_INDEX);
+        idt.page_fault
+            .set_handler_fn(page_fault)
+            .set_stack_index(super::gdt::FAULT_IST_INDEX);
         idt.double_fault
             .set_handler_fn(double_fault)
             .set_stack_index(DOUBLE_FAULT_IST_INDEX);
@@ -212,52 +218,108 @@ extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
     );
 }
 
-/// §75 DEBUG: stop all cores + print full fault info via the lock-bypassing
-/// console, then halt — used to capture the FIRST fault (user OR kernel) under SMP
-/// without the print deadlocking. (Replaces the normal user-kill/kernel-panic
-/// behaviour for the multi-AP debugging run.) Reads only the raw tid (no TCB
-/// deref) in case per-CPU state is itself corrupt.
+// §77 DEBUG: dead-simple direct-to-UART output — touches ONLY the serial port and
+// the passed-in values (no percpu, no locks, no fmt), so it can't itself fault.
+fn raw_putc(b: u8) {
+    use x86_64::instructions::port::Port;
+    unsafe {
+        let mut lsr = Port::<u8>::new(0x3FD);
+        let mut s = 0u32;
+        while lsr.read() & 0x20 == 0 {
+            s += 1;
+            if s > 1_000_000 {
+                break;
+            }
+        }
+        Port::<u8>::new(0x3F8).write(b);
+    }
+}
+fn raw_str(s: &str) {
+    for &b in s.as_bytes() {
+        raw_putc(b);
+    }
+}
+fn raw_hex(v: u64) {
+    raw_str("0x");
+    for i in (0..16).rev() {
+        let n = ((v >> (i * 4)) & 0xf) as u8;
+        raw_putc(if n < 10 { b'0' + n } else { b'a' + n - 10 });
+    }
+}
+
+/// §77: a KERNEL fault is fatal — stop the other cores (NMI) and print the oops via
+/// the lock-bypassing console, then halt. Runs on the IST fault stack (§77), so it
+/// survives even a corrupted thread kernel stack (otherwise the handler re-faults on
+/// the bad stack and the machine hangs silently).
+fn fault_stop(name: &str, ring: u64, rip: u64, cr2: u64, err: u64, tid: usize) -> ! {
+    if crate::PANICKED.swap(true, Ordering::SeqCst) {
+        loop {
+            unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
+        }
+    }
+    unsafe { super::lapic::send_nmi_all_but_self() };
+    for _ in 0..6_000_000 {
+        core::hint::spin_loop();
+    }
+    raw_str("\n[FAULT] ");
+    raw_str(name);
+    raw_str(" ring=");
+    raw_hex(ring);
+    raw_str(" rip=");
+    raw_hex(rip);
+    raw_str(" cr2=");
+    raw_hex(cr2);
+    raw_str(" err=");
+    raw_hex(err);
+    raw_str(" tcb=");
+    raw_hex(tid as u64);
+    raw_putc(b'\n');
+    for c in 0..8u64 {
+        let r = crate::STOPPED_RIP[c as usize].load(Ordering::Acquire);
+        if r != 0 {
+            raw_str("  cpu ");
+            raw_hex(c);
+            raw_str(" at ");
+            raw_hex(r);
+            raw_putc(b'\n');
+        }
+    }
+    loop {
+        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
+    }
+}
+
 extern "x86-interrupt" fn general_protection_fault(frame: InterruptStackFrame, error_code: u64) {
-    // A fault from ring 3 kills the offending thread/process; the kernel lives on.
+    let tid = crate::percpu::current();
+    // Ring-3 #GP kills the offending thread; the kernel lives on. Brief raw print
+    // (no lock → can't deadlock under SMP), then kill.
     if frame.code_segment.0 & 3 == 3 {
-        println!(
-            "[trap] #GP user err={:#x} -- killing tcb {} (proc {})",
-            error_code,
-            crate::thread::current(),
-            crate::thread::current_proc()
-        );
+        raw_str("[trap] #GP user rip=");
+        raw_hex(frame.instruction_pointer.as_u64());
+        raw_str(" err=");
+        raw_hex(error_code);
+        raw_str(" -- killing tcb ");
+        raw_hex(tid as u64);
+        raw_putc(b'\n');
         crate::thread::kill_current_user();
     }
-    // §75: a KERNEL #GP is fatal — panic!() now stops the other cores + prints safely.
-    panic!(
-        "#GP (kernel) error_code={:#x} at rip={:#x}\n{:#?}",
-        error_code,
-        frame.instruction_pointer.as_u64(),
-        frame
-    );
+    fault_stop("#GP", 0, frame.instruction_pointer.as_u64(), 0, error_code, tid);
 }
 
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
-    let cr2 = x86_64::registers::control::Cr2::read();
-    // A user-mode page fault kills the offending thread/process, not the machine.
+    let cr2 = x86_64::registers::control::Cr2::read_raw();
+    let tid = crate::percpu::current();
     if error_code.contains(PageFaultErrorCode::USER_MODE) {
-        println!(
-            "[trap] #PF user cr2={:?} err={:?} rip={:#x} -- killing tcb {} (proc {})",
-            cr2,
-            error_code,
-            frame.instruction_pointer.as_u64(),
-            crate::thread::current(),
-            crate::thread::current_proc()
-        );
+        raw_str("[trap] #PF user cr2=");
+        raw_hex(cr2);
+        raw_str(" rip=");
+        raw_hex(frame.instruction_pointer.as_u64());
+        raw_str(" -- killing tcb ");
+        raw_hex(tid as u64);
+        raw_putc(b'\n');
         crate::thread::kill_current_user();
     }
-    panic!(
-        "#PF (kernel) accessing {:?}, error={:?}, at rip={:#x}\n{:#?}",
-        cr2,
-        error_code,
-        frame.instruction_pointer.as_u64(),
-        frame
-    );
+    fault_stop("#PF", 0, frame.instruction_pointer.as_u64(), cr2, error_code.bits(), tid);
 }
 
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, error_code: u64) -> ! {

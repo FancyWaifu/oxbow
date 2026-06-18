@@ -23,9 +23,15 @@ use crate::percpu::MAX_CPUS;
 const KERNEL_STACK_SIZE: usize = 32 * 1024;
 /// Dedicated stack for #DF, so a stack fault can't turn into a triple fault.
 const DF_STACK_SIZE: usize = 16 * 1024;
+/// §77: dedicated stack for #PF/#GP so the fault handler runs on a KNOWN-GOOD stack
+/// even when the faulting thread's kernel stack is corrupt — otherwise the handler
+/// re-faults on the bad stack (a silent fault storm) and can never print the oops.
+const FAULT_STACK_SIZE: usize = 16 * 1024;
 
 /// Index into the IST for the double-fault handler.
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+/// Index into the IST for the #PF/#GP fault handlers (§77).
+pub const FAULT_IST_INDEX: u16 = 1;
 
 /// GDT capacity: the null descriptor, four segment descriptors, plus a two-entry
 /// system (TSS) descriptor for every possible CPU.
@@ -40,6 +46,8 @@ static mut KERNEL_STACKS: [Stack<KERNEL_STACK_SIZE>; MAX_CPUS] =
     [const { Stack([0; KERNEL_STACK_SIZE]) }; MAX_CPUS];
 static mut DF_STACKS: [Stack<DF_STACK_SIZE>; MAX_CPUS] =
     [const { Stack([0; DF_STACK_SIZE]) }; MAX_CPUS];
+static mut FAULT_STACKS: [Stack<FAULT_STACK_SIZE>; MAX_CPUS] =
+    [const { Stack([0; FAULT_STACK_SIZE]) }; MAX_CPUS];
 
 static mut TSS: [TaskStateSegment; MAX_CPUS] = [const { TaskStateSegment::new() }; MAX_CPUS];
 static mut GDT: GlobalDescriptorTable<GDT_CAP> = GlobalDescriptorTable::empty();
@@ -65,6 +73,9 @@ fn kernel_stack_top_of(cpu: usize) -> u64 {
 fn df_stack_top_of(cpu: usize) -> u64 {
     unsafe { addr_of!(DF_STACKS[cpu]) as u64 + DF_STACK_SIZE as u64 }
 }
+fn fault_stack_top_of(cpu: usize) -> u64 {
+    unsafe { addr_of!(FAULT_STACKS[cpu]) as u64 + FAULT_STACK_SIZE as u64 }
+}
 
 /// Top of the BSP's kernel exception stack — used by `switch_address_space` as the
 /// stage-2 stack (runs on the BSP, before per-CPU state exists).
@@ -83,6 +94,8 @@ pub fn init() {
             tss.privilege_stack_table[0] = VirtAddr::new(kernel_stack_top_of(cpu));
             tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
                 VirtAddr::new(df_stack_top_of(cpu));
+            tss.interrupt_stack_table[FAULT_IST_INDEX as usize] =
+                VirtAddr::new(fault_stack_top_of(cpu)); // §77: #PF/#GP good stack
         }
 
         // Append order defines the selectors (see module docs): the four segment

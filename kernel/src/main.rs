@@ -847,6 +847,28 @@ pub static PANICKED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 pub static STOPPED_RIP: [core::sync::atomic::AtomicU64; 8] =
     [const { core::sync::atomic::AtomicU64::new(0) }; 8];
 
+/// §77 DEBUG: `switch_to` is about to load a corrupt cr3 (would triple-fault). Stop
+/// the other cores and report which thread + cr3 + who was switching, then halt.
+pub fn cr3_bug(next: usize, cr3: u64, proc: usize, from: usize, pml4_256: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    if !PANICKED.swap(true, Ordering::SeqCst) {
+        unsafe { arch::lapic::send_nmi_all_but_self() };
+        for _ in 0..6_000_000 {
+            core::hint::spin_loop();
+        }
+    }
+    arch::panic_print(format_args!(
+        "\n[CR3 BUG] cpu {} switching tid {} -> tid {} (proc {}) cr3={:#x} pml4[256]={:#x}\n",
+        percpu::cpu_index(),
+        from,
+        next,
+        proc,
+        cr3,
+        pml4_256,
+    ));
+    arch::halt();
+}
+
 /// §75 DEBUG: a spinlock-timeout watchdog detected a likely deadlock — stop every
 /// other core (NMI), then print this core's complaint plus every stopped core's rip
 /// (recorded by their NMI handlers). Turns a silent IF=0 multi-core hang into a
