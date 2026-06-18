@@ -48,6 +48,34 @@ ares_status_t ares_init_by_environment(ares_sysconfig_t *sysconfig)
   return ARES_SUCCESS;
 }
 
+/* §94: ares_parse_sortlist is also defined in the skipped ares_sysconfig_files.c
+ * but referenced by ares_init.c. The boot binaries link via ld, which prunes the
+ * unreached reference; tcc's archive linker pulls the object in and needs a
+ * definition. Stub it empty — DNS address sortlist is an optional resolv.conf
+ * feature oxbow never configures. */
+ares_status_t ares_parse_sortlist(struct apattern **sortlist, size_t *nsort,
+                                  const char *str)
+{
+  (void)str;
+  if (sortlist)
+    *sortlist = 0;
+  if (nsort)
+    *nsort = 0;
+  return ARES_SUCCESS;
+}
+
+/* §94: getservbyport (port -> /etc/services name) is referenced by
+ * ares_getnameinfo.c on the generic path but oxbow ships no service database.
+ * Return NULL (the caller falls back to the numeric port). `struct servent` is
+ * left incomplete — we only return a pointer to it. */
+struct servent;
+struct servent *getservbyport(int port, const char *proto)
+{
+  (void)port;
+  (void)proto;
+  return 0;
+}
+
 /* Event-thread / config-change-watch backends are not compiled (oxbow has no
  * epoll/kqueue and we drive ares_process_fd synchronously). These are only
  * reached via ARES_OPT_EVENT_THREAD, which we never set — stub to satisfy the
