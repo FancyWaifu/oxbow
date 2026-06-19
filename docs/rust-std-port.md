@@ -181,7 +181,17 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     instead of panicking; std `Thread::new` turns that into `Err` (reclaiming the
     stack/packet). Verified: 100-sender mpsc completes, and a program spawning past
     the pool gets `Err` with the kernel surviving (no crash).
-  Next: broaden the suite further as the continuing "done" bar.
+  - ✅ **Broadened to env/fs/collections: 64/67 pass.** `alloctests/string.rs` (60
+    String/collections tests) + `std/tests/env.rs` all pass. 🐛 **Found + fixed an
+    allocator self-deadlock:** `String::try_reserve(isize::MAX)` lands in slab bucket
+    63 but `free[]` has only `NBUCKETS=40` — `free[63]` panicked out-of-bounds WHILE
+    holding the `HeapLock` spinlock, and the panic's own allocation re-entered and
+    self-deadlocked (a hang). Fix (`rt/src/lib.rs`): fail fast (`null`) when
+    `bucket >= NBUCKETS`. The 3 remaining failures are the same **capability-model
+    gap**: `env::current_dir`/`current_exe`/`set_current_dir` — POSIX global-path
+    concepts that don't exist in oxbow's cap-based cwd (a design decision: stub with a
+    sentinel for compat, or leave unsupported). Verified: 64 pass, no hang.
+  Next: broaden further (HashMap/BTreeMap, more fs) + decide the cwd/exe-path stance.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 

@@ -125,6 +125,13 @@ mod heap {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             let _g = HeapLock::acquire(); // §96: released on every return path
             let bucket = bucket_of(layout);
+            // §105: an absurd request (e.g. `try_reserve(isize::MAX)`) lands in a
+            // bucket past the table — fail fast. Indexing `free[bucket]` would panic
+            // out-of-bounds WHILE holding HeapLock, and the panic's own allocation
+            // would then self-deadlock on the spinlock (a hang, not an error).
+            if bucket >= NBUCKETS {
+                return core::ptr::null_mut();
+            }
             let class = 1usize << bucket;
 
             // 1. Reuse a freed block of this class (pop the intrusive free list).
