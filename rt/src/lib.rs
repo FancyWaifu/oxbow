@@ -506,6 +506,18 @@ pub extern "C" fn __oxbow_yield() {
         syscall1(oxbow_abi::SYS_YIELD, 0);
     }
 }
+/// §96: the spawn argument string (SPAWN_ARGV) for std's `env::args()`. Writes the
+/// length and returns the pointer; the kernel mapped it on spawn (the boot-module
+/// cmdline, or the shell's argv).
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_argv(len: *mut usize) -> *const u8 {
+    let a = argv();
+    unsafe {
+        len.write(a.len());
+    }
+    a.as_ptr()
+}
 
 // --- Raw syscall stubs ----------------------------------------------------
 // nr in rax; args rdi, rsi, rdx, r10, r8, r9; returns rax (+ rdx). rcx/r11 are

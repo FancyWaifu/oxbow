@@ -73,7 +73,16 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     (`Condvar::wait_timeout` blocks until woken); TLS destructors don't run (guard is
     a no-op → TLS values leak at thread exit); boot-module std demos need a bumped
     Memory budget (shell-funded children get plenty).
-  - ☐ Real env block (passed at spawn like `SPAWN_ARGV`) → `std::env::var`.
+  - ✅ **env + args** — `std::env::args()` reads `SPAWN_ARGV` (the kernel now maps it
+    for boot modules too, not just shell-spawned children) via the rt `__oxbow_argv`
+    shim → `sys/args/oxbow.rs`. `std::env::var`/`set_var`/`vars`/`remove_var` work via
+    an in-process table (`sys/env/oxbow.rs`, using the now-working `Mutex`), seeded
+    with defaults (PATH=/bin, HOME=/home, TERM=oxterm) — oxbow has no spawn-passed
+    env block yet, so vars are process-local + the defaults.
+
+  **Phase 2 DONE.** A comprehensive demo (`std-port/oxhello-demo.elf`) prints the
+  wall clock, env/args, and a 4-thread `Arc<Mutex<u64>>` sum — alloc, time, env,
+  threads, Mutex, and TLS all in one std program.
 - **Phase 3 — harden.** Native ELF TLS, `Command` stdio piping (spawn-not-fork),
   full `Metadata`, optional `panic=unwind`.
 - **Phase 4 — the std test suite** as the "done" bar.

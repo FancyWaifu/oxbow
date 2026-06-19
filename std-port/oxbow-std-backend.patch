@@ -47,6 +47,119 @@ index 00000000..104afa83
 +        unsafe { realloc_fallback(self, ptr, layout, new_size) }
 +    }
 +}
+diff --git a/library/std/src/sys/args/mod.rs b/library/std/src/sys/args/mod.rs
+index 2659750f..f9f7583e 100644
+--- a/library/std/src/sys/args/mod.rs
++++ b/library/std/src/sys/args/mod.rs
+@@ -10,10 +10,15 @@
+     target_os = "uefi",
+     target_os = "wasi",
+     target_os = "xous",
++    target_os = "oxbow",
+ ))]
+ mod common;
+ 
+ cfg_select! {
++    target_os = "oxbow" => {
++        mod oxbow;
++        pub use oxbow::*;
++    }
+     any(
+         all(target_family = "unix", not(any(all(target_family = "wasm", target_os = "linux"), target_os = "espidf", target_os = "vita"))),
+         target_os = "hermit",
+diff --git a/library/std/src/sys/args/oxbow.rs b/library/std/src/sys/args/oxbow.rs
+new file mode 100644
+index 00000000..63cb02ed
+--- /dev/null
++++ b/library/std/src/sys/args/oxbow.rs
+@@ -0,0 +1,23 @@
++//! oxbow program arguments — split the SPAWN_ARGV string (the boot-module cmdline
++//! or the shell's argv), via oxbow-rt's `__oxbow_argv` shim.
++pub use super::common::Args;
++use crate::ffi::OsString;
++
++unsafe extern "C" {
++    fn __oxbow_argv(len: *mut usize) -> *const u8;
++}
++
++pub fn args() -> Args {
++    let mut len = 0usize;
++    let ptr = unsafe { __oxbow_argv(&mut len) };
++    if ptr.is_null() || len == 0 {
++        return Args::new(crate::vec::Vec::new());
++    }
++    let bytes = unsafe { crate::slice::from_raw_parts(ptr, len) };
++    let v: crate::vec::Vec<OsString> = bytes
++        .split(|&b| b == b' ')
++        .filter(|s| !s.is_empty())
++        .map(|s| OsString::from(crate::string::String::from_utf8_lossy(s).into_owned()))
++        .collect();
++    Args::new(v)
++}
+diff --git a/library/std/src/sys/env/mod.rs b/library/std/src/sys/env/mod.rs
+index 89856516..bf08652f 100644
+--- a/library/std/src/sys/env/mod.rs
++++ b/library/std/src/sys/env/mod.rs
+@@ -11,10 +11,15 @@
+     target_os = "uefi",
+     target_os = "wasi",
+     target_os = "xous",
++    target_os = "oxbow",
+ ))]
+ mod common;
+ 
+ cfg_select! {
++    target_os = "oxbow" => {
++        mod oxbow;
++        pub use oxbow::*;
++    }
+     target_family = "unix" => {
+         mod unix;
+         pub use unix::*;
+diff --git a/library/std/src/sys/env/oxbow.rs b/library/std/src/sys/env/oxbow.rs
+new file mode 100644
+index 00000000..437f42ee
+--- /dev/null
++++ b/library/std/src/sys/env/oxbow.rs
+@@ -0,0 +1,38 @@
++//! oxbow environment — an in-process table (oxbow has no spawn-passed env yet, so
++//! it starts with a few sensible defaults; `set_var`/`var`/`vars`/`remove_var` all
++//! work via it). Uses std's own `Mutex`, which now runs on oxbow's futex.
++pub use super::common::Env;
++use crate::collections::BTreeMap;
++use crate::ffi::{OsStr, OsString};
++use crate::io;
++use crate::sync::{Mutex, OnceLock};
++
++fn table() -> &'static Mutex<BTreeMap<OsString, OsString>> {
++    static T: OnceLock<Mutex<BTreeMap<OsString, OsString>>> = OnceLock::new();
++    T.get_or_init(|| {
++        let mut m = BTreeMap::new();
++        m.insert(OsString::from("PATH"), OsString::from("/bin"));
++        m.insert(OsString::from("HOME"), OsString::from("/home"));
++        m.insert(OsString::from("TERM"), OsString::from("oxterm"));
++        Mutex::new(m)
++    })
++}
++
++pub fn env() -> Env {
++    let t = table().lock().unwrap();
++    Env::new(t.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
++}
++
++pub fn getenv(k: &OsStr) -> Option<OsString> {
++    table().lock().unwrap().get(k).cloned()
++}
++
++pub unsafe fn setenv(k: &OsStr, v: &OsStr) -> io::Result<()> {
++    table().lock().unwrap().insert(k.to_os_string(), v.to_os_string());
++    Ok(())
++}
++
++pub unsafe fn unsetenv(k: &OsStr) -> io::Result<()> {
++    table().lock().unwrap().remove(k);
++    Ok(())
++}
 diff --git a/library/std/src/sys/io/error/mod.rs b/library/std/src/sys/io/error/mod.rs
 index cc8cda9a..28052f04 100644
 --- a/library/std/src/sys/io/error/mod.rs

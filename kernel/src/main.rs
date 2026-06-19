@@ -395,6 +395,19 @@ fn kmain_stage2() -> ! {
             }
             mm::vm::map_user_4k_in(as_i, oxbow_abi::SPAWN_IDENT, idframe, false, false);
         }
+        // §96: map the cmdline at SPAWN_ARGV so boot modules can read rt::argv() /
+        // std::env::args() (shell-spawned children get theirs in spawn_common).
+        // Without this the first read of SPAWN_ARGV faults.
+        if let Some(argframe) = mm::pmm::alloc_frame() {
+            unsafe {
+                let dst = mm::phys_to_virt(argframe) as *mut u8;
+                core::ptr::write_bytes(dst, 0, 0x1000);
+                let abytes = name.as_bytes();
+                let n = abytes.len().min(4095);
+                core::ptr::copy_nonoverlapping(abytes.as_ptr(), dst, n);
+            }
+            mm::vm::map_user_4k_in(as_i, oxbow_abi::SPAWN_ARGV, argframe, false, false);
+        }
         // The shell is the system's spawner; it needs a large budget to fund the
         // processes it launches (it pays from its own untyped). Drivers get 256K.
         // The shell funds every program it spawns from its own budget; tcc wants
