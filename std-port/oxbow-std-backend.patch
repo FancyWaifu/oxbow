@@ -177,10 +177,10 @@ index 0c297c57..a1404d0b 100644
          use vexos as imp;
 diff --git a/library/std/src/sys/fs/oxbow.rs b/library/std/src/sys/fs/oxbow.rs
 new file mode 100644
-index 00000000..55a9c6dc
+index 00000000..8856575d
 --- /dev/null
 +++ b/library/std/src/sys/fs/oxbow.rs
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,438 @@
 +//! oxbow std::fs — real File open/read/write/seek + stat over the fsd protocol
 +//! (oxbow-rt's `__oxbow_fs_*` shims), relative to the program's cwd dir cap.
 +//! Directory listing, symlinks, rename/unlink, timestamps and permissions are not
@@ -207,7 +207,11 @@ index 00000000..55a9c6dc
 +    fn __oxbow_fs_pread(file: i64, buf: *mut u8, len: usize, off: u64) -> isize;
 +    fn __oxbow_fs_pwrite(file: i64, buf: *const u8, len: usize, off: u64) -> isize;
 +    fn __oxbow_fs_close(file: i64);
++    fn __oxbow_fs_mkdir(path: *const u8, len: usize) -> i32;
++    fn __oxbow_fs_readdir(dir: i64, cursor: u64, name_out: *mut u8, name_cap: usize, kind_out: *mut u32) -> isize;
 +}
++
++const FS_DIR: u32 = 1; // oxbow_abi::FS_DIR
 +
 +#[inline]
 +fn pbytes(p: &Path) -> &[u8] {
@@ -230,8 +234,23 @@ index 00000000..55a9c6dc
 +    is_dir: bool,
 +}
 +
-+pub struct ReadDir(!);
-+pub struct DirEntry(!);
++pub struct ReadDir {
++    cap: i64,
++    cursor: u64,
++    base: PathBuf,
++}
++impl Drop for ReadDir {
++    fn drop(&mut self) {
++        unsafe { __oxbow_fs_close(self.cap) };
++    }
++}
++
++#[derive(Clone)]
++pub struct DirEntry {
++    name: OsString,
++    kind: FileType,
++    base: PathBuf,
++}
 +
 +#[derive(Clone, Debug)]
 +pub struct OpenOptions {
@@ -303,28 +322,47 @@ index 00000000..55a9c6dc
 +}
 +
 +impl fmt::Debug for ReadDir {
-+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        self.0
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("ReadDir").field("base", &self.base).finish()
 +    }
 +}
 +impl Iterator for ReadDir {
 +    type Item = io::Result<DirEntry>;
 +    fn next(&mut self) -> Option<io::Result<DirEntry>> {
-+        self.0
++        loop {
++            let mut buf = [0u8; 64];
++            let mut kind = 0u32;
++            let n = unsafe {
++                __oxbow_fs_readdir(self.cap, self.cursor, buf.as_mut_ptr(), buf.len(), &mut kind)
++            };
++            self.cursor += 1;
++            if n < 0 {
++                return None;
++            }
++            let name = OsString::from(String::from_utf8_lossy(&buf[..n as usize]).into_owned());
++            if name == "." || name == ".." {
++                continue; // std::fs::read_dir omits . and ..
++            }
++            return Some(Ok(DirEntry {
++                name,
++                kind: FileType { is_dir: kind == FS_DIR },
++                base: self.base.clone(),
++            }));
++        }
 +    }
 +}
 +impl DirEntry {
 +    pub fn path(&self) -> PathBuf {
-+        self.0
++        self.base.join(&self.name)
 +    }
 +    pub fn file_name(&self) -> OsString {
-+        self.0
++        self.name.clone()
 +    }
 +    pub fn metadata(&self) -> io::Result<FileAttr> {
-+        self.0
++        stat(&self.path())
 +    }
 +    pub fn file_type(&self) -> io::Result<FileType> {
-+        self.0
++        Ok(self.kind)
 +    }
 +}
 +
@@ -498,8 +536,12 @@ index 00000000..55a9c6dc
 +    pub fn new() -> DirBuilder {
 +        DirBuilder {}
 +    }
-+    pub fn mkdir(&self, _p: &Path) -> io::Result<()> {
-+        unsupported()
++    pub fn mkdir(&self, p: &Path) -> io::Result<()> {
++        let b = pbytes(p);
++        if unsafe { __oxbow_fs_mkdir(b.as_ptr(), b.len()) } != 0 {
++            return Err(ioerr(io::ErrorKind::Other, "oxbow fs: mkdir failed"));
++        }
++        Ok(())
 +    }
 +}
 +
@@ -527,8 +569,19 @@ index 00000000..55a9c6dc
 +    Ok(stat(p).is_ok())
 +}
 +
-+pub fn readdir(_p: &Path) -> io::Result<ReadDir> {
-+    unsupported()
++pub fn readdir(p: &Path) -> io::Result<ReadDir> {
++    let b = pbytes(p);
++    let mut size = 0u64;
++    let mut is_dir = 0i32;
++    let cap = unsafe { __oxbow_fs_open(b.as_ptr(), b.len(), 0, &mut size, &mut is_dir) };
++    if cap < 0 {
++        return Err(ioerr(io::ErrorKind::NotFound, "oxbow fs: read_dir not found"));
++    }
++    if is_dir == 0 {
++        unsafe { __oxbow_fs_close(cap) };
++        return Err(ioerr(io::ErrorKind::NotADirectory, "oxbow fs: not a directory"));
++    }
++    Ok(ReadDir { cap, cursor: 0, base: p.to_path_buf() })
 +}
 +pub fn unlink(_p: &Path) -> io::Result<()> {
 +    unsupported()

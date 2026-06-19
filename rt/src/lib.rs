@@ -597,6 +597,47 @@ pub unsafe extern "C" fn __oxbow_fs_pwrite(file: i64, buf: *const u8, len: usize
 pub extern "C" fn __oxbow_fs_close(file: i64) {
     let _ = sys_close(file as Handle);
 }
+/// std::fs::create_dir — TAG_FS_MKDIR(name) to the cwd dir cap (slot 1).
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_fs_mkdir(path: *const u8, len: usize) -> i32 {
+    let mut m = MsgBuf::new(oxbow_abi::TAG_FS_MKDIR);
+    let n = len.min(56);
+    let dst = m.data.as_mut_ptr() as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(path, dst, n);
+        *dst.add(n) = 0;
+    }
+    m.data_len = ((n + 1 + 7) / 8) as u32;
+    if sys_call(1 as Handle, &mut m).is_err() || m.data[0] != 0 {
+        -1
+    } else {
+        0
+    }
+}
+/// std::fs::read_dir entry at `cursor` on an open dir cap. Writes the name into
+/// `name_out` (returns its length) + the kind (FS_DIR/FS_FILE); -1 past the end.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_fs_readdir(
+    dir: i64,
+    cursor: u64,
+    name_out: *mut u8,
+    name_cap: usize,
+    kind_out: *mut u32,
+) -> isize {
+    match fs::readdir(dir as Handle, cursor) {
+        Some((name, kind)) => {
+            let n = name.len().min(name_cap);
+            unsafe {
+                core::ptr::copy_nonoverlapping(name.as_ptr(), name_out, n);
+                kind_out.write(kind as u32);
+            }
+            n as isize
+        }
+        None => -1,
+    }
+}
 
 // --- Raw syscall stubs ----------------------------------------------------
 // nr in rax; args rdi, rsi, rdx, r10, r8, r9; returns rax (+ rdx). rcx/r11 are
