@@ -10,6 +10,18 @@ index fc0a627d..bf99ccd8 100644
          all(target_family = "unix", not(any(target_os = "espidf", target_os = "nuttx"))),
          all(target_vendor = "fortanix", target_env = "sgx"),
          target_family = "wasm",
+diff --git a/library/std/build.rs b/library/std/build.rs
+index 5f2e441b..f5839585 100644
+--- a/library/std/build.rs
++++ b/library/std/build.rs
+@@ -57,6 +57,7 @@ fn main() {
+         || target_os == "nuttx"
+         || target_os == "cygwin"
+         || target_os == "vexos"
++        || target_os == "oxbow"
+ 
+         // See src/bootstrap/src/core/build_steps/synthetic_targets.rs
+         || env::var("RUSTC_BOOTSTRAP_SYNTHETIC_TARGET").is_ok()
 diff --git a/library/std/src/sys/alloc/mod.rs b/library/std/src/sys/alloc/mod.rs
 index f2f1d1c7..e283598c 100644
 --- a/library/std/src/sys/alloc/mod.rs
@@ -26,10 +38,10 @@ index f2f1d1c7..e283598c 100644
          target_os = "wasi",
 diff --git a/library/std/src/sys/alloc/oxbow.rs b/library/std/src/sys/alloc/oxbow.rs
 new file mode 100644
-index 00000000..104afa83
+index 00000000..f86d60cd
 --- /dev/null
 +++ b/library/std/src/sys/alloc/oxbow.rs
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,30 @@
 +//! oxbow System allocator — delegates to oxbow-rt's hosted slab shims
 +//! (`__oxbow_alloc`/`_zeroed`/`_dealloc`). realloc uses std's generic fallback.
 +use super::realloc_fallback;
@@ -41,6 +53,7 @@ index 00000000..104afa83
 +    fn __oxbow_dealloc(ptr: *mut u8, size: usize, align: usize);
 +}
 +
++#[stable(feature = "alloc_system_type", since = "1.28.0")]
 +unsafe impl GlobalAlloc for System {
 +    #[inline]
 +    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {

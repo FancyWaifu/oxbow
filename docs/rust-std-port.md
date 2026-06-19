@@ -156,7 +156,16 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     still leak — the whole AS is torn down, so it's moot.)
 - **Phase 3 — DONE.** native TLS, TLS destructors, Command try_wait/kill, panic=unwind
   all landed and verified.
-- **Phase 4 — the std test suite** as the "done" bar.
+- **Phase 4 — STARTED: `libtest` runs on oxbow.** oxbow was added to `std/build.rs`'s
+  supported-OS list, so std is no longer `restricted_std` (std is now "supported"; the
+  one missing stability attr on `sys/alloc/oxbow.rs`'s `GlobalAlloc impl` was added).
+  Programs no longer need `#![feature(restricted_std)]`. The real `test` crate harness
+  compiles + runs: build a bin with `#[test]` fns, `#![no_main]` +
+  `#![feature(custom_test_frameworks)]` + `#![reexport_test_harness_main = "harness_main"]`
+  called from `oxbow_main`, built with `-Z build-std=std,test,panic_unwind --tests`
+  (panic=unwind is required — libtest isolates failing tests via `catch_unwind`).
+  Verified: 5 tests run with `ok`/`FAILED`/`should panic` results + the summary line.
+  Next: run actual std test files / a broader suite as the "done" bar.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 
