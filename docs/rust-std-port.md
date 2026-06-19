@@ -44,10 +44,15 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
   program is `#![no_main]` + `#![feature(restricted_std)]`, provides a C `main` or
   `oxbow_main`, and links `oxbow-rt` (hosted) for `_start`. A size-optimised release
   build (`opt-level=z` + LTO + `optimize_for_size`) is **19 KB**.
-- **Phase 2 — keystones.** In-process threads (`SYS_THREAD_SPAWN` sharing the
-  current pml4 + a fresh stack; the SMP/TCB infra already exists), a futex
-  (wait-on-address, from `notif` or a new syscall), a real wall clock (CMOS RTC →
-  `SYS_WALLTIME`), and a real env block (passed at spawn like `SPAWN_ARGV`).
+- **Phase 2 — keystones.** 🟡 IN PROGRESS.
+  - ✅ **Wall clock** — `SYS_WALLTIME` (52) reads the CMOS RTC (`kernel/.../rtc.rs`)
+    → `(epoch_secs, nanos)`; oxbow-rt shims `__oxbow_walltime`/`__oxbow_uptime_ms`;
+    std `sys/time/oxbow.rs` gives a real `SystemTime::now()` (verified: prints the
+    correct UTC date) and a monotonic `Instant`.
+  - ☐ Real env block (passed at spawn like `SPAWN_ARGV`) → `std::env::var`.
+  - ☐ In-process threads (`SYS_THREAD_SPAWN` sharing the current pml4 + a fresh
+    stack; the SMP/TCB infra already exists), a futex (wait-on-address), real
+    per-thread TLS → `std::thread::spawn` + `join` + `Mutex`.
 - **Phase 3 — harden.** Native ELF TLS, `Command` stdio piping (spawn-not-fork),
   full `Metadata`, optional `panic=unwind`.
 - **Phase 4 — the std test suite** as the "done" bar.

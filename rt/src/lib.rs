@@ -409,6 +409,20 @@ pub unsafe extern "C" fn __oxbow_getentropy(buf: *mut u8, len: usize) -> i32 {
 pub unsafe extern "C" fn __oxbow_exit(code: i32) -> ! {
     sys_exit(code as u64)
 }
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_uptime_ms() -> u64 {
+    sys_uptime_ms()
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_walltime(secs: *mut u64, nanos: *mut u32) {
+    let (s, n) = sys_walltime();
+    unsafe {
+        secs.write(s);
+        nanos.write(n as u32);
+    }
+}
 
 // --- Raw syscall stubs ----------------------------------------------------
 // nr in rax; args rdi, rsi, rdx, r10, r8, r9; returns rax (+ rdx). rcx/r11 are
@@ -717,6 +731,12 @@ pub fn sys_protect(mem: Handle, vaddr: u64, len: u64, prot: u64) -> SysResult {
 pub fn sys_uptime_ms() -> u64 {
     let (_, rdx) = unsafe { syscall1(oxbow_abi::SYS_UPTIME_MS, 0) };
     rdx
+}
+
+/// Wall-clock time as `(epoch_seconds, nanoseconds)` from the CMOS RTC — ambient,
+/// like uptime. Backs `std::time::SystemTime`.
+pub fn sys_walltime() -> (u64, u64) {
+    unsafe { syscall1(oxbow_abi::SYS_WALLTIME, 0) }
 }
 
 /// `(used_kib, total_kib)` of the kernel's managed physical region — ambient, for

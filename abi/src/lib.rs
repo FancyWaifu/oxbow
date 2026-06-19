@@ -190,6 +190,7 @@ pub const SYS_NOTIF_STATUS: u64 = 48; // (notif) -> rdx = last exit code (§81).
 pub const SYS_DMA_ALLOC_CONTIG: u64 = 49; // (mem, vaddr, pages) -> contiguous phys. needs R_MAP
 pub const SYS_SHM_PHYS: u64 = 50; // (shm) -> rdx = physical base of a CONTIGUOUS shm. needs R_MAP
 pub const SYS_NOTIF_POLL: u64 = 51; // (notif) -> rdx = drained count, NON-BLOCKING. needs R_WAIT
+pub const SYS_WALLTIME: u64 = 52; // () -> (epoch_secs in rax, nanoseconds in rdx). CMOS RTC. stdio
 /// Capability kinds reported by SYS_CAP_TYPE (so recvmsg can reconstruct the
 /// right fd flavor from a passed handle). 0 = anything else.
 pub const CAP_OTHER: u64 = 0;

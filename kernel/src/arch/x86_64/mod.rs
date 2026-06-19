@@ -7,6 +7,7 @@ pub mod ioapic;
 pub mod lapic;
 pub mod pic;
 pub mod pit;
+pub mod rtc;
 pub mod serial;
 pub mod syscall;
 
@@ -27,6 +28,15 @@ pub fn timer_init(hz: u32) {
 #[allow(dead_code)] // scheduler heartbeat API; not currently read
 pub fn ticks() -> u64 {
     idt::TICKS.load(Ordering::Relaxed)
+}
+
+/// Wall-clock time for `SYS_WALLTIME`: `(epoch_seconds, nanoseconds)`. Seconds
+/// come from the CMOS RTC (1 s granular); the sub-second part is derived from the
+/// PIT so `SystemTime` still advances within a second.
+pub fn walltime() -> (u64, u64) {
+    let secs = rtc::epoch_secs();
+    let ms = ticks().wrapping_mul(10);
+    (secs, (ms % 1000) * 1_000_000)
 }
 
 /// Re-mask all IRQ lines.
