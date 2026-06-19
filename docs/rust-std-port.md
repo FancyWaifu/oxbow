@@ -109,6 +109,16 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     on the drained notification. Verified: `running` → `wait=Some(5)` → cached
     `try_wait=Some(5)`. `kill` still unsupported — it needs a process-control
     capability (pid-based kill would be ambient authority; deferred design decision).
+  - ✅ **`panic=unwind`** — real DWARF stack unwinding. The pure-Rust `unwinding`
+    crate (fde-static) supplies the Itanium `_Unwind_*` ABI; `library/unwind` routes
+    oxbow through the xous-style binding (its own types — ABI-safe), and oxbow was
+    added to the `panic_unwind` + `sys/personality` gcc arms (so `rust_eh_personality`
+    exists). The target dropped `panic-strategy: abort`; the linker script keeps
+    `.eh_frame`/`.gcc_except_table` + defines `__executable_start`/`__etext`/`__eh_frame`
+    for the static FDE finder (no runtime registration → fits `#![no_main]`). Build a
+    program with `-Z build-std=std,panic_unwind` + profile `panic = "unwind"`. Verified:
+    `catch_unwind` catches a panic and the program continues; a panicking thread's
+    `join()` returns `Err` and the **process survives** (panic isolation).
   - 🐛 **Fixed a kernel-panicking std bug:** `std::process::exit` had no oxbow arm in
     `sys/exit.rs` → fell into `_ => intrinsics::abort()` → `ud2` → a userland #UD on
     *every* exit, which the kernel's `invalid_opcode` handler escalated to a full
@@ -135,7 +145,8 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     `__oxbow_thread_exit`. Verified: `Dropper(7) dropped at thread exit` prints
     between the thread's work and the join. (Main-thread TLS dtors at process exit
     still leak — the whole AS is torn down, so it's moot.)
-- **Phase 3 (cont.) — harden.** optional `panic=unwind`; Command kill/try_wait.
+- **Phase 3 — DONE.** native TLS, TLS destructors, Command try_wait, panic=unwind all
+  landed. Only `Command::kill` deferred (needs a process-control capability decision).
 - **Phase 4 — the std test suite** as the "done" bar.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)

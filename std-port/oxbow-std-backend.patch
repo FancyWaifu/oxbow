@@ -1,3 +1,15 @@
+diff --git a/library/panic_unwind/src/lib.rs b/library/panic_unwind/src/lib.rs
+index fc0a627d..bf99ccd8 100644
+--- a/library/panic_unwind/src/lib.rs
++++ b/library/panic_unwind/src/lib.rs
+@@ -51,6 +51,7 @@
+         target_os = "psp",
+         target_os = "xous",
+         target_os = "solid_asp3",
++        target_os = "oxbow",
+         all(target_family = "unix", not(any(target_os = "espidf", target_os = "nuttx"))),
+         all(target_vendor = "fortanix", target_env = "sgx"),
+         target_family = "wasm",
 diff --git a/library/std/src/sys/alloc/mod.rs b/library/std/src/sys/alloc/mod.rs
 index f2f1d1c7..e283598c 100644
 --- a/library/std/src/sys/alloc/mod.rs
@@ -776,6 +788,18 @@ index c4b14ab4..d0e8b2aa 100644
 +
 +#[cfg(target_os = "oxbow")]
 +pub mod futex;
+diff --git a/library/std/src/sys/personality/mod.rs b/library/std/src/sys/personality/mod.rs
+index eabef922..c881f4cc 100644
+--- a/library/std/src/sys/personality/mod.rs
++++ b/library/std/src/sys/personality/mod.rs
+@@ -33,6 +33,7 @@ fn rust_eh_personality() {
+         target_os = "psp",
+         target_os = "xous",
+         target_os = "solid_asp3",
++        target_os = "oxbow",
+         all(target_family = "unix", not(target_os = "espidf"), not(target_os = "l4re"), not(target_os = "nuttx")),
+         all(target_vendor = "fortanix", target_env = "sgx"),
+     ) => {
 diff --git a/library/std/src/sys/pipe/mod.rs b/library/std/src/sys/pipe/mod.rs
 index 85228963..433b164d 100644
 --- a/library/std/src/sys/pipe/mod.rs
@@ -1717,3 +1741,49 @@ index 00000000..a7afb6c1
 +        Some(SystemTime(self.0.checked_sub(*other)?))
 +    }
 +}
+diff --git a/library/unwind/Cargo.toml b/library/unwind/Cargo.toml
+index f02744a1..4bf667f1 100644
+--- a/library/unwind/Cargo.toml
++++ b/library/unwind/Cargo.toml
+@@ -22,6 +22,12 @@ libc = { version = "0.2.140", features = ['rustc-dep-of-std'], default-features
+ [target.'cfg(target_os = "xous")'.dependencies]
+ unwinding = { version = "0.2.7", features = ['rustc-dep-of-std', 'unwinder', 'fde-custom'], default-features = false }
+ 
++# oxbow: bare-metal static ELF. fde-static finds .eh_frame via linker symbols
++# (__executable_start/__etext/__eh_frame), so no runtime finder registration is
++# needed — fits oxbow's `#![no_main]` programs (no pal init runs).
++[target.'cfg(target_os = "oxbow")'.dependencies]
++unwinding = { version = "0.2.7", features = ['rustc-dep-of-std', 'unwinder', 'fde-static'], default-features = false }
++
+ [features]
+ 
+ # Only applies for Linux and Fuchsia targets
+diff --git a/library/unwind/src/lib.rs b/library/unwind/src/lib.rs
+index 22568d5f..b103cf2e 100644
+--- a/library/unwind/src/lib.rs
++++ b/library/unwind/src/lib.rs
+@@ -38,7 +38,7 @@
+         mod libunwind;
+         pub use libunwind::*;
+     }
+-    target_os = "xous" => {
++    any(target_os = "xous", target_os = "oxbow") => {
+         mod unwinding;
+         pub use unwinding::*;
+     }
+diff --git a/library/unwind/src/unwinding.rs b/library/unwind/src/unwinding.rs
+index 36120bc8..9e19dbcd 100644
+--- a/library/unwind/src/unwinding.rs
++++ b/library/unwind/src/unwinding.rs
+@@ -28,6 +28,11 @@ pub enum _Unwind_Reason_Code {
+ pub use unwinding::abi::{UnwindContext, UnwindException};
+ pub enum _Unwind_Context {}
+ 
++// The custom-finder API is only used by the xous pal (fde-custom). oxbow uses
++// fde-static (linker symbols), which needs no runtime registration — important
++// because oxbow programs are `#![no_main]` and never run the pal init that would
++// register a finder.
++#[cfg(target_os = "xous")]
+ pub use unwinding::custom_eh_frame_finder::{
+     EhFrameFinder, FrameInfo, FrameInfoKind, set_custom_eh_frame_finder,
+ };
