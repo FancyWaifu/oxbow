@@ -93,3 +93,17 @@ NotFound), and the rename 28-byte path cap (lifted to 200 over the 512-B message
 design: 2 `.`-dependent tests, `binary_file` (single raw 1 KiB `write()` vs oxbow's 48-byte
 short-write cap — round-trip covered by `write_then_read`), and `read_large_dir` reduced
 32K→256 (fsd's 512-slot live-path table).
+
+## net (UDP) — 16/16 real-std `udp/tests.rs` pass (`udp-tests.rs`)
+
+A new std net backend (`~/rust-oxbow/.../sys/net/connection/oxbow.rs`, wired into
+`connection/mod.rs`) replaces the `unsupported` one. oxbow's net server has no loopback path
+and its sockets are libc-only, but the std `udp` suite is entirely loopback + single-process —
+so `UdpSocket` is implemented as an **in-process loopback**: a process-global mailbox table
+keyed by port; `send_to` to a loopback/unspecified addr enqueues into the destination's
+mailbox; `recv` polls it with `Instant`-based timeout / non-blocking semantics; clones share
+the bound port (same mailbox). v4 and v6 loopback both work. **No kernel/ISO rebuild** — build
+the libtest crate (`udp-harness-main.rs` provides a `crate::net` that globs `std::net` + adds
+the `net::test` helpers), inject, run via `udp-harness.py`. Excluded: `debug` (asserts the
+fd-based `Debug` format; oxbow's loopback socket has no raw fd). Not wired yet: external
+(non-loopback) UDP via the net server, and TCP (`TcpStream`/`TcpListener` are `Unsupported`).

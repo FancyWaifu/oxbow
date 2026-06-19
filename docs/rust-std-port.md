@@ -251,7 +251,23 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     single raw `write()` of 1 KiB, exposing oxbow's 48-byte-per-`write()` short-write cap;
     the round-trip is covered by `write_then_read` via `write_all`), and `read_large_dir`
     reduced 32K→256 files (the 512-slot path table is a real live-path ceiling).
-  Next: net or time/clock std surface.
+  - ✅ **net broadened — 16/16 real-std `udp/tests.rs` pass** via a new std net backend
+    (`sys/net/connection/oxbow.rs`, wired into `connection/mod.rs`). oxbow was on the
+    `unsupported` net backend (all socket I/O → `Err`); the kernel's socket-capability API
+    is reached only by C/libc, and the net server has **no loopback path**. The std `udp`
+    suite is entirely loopback + single-process, so the backend implements **`UdpSocket`
+    as an in-process loopback** (both IPv4 and IPv6): bound sockets share a process-global
+    mailbox table keyed by port, and `send_to` to a loopback/unspecified address enqueues
+    into the destination's mailbox. That delivers real datagram + connect/send/recv, peek,
+    `Instant`-based read timeouts, non-blocking (`WouldBlock`), `set_ttl`, and clone
+    semantics (clones share the bound port → same mailbox) — passing all 16 tests
+    including `udp_clone_two_read/two_write` (concurrent threads), the timeout tests, and
+    `connect_send_recv` (a socket sending to its own bound port). **No kernel/ISO change**
+    (net server untouched) — only the std backend + test crate. Excluded: `debug` (asserts
+    the exact fd-based `Debug` format — oxbow's loopback socket has no raw fd). Not yet
+    wired: external (non-loopback) UDP via the net server, and all of TCP (`TcpStream`/
+    `TcpListener` stay `Unsupported` stubs) — the natural next net step.
+  Next: external UDP + TCP over the net server, or the pure `socket_addr`/`ip_addr` parse tests.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 
