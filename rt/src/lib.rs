@@ -459,8 +459,11 @@ pub unsafe extern "C" fn __oxbow_walltime(secs: *mut u64, nanos: *mut u32) {
 // §96 hosted shims for std's pal thread + futex backend.
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __oxbow_futex_wait(addr: *const u32, expected: u32) {
-    unsafe { sys_futex_wait(addr, expected) };
+pub unsafe extern "C" fn __oxbow_futex_wait(addr: *const u32, expected: u32, timeout_ms: u64) -> i32 {
+    // returns 1 if the wait timed out, 0 otherwise.
+    let (timed_out, _) =
+        unsafe { syscall3(oxbow_abi::SYS_FUTEX_WAIT, addr as u64, expected as u64, timeout_ms) };
+    timed_out as i32
 }
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
@@ -1021,7 +1024,8 @@ pub fn sys_thread_exit() -> ! {
 /// if `*addr` already differs (the compare-and-block that avoids lost wakeups).
 pub unsafe fn sys_futex_wait(addr: *const u32, expected: u32) {
     unsafe {
-        syscall2(oxbow_abi::SYS_FUTEX_WAIT, addr as u64, expected as u64);
+        // timeout 0 = block indefinitely.
+        syscall3(oxbow_abi::SYS_FUTEX_WAIT, addr as u64, expected as u64, 0);
     }
 }
 

@@ -665,11 +665,20 @@ pub fn spawn_thread_in_current(entry: u64, user_rsp: u64) -> usize {
 /// only if `*addr == expected` (the compare-and-block that closes the lost-wakeup
 /// race). `addr` is a user vaddr live in the current address space. Uses the same
 /// prepare/re-check/block protocol as the rest of the kernel.
-pub fn futex_wait(addr: u64, expected: u32) {
+pub fn futex_wait(addr: u64, expected: u32, timeout_ms: u64) -> bool {
     let cur = current();
     unsafe {
         (*addr_of_mut!(TCBS[cur])).futex_addr = addr;
     }
+    // §97 timeout: arm a timer deadline; `wake_expired` (timer IRQ) wakes us when it
+    // passes. 100 Hz PIT → 1 tick = 10 ms; round up, at least 1 tick. 0 = no timeout.
+    let deadline = if timeout_ms != 0 {
+        let d = crate::arch::ticks() + (timeout_ms + 9) / 10;
+        set_wake_at(cur, d);
+        d
+    } else {
+        0
+    };
     prepare_block();
     // Re-check AFTER publishing Blocked: pairs with a waker that stores `*addr`
     // then calls `futex_wake` (which loads our state under SCHED_LOCK).
@@ -679,12 +688,17 @@ pub fn futex_wait(addr: u64, expected: u32) {
         unsafe {
             (*addr_of_mut!(TCBS[cur])).futex_addr = 0;
         }
-        return;
+        set_wake_at(cur, 0);
+        return false;
     }
     block_current();
+    // Woken by a `futex_wake`, or (if armed) the timer once the deadline passed.
+    let timed_out = deadline != 0 && crate::arch::ticks() >= deadline;
     unsafe {
         (*addr_of_mut!(TCBS[cur])).futex_addr = 0;
     }
+    set_wake_at(cur, 0);
+    timed_out
 }
 
 /// §96: tid of the calling thread — backs `SYS_THREAD_ID` (std's keyed TLS keys

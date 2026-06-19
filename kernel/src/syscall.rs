@@ -148,8 +148,8 @@ pub extern "C" fn syscall_dispatch(
         }
         SYS_THREAD_EXIT => crate::thread::thread_exit(a1),
         SYS_FUTEX_WAIT => {
-            crate::thread::futex_wait(a1, a2 as u32);
-            SyscallRet { rax: 0, rdx: 0 }
+            let timed_out = crate::thread::futex_wait(a1, a2 as u32, a3);
+            SyscallRet { rax: timed_out as u64, rdx: 0 }
         }
         SYS_FUTEX_WAKE => {
             let woken = crate::thread::futex_wake(a1, a2 as usize);

@@ -69,8 +69,7 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     safely); (4) **keyed per-thread TLS** `thread_local/key/oxbow.rs` — a
     `(tid, key)` table indexed by `SYS_THREAD_ID` (each thread owns its row →
     race-free; makes `CURRENT` per-thread, fixing the no_threads UAF). New syscalls
-    `SYS_THREAD_ID`(57), `SYS_YIELD`(58). Limitations: no futex timeout yet
-    (`Condvar::wait_timeout` blocks until woken); TLS destructors don't run (guard is
+    `SYS_THREAD_ID`(57), `SYS_YIELD`(58). Limitations: TLS destructors don't run (guard is
     a no-op → TLS values leak at thread exit); boot-module std demos need a bumped
     Memory budget (shell-funded children get plenty).
   - ✅ **env + args** — `std::env::args()` reads `SPAWN_ARGV` (the kernel now maps it
