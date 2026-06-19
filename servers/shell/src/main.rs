@@ -823,7 +823,10 @@ fn find_program(verb: &[u8], path: &Path) -> Option<usize> {
 /// `args`, and our identity. The exit status flows into `$?`.
 fn run_program(len: usize, cwd: Handle, args: &[u8], sp: &Spawner) {
     let mut sm = MsgBuf::new(0);
-    sm.data[0] = 0;
+    // §96: 16 MiB default budget — std programs spawn threads (each a 256 KiB stack)
+    // and want heap headroom; the old 256 KiB default OOM'd them. The shell funds it
+    // from its own 96 MiB and the budget is refunded when the child exits.
+    sm.data[0] = 16 * 1024 * 1024;
     sm.data[1] = args.as_ptr() as u64;
     sm.data[2] = args.len() as u64;
     sm.data_len = 3;

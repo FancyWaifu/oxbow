@@ -99,7 +99,6 @@ _iso:
     cp target/x86_64-unknown-none/debug/badge iso_root/boot/badge.elf
     # §95: the Rust `std` demo as a boot module (kernel spawns it → output to the
     # serial console), if prebuilt. Proves real Rust std runs on oxbow.
-    [ -f std-port/oxhello-demo.elf ] && cp std-port/oxhello-demo.elf iso_root/boot/oxhello.elf || true
     cp target/x86_64-unknown-none/debug/fsd iso_root/boot/fs.elf
     -strip -S iso_root/boot/fs.elf
     cp target/x86_64-unknown-none/debug/net iso_root/boot/net.elf

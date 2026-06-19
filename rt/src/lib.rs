@@ -413,11 +413,14 @@ extern "C" fn start_rust() -> ! {
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __oxbow_write(_fd: i32, buf: *const u8, len: usize) -> isize {
-    // stdout/stderr both go to the boot console; fd is ignored for now.
-    match sys_console_write(BOOT_CONSOLE, buf, len) {
-        Ok(_) => len as isize,
-        Err(_) => -1,
-    }
+    // §96: use the SAME path as rt::println! — TAG_TTY_WRITE to SPAWN_STDOUT with a
+    // pipe fallback (`stdout_write`). A shell-spawned program's stdout is a tty
+    // endpoint or a pipe, NOT a kernel Console cap, so the old
+    // sys_console_write(BOOT_CONSOLE) silently dropped output (and std's stdout layer
+    // then wedged). stdout/stderr both route here.
+    let slice = unsafe { core::slice::from_raw_parts(buf, len) };
+    stdout_write(slice);
+    len as isize
 }
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
