@@ -29,7 +29,9 @@ fn announce_first_cr3(proc: usize) {
 // user command like `ls` had no slot left ("out of TCB slots"). Give generous
 // headroom for the desktop plus several concurrent user processes / pipelines. Each
 // slot costs a 16 KiB kernel stack + a 512 B FX area (static BSS), so this is cheap.
-pub const MAX_THREADS: usize = 32;
+// §104: bumped 32 -> 256 so a thread-heavy std program (e.g. a libtest run, or an
+// mpsc stress test spawning ~100 senders) doesn't exhaust the pool. ~4 MiB of BSS.
+pub const MAX_THREADS: usize = 256;
 const KSTACK_SIZE: usize = 16 * 1024;
 /// The boot thread becomes the idle thread; it is never in the Ready set.
 const IDLE: usize = 0;
@@ -210,6 +212,9 @@ fn init_stack(slot: usize, entry: u64, arg1: u64, arg2: u64) -> (u64, u64) {
     (sp, top)
 }
 
+/// Claim a TCB slot and start a thread. Returns the tid (>= 1), or 0 if the pool is
+/// exhausted (§104) — a userland spawn must NEVER panic the kernel, so the caller
+/// turns 0 into an error the program handles (std `thread::spawn` -> `Err`).
 fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64, fs_base: u64) -> usize {
     // §72: under SCHED_LOCK — two cores (a user thread on each) can `sys_spawn`
     // concurrently, and a scheduler on another core may be scanning for Ready
@@ -249,7 +254,7 @@ fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64, fs_base: u64) 
         }
     }
     sched_unlock();
-    panic!("thread: out of TCB slots");
+    0 // pool exhausted — caller returns an error to userland (never a kernel panic)
 }
 
 /// Spawn a kernel thread (no owning process; runs under whatever CR3 is live).

@@ -172,10 +172,16 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     had no `Drop`, so a spawned-but-not-joined thread leaked its 256 KiB stack — across
     a libtest run that OOM'd spawns. Now `join` only waits, `Drop` frees an exited
     thread's stack, and a reaper sweeps still-running detached threads on later spawns
-    (`sys/thread/oxbow.rs`). Also bumped the shell's default child budget 16→64 MiB
-    (thread-heavy programs). Known gap: heavy channel-stress tests (`mpsc::*_stress`)
-    hang under the busy-yield scheduler — a concurrency follow-up.
-  Next: broaden the suite + the `mpsc` stress hang as the continuing "done" bar.
+    (`sys/thread/oxbow.rs`). Also bumped the shell's default child budget 16→64 MiB.
+  - ✅ **mpsc stress hang fixed → 111/111 pass** (incl. all of `sync/mpsc.rs`'s 54
+    tests + its stress tests). 🐛 Two kernel bugs: the TCB pool was `MAX_THREADS = 32`
+    (a program spawning ~100 threads exhausted it), and on exhaustion `thread::spawn`
+    **`panic!`'d the kernel** — so a thread-heavy userland program froze the whole OS.
+    Fixes (`kernel/thread.rs`): `MAX_THREADS` 32→256, and `spawn` returns 0 (no slot)
+    instead of panicking; std `Thread::new` turns that into `Err` (reclaiming the
+    stack/packet). Verified: 100-sender mpsc completes, and a program spawning past
+    the pool gets `Err` with the kernel surviving (no crash).
+  Next: broaden the suite further as the continuing "done" bar.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 

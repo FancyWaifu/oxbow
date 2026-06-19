@@ -113,7 +113,18 @@ impl Thread {
         let done = Box::into_raw(Box::new(AtomicU32::new(0)));
         let packet = Box::into_raw(Box::new(Packet { init, done }));
         let stack_top = stack_ptr as u64 + stack_len as u64;
-        unsafe { __oxbow_thread_spawn(stack_top, thread_start, packet as u64) };
+        // §104: the kernel returns the new tid, or 0 if its TCB pool is exhausted.
+        let tid = unsafe { __oxbow_thread_spawn(stack_top, thread_start, packet as u64) };
+        if tid == 0 {
+            // Spawn failed: the closure never ran, so reclaim everything we allocated.
+            unsafe {
+                drop(Box::from_raw(packet)); // drops the captured closure too
+                drop(Box::from_raw(done));
+                let layout = crate::alloc::Layout::from_size_align(stack_len, 16).unwrap();
+                crate::alloc::dealloc(stack_ptr, layout);
+            }
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "kernel thread pool exhausted"));
+        }
         Ok(Thread { done, stack: stack_ptr, stack_len })
     }
 
