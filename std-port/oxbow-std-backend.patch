@@ -801,6 +801,115 @@ index c4b14ab4..d0e8b2aa 100644
 +
 +#[cfg(target_os = "oxbow")]
 +pub mod futex;
+diff --git a/library/std/src/sys/paths/mod.rs b/library/std/src/sys/paths/mod.rs
+index 8880a837..45266c31 100644
+--- a/library/std/src/sys/paths/mod.rs
++++ b/library/std/src/sys/paths/mod.rs
+@@ -17,6 +17,15 @@ mod imp {
+             pub use super::unsupported::{SplitPaths, split_paths, JoinPathsError, join_paths, home_dir};
+         }
+     }
++    target_os = "oxbow" => {
++        mod oxbow;
++        #[expect(dead_code)]
++        mod unsupported;
++        mod imp {
++            pub use super::oxbow::{getcwd, chdir, current_exe, temp_dir};
++            pub use super::unsupported::{SplitPaths, split_paths, JoinPathsError, join_paths, home_dir};
++        }
++    }
+     all(target_vendor = "fortanix", target_env = "sgx") => {
+         mod sgx;
+         #[expect(dead_code)]
+diff --git a/library/std/src/sys/paths/oxbow.rs b/library/std/src/sys/paths/oxbow.rs
+new file mode 100644
+index 00000000..cc8bea76
+--- /dev/null
++++ b/library/std/src/sys/paths/oxbow.rs
+@@ -0,0 +1,83 @@
++//! oxbow working-directory + executable-path backend.
++//!
++//! oxbow has no global filesystem namespace: a process's working directory is a
++//! *capability* (the dir cap the spawner installed at handle slot 1), not an
++//! ambient path string. This backend settles `std::env`'s path APIs to that model:
++//!
++//! * [`getcwd`] returns a process-local path *label* that std maintains. The label
++//!   is purely informational — reporting it leaks no authority — and defaults to
++//!   `/` until the program changes directory.
++//! * [`chdir`] re-roots the cwd *capability* through the runtime (`__oxbow_chdir`
++//!   opens the target as a new directory cap and installs it), so subsequent
++//!   relative file operations and child spawns genuinely follow it; it then updates
++//!   the informational label to match.
++//! * [`current_exe`] is unsupported: oxbow spawns processes from raw ELF bytes
++//!   (`sys_spawn_bytes`), not from a named, re-openable file, so there is no
++//!   canonical executable path. std explicitly permits `Err` here.
++
++use crate::io;
++use crate::path::{self, Component, PathBuf};
++use crate::sync::Mutex;
++
++unsafe extern "C" {
++    /// Re-root the cwd capability to `path` (relative to the current cwd). Returns 0
++    /// on success, -1 if the path can't be opened or names a non-directory.
++    fn __oxbow_chdir(path: *const u8, len: usize) -> i32;
++}
++
++/// The informational cwd label. `None` means the default root (`/`); std seeds no
++/// path at startup because the spawner hands over a capability, not a path.
++static CWD: Mutex<Option<PathBuf>> = Mutex::new(None);
++
++/// Lexically resolve `.`/`..` against an absolute path so the label stays tidy.
++fn normalize(p: &path::Path) -> PathBuf {
++    let mut out = PathBuf::from("/");
++    for comp in p.components() {
++        match comp {
++            Component::RootDir => out = PathBuf::from("/"),
++            Component::CurDir => {}
++            Component::ParentDir => {
++                out.pop();
++            }
++            Component::Normal(c) => out.push(c),
++            Component::Prefix(_) => {}
++        }
++    }
++    out
++}
++
++pub fn getcwd() -> io::Result<PathBuf> {
++    let cwd = CWD.lock().unwrap();
++    Ok(cwd.clone().unwrap_or_else(|| PathBuf::from("/")))
++}
++
++pub fn chdir(p: &path::Path) -> io::Result<()> {
++    // Resolve to the new absolute target within our namespace. `..`/`.` are folded
++    // lexically and cannot ascend above `/` (the slot-1 confinement boundary); the
++    // runtime then opens that absolute path from the root cap, so descent/ascent/
++    // multi-component all behave uniformly.
++    let target = {
++        let cwd = CWD.lock().unwrap();
++        let base = cwd.clone().unwrap_or_else(|| PathBuf::from("/"));
++        normalize(&if p.is_absolute() { p.to_path_buf() } else { base.join(p) })
++    };
++    let bytes = target.as_os_str().as_encoded_bytes();
++    let rc = unsafe { __oxbow_chdir(bytes.as_ptr(), bytes.len()) };
++    if rc != 0 {
++        return Err(io::const_error!(
++            io::ErrorKind::NotFound,
++            "set_current_dir: path is not an openable directory",
++        ));
++    }
++    *CWD.lock().unwrap() = Some(target);
++    Ok(())
++}
++
++pub fn current_exe() -> io::Result<PathBuf> {
++    // No exe-path concept on oxbow — see the module docs.
++    crate::sys::pal::unsupported()
++}
++
++pub fn temp_dir() -> PathBuf {
++    PathBuf::from("/tmp")
++}
 diff --git a/library/std/src/sys/personality/mod.rs b/library/std/src/sys/personality/mod.rs
 index eabef922..c881f4cc 100644
 --- a/library/std/src/sys/personality/mod.rs

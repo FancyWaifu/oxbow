@@ -30,7 +30,8 @@ Heavy `mpsc::*_stress` tests hang under the busy-yield scheduler (follow-up).
   out-of-bounds while holding the heap spinlock → re-entrant alloc self-deadlock.
   Fix in `rt`: fail fast when the size class exceeds the slab.
 - Remaining failures = `env::current_dir`/`current_exe`/`set_current_dir`: POSIX
-  path concepts with no cap-based-cwd equivalent (a design decision).
+  path concepts with no cap-based-cwd equivalent — **now settled + implemented**, see
+  the "env cwd/exe stance" section below.
 
 ## Collections: HashMap + BTreeSet — 85/85 pass (no source changes)
 
@@ -49,3 +50,26 @@ coupled to internals via `crate::`/`super::`/`realstd::` + use `rand`. Run them 
 
 BTreeMap's *own* tests poke private node internals (NodeRef/MIN_LEN/crate::testing),
 so they aren't standalone-extractable; BTreeSet wraps BTreeMap and validates the tree.
+
+## env cwd/exe stance — SETTLED + verified (`env-stance-test.rs`)
+
+The three `std::env` path APIs that were "capability-model gaps" are now settled in
+`~/rust-oxbow/.../sys/paths/oxbow.rs` + `rt::__oxbow_chdir`. Principle: **the cwd is the
+slot-1 spawn-root capability; the path is relative to it** (`/` = slot 1; you navigate
+within your subtree, never above it — fsd rejects `..` as L3 confinement).
+
+- `current_dir()` → process-local path *label* (default `/`); informational, no authority.
+- `set_current_dir(p)` → std folds `.`/`..` lexically to an absolute target, then
+  `__oxbow_chdir` opens it **from the root cap (slot 1)** and installs the dir cap as the
+  cwd, so relative fs ops + child spawns follow it. Re-opening from root (not relatively)
+  makes descent/ascent/multi-component uniform without fsd `..` support.
+- `current_exe()` → `Err(Unsupported)` — oxbow spawns from bytes, there is no exe path.
+
+`env-stance-test.rs` is a plain (non-libtest) `oxbow_main` program: build with
+`-Z build-std=std,panic_unwind -Z build-std-features=compiler-builtins-mem` (set
+`RUST_TARGET_PATH=~/oxbow` + `RUSTFLAGS=-Zunstable-options` for the custom-target probe),
+inject to `/bin/oxtest`, run via `env-stance-harness.py`. All checks pass: defaults to
+`/`, chdir descent + `..` ascent, relative writes land under the new cwd (absent from
+`/`), qualified multi-component reads resolve, bad chdir errors + leaves cwd unchanged.
+The only real-std `env.rs` test left red is `test_self_exe_path` (asserts
+`current_exe().is_ok()`) — the expected cost of the honest `Err`.

@@ -195,6 +195,20 @@ mod heap {
 /// granting a pipe's R_OUT end at SPAWN_STDOUT instead of a tty endpoint.
 static STDOUT_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+/// §97b The process's current-working-directory capability. Starts at slot 1 — the
+/// cwd dir cap the spawner installed. `std::env::set_current_dir` re-roots it
+/// (`__oxbow_chdir`) by opening a new dir cap and storing its handle here, so every
+/// subsequent *relative* fs op (open/mkdir/unlink/rename) and child spawn resolves
+/// against the new directory. The original slot 1 is never closed; re-rooted caps are.
+#[cfg(feature = "hosted")]
+static CWD_HANDLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// The handle the relative-path fs shims send to. Defaults to slot 1.
+#[cfg(feature = "hosted")]
+fn cwd_handle() -> Handle {
+    CWD_HANDLE.load(core::sync::atomic::Ordering::Relaxed) as Handle
+}
+
 /// Write all of `bytes` into pipe handle `pipe`, looping over partial writes. The
 /// kernel blocks the writer while the pipe is full, so this never busy-spins; a
 /// return of 0 means the read end closed (broken pipe) — stop.
@@ -544,7 +558,7 @@ pub unsafe extern "C" fn __oxbow_fs_open(
     is_dir_out: *mut i32,
 ) -> i64 {
     let p = unsafe { core::slice::from_raw_parts(path, path_len) };
-    let cwd: Handle = 1; // SPAWN cwd dir cap (slot 1)
+    let cwd: Handle = cwd_handle(); // current cwd dir cap (slot 1, or re-rooted)
     if create != 0 {
         match fs::create(cwd, p) {
             Some(h) => {
@@ -619,7 +633,7 @@ pub unsafe extern "C" fn __oxbow_fs_mkdir(path: *const u8, len: usize) -> i32 {
         *dst.add(n) = 0;
     }
     m.data_len = ((n + 1 + 7) / 8) as u32;
-    if sys_call(1 as Handle, &mut m).is_err() || m.data[0] != 0 {
+    if sys_call(cwd_handle(), &mut m).is_err() || m.data[0] != 0 {
         -1
     } else {
         0
@@ -660,7 +674,7 @@ pub unsafe extern "C" fn __oxbow_fs_unlink(path: *const u8, len: usize) -> i32 {
         *dst.add(n) = 0;
     }
     m.data_len = ((n + 1 + 7) / 8) as u32;
-    if sys_call(1 as Handle, &mut m).is_err() || m.data[0] != 0 {
+    if sys_call(cwd_handle(), &mut m).is_err() || m.data[0] != 0 {
         -1
     } else {
         0
@@ -686,10 +700,49 @@ pub unsafe extern "C" fn __oxbow_fs_rename(
         *dst.add(ol + 1 + nl) = 0;
     }
     m.data_len = 8;
-    if sys_call(1 as Handle, &mut m).is_err() || m.data[0] != 0 {
+    if sys_call(cwd_handle(), &mut m).is_err() || m.data[0] != 0 {
         -1
     } else {
         0
+    }
+}
+/// §97b std::env::set_current_dir — re-root the cwd *capability*. `path` is the
+/// std-normalized *absolute* target within this process's namespace: it always starts
+/// with `/` and contains no `.`/`..` (std collapses those lexically — it cannot ascend
+/// above `/`, which is the slot-1 spawn-root, matching fsd's confinement rule). We
+/// resolve it relative to slot 1 (the root cap) so descent, ascent, and multi-component
+/// paths all work uniformly. `/` itself resolves to slot 1. Installs the new dir cap as
+/// the cwd (so later relative fs ops + child spawns follow it) and returns 0; returns -1
+/// if the path can't be opened or names a non-directory. Closes the previously re-rooted
+/// cap (never the original slot 1) so repeated chdirs don't leak handles.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_chdir(path: *const u8, len: usize) -> i32 {
+    let p = unsafe { core::slice::from_raw_parts(path, len) };
+    // Strip the leading '/': fsd resolves relative to the slot-1 root cap's subtree.
+    let rel = if p.first() == Some(&b'/') { &p[1..] } else { p };
+    let store = |new: u64| {
+        let old = CWD_HANDLE.swap(new, core::sync::atomic::Ordering::Relaxed);
+        if old != 1 {
+            let _ = sys_close(old as Handle);
+        }
+    };
+    if rel.is_empty() {
+        // Target is the root of our namespace — that is slot 1 itself.
+        store(1);
+        return 0;
+    }
+    match fs::open(1 as Handle, rel) {
+        Some(n) if n.kind == oxbow_abi::FS_DIR => {
+            store(n.cap as u64);
+            0
+        }
+        Some(n) => {
+            // Opened, but it is a regular file, not a directory — release + reject.
+            let _ = sys_close(n.cap as Handle);
+            -1
+        }
+        None => -1,
     }
 }
 
@@ -715,7 +768,7 @@ pub unsafe extern "C" fn __oxbow_spawn(
     sm.data[2] = argv_len as u64;
     sm.data_len = 3;
     sm.handle_count = 4;
-    sm.handles[0] = 1; // cwd dir cap (slot 1)
+    sm.handles[0] = cwd_handle(); // cwd dir cap (slot 1, or the parent's re-rooted cwd)
     sm.handles[1] = stdout_cap as Handle; // stdout: 2 (inherit) or a pipe write-end
     sm.handles[2] = 4; // stdin (SPAWN_STDIN)
     sm.handles[3] = oxbow_abi::BOOT_NET_EP; // net

@@ -201,7 +201,31 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     re-exports the type (so `super::HashMap`/`super::*` resolve). BTreeMap's *own* tests
     poke private node internals (`NodeRef`/`MIN_LEN`/`crate::testing`), so they aren't
     standalone-extractable — but BTreeSet wraps BTreeMap, so the B-tree is validated.
-  Next: more fs; decide the cwd/exe-path stance.
+  - ✅ **cwd/exe-path stance SETTLED + implemented** (`sys/paths/oxbow.rs` +
+    `rt::__oxbow_chdir`). The principle: **a process's working directory is its slot-1
+    spawn-root *capability*, and the path is relative to it** — `/` *is* slot 1, and you
+    can navigate within your subtree but never above it (fsd already rejects `..` as
+    capability confinement, L3).
+      - `current_dir()` → **works**: returns a process-local path *label* std maintains
+        (default `/`). Reporting it leaks no authority; it's informational.
+      - `set_current_dir(p)` → **works**: std folds `.`/`..` lexically into an absolute
+        target (can't ascend above `/`), then `__oxbow_chdir` opens that path from the
+        slot-1 root cap and installs the returned dir cap as the cwd — so subsequent
+        *relative* fs ops (open/mkdir/unlink/rename) **and child spawns** genuinely
+        follow it. Resolving from root (not relatively) makes descent, ascent, and
+        multi-component paths all work without needing fsd `..` support. Errors (and
+        leaves the cwd unchanged) if the target isn't an openable directory.
+      - `current_exe()` → **`Err(Unsupported)`** by design: oxbow spawns from raw ELF
+        bytes (`sys_spawn_bytes`), not a named, re-openable file — there is no canonical
+        exe path. std explicitly permits `Err` here (redox/sgx do the same).
+      - rt change: the relative-path fs shims + spawn now route through a tracked
+        `CWD_HANDLE` (default slot 1) instead of a hardcoded `1`, so re-rooting takes
+        effect. Verified end-to-end on hardware-ish QEMU: defaults to `/`, chdir
+        descent + `..` ascent, relative writes land under the new cwd (and are absent
+        from `/`), multi-component qualified reads resolve, bad chdir errors — all pass.
+        The one real-std `env.rs` test that stays red is `test_self_exe_path` (it asserts
+        `current_exe().is_ok()`), which is the *expected* consequence of the honest `Err`.
+  Next: more fs.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 
