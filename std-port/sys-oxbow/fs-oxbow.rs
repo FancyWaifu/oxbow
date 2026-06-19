@@ -425,11 +425,26 @@ pub fn set_times(_p: &Path, _times: FileTimes) -> io::Result<()> {
 pub fn set_times_nofollow(_p: &Path, _times: FileTimes) -> io::Result<()> {
     unsupported()
 }
-pub fn rmdir(_p: &Path) -> io::Result<()> {
-    unsupported()
+pub fn rmdir(p: &Path) -> io::Result<()> {
+    // fsd's UNLINK (oxfs_remove) falls back to ext4_dir_rm, so it removes an
+    // (empty) directory too.
+    let b = pbytes(p);
+    if unsafe { __oxbow_fs_unlink(b.as_ptr(), b.len()) } != 0 {
+        return Err(ioerr(io::ErrorKind::Other, "oxbow fs: remove_dir failed"));
+    }
+    Ok(())
 }
-pub fn remove_dir_all(_path: &Path) -> io::Result<()> {
-    unsupported()
+pub fn remove_dir_all(path: &Path) -> io::Result<()> {
+    for entry in readdir(path)? {
+        let entry = entry?;
+        let p = entry.path();
+        if entry.file_type()?.is_dir() {
+            remove_dir_all(&p)?;
+        } else {
+            unlink(&p)?;
+        }
+    }
+    rmdir(path)
 }
 pub fn readlink(_p: &Path) -> io::Result<PathBuf> {
     unsupported()

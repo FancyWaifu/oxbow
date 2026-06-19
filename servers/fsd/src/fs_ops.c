@@ -78,10 +78,15 @@ int oxfs_mkdir(const char *path)
 /* Remove a regular file, or an empty directory. */
 int oxfs_remove(const char *path)
 {
-	int r = ext4_fremove(path);
-	if (r == EOK)
-		return EOK;
-	return ext4_dir_rm(path);
+	/* A directory must go through ext4_dir_rm; ext4_fremove returns EOK on a dir
+	 * WITHOUT removing it, so std::fs::remove_dir silently no-op'd. Dispatch by
+	 * type: if the path opens as a directory, rm the directory; else fremove. */
+	ext4_dir d;
+	if (ext4_dir_open(&d, path) == EOK) {
+		ext4_dir_close(&d);
+		return ext4_dir_rm(path);
+	}
+	return ext4_fremove(path);
 }
 
 int oxfs_rename(const char *path, const char *new_path)

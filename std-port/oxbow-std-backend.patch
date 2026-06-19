@@ -177,10 +177,10 @@ index 0c297c57..a1404d0b 100644
          use vexos as imp;
 diff --git a/library/std/src/sys/fs/oxbow.rs b/library/std/src/sys/fs/oxbow.rs
 new file mode 100644
-index 00000000..c17de23a
+index 00000000..0f0931f3
 --- /dev/null
 +++ b/library/std/src/sys/fs/oxbow.rs
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,463 @@
 +//! oxbow std::fs — real File open/read/write/seek + stat over the fsd protocol
 +//! (oxbow-rt's `__oxbow_fs_*` shims), relative to the program's cwd dir cap.
 +//! Directory listing, symlinks, rename/unlink, timestamps and permissions are not
@@ -608,11 +608,26 @@ index 00000000..c17de23a
 +pub fn set_times_nofollow(_p: &Path, _times: FileTimes) -> io::Result<()> {
 +    unsupported()
 +}
-+pub fn rmdir(_p: &Path) -> io::Result<()> {
-+    unsupported()
++pub fn rmdir(p: &Path) -> io::Result<()> {
++    // fsd's UNLINK (oxfs_remove) falls back to ext4_dir_rm, so it removes an
++    // (empty) directory too.
++    let b = pbytes(p);
++    if unsafe { __oxbow_fs_unlink(b.as_ptr(), b.len()) } != 0 {
++        return Err(ioerr(io::ErrorKind::Other, "oxbow fs: remove_dir failed"));
++    }
++    Ok(())
 +}
-+pub fn remove_dir_all(_path: &Path) -> io::Result<()> {
-+    unsupported()
++pub fn remove_dir_all(path: &Path) -> io::Result<()> {
++    for entry in readdir(path)? {
++        let entry = entry?;
++        let p = entry.path();
++        if entry.file_type()?.is_dir() {
++            remove_dir_all(&p)?;
++        } else {
++            unlink(&p)?;
++        }
++    }
++    rmdir(path)
 +}
 +pub fn readlink(_p: &Path) -> io::Result<PathBuf> {
 +    unsupported()

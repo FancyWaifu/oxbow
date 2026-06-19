@@ -89,7 +89,7 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     persisted to ext2. rt shims `__oxbow_fs_open`/`_pread`/`_pwrite`/`_close`
     (positioned, relative to the program's cwd dir cap at slot 1); std backend
     `sys/fs/oxbow.rs`. Verified from the shell: write a file, read it back, stat its
-    size, seek + read a slice. Plus `read_dir` + `create_dir` (multi-component paths, .\/.. omitted). Plus `remove_file` + `rename`. Not yet wired: `remove_dir`, symlinks, timestamps/permissions.
+    size, seek + read a slice. Plus `read_dir` + `create_dir` (multi-component paths, .\/.. omitted). Plus `remove_file`/`rename`/`remove_dir`/`remove_dir_all`. Not yet wired: symlinks, timestamps/permissions.
   - ☐ The original hardening list:
 - **Phase 3 (cont.) — harden.** Native ELF TLS, `Command` stdio piping (spawn-not-fork),
   full `Metadata`, optional `panic=unwind`.
