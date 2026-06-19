@@ -30,11 +30,26 @@ pub enum PState {
     Dead,
 }
 
+/// PT_TLS template for §101 native ELF thread-local storage. Each thread gets its
+/// own TLS block copied from this template; `vaddr` is where `.tdata` lives in the
+/// process address space (so spawned threads can re-read it live).
+#[derive(Clone, Copy)]
+pub struct TlsTemplate {
+    pub vaddr: u64,
+    pub filesz: u64,
+    pub memsz: u64,
+    pub align: u64,
+}
+
 /// A process: its address space root and its capability handle table (ABI §3).
 #[derive(Clone, Copy)]
 pub struct Process {
     pub state: PState,
     pub pml4_phys: u64,
+    /// PT_TLS template (None if the image has no thread-local storage).
+    pub tls: Option<TlsTemplate>,
+    /// Bump allocator for per-thread TLS block vaddrs (one frame each).
+    pub tls_next: u64,
     handles: [Option<HandleEntry>; HANDLE_TABLE_SIZE],
     /// Notification the kernel signals when this process exits (set at spawn).
     exit_notif: Option<u8>,
@@ -62,6 +77,8 @@ impl Process {
         Process {
             state: PState::Free,
             pml4_phys: 0,
+            tls: None,
+            tls_next: TLS_REGION_BASE,
             handles: [None; HANDLE_TABLE_SIZE],
             exit_notif: None,
             mem_idx: None,
@@ -240,9 +257,66 @@ const USER_STACK_PAGES: u64 = 128;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 
+/// Base of the per-thread TLS region (§101). Far below the stack and above the
+/// image; one frame is bump-allocated per thread (`Process::tls_next`).
+pub const TLS_REGION_BASE: u64 = 0x0000_7000_0000_0000;
+
+/// Build one per-thread TLS block (x86-64 variant II): a fresh user RW frame mapped
+/// at the process's next TLS vaddr, with `.tdata` (`t.filesz` bytes from `src`, a
+/// pointer readable in the CURRENT address space) at the bottom, `.tbss` zeroed, and
+/// the TCB self-pointer at the thread pointer. Returns the thread pointer (= %fs
+/// base). The static-TLS block sits BELOW the TP, so a TLS symbol at template offset
+/// `s` is reached at `%fs:(s - tls_size)` = user `vaddr + s` (local-exec model).
+fn build_tls_block(pml4_phys: u64, tls_next: &mut u64, t: &TlsTemplate, src: *const u8) -> u64 {
+    let align = t.align.max(8);
+    let tls_size = (t.memsz + align - 1) & !(align - 1);
+    assert!(tls_size + 16 <= FRAME, "tls: block too large for one frame");
+    let vaddr = *tls_next;
+    *tls_next += FRAME;
+    let frame = pmm::alloc_frame().expect("tls: out of frames");
+    let kbase = mm::phys_to_virt(frame) as *mut u8;
+    let tp = vaddr + tls_size;
+    unsafe {
+        core::ptr::write_bytes(kbase, 0, FRAME as usize);
+        if t.filesz > 0 {
+            core::ptr::copy_nonoverlapping(src, kbase, t.filesz as usize);
+        }
+        // TCB self-pointer at the thread pointer (ABI: *tp == tp).
+        *(kbase.add(tls_size as usize) as *mut u64) = tp;
+    }
+    mm::vm::map_user_4k_in(pml4_phys, vaddr, frame, true, false); // RW, NX
+    tp
+}
+
+/// Set up the TLS block for a NEWLY SPAWNED thread of a live process, reading the
+/// `.tdata` template from the process's own mapped memory (the current address space
+/// is the process's when it calls SYS_THREAD_SPAWN). Returns the thread pointer, or 0
+/// if the process has no TLS. §101.
+pub fn build_thread_tls(proc_id: usize) -> u64 {
+    let mut procs = PROCESSES.lock();
+    let p = &mut procs[proc_id];
+    let Some(t) = p.tls else { return 0 };
+    let pml4 = p.pml4_phys;
+    let mut next = p.tls_next;
+    let tp = build_tls_block(pml4, &mut next, &t, t.vaddr as *const u8);
+    p.tls_next = next;
+    tp
+}
+
 /// Map an ELF image's PT_LOAD segments (W^X-clean, U=1) and a guarded 64 KiB
-/// stack into the given address space. Returns `(entry, user_rsp)`.
-fn load_into(img: &Image, pml4_phys: u64) -> (u64, u64) {
+/// What `load_into` produces: the entry/stack plus the main thread's TLS pointer
+/// and the (template, next-vaddr) state to copy onto the Process afterwards.
+struct LoadResult {
+    entry: u64,
+    user_rsp: u64,
+    fs_base: u64,
+    tls: Option<TlsTemplate>,
+    tls_next: u64,
+}
+
+/// stack into the given address space. The `fs_base` in the result is the main
+/// thread's TLS thread pointer (0 if the image has no TLS).
+fn load_into(img: &Image, pml4_phys: u64) -> LoadResult {
     let bytes = img.bytes();
     let mut segments = 0u32;
 
@@ -310,14 +384,43 @@ fn load_into(img: &Image, pml4_phys: u64) -> (u64, u64) {
             slide
         );
     }
-    (img.entry, stack_top)
+
+    // §101 native ELF TLS: if the image has a PT_TLS template, set up the MAIN
+    // thread's TLS block now, reading `.tdata` straight from the image bytes (the
+    // segments are in `pml4_phys`, not the live CR3, so we can't read by vaddr yet).
+    // The template + bumped vaddr are returned for the caller to store on the Process.
+    let mut fs_base = 0u64;
+    let mut tls = None;
+    let mut tls_next = TLS_REGION_BASE;
+    if let Some(ph) = img.tls() {
+        let t = TlsTemplate {
+            vaddr: ph.p_vaddr,
+            filesz: ph.p_filesz,
+            memsz: ph.p_memsz,
+            align: ph.p_align,
+        };
+        let src = unsafe { img.bytes().as_ptr().add(ph.p_offset as usize) };
+        fs_base = build_tls_block(pml4_phys, &mut tls_next, &t, src);
+        tls = Some(t);
+        if crate::verbose() {
+            println!(
+                "[elf] TLS template filesz={} memsz={} align={} -> main tp={:#x}",
+                ph.p_filesz, ph.p_memsz, ph.p_align, fs_base
+            );
+        }
+    }
+    LoadResult { entry: img.entry, user_rsp: stack_top, fs_base, tls, tls_next }
 }
 
 /// Create a process: claim a pool slot (reusing a `Dead` one), map the image
 /// into `pml4_phys`, and return `(proc id, entry, user_rsp)`. Grants NO handles
 /// — the caller installs the boot set (`grant_standard` + per-name device caps)
 /// or the spawn set (the §13 convention). `E_NOMEM` if the pool is full.
-pub fn create(img: &Image, pml4_phys: u64, name: &str) -> Result<(usize, u64, u64), SysError> {
+pub fn create(
+    img: &Image,
+    pml4_phys: u64,
+    name: &str,
+) -> Result<(usize, u64, u64, u64), SysError> {
     let (id, dead_pml4) = {
         let mut procs = PROCESSES.lock();
         let id = (0..MAX_PROCS)
@@ -338,11 +441,18 @@ pub fn create(img: &Image, pml4_phys: u64, name: &str) -> Result<(usize, u64, u6
         mm::vm::free_user_pml4(old);
     }
 
-    let (entry, user_rsp) = load_into(img, pml4_phys);
+    let lr = load_into(img, pml4_phys);
+    // Record the TLS template + bumped vaddr on the Process (lock dropped during the
+    // mm-heavy load_into; re-take it for this small write).
+    if lr.tls.is_some() {
+        let mut procs = PROCESSES.lock();
+        procs[id].tls = lr.tls;
+        procs[id].tls_next = lr.tls_next;
+    }
     if crate::verbose() {
         println!("[proc] {} = proc {} (as pml4={:#x})", name, id, pml4_phys);
     }
-    Ok((id, entry, user_rsp))
+    Ok((id, lr.entry, lr.user_rsp, lr.fs_base))
 }
 
 /// Grant a boot process its standard birth capabilities: a Console (write) and a

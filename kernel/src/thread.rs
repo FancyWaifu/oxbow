@@ -94,6 +94,9 @@ struct Tcb {
     /// §96 futex: the user address this thread is `SYS_FUTEX_WAIT`-blocked on
     /// (0 = not futex-waiting). `SYS_FUTEX_WAKE` scans for matches in the same proc.
     futex_addr: u64,
+    /// §101 native ELF TLS: this thread's %fs base (thread pointer), loaded into
+    /// IA32_FS_BASE on switch-in. 0 = no TLS (kernel threads / TLS-less images).
+    fs_base: u64,
 }
 
 static mut TCBS: [Tcb; MAX_THREADS] = [Tcb {
@@ -103,6 +106,7 @@ static mut TCBS: [Tcb; MAX_THREADS] = [Tcb {
     cr3: 0,
     wake_at: 0,
     futex_addr: 0,
+    fs_base: 0,
 }; MAX_THREADS];
 
 // §70 SMP lost-wakeup fix: the thread STATE lives in its own atomic array, NOT in
@@ -135,6 +139,9 @@ fn kstack_top(s: usize) -> u64 {
 }
 fn cr3_of(s: usize) -> u64 {
     unsafe { (*addr_of!(TCBS[s])).cr3 }
+}
+fn fs_base_of(s: usize) -> u64 {
+    unsafe { (*addr_of!(TCBS[s])).fs_base }
 }
 fn proc_of(s: usize) -> usize {
     unsafe { (*addr_of!(TCBS[s])).proc }
@@ -195,7 +202,7 @@ fn init_stack(slot: usize, entry: u64, arg1: u64, arg2: u64) -> (u64, u64) {
     (sp, top)
 }
 
-fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64) -> usize {
+fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64, fs_base: u64) -> usize {
     // §72: under SCHED_LOCK — two cores (a user thread on each) can `sys_spawn`
     // concurrently, and a scheduler on another core may be scanning for Ready
     // threads. The lock makes "claim a Free/Exited slot, fill it, publish Ready"
@@ -216,6 +223,7 @@ fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64) -> usize {
                     cr3,
                     wake_at: 0,
                     futex_addr: 0,
+                    fs_base,
                 };
                 // Fresh (or reused) slot: reset its FPU state to the clean template.
                 core::ptr::copy_nonoverlapping(
@@ -238,7 +246,7 @@ fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64) -> usize {
 /// Spawn a kernel thread (no owning process; runs under whatever CR3 is live).
 #[allow(dead_code)] // scheduler API; kernel-thread demos were retired in arc 3
 pub fn spawn_kernel(entry: extern "C" fn(u64), arg: u64) -> usize {
-    spawn(entry as *const () as u64, arg, 0, NO_PROC, 0)
+    spawn(entry as *const () as u64, arg, 0, NO_PROC, 0, 0)
 }
 
 /// Register an idle thread for an AP that is ALREADY executing on `kstack_top` (its
@@ -259,6 +267,7 @@ pub fn register_running_idle(kstack_top: u64) -> usize {
                     cr3: 0,
                     wake_at: 0,
                     futex_addr: 0,
+                    fs_base: 0,
                 };
             }
             set_state(slot, State::Running); // the AP is already running on this stack
@@ -402,6 +411,10 @@ fn switch_to(next: usize) {
     // stack BEFORE the switch — safe because IF=0 throughout the kernel, so
     // nothing can trap from ring 3 between this update and the switch.
     crate::arch::set_kernel_stack(kstack_top(next));
+    // §101 native ELF TLS: load the incoming thread's %fs base (its TLS thread
+    // pointer). Per-thread MSR state, not saved on the kernel stack — set it on
+    // every switch-in from the Tcb. 0 for kernel/TLS-less threads (harmless).
+    crate::arch::set_fs_base(fs_base_of(next));
     // Load the incoming process's address space (skip for kernel threads, cr3=0,
     // and when unchanged). Safe to reload CR3 here: the executing code, this
     // kernel stack (in .bss), and the next thread's saved context all live in
@@ -645,20 +658,22 @@ extern "C" fn user_thread_entry(entry: u64, user_rsp: u64) {
 /// Spawn a user process's main thread, bound to process `proc` and address space
 /// `cr3`. It enters ring 3 (IF=1) the first time it is scheduled (under its own
 /// CR3) and the timer preempts it mid-userspace thereafter.
-pub fn spawn_user(proc: usize, cr3: u64, entry: u64, user_rsp: u64) -> usize {
-    spawn(user_thread_entry as *const () as u64, entry, user_rsp, proc, cr3)
+pub fn spawn_user(proc: usize, cr3: u64, entry: u64, user_rsp: u64, fs_base: u64) -> usize {
+    spawn(user_thread_entry as *const () as u64, entry, user_rsp, proc, cr3, fs_base)
 }
 
 /// §96: spawn a new thread in the CALLER's address space (shares its `cr3` + owning
 /// process) with a caller-provided user stack. Backs `SYS_THREAD_SPAWN` — the
-/// kernel half of `std::thread::spawn`. Returns the new tid.
+/// kernel half of `std::thread::spawn`. Returns the new tid. §101: builds a fresh
+/// per-thread TLS block (the caller's AS is the process's, so `.tdata` is live).
 pub fn spawn_thread_in_current(entry: u64, user_rsp: u64) -> usize {
     let cur = current();
     let (proc, cr3) = unsafe {
         let t = &*addr_of!(TCBS[cur]);
         (t.proc, t.cr3)
     };
-    spawn_user(proc, cr3, entry, user_rsp)
+    let fs_base = crate::proc::build_thread_tls(proc);
+    spawn_user(proc, cr3, entry, user_rsp, fs_base)
 }
 
 /// §96 futex wait — block the caller until a `futex_wake` on `addr` arrives, but

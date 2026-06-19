@@ -106,6 +106,16 @@ pub fn set_kernel_stack(top: u64) {
     syscall::set_kernel_stack_top(top);
 }
 
+/// §101 native ELF TLS: set the running thread's `%fs` base (its TLS thread pointer)
+/// via the IA32_FS_BASE MSR. Userland `#[thread_local]` resolves to `%fs:offset`.
+/// `%fs` is untouched by SWAPGS (which swaps `%gs`), so this survives syscall
+/// round-trips and only needs re-loading on a thread switch.
+pub fn set_fs_base(base: u64) {
+    use x86_64::registers::model_specific::Msr;
+    const IA32_FS_BASE: u32 = 0xC000_0100;
+    unsafe { Msr::new(IA32_FS_BASE).write(base) };
+}
+
 /// Load the shared GDT + IDT on Application Processor `cpu` and reload its segment
 /// registers, including `ltr` of that CPU's own TSS (§69 SMP Phase 5). The BSP
 /// built both in `init`; an AP just points its GDTR/IDTR at them.

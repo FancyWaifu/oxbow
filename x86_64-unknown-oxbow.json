@@ -16,6 +16,7 @@
   },
   "os": "oxbow",
   "vendor": "unknown",
+  "has-thread-local": true,
   "panic-strategy": "abort",
   "relocation-model": "static",
   "position-independent-executables": false,

@@ -566,7 +566,7 @@ fn spawn_common(
     // ---- Side effects. Create the child (claims a slot, loads the image), then
     // mint its budget, install its handles, debit the parent, and start it. ----
     let pml4 = mm::vm::new_user_pml4();
-    let (cid, entry, rsp) = match proc::create(img, pml4, label) {
+    let (cid, entry, rsp, fs_base) = match proc::create(img, pml4, label) {
         Ok(t) => t,
         Err(e) => return SyscallRet::err(e), // pool full — nothing debited yet
     };
@@ -623,7 +623,7 @@ fn spawn_common(
     }
     // Debit the parent now (guaranteed to succeed — we checked `remaining`).
     let _ = mm::mem::debit(prep.midx, prep.cost);
-    let tcb = crate::thread::spawn_user(cid, pml4, entry, rsp);
+    let tcb = crate::thread::spawn_user(cid, pml4, entry, rsp, fs_base);
     if crate::verbose() {
         println!("[spawn] pid {} (tcb {}) {} -{} KiB", cid, tcb, label, prep.cost / 1024);
     }

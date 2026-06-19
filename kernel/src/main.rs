@@ -385,7 +385,7 @@ fn kmain_stage2() -> ! {
         println!("[mod] module '{}': {} bytes", name, bytes.len());
         let img = elf::Image::validate(bytes);
         let as_i = mm::vm::new_user_pml4();
-        let (pid, entry, user_rsp) = proc::create(&img, as_i, name).expect("boot: create");
+        let (pid, entry, user_rsp, fs_base) = proc::create(&img, as_i, name).expect("boot: create");
         // §24: map a zeroed identity page so boot modules read as root via
         // rt::identity() (runtime spawns get theirs in spawn_common). Without this
         // the first read of SPAWN_IDENT faults.
@@ -980,7 +980,7 @@ fn kmain_stage2() -> ! {
                 });
             }
         }
-        let tcb = thread::spawn_user(pid, as_i, entry, user_rsp);
+        let tcb = thread::spawn_user(pid, as_i, entry, user_rsp, fs_base);
         println!("[user] {} scheduled as tcb {} (ring 3, IF=1)", name, tcb);
     }
 

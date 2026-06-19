@@ -110,8 +110,21 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     kernel panic (silent freeze). Fixes: (1) `sys/exit.rs` oxbow arm → `__oxbow_exit`;
     (2) kernel `idt.rs` — a ring-3 #UD now `kill_current_user()`s (like #PF) instead
     of panicking, so a bad user instruction can't take down the machine.
-- **Phase 3 (cont.) — harden.** Native ELF TLS, TLS destructors,
-  optional `panic=unwind`.
+  - ✅ **Native ELF TLS** (replaces the keyed `(tid,key)`-table hack). Kernel: the
+    ELF loader captures `PT_TLS` (`elf.rs`); each thread gets its own TLS block built
+    from the template (x86-64 variant II — `.tdata`/`.tbss` below the thread pointer,
+    TCB self-pointer at it) by `proc::build_tls_block` (main thread in `load_into`,
+    spawned threads in `build_thread_tls`); the block's thread pointer is stored in
+    `Tcb.fs_base` and loaded into `IA32_FS_BASE` on every `switch_to` (`arch::set_fs_base`).
+    Userland: `has-thread-local: true` in the target spec flips `cfg(target_thread_local)`
+    so std's `thread_local!` uses the **native** backend (no std-source change). Std
+    programs need the TLS-aware linker script (`std-port/user-tls.ld` — adds a
+    `tls PT_TLS` PHDR + `.tdata`/`.tbss`). Verified: raw `#[thread_local]` AND
+    `thread_local!` give per-thread isolation across main + spawned threads
+    (`main=1`, each spawned thread sees the fresh template then its own write).
+    The keyed `sys/thread_local/key/oxbow.rs` is now dead (left in place).
+- **Phase 3 (cont.) — harden.** TLS destructors (run `Drop` at thread exit — the
+  native guard currently leaks), optional `panic=unwind`; Command kill/try_wait.
 - **Phase 4 — the std test suite** as the "done" bar.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)

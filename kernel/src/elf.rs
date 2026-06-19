@@ -7,6 +7,7 @@
 const ET_EXEC: u16 = 2;
 const EM_X86_64: u16 = 62;
 const PT_LOAD: u32 = 1;
+const PT_TLS: u32 = 7;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -99,6 +100,18 @@ impl<'a> Image<'a> {
         (0..self.phnum).filter_map(move |i| {
             let ph: Elf64Phdr = read(self.bytes, self.phoff + i * self.phentsize);
             (ph.p_type == PT_LOAD).then_some(ph)
+        })
+    }
+
+    /// The PT_TLS program header, if the image has thread-local storage. Describes
+    /// the TLS template: `p_vaddr` = where `.tdata` lives in the loaded image,
+    /// `p_filesz` = initialized `.tdata` bytes, `p_memsz` = total TLS size
+    /// (`.tdata` + `.tbss`), `p_align` = required alignment. Per-thread TLS blocks
+    /// are copied from this template (§101 native ELF TLS).
+    pub fn tls(&self) -> Option<Elf64Phdr> {
+        (0..self.phnum).find_map(|i| {
+            let ph: Elf64Phdr = read(self.bytes, self.phoff + i * self.phentsize);
+            (ph.p_type == PT_TLS).then_some(ph)
         })
     }
 
