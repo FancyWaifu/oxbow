@@ -225,7 +225,33 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
         from `/`), multi-component qualified reads resolve, bad chdir errors — all pass.
         The one real-std `env.rs` test that stays red is `test_self_exe_path` (it asserts
         `current_exe().is_ok()`), which is the *expected* consequence of the honest `Err`.
-  Next: more fs.
+  - ✅ **fs broadened — 35/35 curated real-std `fs/tests.rs` pass** (`std-port/tests/fs-tests.rs`).
+    Curated to the operations fsd implements (open/create/read/write/seek, metadata,
+    read_dir, mkdir/create_dir_all, unlink/rmdir/remove_dir_all, rename, copy); symlink/
+    lock/perm/time/truncate/clone/canonicalize tests are excluded (genuine gaps; the
+    verbatim file won't even compile on a non-`unix` target). Running them surfaced + fixed
+    **three real bugs**:
+      1. **fsd path-intern table leak** (`servers/fsd`): `intern()` allocates a `PATHS`
+         slot per distinct path opened (`MAXID=512`) and `unlink`/`rmdir` never freed it,
+         so a process touching >512 paths (or `read_large_dir`'s many files) exhausted the
+         table and **every later open/mkdir cascaded to failure**. Fix: `free_intern()` on
+         a successful remove. (Caveat noted: a cap held across its own file's unlink could
+         see the slot reused — unusual, accepted.)
+      2. **error-kind gaps** (`sys/fs/oxbow.rs`): oxbow's fs was permissive where POSIX
+         reports errors. Added stat pre-checks so `create_new` on an existing path →
+         `AlreadyExists`, `create_dir` on an existing path → `AlreadyExists` (keeps
+         `create_dir_all` idempotent), and `remove_file` on a missing path → `NotFound`.
+      3. **rename path-length cap** (`rt` + `servers/fsd`): `TAG_FS_RENAME` packed each
+         path into a 28-byte slice and fsd parsed only a 64-byte window, so any deep/
+         tmpdir-prefixed rename was truncated. The inline data area is actually 512 B
+         (`MSG_DATA_WORDS=64`); lifted both caps to fsd's `PLEN` (200) and made fsd parse
+         the valid data region. `rename_directory` now passes.
+    Excluded-by-design in the curated set: 2 `.`-dependent tests (`.` isn't a navigable
+    ambient path — same confinement principle as the cwd stance), `binary_file` (uses a
+    single raw `write()` of 1 KiB, exposing oxbow's 48-byte-per-`write()` short-write cap;
+    the round-trip is covered by `write_then_read` via `write_all`), and `read_large_dir`
+    reduced 32K→256 files (the 512-slot path table is a real live-path ceiling).
+  Next: net or time/clock std surface.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 

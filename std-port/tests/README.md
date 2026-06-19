@@ -73,3 +73,23 @@ inject to `/bin/oxtest`, run via `env-stance-harness.py`. All checks pass: defau
 `/`), qualified multi-component reads resolve, bad chdir errors + leaves cwd unchanged.
 The only real-std `env.rs` test left red is `test_self_exe_path` (asserts
 `current_exe().is_ok()`) — the expected cost of the honest `Err`.
+
+## fs — 35/35 curated real-std tests pass (`fs-tests.rs`)
+
+`fs-tests.rs` is a libtest module of real-std `library/std/src/fs/tests.rs` bodies, curated
+to the operations fsd implements (open/create/read/write/seek, metadata, read_dir, mkdir/
+create_dir_all, unlink/rmdir/remove_dir_all, rename, copy). The verbatim file can't run on
+oxbow: it's non-`unix`, has no `symlink_file`/`Dir`/file-times, and pulls locks/perms. So:
+- `fs-harness-main.rs` is the libtest crate root (`harness_main` from `oxbow_main`) with an
+  oxbow `test_helpers` (TempDir + a counter-based `tmpdir()` under `env::temp_dir()` = /tmp,
+  ensuring the base exists) and a `test_rng()`.
+- build with `-Z build-std=std,test,panic_unwind -Z build-std-features=compiler-builtins-mem
+  --tests` (+ `RUST_TARGET_PATH=~/oxbow RUSTFLAGS=-Zunstable-options`), inject the
+  `deps/oxtest-<hash>` test binary to `/bin/oxtest`, run via `fs-harness.py`.
+
+Running these surfaced + fixed three real bugs (see `docs/rust-std-port.md`): fsd path-intern
+table leak (`free_intern` on remove), error-kind gaps (stat pre-checks for AlreadyExists/
+NotFound), and the rename 28-byte path cap (lifted to 200 over the 512-B message). Excluded by
+design: 2 `.`-dependent tests, `binary_file` (single raw 1 KiB `write()` vs oxbow's 48-byte
+short-write cap — round-trip covered by `write_then_read`), and `read_large_dir` reduced
+32K→256 (fsd's 512-slot live-path table).

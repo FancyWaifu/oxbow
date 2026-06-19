@@ -690,8 +690,10 @@ pub unsafe extern "C" fn __oxbow_fs_rename(
     new_len: usize,
 ) -> i32 {
     let mut m = MsgBuf::new(oxbow_abi::TAG_FS_RENAME);
-    let ol = old_len.min(28);
-    let nl = new_len.min(28);
+    // Pack `old\0new\0` into the 512-byte inline data area. Cap each path at fsd's
+    // PLEN (200) — far past the old 28-byte limit, so deep/tmpdir-prefixed renames work.
+    let ol = old_len.min(200);
+    let nl = new_len.min(200);
     let dst = m.data.as_mut_ptr() as *mut u8;
     unsafe {
         core::ptr::copy_nonoverlapping(old, dst, ol);
@@ -699,7 +701,8 @@ pub unsafe extern "C" fn __oxbow_fs_rename(
         core::ptr::copy_nonoverlapping(new, dst.add(ol + 1), nl);
         *dst.add(ol + 1 + nl) = 0;
     }
-    m.data_len = 8;
+    // Tell the kernel how many words carry the two NUL-terminated paths.
+    m.data_len = (((ol + 1 + nl + 1) + 7) / 8) as u32;
     if sys_call(cwd_handle(), &mut m).is_err() || m.data[0] != 0 {
         -1
     } else {

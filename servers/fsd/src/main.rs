@@ -459,6 +459,24 @@ fn intern(relpath: &[u8]) -> usize {
     0
 }
 
+/// Release the intern slot for a now-removed `relpath`, so the fixed-size `PATHS`
+/// table is reclaimed instead of leaking. Without this, a long-lived process that
+/// creates+removes many distinct paths (or one that opens >MAXID paths total) would
+/// exhaust the table and have every later open/mkdir fail. Note: a client still
+/// holding a cap to this id after unlink would see the slot reused for a future path
+/// — unusual (you'd have to keep an open File across its own deletion), accepted here.
+fn free_intern(relpath: &[u8]) {
+    unsafe {
+        for i in 2..MAXID {
+            if USED[i] && &PATHS[i][..PLENS[i] as usize] == relpath {
+                USED[i] = false;
+                PLENS[i] = 0;
+                return;
+            }
+        }
+    }
+}
+
 /// A path component is single and safe: non-empty, no '/', not '.' or '..'
 /// (capability confinement — a dir cap cannot walk above its subtree, L3).
 fn name_ok(name: &[u8]) -> bool {
@@ -791,6 +809,7 @@ pub extern "C" fn oxbow_main() -> ! {
                         full_from_rel(&relbuf[..clen], &mut full);
                         if clen > 0 && unsafe { oxfs_remove(full.as_ptr()) } == 0 {
                             status = 0;
+                            free_intern(&relbuf[..clen]); // reclaim the path-table slot
                             flush();
                         }
                     }
@@ -800,12 +819,14 @@ pub extern "C" fn oxbow_main() -> ! {
             TAG_FS_RENAME => {
                 cache_invalidate(); // §94
                 sync_writes();
-                // data = old name NUL, then new name NUL.
-                let bytes = unsafe { core::slice::from_raw_parts(m.data.as_ptr() as *const u8, 64) };
+                // data = old name NUL, then new name NUL — over the valid data region
+                // (rt packs up to PLEN bytes per path, not just the old 64-byte window).
+                let win = ((m.data_len as usize) * 8).clamp(64, 512); // 512 B inline data area
+                let bytes = unsafe { core::slice::from_raw_parts(m.data.as_ptr() as *const u8, win) };
                 let oldlen = bytes.iter().position(|&b| b == 0).unwrap_or(0);
                 let old = &bytes[..oldlen];
                 let nstart = oldlen + 1;
-                let new = if nstart < 64 {
+                let new = if nstart < win {
                     let rest = &bytes[nstart..];
                     let nl = rest.iter().position(|&b| b == 0).unwrap_or(0);
                     &rest[..nl]
