@@ -165,7 +165,17 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
   called from `oxbow_main`, built with `-Z build-std=std,test,panic_unwind --tests`
   (panic=unwind is required — libtest isolates failing tests via `catch_unwind`).
   Verified: 5 tests run with `ok`/`FAILED`/`should panic` results + the summary line.
-  Next: run actual std test files / a broader suite as the "done" bar.
+  - ✅ **Real std test files run.** `library/std/tests/{thread,num}.rs` + the `sync/`
+    tests (`once`, `oneshot`, `barrier`) wired verbatim as modules: **56/57 pass** (1
+    platform-ignored) — incl. `once::stampede_once` (50 threads), `oneshot` (19),
+    `num` (13). 🐛 **Fixed a real thread-stack leak found by these tests:** `Thread`
+    had no `Drop`, so a spawned-but-not-joined thread leaked its 256 KiB stack — across
+    a libtest run that OOM'd spawns. Now `join` only waits, `Drop` frees an exited
+    thread's stack, and a reaper sweeps still-running detached threads on later spawns
+    (`sys/thread/oxbow.rs`). Also bumped the shell's default child budget 16→64 MiB
+    (thread-heavy programs). Known gap: heavy channel-stress tests (`mpsc::*_stress`)
+    hang under the busy-yield scheduler — a concurrency follow-up.
+  Next: broaden the suite + the `mpsc` stress hang as the continuing "done" bar.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 

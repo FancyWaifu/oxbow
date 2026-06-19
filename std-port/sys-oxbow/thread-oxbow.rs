@@ -49,9 +49,61 @@ extern "C" fn thread_start(arg: u64) -> ! {
     unsafe { __oxbow_thread_exit(done) }
 }
 
+// §104: a thread's user stack is heap memory the kernel does not reclaim, so it
+// must be freed once the thread has left it. `join` waits and `Drop` frees (the
+// thread sets its join word AFTER the kernel carried it off the stack). A DETACHED
+// thread (handle dropped while it still runs) can't be freed yet — it's parked here
+// and reaped on a later spawn, once its join word shows it exited. This stops the
+// per-thread stack leak that OOM'd thread-heavy programs (e.g. a libtest runner).
+struct Reapable {
+    stack: usize,
+    stack_len: usize,
+    done: usize,
+}
+static REAPER: crate::sync::Mutex<crate::vec::Vec<Reapable>> =
+    crate::sync::Mutex::new(crate::vec::Vec::new());
+
+unsafe fn free_thread(stack: *mut u8, stack_len: usize, done: *const AtomicU32) {
+    unsafe {
+        let layout = crate::alloc::Layout::from_size_align(stack_len, 16).unwrap();
+        crate::alloc::dealloc(stack, layout);
+        drop(Box::from_raw(done as *mut AtomicU32));
+    }
+}
+
+fn reap_detached() {
+    let mut r = REAPER.lock().unwrap_or_else(|e| e.into_inner());
+    r.retain(|d| {
+        let done = unsafe { &*(d.done as *const AtomicU32) };
+        if done.load(Ordering::Acquire) != 0 {
+            unsafe { free_thread(d.stack as *mut u8, d.stack_len, d.done as *const AtomicU32) };
+            false
+        } else {
+            true
+        }
+    });
+}
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        let done = unsafe { &*self.done };
+        if done.load(Ordering::Acquire) != 0 {
+            unsafe { free_thread(self.stack, self.stack_len, self.done) };
+        } else {
+            // Still running: hand it to the reaper to free after it exits.
+            REAPER.lock().unwrap_or_else(|e| e.into_inner()).push(Reapable {
+                stack: self.stack as usize,
+                stack_len: self.stack_len,
+                done: self.done as usize,
+            });
+        }
+    }
+}
+
 impl Thread {
     // unsafe: see thread::Builder::spawn_unchecked
     pub unsafe fn new(stack: usize, init: Box<ThreadInit>) -> io::Result<Thread> {
+        reap_detached(); // sweep exited detached threads' stacks before allocating
         let stack_len = stack.max(DEFAULT_MIN_STACK_SIZE).next_multiple_of(16);
         let layout = crate::alloc::Layout::from_size_align(stack_len, 16).unwrap();
         let stack_ptr = unsafe { crate::alloc::alloc(layout) };
@@ -70,13 +122,8 @@ impl Thread {
         while done.load(Ordering::Acquire) == 0 {
             unsafe { __oxbow_futex_wait(self.done as *const u32, 0) };
         }
-        // The kernel set the join word with the thread already off its stack, so
-        // reclaiming the stack + join word here is safe.
-        unsafe {
-            let layout = crate::alloc::Layout::from_size_align(self.stack_len, 16).unwrap();
-            crate::alloc::dealloc(self.stack, layout);
-            drop(Box::from_raw(self.done as *mut AtomicU32));
-        }
+        // `self` drops here: the join word is set, so `Drop` reclaims the stack +
+        // join word (the kernel carried the thread off its stack before setting it).
     }
 }
 
