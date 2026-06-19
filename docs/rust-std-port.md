@@ -103,7 +103,12 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     drains (the kernel pipe has no writer-refcount, so EOF is an explicit call). rt
     shims `__oxbow_pipe`/`_read`/`_write`/`_close`/`_eof`; std `sys/pipe/oxbow.rs`.
     Verified: parent gets `56 bytes, exit Some(7)` from a child that prints 2 lines.
-    Still not wired: kill, try_wait.
+  - ✅ **`Command::try_wait`** — non-blocking child-exit check via `SYS_NOTIF_POLL`
+    (rt `__oxbow_try_wait`). It drains the exit signal, so `Process` caches the status
+    (`exited`) and a later blocking `wait()` returns the cache instead of deadlocking
+    on the drained notification. Verified: `running` → `wait=Some(5)` → cached
+    `try_wait=Some(5)`. `kill` still unsupported — it needs a process-control
+    capability (pid-based kill would be ambient authority; deferred design decision).
   - 🐛 **Fixed a kernel-panicking std bug:** `std::process::exit` had no oxbow arm in
     `sys/exit.rs` → fell into `_ => intrinsics::abort()` → `ud2` → a userland #UD on
     *every* exit, which the kernel's `invalid_opcode` handler escalated to a full

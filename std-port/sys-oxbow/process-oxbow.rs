@@ -21,6 +21,7 @@ unsafe extern "C" {
         pid_out: *mut u32,
     ) -> i64;
     fn __oxbow_wait(notif: i64) -> i32;
+    fn __oxbow_try_wait(notif: i64) -> i64;
     fn __oxbow_pipe_eof(pipe: u32);
     fn __oxbow_pipe_close(pipe: u32);
 }
@@ -148,7 +149,7 @@ impl Command {
             None => 0,
         };
         Ok((
-            Process { notif, pid, wend },
+            Process { notif, pid, wend, exited: None },
             StdioPipes { stdin: None, stdout: read_end, stderr: None },
         ))
     }
@@ -260,6 +261,9 @@ pub struct Process {
     // The parent's pipe write-end when stdout was captured (0 = inherited stdio).
     // Held so `output` can mark EOF after the child exits; closed on drop.
     wend: u32,
+    // Cached exit status once observed. `try_wait` drains the exit signal, so the
+    // status is cached here and a later `wait` returns it without re-blocking.
+    exited: Option<i32>,
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -273,13 +277,31 @@ impl Process {
         self.pid
     }
     pub fn kill(&mut self) -> io::Result<()> {
+        // oxbow has no cross-process kill yet — it needs a process-control capability
+        // (killing a child is authority the spawner must hold; pid-based kill would be
+        // ambient). Tracked as a Phase 3 follow-up.
         unsupported()
     }
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        Ok(ExitStatus(unsafe { __oxbow_wait(self.notif) }))
+        if let Some(c) = self.exited {
+            return Ok(ExitStatus(c));
+        }
+        let c = unsafe { __oxbow_wait(self.notif) };
+        self.exited = Some(c);
+        Ok(ExitStatus(c))
     }
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        Ok(None) // no non-blocking wait yet
+        if let Some(c) = self.exited {
+            return Ok(Some(ExitStatus(c)));
+        }
+        let r = unsafe { __oxbow_try_wait(self.notif) };
+        if r == i64::MIN {
+            Ok(None)
+        } else {
+            let c = r as i32;
+            self.exited = Some(c);
+            Ok(Some(ExitStatus(c)))
+        }
     }
 }
 

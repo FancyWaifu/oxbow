@@ -731,6 +731,19 @@ pub extern "C" fn __oxbow_wait(notif: i64) -> i32 {
     let _ = sys_notif_wait(notif as Handle);
     sys_notif_status(notif as Handle)
 }
+/// Non-blocking child-exit check (std `Command::try_wait`). Returns the exit code if
+/// the child has exited, or `i64::MIN` if it is still running. Drains the exit
+/// signal, so the caller (std) caches the result — a later `__oxbow_wait` reads that
+/// cache instead of blocking on a now-drained notification.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_try_wait(notif: i64) -> i64 {
+    if sys_notif_poll(notif as Handle) > 0 {
+        sys_notif_status(notif as Handle) as i64
+    } else {
+        i64::MIN
+    }
+}
 // §100 piped Command stdio: a pipe → a grantable write-end (R_OUT|R_GRANT) the
 // child gets as stdout, and a read-end (R_IN) the parent reads.
 #[cfg(feature = "hosted")]
