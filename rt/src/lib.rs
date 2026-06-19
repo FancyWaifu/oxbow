@@ -522,6 +522,82 @@ pub extern "C" fn __oxbow_argv(len: *mut usize) -> *const u8 {
     a.as_ptr()
 }
 
+// §97 std::fs shims — open/read/write/close on the fsd protocol, relative to the
+// program's cwd dir cap (slot 1). Positioned (offset-based) so std::fs::File works.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_fs_open(
+    path: *const u8,
+    path_len: usize,
+    create: i32,
+    size_out: *mut u64,
+    is_dir_out: *mut i32,
+) -> i64 {
+    let p = unsafe { core::slice::from_raw_parts(path, path_len) };
+    let cwd: Handle = 1; // SPAWN cwd dir cap (slot 1)
+    if create != 0 {
+        match fs::create(cwd, p) {
+            Some(h) => {
+                unsafe {
+                    size_out.write(0);
+                    is_dir_out.write(0);
+                }
+                h as i64
+            }
+            None => -1,
+        }
+    } else {
+        match fs::open(cwd, p) {
+            Some(n) => {
+                unsafe {
+                    size_out.write(n.size as u64);
+                    is_dir_out.write((n.kind == oxbow_abi::FS_DIR) as i32);
+                }
+                n.cap as i64
+            }
+            None => -1,
+        }
+    }
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_fs_pread(file: i64, buf: *mut u8, len: usize, off: u64) -> isize {
+    let mut m = MsgBuf::new(oxbow_abi::TAG_FS_READ);
+    m.data[0] = off;
+    m.data_len = 1;
+    if sys_call(file as Handle, &mut m).is_err() {
+        return -1;
+    }
+    let count = (m.data[0] as usize).min(len);
+    if count > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping((m.data.as_ptr() as *const u8).add(8), buf, count);
+        }
+    }
+    count as isize
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_fs_pwrite(file: i64, buf: *const u8, len: usize, off: u64) -> isize {
+    let n = len.min(48);
+    let mut m = MsgBuf::new(oxbow_abi::TAG_FS_WRITE);
+    m.data[0] = off;
+    m.data[1] = n as u64;
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf, (m.data.as_mut_ptr() as *mut u8).add(16), n);
+    }
+    m.data_len = 8;
+    if sys_call(file as Handle, &mut m).is_err() {
+        return -1;
+    }
+    m.data[0] as isize
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_fs_close(file: i64) {
+    let _ = sys_close(file as Handle);
+}
+
 // --- Raw syscall stubs ----------------------------------------------------
 // nr in rax; args rdi, rsi, rdx, r10, r8, r9; returns rax (+ rdx). rcx/r11 are
 // clobbered by the `syscall` instruction. No `nomem`/`nostack` options: the

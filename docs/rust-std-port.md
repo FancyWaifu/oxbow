@@ -83,7 +83,16 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
   **Phase 2 DONE.** A comprehensive demo (`std-port/oxhello-demo.elf`) prints the
   wall clock, env/args, and a 4-thread `Arc<Mutex<u64>>` sum — alloc, time, env,
   threads, Mutex, and TLS all in one std program.
-- **Phase 3 — harden.** Native ELF TLS, `Command` stdio piping (spawn-not-fork),
+- **Phase 3 — capabilities + harden.** 🟡 IN PROGRESS.
+  - ✅ **`std::fs` file I/O** — `std::fs::write`/`read`/`read_to_string`, `File::open`/
+    `read`/`write`/`seek`/`metadata`, and `fs::metadata`/`exists` work over fsd,
+    persisted to ext2. rt shims `__oxbow_fs_open`/`_pread`/`_pwrite`/`_close`
+    (positioned, relative to the program's cwd dir cap at slot 1); std backend
+    `sys/fs/oxbow.rs`. Verified from the shell: write a file, read it back, stat its
+    size, seek + read a slice. Not yet wired: `read_dir`, `create_dir`, `remove_file`/
+    `rename` (stubbed Unsupported), file timestamps/permissions.
+  - ☐ The original hardening list:
+- **Phase 3 (cont.) — harden.** Native ELF TLS, `Command` stdio piping (spawn-not-fork),
   full `Metadata`, optional `panic=unwind`.
 - **Phase 4 — the std test suite** as the "done" bar.
 
