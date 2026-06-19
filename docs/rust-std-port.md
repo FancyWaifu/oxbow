@@ -123,8 +123,14 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     `thread_local!` give per-thread isolation across main + spawned threads
     (`main=1`, each spawned thread sees the fresh template then its own write).
     The keyed `sys/thread_local/key/oxbow.rs` is now dead (left in place).
-- **Phase 3 (cont.) — harden.** TLS destructors (run `Drop` at thread exit — the
-  native guard currently leaks), optional `panic=unwind`; Command kill/try_wait.
+  - ✅ **TLS destructors** — a `thread_local!` holding a `Drop` type now runs its
+    destructor when a spawned thread exits. oxbow has no automatic thread-exit
+    callback (its `guard::enable` is a no-op), so `sys/thread/oxbow.rs::thread_start`
+    calls `destructors::run()` + `rt::thread_cleanup()` after the closure, before
+    `__oxbow_thread_exit`. Verified: `Dropper(7) dropped at thread exit` prints
+    between the thread's work and the join. (Main-thread TLS dtors at process exit
+    still leak — the whole AS is torn down, so it's moot.)
+- **Phase 3 (cont.) — harden.** optional `panic=unwind`; Command kill/try_wait.
 - **Phase 4 — the std test suite** as the "done" bar.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)

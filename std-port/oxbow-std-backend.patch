@@ -1429,10 +1429,10 @@ index 9816981c..7e04afa7 100644
          pub use motor::*;
 diff --git a/library/std/src/sys/thread/oxbow.rs b/library/std/src/sys/thread/oxbow.rs
 new file mode 100644
-index 00000000..671a249b
+index 00000000..2df0a533
 --- /dev/null
 +++ b/library/std/src/sys/thread/oxbow.rs
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,103 @@
 +//! oxbow threads — std::thread on SYS_THREAD_SPAWN/EXIT + the futex (via oxbow-rt
 +//! hosted shims). The spawned thread runs `init.init()` then signals a join word;
 +//! `join` futex-waits on it. The kernel sets the join word AFTER the thread is off
@@ -1476,6 +1476,11 @@ index 00000000..671a249b
 +    let done = packet.done as u64;
 +    let run = packet.init.init();
 +    run();
++    // §101 TLS destructors: oxbow has no automatic thread-exit callback (its
++    // `guard::enable` is a no-op), so run this thread's registered TLS destructors
++    // and the runtime's per-thread cleanup here, before signalling join + exiting.
++    unsafe { crate::sys::thread_local::destructors::run() };
++    crate::rt::thread_cleanup();
 +    unsafe { __oxbow_thread_exit(done) }
 +}
 +

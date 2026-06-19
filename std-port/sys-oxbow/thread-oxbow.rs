@@ -41,6 +41,11 @@ extern "C" fn thread_start(arg: u64) -> ! {
     let done = packet.done as u64;
     let run = packet.init.init();
     run();
+    // §101 TLS destructors: oxbow has no automatic thread-exit callback (its
+    // `guard::enable` is a no-op), so run this thread's registered TLS destructors
+    // and the runtime's per-thread cleanup here, before signalling join + exiting.
+    unsafe { crate::sys::thread_local::destructors::run() };
+    crate::rt::thread_cleanup();
     unsafe { __oxbow_thread_exit(done) }
 }
 
