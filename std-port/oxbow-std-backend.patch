@@ -160,6 +160,26 @@ index 00000000..437f42ee
 +    table().lock().unwrap().remove(k);
 +    Ok(())
 +}
+diff --git a/library/std/src/sys/exit.rs b/library/std/src/sys/exit.rs
+index 53fb92ba..5b5db5a4 100644
+--- a/library/std/src/sys/exit.rs
++++ b/library/std/src/sys/exit.rs
+@@ -135,6 +135,15 @@ pub fn exit(code: i32) -> ! {
+         target_os = "xous" => {
+             crate::os::xous::ffi::exit(code as u32)
+         }
++        target_os = "oxbow" => {
++            // oxbow-rt's hosted exit shim → SYS_EXIT (the kernel halts the process).
++            // Without this, oxbow fell into the `_` abort arm below → `ud2` → a user
++            // #UD on every `process::exit`.
++            unsafe extern "C" {
++                fn __oxbow_exit(code: i32) -> !;
++            }
++            unsafe { __oxbow_exit(code) }
++        }
+         _ => {
+             let _ = code;
+             crate::intrinsics::abort()
 diff --git a/library/std/src/sys/fs/mod.rs b/library/std/src/sys/fs/mod.rs
 index 0c297c57..a1404d0b 100644
 --- a/library/std/src/sys/fs/mod.rs
@@ -756,6 +776,132 @@ index c4b14ab4..d0e8b2aa 100644
 +
 +#[cfg(target_os = "oxbow")]
 +pub mod futex;
+diff --git a/library/std/src/sys/pipe/mod.rs b/library/std/src/sys/pipe/mod.rs
+index 85228963..433b164d 100644
+--- a/library/std/src/sys/pipe/mod.rs
++++ b/library/std/src/sys/pipe/mod.rs
+@@ -13,6 +13,10 @@
+         mod motor;
+         pub use motor::{Pipe, pipe};
+     }
++    target_os = "oxbow" => {
++        mod oxbow;
++        pub use oxbow::*;
++    }
+     _ => {
+         mod unsupported;
+         pub use unsupported::{Pipe, pipe};
+diff --git a/library/std/src/sys/pipe/oxbow.rs b/library/std/src/sys/pipe/oxbow.rs
+new file mode 100644
+index 00000000..7282301c
+--- /dev/null
++++ b/library/std/src/sys/pipe/oxbow.rs
+@@ -0,0 +1,105 @@
++//! oxbow anonymous pipe — over SYS_PIPE (rt shims). A pipe is one kernel object
++//! attenuated into a write-end (R_OUT|R_GRANT, handed to a child as stdout) and a
++//! read-end (R_IN, read by the parent). EOF when all write-ends close (child exit).
++use crate::fmt;
++use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
++
++unsafe extern "C" {
++    fn __oxbow_pipe(rend_out: *mut u32, wend_out: *mut u32) -> i32;
++    fn __oxbow_pipe_read(pipe: u32, buf: *mut u8, len: usize) -> isize;
++    fn __oxbow_pipe_write(pipe: u32, buf: *const u8, len: usize) -> isize;
++    fn __oxbow_pipe_close(pipe: u32);
++}
++
++pub struct Pipe(u32);
++
++impl Pipe {
++    pub(crate) fn handle(&self) -> u32 {
++        self.0
++    }
++    pub fn try_clone(&self) -> io::Result<Self> {
++        Err(io::Error::new(io::ErrorKind::Unsupported, "oxbow: pipe try_clone"))
++    }
++    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
++        let n = unsafe { __oxbow_pipe_read(self.0, buf.as_mut_ptr(), buf.len()) };
++        if n < 0 {
++            Err(io::Error::new(io::ErrorKind::Other, "oxbow: pipe read"))
++        } else {
++            Ok(n as usize)
++        }
++    }
++    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
++        let mut tmp = [0u8; 512];
++        let want = cursor.capacity().min(tmp.len());
++        let n = self.read(&mut tmp[..want])?;
++        cursor.append(&tmp[..n]);
++        Ok(())
++    }
++    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
++        for b in bufs {
++            if !b.is_empty() {
++                return self.read(b);
++            }
++        }
++        Ok(0)
++    }
++    pub fn is_read_vectored(&self) -> bool {
++        false
++    }
++    pub fn read_to_end(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
++        let mut total = 0;
++        loop {
++            let mut tmp = [0u8; 512];
++            let n = self.read(&mut tmp)?;
++            if n == 0 {
++                break;
++            }
++            buf.extend_from_slice(&tmp[..n]);
++            total += n;
++        }
++        Ok(total)
++    }
++    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
++        let n = unsafe { __oxbow_pipe_write(self.0, buf.as_ptr(), buf.len()) };
++        if n < 0 {
++            Err(io::Error::new(io::ErrorKind::Other, "oxbow: pipe write"))
++        } else {
++            Ok(n as usize)
++        }
++    }
++    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
++        for b in bufs {
++            if !b.is_empty() {
++                return self.write(b);
++            }
++        }
++        Ok(0)
++    }
++    pub fn is_write_vectored(&self) -> bool {
++        false
++    }
++    pub fn diverge(&self) -> ! {
++        panic!("oxbow: pipe diverge (unsupported pipe chaining)")
++    }
++}
++
++impl Drop for Pipe {
++    fn drop(&mut self) {
++        unsafe { __oxbow_pipe_close(self.0) };
++    }
++}
++
++impl fmt::Debug for Pipe {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("Pipe").field("handle", &self.0).finish()
++    }
++}
++
++pub fn pipe() -> io::Result<(Pipe, Pipe)> {
++    let mut rend = 0u32;
++    let mut wend = 0u32;
++    if unsafe { __oxbow_pipe(&mut rend, &mut wend) } != 0 {
++        return Err(io::Error::new(io::ErrorKind::Other, "oxbow: pipe create"));
++    }
++    Ok((Pipe(rend), Pipe(wend)))
++}
 diff --git a/library/std/src/sys/process/mod.rs b/library/std/src/sys/process/mod.rs
 index 3eb20dae..63e444e3 100644
 --- a/library/std/src/sys/process/mod.rs
@@ -773,10 +919,10 @@ index 3eb20dae..63e444e3 100644
          use unsupported as imp;
 diff --git a/library/std/src/sys/process/oxbow.rs b/library/std/src/sys/process/oxbow.rs
 new file mode 100644
-index 00000000..5197f6f4
+index 00000000..f6559404
 --- /dev/null
 +++ b/library/std/src/sys/process/oxbow.rs
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,329 @@
 +//! oxbow std::process — spawn a child program (std reads its ELF via std::fs),
 +//! inheriting the parent's stdio/cwd/net caps, and wait on its exit notification.
 +//! Piped stdio (output capture) + kill + try_wait are not wired yet.
@@ -796,9 +942,12 @@ index 00000000..5197f6f4
 +        elf_len: usize,
 +        argv: *const u8,
 +        argv_len: usize,
++        stdout_cap: u32,
 +        pid_out: *mut u32,
 +    ) -> i64;
 +    fn __oxbow_wait(notif: i64) -> i32;
++    fn __oxbow_pipe_eof(pipe: u32);
++    fn __oxbow_pipe_close(pipe: u32);
 +}
 +
 +pub struct Command {
@@ -875,7 +1024,7 @@ index 00000000..5197f6f4
 +
 +    pub fn spawn(
 +        &mut self,
-+        _default: Stdio,
++        default: Stdio,
 +        _needs_stdin: bool,
 +    ) -> io::Result<(Process, StdioPipes)> {
 +        // Resolve a bare program name to /bin/<name> (a path passes through).
@@ -892,25 +1041,61 @@ index 00000000..5197f6f4
 +            }
 +            argv.push_str(&a.to_string_lossy());
 +        }
++        // stdout: a MakePipe request wires the child's stdout (handle slot 2) to a
++        // fresh pipe's write-end; the parent keeps the read-end. Otherwise the
++        // child inherits the parent's stdout (handle 2).
++        let stdout_spec = self.stdout.as_ref().unwrap_or(&default);
++        let make_pipe = matches!(stdout_spec, Stdio::MakePipe);
++        let (read_end, write_end) = if make_pipe {
++            let (r, w) = crate::sys::pipe::pipe()?;
++            (Some(r), Some(w))
++        } else {
++            (None, None)
++        };
++        let stdout_cap = write_end.as_ref().map(|w| w.handle()).unwrap_or(2);
 +        let mut pid: u32 = 0;
 +        let notif = unsafe {
-+            __oxbow_spawn(elf.as_ptr(), elf.len(), argv.as_ptr(), argv.len(), &mut pid)
++            __oxbow_spawn(elf.as_ptr(), elf.len(), argv.as_ptr(), argv.len(), stdout_cap, &mut pid)
 +        };
 +        if notif < 0 {
 +            return Err(io::Error::new(io::ErrorKind::Other, "oxbow: spawn rejected"));
 +        }
++        // Retain the parent's write-end handle: the kernel has no writer-refcount, so
++        // the reader only gets EOF once someone calls sys_pipe_eof — the holder of
++        // this handle does that (in `output`, after the child exits). `forget` the
++        // Pipe so its Drop doesn't close the handle out from under us; Process owns it.
++        let wend = match write_end {
++            Some(w) => {
++                let h = w.handle();
++                crate::mem::forget(w);
++                h
++            }
++            None => 0,
++        };
 +        Ok((
-+            Process { notif, pid },
-+            StdioPipes { stdin: None, stdout: None, stderr: None },
++            Process { notif, pid, wend },
++            StdioPipes { stdin: None, stdout: read_end, stderr: None },
 +        ))
 +    }
 +}
 +
 +pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
-+    // Inherit stdio (no pipe capture yet): the child's output goes to the terminal.
-+    let (mut proc, _pipes) = cmd.spawn(Stdio::Inherit, false)?;
-+    let status = proc.wait()?;
-+    Ok((status, Vec::new(), Vec::new()))
++    // Capture the child's stdout via a pipe. oxbow has no separate stderr stream
++    // (the child folds stderr into stdout), so the stderr vec stays empty. The
++    // kernel has no writer-refcount, so we mirror the shell's $() capture: wait for
++    // the child to exit (its output buffered in the pipe), mark the write-end EOF,
++    // then drain. Captured output is bounded by the pipe buffer (a child that writes
++    // more than that, with no concurrent reader, blocks — a documented limit).
++    let (mut process, mut pipes) = cmd.spawn(Stdio::MakePipe, false)?;
++    let status = process.wait()?;
++    if process.wend != 0 {
++        unsafe { __oxbow_pipe_eof(process.wend) };
++    }
++    let mut stdout = Vec::new();
++    if let Some(pipe) = pipes.stdout.take() {
++        pipe.read_to_end(&mut stdout)?;
++    }
++    Ok((status, stdout, Vec::new()))
 +}
 +
 +impl From<ChildPipe> for Stdio {
@@ -997,6 +1182,16 @@ index 00000000..5197f6f4
 +pub struct Process {
 +    notif: i64,
 +    pid: u32,
++    // The parent's pipe write-end when stdout was captured (0 = inherited stdio).
++    // Held so `output` can mark EOF after the child exits; closed on drop.
++    wend: u32,
++}
++impl Drop for Process {
++    fn drop(&mut self) {
++        if self.wend != 0 {
++            unsafe { __oxbow_pipe_close(self.wend) };
++        }
++    }
 +}
 +impl Process {
 +    pub fn id(&self) -> u32 {

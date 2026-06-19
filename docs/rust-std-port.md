@@ -97,8 +97,20 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     rt shims `__oxbow_spawn`/`__oxbow_wait` (sys_spawn_bytes + an exit notif).
     The program is resolved relative to the cwd cap (the user namespace) — /bin (the
     shell's tools) is NOT reachable from a user process, by the capability model.
-    Not wired: piped stdio (output capture), kill, try_wait.
-- **Phase 3 (cont.) — harden.** Native ELF TLS, piped Command stdio, TLS destructors,
+  - ✅ **Piped `Command::output()`** — captures a child's stdout + exit code over a
+    kernel pipe. `Command::spawn` wires `Stdio::MakePipe` (grant the pipe write-end to
+    the child as its stdout, keep the read-end), `output()` waits → `sys_pipe_eof` →
+    drains (the kernel pipe has no writer-refcount, so EOF is an explicit call). rt
+    shims `__oxbow_pipe`/`_read`/`_write`/`_close`/`_eof`; std `sys/pipe/oxbow.rs`.
+    Verified: parent gets `56 bytes, exit Some(7)` from a child that prints 2 lines.
+    Still not wired: kill, try_wait.
+  - 🐛 **Fixed a kernel-panicking std bug:** `std::process::exit` had no oxbow arm in
+    `sys/exit.rs` → fell into `_ => intrinsics::abort()` → `ud2` → a userland #UD on
+    *every* exit, which the kernel's `invalid_opcode` handler escalated to a full
+    kernel panic (silent freeze). Fixes: (1) `sys/exit.rs` oxbow arm → `__oxbow_exit`;
+    (2) kernel `idt.rs` — a ring-3 #UD now `kill_current_user()`s (like #PF) instead
+    of panicking, so a bad user instruction can't take down the machine.
+- **Phase 3 (cont.) — harden.** Native ELF TLS, TLS destructors,
   optional `panic=unwind`.
 - **Phase 4 — the std test suite** as the "done" bar.
 

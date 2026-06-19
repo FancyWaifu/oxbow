@@ -211,11 +211,19 @@ extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
-    panic!(
-        "#UD invalid opcode at rip={:#x}\n{:#?}",
-        frame.instruction_pointer.as_u64(),
-        frame
-    );
+    let rip = frame.instruction_pointer.as_u64();
+    // A ring-3 #UD is a buggy user program (e.g. a Rust `abort()`/`ud2`), not a
+    // kernel fault — kill just that process, like the page-fault handler does, so a
+    // bad userland instruction can't take down the whole machine.
+    if frame.code_segment.0 & 3 == 3 {
+        raw_str("[trap] #UD user rip=");
+        raw_hex(rip);
+        raw_str(" -- killing tcb ");
+        raw_hex(crate::percpu::current() as u64);
+        raw_putc(b'\n');
+        crate::thread::kill_current_user();
+    }
+    panic!("#UD invalid opcode at rip={:#x}\n{:#?}", rip, frame);
 }
 
 // §77 DEBUG: dead-simple direct-to-UART output — touches ONLY the serial port and

@@ -17,9 +17,12 @@ unsafe extern "C" {
         elf_len: usize,
         argv: *const u8,
         argv_len: usize,
+        stdout_cap: u32,
         pid_out: *mut u32,
     ) -> i64;
     fn __oxbow_wait(notif: i64) -> i32;
+    fn __oxbow_pipe_eof(pipe: u32);
+    fn __oxbow_pipe_close(pipe: u32);
 }
 
 pub struct Command {
@@ -96,7 +99,7 @@ impl Command {
 
     pub fn spawn(
         &mut self,
-        _default: Stdio,
+        default: Stdio,
         _needs_stdin: bool,
     ) -> io::Result<(Process, StdioPipes)> {
         // Resolve a bare program name to /bin/<name> (a path passes through).
@@ -113,25 +116,61 @@ impl Command {
             }
             argv.push_str(&a.to_string_lossy());
         }
+        // stdout: a MakePipe request wires the child's stdout (handle slot 2) to a
+        // fresh pipe's write-end; the parent keeps the read-end. Otherwise the
+        // child inherits the parent's stdout (handle 2).
+        let stdout_spec = self.stdout.as_ref().unwrap_or(&default);
+        let make_pipe = matches!(stdout_spec, Stdio::MakePipe);
+        let (read_end, write_end) = if make_pipe {
+            let (r, w) = crate::sys::pipe::pipe()?;
+            (Some(r), Some(w))
+        } else {
+            (None, None)
+        };
+        let stdout_cap = write_end.as_ref().map(|w| w.handle()).unwrap_or(2);
         let mut pid: u32 = 0;
         let notif = unsafe {
-            __oxbow_spawn(elf.as_ptr(), elf.len(), argv.as_ptr(), argv.len(), &mut pid)
+            __oxbow_spawn(elf.as_ptr(), elf.len(), argv.as_ptr(), argv.len(), stdout_cap, &mut pid)
         };
         if notif < 0 {
             return Err(io::Error::new(io::ErrorKind::Other, "oxbow: spawn rejected"));
         }
+        // Retain the parent's write-end handle: the kernel has no writer-refcount, so
+        // the reader only gets EOF once someone calls sys_pipe_eof — the holder of
+        // this handle does that (in `output`, after the child exits). `forget` the
+        // Pipe so its Drop doesn't close the handle out from under us; Process owns it.
+        let wend = match write_end {
+            Some(w) => {
+                let h = w.handle();
+                crate::mem::forget(w);
+                h
+            }
+            None => 0,
+        };
         Ok((
-            Process { notif, pid },
-            StdioPipes { stdin: None, stdout: None, stderr: None },
+            Process { notif, pid, wend },
+            StdioPipes { stdin: None, stdout: read_end, stderr: None },
         ))
     }
 }
 
 pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
-    // Inherit stdio (no pipe capture yet): the child's output goes to the terminal.
-    let (mut proc, _pipes) = cmd.spawn(Stdio::Inherit, false)?;
-    let status = proc.wait()?;
-    Ok((status, Vec::new(), Vec::new()))
+    // Capture the child's stdout via a pipe. oxbow has no separate stderr stream
+    // (the child folds stderr into stdout), so the stderr vec stays empty. The
+    // kernel has no writer-refcount, so we mirror the shell's $() capture: wait for
+    // the child to exit (its output buffered in the pipe), mark the write-end EOF,
+    // then drain. Captured output is bounded by the pipe buffer (a child that writes
+    // more than that, with no concurrent reader, blocks — a documented limit).
+    let (mut process, mut pipes) = cmd.spawn(Stdio::MakePipe, false)?;
+    let status = process.wait()?;
+    if process.wend != 0 {
+        unsafe { __oxbow_pipe_eof(process.wend) };
+    }
+    let mut stdout = Vec::new();
+    if let Some(pipe) = pipes.stdout.take() {
+        pipe.read_to_end(&mut stdout)?;
+    }
+    Ok((status, stdout, Vec::new()))
 }
 
 impl From<ChildPipe> for Stdio {
@@ -218,6 +257,16 @@ impl From<u8> for ExitCode {
 pub struct Process {
     notif: i64,
     pid: u32,
+    // The parent's pipe write-end when stdout was captured (0 = inherited stdio).
+    // Held so `output` can mark EOF after the child exits; closed on drop.
+    wend: u32,
+}
+impl Drop for Process {
+    fn drop(&mut self) {
+        if self.wend != 0 {
+            unsafe { __oxbow_pipe_close(self.wend) };
+        }
+    }
 }
 impl Process {
     pub fn id(&self) -> u32 {

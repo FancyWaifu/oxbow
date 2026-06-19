@@ -695,6 +695,7 @@ pub unsafe extern "C" fn __oxbow_spawn(
     elf_len: usize,
     argv: *const u8,
     argv_len: usize,
+    stdout_cap: u32,
     pid_out: *mut u32,
 ) -> i64 {
     let notif = match sys_notif_create() {
@@ -708,7 +709,7 @@ pub unsafe extern "C" fn __oxbow_spawn(
     sm.data_len = 3;
     sm.handle_count = 4;
     sm.handles[0] = 1; // cwd dir cap (slot 1)
-    sm.handles[1] = 2; // stdout (SPAWN_STDOUT)
+    sm.handles[1] = stdout_cap as Handle; // stdout: 2 (inherit) or a pipe write-end
     sm.handles[2] = 4; // stdin (SPAWN_STDIN)
     sm.handles[3] = oxbow_abi::BOOT_NET_EP; // net
     let elf_slice = unsafe { core::slice::from_raw_parts(elf, elf_len) };
@@ -729,6 +730,54 @@ pub unsafe extern "C" fn __oxbow_spawn(
 pub extern "C" fn __oxbow_wait(notif: i64) -> i32 {
     let _ = sys_notif_wait(notif as Handle);
     sys_notif_status(notif as Handle)
+}
+// §100 piped Command stdio: a pipe → a grantable write-end (R_OUT|R_GRANT) the
+// child gets as stdout, and a read-end (R_IN) the parent reads.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_pipe(rend_out: *mut u32, wend_out: *mut u32) -> i32 {
+    let pipe = match sys_pipe() {
+        Ok(p) => p,
+        Err(_) => return -1,
+    };
+    let wend = sys_attenuate(pipe, oxbow_abi::R_OUT | oxbow_abi::R_GRANT).unwrap_or(0);
+    let rend = sys_attenuate(pipe, oxbow_abi::R_IN).unwrap_or(0);
+    let _ = sys_close(pipe);
+    if wend == 0 || rend == 0 {
+        let _ = sys_close(wend);
+        let _ = sys_close(rend);
+        return -1;
+    }
+    unsafe {
+        rend_out.write(rend);
+        wend_out.write(wend);
+    }
+    0
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_pipe_read(pipe: u32, buf: *mut u8, len: usize) -> isize {
+    let slice = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    sys_pipe_read(pipe as Handle, slice) as isize
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_pipe_write(pipe: u32, buf: *const u8, len: usize) -> isize {
+    let slice = unsafe { core::slice::from_raw_parts(buf, len) };
+    sys_pipe_write(pipe as Handle, slice) as isize
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_pipe_close(pipe: u32) {
+    let _ = sys_close(pipe as Handle);
+}
+// Mark the pipe's write side closed (readers drain remaining bytes, then get EOF).
+// The kernel has no writer-refcount, so closing the write-end handle alone does NOT
+// signal EOF — the holder must call this explicitly (mirrors the shell's $() capture).
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_pipe_eof(pipe: u32) {
+    let _ = sys_pipe_eof(pipe as Handle);
 }
 
 // --- Raw syscall stubs ----------------------------------------------------
