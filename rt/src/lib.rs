@@ -61,12 +61,38 @@ mod heap {
         free: [AtomicUsize; NBUCKETS], // per-class free-list heads (0 = empty)
     }
 
+    #[cfg(not(feature = "hosted"))] // §95: std supplies the allocator when hosted
     #[global_allocator]
     static HEAP: Slab = Slab {
         bump: AtomicUsize::new(0),
         mapped_end: AtomicUsize::new(0),
         free: [const { AtomicUsize::new(0) }; NBUCKETS],
     };
+    #[cfg(feature = "hosted")]
+    static HEAP: Slab = Slab {
+        bump: AtomicUsize::new(0),
+        mapped_end: AtomicUsize::new(0),
+        free: [const { AtomicUsize::new(0) }; NBUCKETS],
+    };
+
+    // §95: hosted shims — a Rust `std` program's `sys/pal/oxbow` System allocator
+    // calls these instead of using HEAP as the `#[global_allocator]` (std owns
+    // that). realloc is left to std's `realloc_fallback`.
+    #[cfg(feature = "hosted")]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn __oxbow_alloc(size: usize, align: usize) -> *mut u8 {
+        HEAP.alloc(Layout::from_size_align_unchecked(size, align))
+    }
+    #[cfg(feature = "hosted")]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn __oxbow_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
+        HEAP.alloc_zeroed(Layout::from_size_align_unchecked(size, align))
+    }
+    #[cfg(feature = "hosted")]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn __oxbow_dealloc(ptr: *mut u8, size: usize, align: usize) {
+        HEAP.dealloc(ptr, Layout::from_size_align_unchecked(size, align))
+    }
 
     unsafe impl GlobalAlloc for Slab {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -351,6 +377,37 @@ pub extern "C" fn _start() -> ! {
 
 extern "C" fn start_rust() -> ! {
     unsafe { oxbow_main() }
+}
+
+// §95: hosted C-ABI shims for a Rust `std` program's `sys/pal/oxbow` (stdio via
+// the boot console, randomness, exit). Compiled only with the `hosted` feature.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_write(_fd: i32, buf: *const u8, len: usize) -> isize {
+    // stdout/stderr both go to the boot console; fd is ignored for now.
+    match sys_console_write(BOOT_CONSOLE, buf, len) {
+        Ok(_) => len as isize,
+        Err(_) => -1,
+    }
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_read(_fd: i32, _buf: *mut u8, _len: usize) -> isize {
+    0 // no console read path yet
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_getentropy(buf: *mut u8, len: usize) -> i32 {
+    let slice = core::slice::from_raw_parts_mut(buf, len);
+    match sys_getentropy(slice) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_exit(code: i32) -> ! {
+    sys_exit(code as u64)
 }
 
 // --- Raw syscall stubs ----------------------------------------------------
@@ -859,6 +916,7 @@ pub fn sys_exit(code: u64) -> ! {
 
 // --- Panic handler --------------------------------------------------------
 
+#[cfg(not(feature = "hosted"))] // §95: std supplies the panic handler when hosted
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     // Best-effort: announce on the console capability, then exit non-zero.

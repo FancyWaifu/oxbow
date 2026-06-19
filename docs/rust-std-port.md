@@ -23,15 +23,27 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
 
 - **Phase 0 — target + core/alloc.** ✅ DONE. The target spec validates; `core`,
   `compiler_builtins`, `alloc` and a `no_std`+`alloc` test crate build for it.
-- **Phase 1 — minimal `std`.** 🟡 IN PROGRESS — **`std` now COMPILES for oxbow.**
+- **Phase 1 — minimal `std`.** ✅ DONE — **real Rust `std` RUNS on oxbow.** A
+  cross-compiled `std` program (`Vec`, iterators, `String`, `println!`) runs as an
+  oxbow process and prints to the console:
+  ```
+  hello from REAL Rust std on oxbow!
+    squares = [1, 4, 9, 16, 25, 36]
+    sum     = 91
+    heap    = greetings via std::string::String
+  ```
   Added `os = "oxbow"` support to rust's `library/std/src/sys` (a fork at the pinned
-  nightly commit; patch + backend mirrored in `std-port/`): System allocator →
-  libc malloc/free, `getentropy` randomness, errno/ErrorKind mapping, TLS routed to
-  the single-threaded no-op path. A cross-compiled `std` hello-world builds into a
-  6 MB ELF for `x86_64-unknown-oxbow` (with `#![feature(restricted_std)]`, since the
-  `pal` backend is still `unsupported`). REMAINING to *run* it: a real `sys/pal/oxbow`
-  backend (stdout via tty, exit, args, time) + entry glue (`_start` → `lang_start`
-  → `main`). That removes `restricted_std` and makes std "supported".
+  nightly commit; patch + backend mirrored in `std-port/`): a System allocator,
+  `getentropy` randomness, errno/ErrorKind mapping, stdio, and TLS routed to the
+  single-threaded no-op path. **Key architecture decision:** rather than link
+  oxbow-libc (a self-contained no_std staticlib that owns the panic handler +
+  global allocator — an irreconcilable clash with std), the std backend is fully
+  self-contained and calls thin C-ABI shims (`__oxbow_alloc`/`_write`/`_getentropy`/
+  `_exit`) exported by **oxbow-rt under a new `hosted` feature**, which reuses its
+  existing slab + syscall stubs and drops its own lang items when hosted. The
+  program is `#![no_main]` + `#![feature(restricted_std)]`, provides a C `main` or
+  `oxbow_main`, and links `oxbow-rt` (hosted) for `_start`. A size-optimised release
+  build (`opt-level=z` + LTO + `optimize_for_size`) is **19 KB**.
 - **Phase 2 — keystones.** In-process threads (`SYS_THREAD_SPAWN` sharing the
   current pml4 + a fresh stack; the SMP/TCB infra already exists), a futex
   (wait-on-address, from `notif` or a new syscall), a real wall clock (CMOS RTC →

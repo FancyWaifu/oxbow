@@ -1,18 +1,29 @@
 # oxbow Rust `std` backend (`x86_64-unknown-oxbow`)
 
-Phase 1 (see `../docs/rust-std-port.md`). **Status: `std` COMPILES for oxbow.**
-A cross-compiled `std` hello-world builds into a 6 MB ELF for `x86_64-unknown-oxbow`.
-Still TODO to *run* it: a real `sys/pal/oxbow` backend (stdout/exit/args/time) +
-the entry-point glue (`_start` → `lang_start` → `main`).
+Phase 1 (see `../docs/rust-std-port.md`). **Status: real Rust `std` RUNS on oxbow.**
+A cross-compiled `std` program (`Vec`, iterators, `String`, `println!`) runs as an
+oxbow process and prints to the console. A size-optimised release build is **19 KB**.
+
+## Architecture (why no oxbow-libc)
+
+oxbow-libc is a self-contained `no_std` staticlib that owns the panic handler +
+global allocator — an irreconcilable clash with std (which owns both). So the std
+backend is **self-contained** and calls thin C-ABI shims exported by **oxbow-rt
+under its `hosted` feature** (`__oxbow_alloc`/`_alloc_zeroed`/`_dealloc`/`_write`/
+`_read`/`_getentropy`/`_exit`), reusing oxbow-rt's slab + syscall stubs. With
+`hosted`, oxbow-rt drops its own `#[global_allocator]` + `#[panic_handler]` so std
+supplies them. A std program is `#![no_main]` + `#![feature(restricted_std)]`,
+provides `oxbow_main` (or a C `main`), and depends on `oxbow-rt` with
+`features = ["hosted"]` for `_start`.
 
 ## What's here
 
 - `oxbow-std-backend.patch` — the patch against rust-lang/rust's `library/std/src/sys`
-  (at the nightly commit `4b0c9d76a`) that adds `os = "oxbow"` support: a System
-  allocator, `getentropy` randomness, errno/ErrorKind mapping, and routes TLS to
-  the single-threaded `no_threads`/no-op-guard path. 7 files, ~121 insertions.
-- `sys-oxbow/` — readable copies of the three new backend modules (the patch is the
-  source of truth for applying).
+  (nightly commit `4b0c9d76a`) adding `os = "oxbow"`: System allocator, `getentropy`
+  randomness, errno/ErrorKind mapping, stdio (console), TLS → single-threaded
+  no-op-guard path. 9 files, ~137 insertions.
+- `sys-oxbow/` — readable copies of the four new backend modules (alloc, random,
+  io/error, stdio). The patch is the source of truth for applying.
 
 ## The fork setup (durable, your machine)
 

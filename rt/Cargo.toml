@@ -9,5 +9,11 @@ repository.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+# §95: when oxbow-rt is linked into a Rust `std` program (not a no_std server),
+# std supplies the panic handler + global allocator, so drop ours to avoid
+# duplicate-lang-item errors. Keeps `_start` + the syscall stubs.
+hosted = []
+
 [dependencies]
 oxbow-abi = { path = "../abi" }

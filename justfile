@@ -96,6 +96,9 @@ _iso:
     cp target/x86_64-unknown-none/debug/serial iso_root/boot/serial.elf
     cp target/x86_64-unknown-none/debug/hello iso_root/boot/hello.elf
     cp target/x86_64-unknown-none/debug/badge iso_root/boot/badge.elf
+    # §95: the Rust `std` demo as a boot module (kernel spawns it → output to the
+    # serial console), if prebuilt. Proves real Rust std runs on oxbow.
+    [ -f std-port/oxhello-demo.elf ] && cp std-port/oxhello-demo.elf iso_root/boot/oxhello.elf || true
     cp target/x86_64-unknown-none/debug/fsd iso_root/boot/fs.elf
     -strip -S iso_root/boot/fs.elf
     cp target/x86_64-unknown-none/debug/net iso_root/boot/net.elf
@@ -170,6 +173,11 @@ _iso:
       cp target/x86_64-unknown-none/debug/$t build/initrd/bin/$t; \
       "$STRIP" --strip-all build/initrd/bin/$t; \
     done
+    # §95: the Rust `std` demo — a cross-compiled std program (Vec/String/println!)
+    # built for x86_64-unknown-oxbow, driven by oxbow-rt's hosted shims. Proves real
+    # Rust std runs on oxbow. Copied only if prebuilt (needs the patched-std fork —
+    # see std-port/). Already stripped at build time.
+    [ -f std-port/oxhello-demo.elf ] && cp std-port/oxhello-demo.elf build/initrd/bin/oxhello || true
     # Self-hosting (§35): liboxbow_libc.a staged at /lib/c.a — the C library
     # archive tcc statically links to produce a standalone binary on oxbow.
     # `cc src.c -o out` expands to `tcc -static src.c -o out /lib/c.a`. Built with

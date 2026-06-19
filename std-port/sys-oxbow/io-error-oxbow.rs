@@ -1,17 +1,14 @@
-//! oxbow errno + ErrorKind mapping. oxbow-libc uses Linux-ish errno values and a
-//! global `errno` symbol.
+//! oxbow errno + ErrorKind mapping. No external libc, so std owns the errno cell;
+//! oxbow uses Linux-ish errno values.
 use crate::io::ErrorKind;
 
-unsafe extern "C" {
-    #[link_name = "errno"]
-    static mut C_ERRNO: i32;
-}
+static mut ERRNO: i32 = 0;
 
 pub fn errno() -> i32 {
-    unsafe { (&raw const C_ERRNO).read() }
+    unsafe { (&raw const ERRNO).read() }
 }
 pub fn set_errno(e: i32) {
-    unsafe { (&raw mut C_ERRNO).write(e) };
+    unsafe { (&raw mut ERRNO).write(e) };
 }
 pub fn is_interrupted(code: i32) -> bool {
     code == 4 // EINTR
@@ -22,16 +19,16 @@ pub fn error_string(code: i32) -> String {
 pub fn decode_error_kind(code: i32) -> ErrorKind {
     use ErrorKind::*;
     match code {
-        1 => PermissionDenied,    // EPERM
-        2 => NotFound,            // ENOENT
-        11 => WouldBlock,         // EAGAIN
-        13 => PermissionDenied,   // EACCES
-        17 => AlreadyExists,      // EEXIST
-        21 => IsADirectory,       // EISDIR
-        22 => InvalidInput,       // EINVAL
-        32 => BrokenPipe,         // EPIPE
-        110 => TimedOut,          // ETIMEDOUT
-        111 => ConnectionRefused, // ECONNREFUSED
+        1 => PermissionDenied,
+        2 => NotFound,
+        11 => WouldBlock,
+        13 => PermissionDenied,
+        17 => AlreadyExists,
+        21 => IsADirectory,
+        22 => InvalidInput,
+        32 => BrokenPipe,
+        110 => TimedOut,
+        111 => ConnectionRefused,
         _ => Uncategorized,
     }
 }
