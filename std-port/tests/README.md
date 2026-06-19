@@ -31,3 +31,21 @@ Heavy `mpsc::*_stress` tests hang under the busy-yield scheduler (follow-up).
   Fix in `rt`: fail fast when the size class exceeds the slab.
 - Remaining failures = `env::current_dir`/`current_exe`/`set_current_dir`: POSIX
   path concepts with no cap-based-cwd equivalent (a design decision).
+
+## Collections: HashMap + BTreeSet — 85/85 pass (no source changes)
+
+Inline std/alloc collection tests (`hash/map/tests.rs`, `btree/set/tests.rs`) are
+coupled to internals via `crate::`/`super::`/`realstd::` + use `rand`. Run them with
+`collections-harness.rs` scaffolding (no oxbow source changes):
+- deps: `rand 0.8` + `rand_xorshift 0.3` (`default-features = false`); provide a
+  fixed-seed `test_rng()` in a `test_helpers` module.
+- `extern crate std as realstd;` (for `realstd::`).
+- re-export std modules at the crate root (`pub use std::{cell,cmp,fmt,hash,...};`)
+  so the test files' `crate::X` resolve.
+- wrap each test file in a module that re-exports its type + needed traits, so
+  `super::HashMap` / `super::*` resolve (e.g. `mod hashmap { pub use
+  std::collections::HashMap; pub use std::collections::hash_map::Entry; mod tests; }`).
+- copy the `alloctests/testing/` helpers for the btree tests (CrashTestDummy, rng).
+
+BTreeMap's *own* tests poke private node internals (NodeRef/MIN_LEN/crate::testing),
+so they aren't standalone-extractable; BTreeSet wraps BTreeMap and validates the tree.

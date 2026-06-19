@@ -191,7 +191,17 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     gap**: `env::current_dir`/`current_exe`/`set_current_dir` — POSIX global-path
     concepts that don't exist in oxbow's cap-based cwd (a design decision: stub with a
     sentinel for compat, or leave unsupported). Verified: 64 pass, no hang.
-  Next: broaden further (HashMap/BTreeMap, more fs) + decide the cwd/exe-path stance.
+  - ✅ **HashMap + BTreeSet: 85/85 pass, zero code changes.** The real
+    `std/.../hash/map/tests.rs` (52 tests) + `alloc/.../btree/set/tests.rs` (33) run
+    verbatim and all pass — randomized tests, `RandomState` entropy, panic-safety
+    (`CrashTestDummy` via panic=unwind), the works. Scaffolding (no source changes):
+    add `rand 0.8`/`rand_xorshift 0.3` (`default-features=false`) + a fixed-seed
+    `test_rng`, `extern crate std as realstd`, re-export std modules at the crate root
+    so the test files' `crate::X` resolve, and wrap each test file in a module that
+    re-exports the type (so `super::HashMap`/`super::*` resolve). BTreeMap's *own* tests
+    poke private node internals (`NodeRef`/`MIN_LEN`/`crate::testing`), so they aren't
+    standalone-extractable — but BTreeSet wraps BTreeMap, so the B-tree is validated.
+  Next: more fs; decide the cwd/exe-path stance.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 
