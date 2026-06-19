@@ -30,7 +30,7 @@ use oxbow_abi::{
 use oxbow_rt as rt;
 
 const SECTOR: usize = 512;
-const READ_CHUNK: usize = 56;
+const READ_CHUNK: usize = 504; // §99: 504 B/IPC (MSG_DATA_WORDS=64 -> 512 B data, minus the count word)
 /// Where fsd maps the shared block-transfer frame (above the rt heap window).
 const FSD_XFER: usize = 0x3F00_0000;
 static mut SHARED_OK: bool = false;
@@ -686,7 +686,7 @@ pub extern "C" fn oxbow_main() -> ! {
                     count = unsafe { cached_read(&full, off, dst) };
                 }
                 r.data[0] = count as u64;
-                r.data_len = 8;
+                r.data_len = 64; // all MSG_DATA_WORDS valid (count + up to 504 payload bytes)
                 let _ = rt::sys_reply(reply, &r);
             }
             TAG_FS_READDIR => {

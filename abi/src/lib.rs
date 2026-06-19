@@ -269,7 +269,7 @@ impl SysError {
 // ---------------------------------------------------------------------------
 
 /// Inline payload words (64 bytes).
-pub const MSG_DATA_WORDS: usize = 8;
+pub const MSG_DATA_WORDS: usize = 64; // §99: 512 B inline payload — bulk FS_READ (504 B/IPC)
 /// Transferable handle slots per message.
 pub const MSG_HANDLES: usize = 4;
 
@@ -298,7 +298,7 @@ pub struct MsgBuf {
 
 // MsgBuf is the cross-ABI wire struct; its size feeds `check_user`. Keep it
 // pinned so a layout drift can never silently desync kernel and userland.
-const _: () = assert!(core::mem::size_of::<MsgBuf>() == 104);
+const _: () = assert!(core::mem::size_of::<MsgBuf>() == 552);
 
 impl MsgBuf {
     /// An empty message with the given tag and no payload or handles.

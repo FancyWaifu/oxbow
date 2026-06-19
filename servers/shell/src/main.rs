@@ -724,7 +724,7 @@ unsafe fn read_all(cap: Handle, buf: &mut [u8]) -> usize {
         if rt::sys_call(cap, &mut m).is_err() {
             break;
         }
-        let count = core::cmp::min(m.data[0] as usize, 56);
+        let count = core::cmp::min(m.data[0] as usize, 504);
         if count == 0 || off + count > buf.len() {
             break;
         }
