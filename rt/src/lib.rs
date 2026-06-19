@@ -638,6 +638,50 @@ pub unsafe extern "C" fn __oxbow_fs_readdir(
         None => -1,
     }
 }
+/// std::fs::remove_file — TAG_FS_UNLINK(name) to the cwd dir cap (slot 1).
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_fs_unlink(path: *const u8, len: usize) -> i32 {
+    let mut m = MsgBuf::new(oxbow_abi::TAG_FS_UNLINK);
+    let n = len.min(56);
+    let dst = m.data.as_mut_ptr() as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(path, dst, n);
+        *dst.add(n) = 0;
+    }
+    m.data_len = ((n + 1 + 7) / 8) as u32;
+    if sys_call(1 as Handle, &mut m).is_err() || m.data[0] != 0 {
+        -1
+    } else {
+        0
+    }
+}
+/// std::fs::rename — TAG_FS_RENAME packs `old\0new\0` (each <=28 B) to the cwd cap.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_fs_rename(
+    old: *const u8,
+    old_len: usize,
+    new: *const u8,
+    new_len: usize,
+) -> i32 {
+    let mut m = MsgBuf::new(oxbow_abi::TAG_FS_RENAME);
+    let ol = old_len.min(28);
+    let nl = new_len.min(28);
+    let dst = m.data.as_mut_ptr() as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(old, dst, ol);
+        *dst.add(ol) = 0;
+        core::ptr::copy_nonoverlapping(new, dst.add(ol + 1), nl);
+        *dst.add(ol + 1 + nl) = 0;
+    }
+    m.data_len = 8;
+    if sys_call(1 as Handle, &mut m).is_err() || m.data[0] != 0 {
+        -1
+    } else {
+        0
+    }
+}
 
 // --- Raw syscall stubs ----------------------------------------------------
 // nr in rax; args rdi, rsi, rdx, r10, r8, r9; returns rax (+ rdx). rcx/r11 are

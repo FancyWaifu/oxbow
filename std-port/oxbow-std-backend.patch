@@ -177,10 +177,10 @@ index 0c297c57..a1404d0b 100644
          use vexos as imp;
 diff --git a/library/std/src/sys/fs/oxbow.rs b/library/std/src/sys/fs/oxbow.rs
 new file mode 100644
-index 00000000..8856575d
+index 00000000..c17de23a
 --- /dev/null
 +++ b/library/std/src/sys/fs/oxbow.rs
-@@ -0,0 +1,438 @@
+@@ -0,0 +1,448 @@
 +//! oxbow std::fs — real File open/read/write/seek + stat over the fsd protocol
 +//! (oxbow-rt's `__oxbow_fs_*` shims), relative to the program's cwd dir cap.
 +//! Directory listing, symlinks, rename/unlink, timestamps and permissions are not
@@ -209,6 +209,8 @@ index 00000000..8856575d
 +    fn __oxbow_fs_close(file: i64);
 +    fn __oxbow_fs_mkdir(path: *const u8, len: usize) -> i32;
 +    fn __oxbow_fs_readdir(dir: i64, cursor: u64, name_out: *mut u8, name_cap: usize, kind_out: *mut u32) -> isize;
++    fn __oxbow_fs_unlink(path: *const u8, len: usize) -> i32;
++    fn __oxbow_fs_rename(old: *const u8, old_len: usize, new: *const u8, new_len: usize) -> i32;
 +}
 +
 +const FS_DIR: u32 = 1; // oxbow_abi::FS_DIR
@@ -583,11 +585,19 @@ index 00000000..8856575d
 +    }
 +    Ok(ReadDir { cap, cursor: 0, base: p.to_path_buf() })
 +}
-+pub fn unlink(_p: &Path) -> io::Result<()> {
-+    unsupported()
++pub fn unlink(p: &Path) -> io::Result<()> {
++    let b = pbytes(p);
++    if unsafe { __oxbow_fs_unlink(b.as_ptr(), b.len()) } != 0 {
++        return Err(ioerr(io::ErrorKind::Other, "oxbow fs: remove_file failed"));
++    }
++    Ok(())
 +}
-+pub fn rename(_old: &Path, _new: &Path) -> io::Result<()> {
-+    unsupported()
++pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
++    let (o, n) = (pbytes(old), pbytes(new));
++    if unsafe { __oxbow_fs_rename(o.as_ptr(), o.len(), n.as_ptr(), n.len()) } != 0 {
++        return Err(ioerr(io::ErrorKind::Other, "oxbow fs: rename failed"));
++    }
++    Ok(())
 +}
 +pub fn set_perm(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
 +    Ok(())

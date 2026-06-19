@@ -26,6 +26,8 @@ unsafe extern "C" {
     fn __oxbow_fs_close(file: i64);
     fn __oxbow_fs_mkdir(path: *const u8, len: usize) -> i32;
     fn __oxbow_fs_readdir(dir: i64, cursor: u64, name_out: *mut u8, name_cap: usize, kind_out: *mut u32) -> isize;
+    fn __oxbow_fs_unlink(path: *const u8, len: usize) -> i32;
+    fn __oxbow_fs_rename(old: *const u8, old_len: usize, new: *const u8, new_len: usize) -> i32;
 }
 
 const FS_DIR: u32 = 1; // oxbow_abi::FS_DIR
@@ -400,11 +402,19 @@ pub fn readdir(p: &Path) -> io::Result<ReadDir> {
     }
     Ok(ReadDir { cap, cursor: 0, base: p.to_path_buf() })
 }
-pub fn unlink(_p: &Path) -> io::Result<()> {
-    unsupported()
+pub fn unlink(p: &Path) -> io::Result<()> {
+    let b = pbytes(p);
+    if unsafe { __oxbow_fs_unlink(b.as_ptr(), b.len()) } != 0 {
+        return Err(ioerr(io::ErrorKind::Other, "oxbow fs: remove_file failed"));
+    }
+    Ok(())
 }
-pub fn rename(_old: &Path, _new: &Path) -> io::Result<()> {
-    unsupported()
+pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
+    let (o, n) = (pbytes(old), pbytes(new));
+    if unsafe { __oxbow_fs_rename(o.as_ptr(), o.len(), n.as_ptr(), n.len()) } != 0 {
+        return Err(ioerr(io::ErrorKind::Other, "oxbow fs: rename failed"));
+    }
+    Ok(())
 }
 pub fn set_perm(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
     Ok(())
