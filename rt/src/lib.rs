@@ -40,7 +40,34 @@ use oxbow_abi::{
 // load/store pairs need no CAS — atomics are only here to satisfy `Sync`.
 mod heap {
     use core::alloc::{GlobalAlloc, Layout};
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    // §96: the slab is now reachable from multiple threads of one process (std
+    // `thread::spawn`), so its free-list/bump load-store pairs need mutual
+    // exclusion. A test-and-set spinlock: critical sections are a handful of
+    // instructions, and ring-3 threads are preemptible (IF=1), so a holder that
+    // is preempted is always rescheduled to release it — no permanent deadlock.
+    static LOCK: AtomicBool = AtomicBool::new(false);
+
+    struct HeapLock;
+    impl HeapLock {
+        #[inline]
+        fn acquire() -> HeapLock {
+            while LOCK
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+            HeapLock
+        }
+    }
+    impl Drop for HeapLock {
+        #[inline]
+        fn drop(&mut self) {
+            LOCK.store(false, Ordering::Release);
+        }
+    }
 
     const HEAP_BASE: usize = 0x3000_0000;
     const HEAP_LIMIT: usize = 0x3400_0000; // 64 MiB ceiling (real cap is the budget)
@@ -96,6 +123,7 @@ mod heap {
 
     unsafe impl GlobalAlloc for Slab {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _g = HeapLock::acquire(); // §96: released on every return path
             let bucket = bucket_of(layout);
             let class = 1usize << bucket;
 
@@ -139,6 +167,7 @@ mod heap {
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            let _g = HeapLock::acquire(); // §96: serialize free-list pushes
             // Push onto this class's free list: stash the old head in the block.
             let bucket = bucket_of(layout);
             let head = self.free[bucket].load(Ordering::Relaxed);
