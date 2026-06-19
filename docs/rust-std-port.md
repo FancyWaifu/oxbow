@@ -90,8 +90,16 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     `sys/fs/oxbow.rs`. Verified from the shell: write a file, read it back, stat its
     size, seek + read a slice. Plus `read_dir` + `create_dir` (multi-component paths, .\/.. omitted). Plus `remove_file`/`rename`/`remove_dir`/`remove_dir_all`. Not yet wired: symlinks, timestamps/permissions.
   - ☐ The original hardening list:
-- **Phase 3 (cont.) — harden.** Native ELF TLS, `Command` stdio piping (spawn-not-fork),
-  full `Metadata`, optional `panic=unwind`.
+  - ✅ **`std::process::Command`** — `Command::new(prog).status()`/`.spawn()`+`wait()`
+    spawns a child (std reads its ELF via std::fs), inheriting the parent's stdio/cwd/
+    net caps, and returns its exit code. Verified: a std parent spawns a std child,
+    the child prints (inherited stdio) and exits 42, the parent reads code Some(42).
+    rt shims `__oxbow_spawn`/`__oxbow_wait` (sys_spawn_bytes + an exit notif).
+    The program is resolved relative to the cwd cap (the user namespace) — /bin (the
+    shell's tools) is NOT reachable from a user process, by the capability model.
+    Not wired: piped stdio (output capture), kill, try_wait.
+- **Phase 3 (cont.) — harden.** Native ELF TLS, piped Command stdio, TLS destructors,
+  optional `panic=unwind`.
 - **Phase 4 — the std test suite** as the "done" bar.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)

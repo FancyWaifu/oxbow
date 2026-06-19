@@ -686,6 +686,51 @@ pub unsafe extern "C" fn __oxbow_fs_rename(
     }
 }
 
+// §98 std::process::Command — spawn a child from ELF bytes (std reads them via
+// std::fs), inheriting the parent's stdio + cwd + net caps; wait on its exit notif.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_spawn(
+    elf: *const u8,
+    elf_len: usize,
+    argv: *const u8,
+    argv_len: usize,
+    pid_out: *mut u32,
+) -> i64 {
+    let notif = match sys_notif_create() {
+        Ok(n) => n,
+        Err(_) => return -1,
+    };
+    let mut sm = MsgBuf::new(0);
+    sm.data[0] = 8 * 1024 * 1024; // child budget (covers coreutils + simple std)
+    sm.data[1] = argv as u64;
+    sm.data[2] = argv_len as u64;
+    sm.data_len = 3;
+    sm.handle_count = 4;
+    sm.handles[0] = 1; // cwd dir cap (slot 1)
+    sm.handles[1] = 2; // stdout (SPAWN_STDOUT)
+    sm.handles[2] = 4; // stdin (SPAWN_STDIN)
+    sm.handles[3] = oxbow_abi::BOOT_NET_EP; // net
+    let elf_slice = unsafe { core::slice::from_raw_parts(elf, elf_len) };
+    match sys_spawn_bytes(elf_slice, BOOT_MEM, &sm, notif) {
+        Ok(pid) => {
+            unsafe { pid_out.write(pid as u32) };
+            notif as i64
+        }
+        Err(_) => {
+            let _ = sys_close(notif);
+            -1
+        }
+    }
+}
+/// Block on a child's exit notification, then return its exit status.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_wait(notif: i64) -> i32 {
+    let _ = sys_notif_wait(notif as Handle);
+    sys_notif_status(notif as Handle)
+}
+
 // --- Raw syscall stubs ----------------------------------------------------
 // nr in rax; args rdi, rsi, rdx, r10, r8, r9; returns rax (+ rdx). rcx/r11 are
 // clobbered by the `syscall` instruction. No `nomem`/`nostack` options: the
