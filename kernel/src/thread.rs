@@ -91,6 +91,9 @@ struct Tcb {
     /// Timer deadline in ticks (0 = none). When `TICKS >= wake_at`, the timer IRQ
     /// wakes this Blocked thread. Used for timed waits (sys_chan_wait timeout).
     wake_at: u64,
+    /// §96 futex: the user address this thread is `SYS_FUTEX_WAIT`-blocked on
+    /// (0 = not futex-waiting). `SYS_FUTEX_WAKE` scans for matches in the same proc.
+    futex_addr: u64,
 }
 
 static mut TCBS: [Tcb; MAX_THREADS] = [Tcb {
@@ -99,6 +102,7 @@ static mut TCBS: [Tcb; MAX_THREADS] = [Tcb {
     proc: NO_PROC,
     cr3: 0,
     wake_at: 0,
+    futex_addr: 0,
 }; MAX_THREADS];
 
 // §70 SMP lost-wakeup fix: the thread STATE lives in its own atomic array, NOT in
@@ -211,6 +215,7 @@ fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64) -> usize {
                     proc,
                     cr3,
                     wake_at: 0,
+                    futex_addr: 0,
                 };
                 // Fresh (or reused) slot: reset its FPU state to the clean template.
                 core::ptr::copy_nonoverlapping(
@@ -253,6 +258,7 @@ pub fn register_running_idle(kstack_top: u64) -> usize {
                     proc: NO_PROC,
                     cr3: 0,
                     wake_at: 0,
+                    futex_addr: 0,
                 };
             }
             set_state(slot, State::Running); // the AP is already running on this stack
@@ -641,4 +647,69 @@ extern "C" fn user_thread_entry(entry: u64, user_rsp: u64) {
 /// CR3) and the timer preempts it mid-userspace thereafter.
 pub fn spawn_user(proc: usize, cr3: u64, entry: u64, user_rsp: u64) -> usize {
     spawn(user_thread_entry as *const () as u64, entry, user_rsp, proc, cr3)
+}
+
+/// §96: spawn a new thread in the CALLER's address space (shares its `cr3` + owning
+/// process) with a caller-provided user stack. Backs `SYS_THREAD_SPAWN` — the
+/// kernel half of `std::thread::spawn`. Returns the new tid.
+pub fn spawn_thread_in_current(entry: u64, user_rsp: u64) -> usize {
+    let cur = current();
+    let (proc, cr3) = unsafe {
+        let t = &*addr_of!(TCBS[cur]);
+        (t.proc, t.cr3)
+    };
+    spawn_user(proc, cr3, entry, user_rsp)
+}
+
+/// §96 futex wait — block the caller until a `futex_wake` on `addr` arrives, but
+/// only if `*addr == expected` (the compare-and-block that closes the lost-wakeup
+/// race). `addr` is a user vaddr live in the current address space. Uses the same
+/// prepare/re-check/block protocol as the rest of the kernel.
+pub fn futex_wait(addr: u64, expected: u32) {
+    let cur = current();
+    unsafe {
+        (*addr_of_mut!(TCBS[cur])).futex_addr = addr;
+    }
+    prepare_block();
+    // Re-check AFTER publishing Blocked: pairs with a waker that stores `*addr`
+    // then calls `futex_wake` (which loads our state under SCHED_LOCK).
+    let now = unsafe { (addr as *const u32).read_volatile() };
+    if now != expected {
+        cancel_block();
+        unsafe {
+            (*addr_of_mut!(TCBS[cur])).futex_addr = 0;
+        }
+        return;
+    }
+    block_current();
+    unsafe {
+        (*addr_of_mut!(TCBS[cur])).futex_addr = 0;
+    }
+}
+
+/// §96 futex wake — wake up to `count` threads of the caller's process that are
+/// blocked on `addr`. Returns how many were woken. A linear TCB scan (the pool is
+/// small), the same shape as `wake_expired`.
+pub fn futex_wake(addr: u64, count: usize) -> usize {
+    let proc = current_proc();
+    let mut woken = 0;
+    sched_lock();
+    for s in 1..MAX_THREADS {
+        if woken >= count {
+            break;
+        }
+        let (t_proc, t_addr) = unsafe {
+            let t = &*addr_of!(TCBS[s]);
+            (t.proc, t.futex_addr)
+        };
+        if t_proc == proc && t_addr == addr && state(s) == State::Blocked {
+            unsafe {
+                (*addr_of_mut!(TCBS[s])).futex_addr = 0;
+            }
+            wake_locked(s);
+            woken += 1;
+        }
+    }
+    sched_unlock();
+    woken
 }

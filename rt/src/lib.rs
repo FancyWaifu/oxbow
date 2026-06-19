@@ -739,6 +739,65 @@ pub fn sys_walltime() -> (u64, u64) {
     unsafe { syscall1(oxbow_abi::SYS_WALLTIME, 0) }
 }
 
+// --- §96 in-process threads + futex ----------------------------------------
+
+/// Spawn a thread in this process at `entry` with stack pointer `user_rsp`. The
+/// caller sets up the stack (including any argument). Returns the new tid.
+pub unsafe fn sys_thread_spawn(entry: u64, user_rsp: u64) -> usize {
+    let (tid, _) = unsafe { syscall2(oxbow_abi::SYS_THREAD_SPAWN, entry, user_rsp) };
+    tid as usize
+}
+
+/// Exit the calling thread (NOT the whole process). Never returns.
+pub fn sys_thread_exit() -> ! {
+    unsafe {
+        syscall1(oxbow_abi::SYS_THREAD_EXIT, 0);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Futex wait: block until `*addr != expected` and a wake arrives. Returns at once
+/// if `*addr` already differs (the compare-and-block that avoids lost wakeups).
+pub unsafe fn sys_futex_wait(addr: *const u32, expected: u32) {
+    unsafe {
+        syscall2(oxbow_abi::SYS_FUTEX_WAIT, addr as u64, expected as u64);
+    }
+}
+
+/// Futex wake: wake up to `count` threads blocked on `addr`. Returns how many.
+pub unsafe fn sys_futex_wake(addr: *const u32, count: u32) -> usize {
+    let (n, _) = unsafe { syscall2(oxbow_abi::SYS_FUTEX_WAKE, addr as u64, count as u64) };
+    n as usize
+}
+
+/// Spawn a thread running `f(arg)` on the given stack region. `f` must never return
+/// (it should end with `sys_thread_exit`). Returns the new tid. The argument and
+/// the entry fn are stashed at the top of the stack for the trampoline.
+pub unsafe fn spawn_thread(stack: &mut [u8], f: extern "C" fn(u64) -> !, arg: u64) -> usize {
+    let top = (stack.as_mut_ptr() as usize + stack.len()) & !0xF;
+    let sp = top - 16;
+    unsafe {
+        (sp as *mut u64).write(f as u64); // [sp]   = entry fn
+        ((sp + 8) as *mut u64).write(arg); // [sp+8] = arg
+        sys_thread_spawn(thread_trampoline as u64, sp as u64)
+    }
+}
+
+/// Entry stub for `spawn_thread`: the kernel enters here with all GPRs zero and
+/// `rsp` at the stashed `[fn, arg]`. Load them and tail-call `f(arg)`.
+#[unsafe(naked)]
+extern "C" fn thread_trampoline() -> ! {
+    core::arch::naked_asm!(
+        "mov rax, [rsp]",     // entry fn
+        "mov rdi, [rsp + 8]", // arg
+        "and rsp, -16",       // SysV stack alignment for the call
+        "call rax",           // f(arg) — must not return
+        "ud2",
+    );
+}
+
 /// `(used_kib, total_kib)` of the kernel's managed physical region — ambient, for
 /// a system monitor. Not a capability; every process may read it.
 pub fn sys_meminfo() -> (u64, u64) {

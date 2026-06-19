@@ -798,6 +798,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "thrtest"
+version = "0.0.0"
+dependencies = [
+ "oxbow-abi",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "touch"
 version = "0.0.0"
 dependencies = [

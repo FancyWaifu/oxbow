@@ -49,10 +49,19 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     → `(epoch_secs, nanos)`; oxbow-rt shims `__oxbow_walltime`/`__oxbow_uptime_ms`;
     std `sys/time/oxbow.rs` gives a real `SystemTime::now()` (verified: prints the
     correct UTC date) and a monotonic `Instant`.
+  - ✅ **Thread + futex kernel foundation** — `SYS_THREAD_SPAWN` (53, a thread in
+    the caller's address space via `spawn_user(current_proc, current_cr3, …)`),
+    `SYS_THREAD_EXIT` (54, `exit_current` — does NOT kill the process),
+    `SYS_FUTEX_WAIT`/`WAKE` (55/56, a per-process wait queue keyed on a user vaddr,
+    reusing the kernel's block/wake + a `Tcb.futex_addr` field). oxbow-rt wrappers +
+    a `spawn_thread`/`thread_trampoline` helper. Verified by `servers/thrtest`
+    (`/bin/thrtest`): a worker thread increments a shared counter to 200000 and
+    signals via the futex while main blocks, then thread-exits — parent survives.
+  - ☐ std `thread`/`Mutex`/`Condvar` backend on top of the futex; real per-thread
+    TLS (today routed to no_threads — fine single-threaded, races with >1 thread).
+    NOTE: oxbow-rt's slab allocator is single-threaded (no CAS) — std threads need a
+    thread-safe global allocator first.
   - ☐ Real env block (passed at spawn like `SPAWN_ARGV`) → `std::env::var`.
-  - ☐ In-process threads (`SYS_THREAD_SPAWN` sharing the current pml4 + a fresh
-    stack; the SMP/TCB infra already exists), a futex (wait-on-address), real
-    per-thread TLS → `std::thread::spawn` + `join` + `Mutex`.
 - **Phase 3 — harden.** Native ELF TLS, `Command` stdio piping (spawn-not-fork),
   full `Metadata`, optional `panic=unwind`.
 - **Phase 4 — the std test suite** as the "done" bar.

@@ -191,6 +191,12 @@ pub const SYS_DMA_ALLOC_CONTIG: u64 = 49; // (mem, vaddr, pages) -> contiguous p
 pub const SYS_SHM_PHYS: u64 = 50; // (shm) -> rdx = physical base of a CONTIGUOUS shm. needs R_MAP
 pub const SYS_NOTIF_POLL: u64 = 51; // (notif) -> rdx = drained count, NON-BLOCKING. needs R_WAIT
 pub const SYS_WALLTIME: u64 = 52; // () -> (epoch_secs in rax, nanoseconds in rdx). CMOS RTC. stdio
+// §96 in-process threads + futex (back std::thread / Mutex / Condvar). A thread
+// shares the spawner's address space; the futex is per-process (keyed on vaddr).
+pub const SYS_THREAD_SPAWN: u64 = 53; // (entry, user_rsp) -> tid. New thread in caller's AS.
+pub const SYS_THREAD_EXIT: u64 = 54; // () -> ! . Exit the calling thread (NOT the process).
+pub const SYS_FUTEX_WAIT: u64 = 55; // (addr: *u32, expected) -> 0. Block if *addr == expected.
+pub const SYS_FUTEX_WAKE: u64 = 56; // (addr: *u32, count) -> rax woken. Wake up to count waiters.
 /// Capability kinds reported by SYS_CAP_TYPE (so recvmsg can reconstruct the
 /// right fd flavor from a passed handle). 0 = anything else.
 pub const CAP_OTHER: u64 = 0;
