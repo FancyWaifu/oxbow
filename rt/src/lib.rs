@@ -744,6 +744,15 @@ pub extern "C" fn __oxbow_try_wait(notif: i64) -> i64 {
         i64::MIN
     }
 }
+/// std `Command::kill` — terminate the child the exit `notif` belongs to.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_kill(notif: i64, code: i32) -> i32 {
+    match sys_proc_kill(notif as Handle, code) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
 // §100 piped Command stdio: a pipe → a grantable write-end (R_OUT|R_GRANT) the
 // child gets as stdout, and a read-end (R_IN) the parent reads.
 #[cfg(feature = "hosted")]
@@ -1258,6 +1267,13 @@ pub fn sys_notif_wait(notif: Handle) -> SysResult<u64> {
 pub fn sys_notif_poll(notif: Handle) -> u64 {
     let (rax, rdx) = unsafe { syscall1(oxbow_abi::SYS_NOTIF_POLL, notif as u64) };
     SysError::from_raw(rax).map(|_| rdx).unwrap_or(0)
+}
+
+/// §103: kill the child whose exit notification is `notif` (with exit `code`).
+/// Authority is holding `notif` (the spawn-time lifecycle handle).
+pub fn sys_proc_kill(notif: Handle, code: i32) -> SysResult {
+    let (rax, _) = unsafe { syscall2(oxbow_abi::SYS_PROC_KILL, notif as u64, code as u64) };
+    SysError::from_raw(rax).map(|_| ())
 }
 
 /// Read the last exit code delivered to `notif` (§81), non-blocking. Call right

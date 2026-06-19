@@ -210,6 +210,16 @@ pub fn set_lifecycle(id: usize, exit_notif: Option<u8>, mem_idx: u8, parent_mem:
     procs[id].spawn_cost = cost;
 }
 
+/// §103 Command::kill: the live process whose exit notification is `notif_idx` — i.e.
+/// the child a spawner controls via the exit-notif handle it holds. `None` if it has
+/// already exited. This is the authority check: holding the child's exit notif (the
+/// lifecycle handle the spawner created + passed to spawn) is what permits killing it.
+pub fn find_by_exit_notif(notif_idx: u8) -> Option<usize> {
+    let procs = PROCESSES.lock();
+    (0..MAX_PROCS)
+        .find(|&i| matches!(procs[i].state, PState::Alive) && procs[i].exit_notif == Some(notif_idx))
+}
+
 /// Mark a process dead and drop its handles (on a ring-3 fault or `sys_exit`).
 /// Any pending Reply it held is abandoned — the blocked caller wakes `E_GONE`.
 /// Releases the child's Memory slot, REFUNDS the spawner's budget by the cost it
@@ -423,8 +433,15 @@ pub fn create(
 ) -> Result<(usize, u64, u64, u64), SysError> {
     let (id, dead_pml4) = {
         let mut procs = PROCESSES.lock();
+        // §103: a Dead slot is reusable only once ALL its threads are gone — reusing
+        // it frees the old address space, which a still-winding-down killed thread is
+        // running on (use-after-free otherwise). Free slots are always reusable.
         let id = (0..MAX_PROCS)
-            .find(|&i| matches!(procs[i].state, PState::Free | PState::Dead))
+            .find(|&i| match procs[i].state {
+                PState::Free => true,
+                PState::Dead => !crate::thread::proc_has_live_threads(i),
+                _ => false,
+            })
             .ok_or(SysError::NoMem)?;
         // If we're reusing a Dead slot, its old address space is no longer live
         // (the owner switched away on exit) — reclaim its frames below.

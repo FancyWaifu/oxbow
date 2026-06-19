@@ -107,8 +107,17 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     (rt `__oxbow_try_wait`). It drains the exit signal, so `Process` caches the status
     (`exited`) and a later blocking `wait()` returns the cache instead of deadlocking
     on the drained notification. Verified: `running` → `wait=Some(5)` → cached
-    `try_wait=Some(5)`. `kill` still unsupported — it needs a process-control
-    capability (pid-based kill would be ambient authority; deferred design decision).
+    `try_wait=Some(5)`.
+  - ✅ **`Command::kill`** — SMP-safe cross-process kill, capability-clean: authority
+    is holding the child's **exit-notif** handle (the spawn-time lifecycle handle —
+    no ambient pid). `SYS_PROC_KILL(notif, code)` finds the child by that notif, reaps
+    it (`proc::kill`: close handles, free budget, signal the notif so `wait()` gets the
+    code), and flags its threads (`SHOULD_DIE`) to **self-terminate** at safe points
+    (`preempt` for Running/Ready, after `block_current` for Blocked — blocked threads
+    are woken to reach it). Self-exit (never an external force-Exited) is the only
+    SMP-safe way — it avoids the kernel-stack-reuse race. `proc::create` won't reuse a
+    Dead slot with live threads (prevents the address-space UAF). Verified: a spinning
+    child AND a parked child both → `wait()=Some(137)`, parent + system survive.
   - ✅ **`panic=unwind`** — real DWARF stack unwinding. The pure-Rust `unwinding`
     crate (fde-static) supplies the Itanium `_Unwind_*` ABI; `library/unwind` routes
     oxbow through the xous-style binding (its own types — ABI-safe), and oxbow was
@@ -145,8 +154,8 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     `__oxbow_thread_exit`. Verified: `Dropper(7) dropped at thread exit` prints
     between the thread's work and the join. (Main-thread TLS dtors at process exit
     still leak — the whole AS is torn down, so it's moot.)
-- **Phase 3 — DONE.** native TLS, TLS destructors, Command try_wait, panic=unwind all
-  landed. Only `Command::kill` deferred (needs a process-control capability decision).
+- **Phase 3 — DONE.** native TLS, TLS destructors, Command try_wait/kill, panic=unwind
+  all landed and verified.
 - **Phase 4 — the std test suite** as the "done" bar.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)

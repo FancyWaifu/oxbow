@@ -943,10 +943,10 @@ index 3eb20dae..63e444e3 100644
          use unsupported as imp;
 diff --git a/library/std/src/sys/process/oxbow.rs b/library/std/src/sys/process/oxbow.rs
 new file mode 100644
-index 00000000..54f0e13d
+index 00000000..1a00306b
 --- /dev/null
 +++ b/library/std/src/sys/process/oxbow.rs
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,355 @@
 +//! oxbow std::process — spawn a child program (std reads its ELF via std::fs),
 +//! inheriting the parent's stdio/cwd/net caps, and wait on its exit notification.
 +//! Piped stdio (output capture) + kill + try_wait are not wired yet.
@@ -971,6 +971,7 @@ index 00000000..54f0e13d
 +    ) -> i64;
 +    fn __oxbow_wait(notif: i64) -> i32;
 +    fn __oxbow_try_wait(notif: i64) -> i64;
++    fn __oxbow_kill(notif: i64, code: i32) -> i32;
 +    fn __oxbow_pipe_eof(pipe: u32);
 +    fn __oxbow_pipe_close(pipe: u32);
 +}
@@ -1226,10 +1227,13 @@ index 00000000..54f0e13d
 +        self.pid
 +    }
 +    pub fn kill(&mut self) -> io::Result<()> {
-+        // oxbow has no cross-process kill yet — it needs a process-control capability
-+        // (killing a child is authority the spawner must hold; pid-based kill would be
-+        // ambient). Tracked as a Phase 3 follow-up.
-+        unsupported()
++        // §103: kill the child via its exit-notif capability (held in `self.notif`).
++        // Best-effort: if the child already exited it's E_GONE, which is still success
++        // (the goal — child not running — holds). 137 = 128 + SIGKILL(9).
++        if self.exited.is_none() {
++            let _ = unsafe { __oxbow_kill(self.notif, 137) };
++        }
++        Ok(())
 +    }
 +    pub fn wait(&mut self) -> io::Result<ExitStatus> {
 +        if let Some(c) = self.exited {

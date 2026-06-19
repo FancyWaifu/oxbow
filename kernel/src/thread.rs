@@ -117,6 +117,14 @@ static mut TCBS: [Tcb; MAX_THREADS] = [Tcb {
 // (p_stat under SCHED_LOCK) rely on. `State::Free` == 0, so the zero-init is Free.
 static STATE: [AtomicU8; MAX_THREADS] = [const { AtomicU8::new(State::Free as u8) }; MAX_THREADS];
 
+// §103 Command::kill: a per-thread "self-terminate" flag. Set on every thread of a
+// killed process; checked at safe resume points (preempt + after block_current),
+// where the thread calls `exit_current` — which terminates it OFF its own kernel
+// stack (the only SMP-safe way; externally forcing a running thread Exited races
+// with kernel-stack reuse). Cleared when a slot is (re)spawned.
+static SHOULD_DIE: [core::sync::atomic::AtomicBool; MAX_THREADS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_THREADS];
+
 // §69 Phase 4: the running thread is PER-CPU — it lives in this CPU's PerCpu
 // (reached via the GS base), not a single global. `current()`/`set_running()`
 // funnel through `crate::percpu`. On one core this is identical to the old global.
@@ -215,6 +223,7 @@ fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64, fs_base: u64) 
         // are free for the next spawn.
         if matches!(state(slot), State::Free | State::Exited) {
             let (ctx_rsp, kstack_top) = init_stack(slot, entry, arg1, arg2);
+            SHOULD_DIE[slot].store(false, Ordering::Relaxed); // fresh slot starts clean
             unsafe {
                 *addr_of_mut!(TCBS[slot]) = Tcb {
                     ctx_rsp,
@@ -520,6 +529,11 @@ pub fn block_current() {
     let next = pick_next().unwrap_or_else(|| crate::percpu::idle_tid());
     switch_to(next); // releases SCHED_LOCK (in the resumed thread)
     // Woken: our waker has already deposited our result (and staging, in IPC).
+    // §103: if our process was killed while we slept, self-terminate now — the
+    // kill woke us precisely so we'd reach this safe exit point.
+    if SHOULD_DIE[current()].load(Ordering::Relaxed) {
+        exit_current();
+    }
 }
 
 /// The CAS at the heart of `wake` (OpenBSD `setrunnable` / Linux `try_to_wake_up`):
@@ -596,11 +610,48 @@ pub fn exit_current() -> ! {
     unreachable!("exited thread resumed");
 }
 
+/// §103 Command::kill: flag every live thread of `proc` to self-terminate, and wake
+/// the blocked ones so they reach the exit check in `block_current`. Running/Ready
+/// threads hit the check in `preempt` on their next tick. The threads exit OFF their
+/// own stacks (safe); the process itself is reaped separately by `proc::kill`.
+pub fn mark_proc_dying(proc: usize) {
+    sched_lock();
+    for s in 1..MAX_THREADS {
+        if proc_of(s) == proc {
+            match state(s) {
+                State::Free | State::Exited => {}
+                st => {
+                    SHOULD_DIE[s].store(true, Ordering::Relaxed);
+                    if st == State::Blocked {
+                        wake_locked(s);
+                    }
+                }
+            }
+        }
+    }
+    sched_unlock();
+}
+
+/// True if `proc` still owns any non-Exited thread. `proc::create` uses this to
+/// avoid reusing a Dead process slot (freeing its address space) while a killed
+/// thread is still winding down on it — which would be a use-after-free (§103).
+pub fn proc_has_live_threads(proc: usize) -> bool {
+    (1..MAX_THREADS).any(|s| {
+        proc_of(s) == proc && !matches!(state(s), State::Free | State::Exited)
+    })
+}
+
 /// Called from the timer IRQ handler (IF=0). Rotate to the next Ready thread;
 /// if none, keep running the current one. The preempted thread resumes through
 /// the handler tail's `iretq`, back where it was interrupted.
 pub fn preempt() {
     sched_lock();
+    // §103: a thread whose process was killed self-terminates here (off its own
+    // kernel stack — safe). Catches threads that were Running/Ready at kill time.
+    if current() != crate::percpu::idle_tid() && SHOULD_DIE[current()].load(Ordering::Relaxed) {
+        sched_unlock(); // exit_current re-takes the lock
+        exit_current();
+    }
     if let Some(n) = pick_next() {
         if current() != crate::percpu::idle_tid() {
             set_state(current(), State::Ready);

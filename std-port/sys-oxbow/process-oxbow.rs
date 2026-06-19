@@ -22,6 +22,7 @@ unsafe extern "C" {
     ) -> i64;
     fn __oxbow_wait(notif: i64) -> i32;
     fn __oxbow_try_wait(notif: i64) -> i64;
+    fn __oxbow_kill(notif: i64, code: i32) -> i32;
     fn __oxbow_pipe_eof(pipe: u32);
     fn __oxbow_pipe_close(pipe: u32);
 }
@@ -277,10 +278,13 @@ impl Process {
         self.pid
     }
     pub fn kill(&mut self) -> io::Result<()> {
-        // oxbow has no cross-process kill yet — it needs a process-control capability
-        // (killing a child is authority the spawner must hold; pid-based kill would be
-        // ambient). Tracked as a Phase 3 follow-up.
-        unsupported()
+        // §103: kill the child via its exit-notif capability (held in `self.notif`).
+        // Best-effort: if the child already exited it's E_GONE, which is still success
+        // (the goal — child not running — holds). 137 = 128 + SIGKILL(9).
+        if self.exited.is_none() {
+            let _ = unsafe { __oxbow_kill(self.notif, 137) };
+        }
+        Ok(())
     }
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         if let Some(c) = self.exited {

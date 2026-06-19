@@ -17,7 +17,7 @@ use oxbow_abi::{
     SYS_PROTECT, SYS_RECV, SYS_REPLY,
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_MEMINFO, SYS_UPTIME_MS,
     SYS_WALLTIME, SYS_THREAD_SPAWN, SYS_THREAD_EXIT, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE,
-    SYS_THREAD_ID, SYS_YIELD,
+    SYS_THREAD_ID, SYS_YIELD, SYS_PROC_KILL,
     SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_PIPE_EOF, CHAN_NONBLOCK, PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT,
     R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM, PLEDGE_SPAWN, PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
 };
@@ -160,6 +160,7 @@ pub extern "C" fn syscall_dispatch(
             crate::thread::yield_now();
             SyscallRet { rax: 0, rdx: 0 }
         }
+        SYS_PROC_KILL => sys_proc_kill(a1, a2),
         SYS_MEMINFO => {
             let (used, total) = crate::mm::pmm::stats();
             let used_kib = (used / 1024) & 0xffff_ffff;
@@ -683,6 +684,35 @@ fn sys_spawn_bytes(buf: u64, len: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u
         return SyscallRet::err(SysError::Msg);
     }
     spawn_common(&img, mem_h, msg_ptr, exit_notif_h, "exec")
+}
+
+/// `sys_proc_kill(exit_notif, code)` — kill the child process whose exit
+/// notification is `exit_notif` (§103). Authority: holding that notif handle (with
+/// R_WAIT) — it is the lifecycle handle the spawner created and passed to spawn, so
+/// no ambient pid authority is involved. Reaps the child (closes its handles, frees
+/// its budget, signals the exit notif with `code`) and flags its threads to
+/// self-terminate at their next safe scheduling point. A child that already exited
+/// returns E_GONE.
+fn sys_proc_kill(notif_h: u64, code: u64) -> SyscallRet {
+    let notif_idx = match (|| -> SysResult<u8> {
+        let entry =
+            proc::with_current(|p| p.lookup(notif_h as Handle, ObjType::Notification, R_WAIT))?;
+        match entry.obj {
+            ObjectRef::Notification(idx) => Ok(idx),
+            _ => Err(SysError::BadType),
+        }
+    })() {
+        Ok(i) => i,
+        Err(e) => return SyscallRet::err(e),
+    };
+    match proc::find_by_exit_notif(notif_idx) {
+        Some(child) => {
+            proc::kill(child, code as i32);
+            crate::thread::mark_proc_dying(child);
+            SyscallRet::ok()
+        }
+        None => SyscallRet::err(SysError::Gone),
+    }
 }
 
 /// `sys_io_in(ioport, port)` — read a byte from a port authorized by an IoPort
@@ -1273,7 +1303,7 @@ fn pledge_class(nr: u64) -> u64 {
         SYS_MAP | SYS_PROTECT | SYS_IMMUTABLE | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC
         | SYS_DMA_ALLOC_CONTIG | SYS_SHM_CREATE | SYS_SHM_MAP | SYS_SHM_PHYS => PLEDGE_MEM,
         SYS_CAP_TYPE | SYS_CAP_DUP => PLEDGE_IPC,
-        SYS_SPAWN | SYS_SPAWN_BYTES => PLEDGE_SPAWN,
+        SYS_SPAWN | SYS_SPAWN_BYTES | SYS_PROC_KILL => PLEDGE_SPAWN,
         SYS_ATTENUATE => PLEDGE_CAP,
         SYS_IO_IN | SYS_IO_OUT | SYS_PCI_READ | SYS_PCI_WRITE | SYS_PCI_BAR_MAP | SYS_IRQ_BIND
         | SYS_IRQ_ACK | SYS_FB_INFO | SYS_FB_MAP => PLEDGE_IO,
