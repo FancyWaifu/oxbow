@@ -408,6 +408,8 @@ fn kmain_stage2() -> ! {
             108 * 1024 * 1024 // libwayland + shm + funds the oxterm/rings/sysmon children
         } else if cmd == b"gpu" {
             32 * 1024 * 1024 // virtqueue rings + a full-resolution scanout backing store
+        } else if cmd == b"oxhello" || cmd == b"thrtest" {
+            8 * 1024 * 1024 // §96 std-thread demos: per-thread stacks + heap
         } else {
             mm::mem::BOOT_BUDGET
         };

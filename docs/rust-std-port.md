@@ -57,10 +57,22 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     a `spawn_thread`/`thread_trampoline` helper. Verified by `servers/thrtest`
     (`/bin/thrtest`): a worker thread increments a shared counter to 200000 and
     signals via the futex while main blocks, then thread-exits — parent survives.
-  - ☐ std `thread`/`Mutex`/`Condvar` backend on top of the futex; real per-thread
-    TLS (today routed to no_threads — fine single-threaded, races with >1 thread).
-    NOTE: oxbow-rt's slab allocator is single-threaded (no CAS) — std threads need a
-    thread-safe global allocator first.
+  - ✅ **std `thread::spawn` + `Mutex`/`Condvar`/`RwLock`/`Once` + `join`** — verified:
+    4 threads each sum 0..100000, accumulate into an `Arc<Mutex<u64>>`, and return
+    their partial via `join()`; the Mutex total and the join-sum both equal
+    19999800000. Pieces: (1) **thread-safe slab** (spinlock, committed d0bd245);
+    (2) **futex backend** `sys/pal/unsupported/futex.rs` (oxbow-only) over
+    `SYS_FUTEX_*`, wired into every `sync/*/mod.rs` futex arm; (3) **pal thread**
+    `sys/thread/oxbow.rs` — `Thread::new` allocs a stack + spawns via
+    `SYS_THREAD_SPAWN`, `join` futex-waits a join word the kernel sets on
+    `SYS_THREAD_EXIT` *after* the thread is off its stack (so the stack frees
+    safely); (4) **keyed per-thread TLS** `thread_local/key/oxbow.rs` — a
+    `(tid, key)` table indexed by `SYS_THREAD_ID` (each thread owns its row →
+    race-free; makes `CURRENT` per-thread, fixing the no_threads UAF). New syscalls
+    `SYS_THREAD_ID`(57), `SYS_YIELD`(58). Limitations: no futex timeout yet
+    (`Condvar::wait_timeout` blocks until woken); TLS destructors don't run (guard is
+    a no-op → TLS values leak at thread exit); boot-module std demos need a bumped
+    Memory budget (shell-funded children get plenty).
   - ☐ Real env block (passed at spawn like `SPAWN_ARGV`) → `std::env::var`.
 - **Phase 3 — harden.** Native ELF TLS, `Command` stdio piping (spawn-not-fork),
   full `Metadata`, optional `panic=unwind`.

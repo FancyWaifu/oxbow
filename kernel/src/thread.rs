@@ -687,6 +687,26 @@ pub fn futex_wait(addr: u64, expected: u32) {
     }
 }
 
+/// §96: tid of the calling thread — backs `SYS_THREAD_ID` (std's keyed TLS keys
+/// per-thread storage on this).
+pub fn current_tid() -> usize {
+    current()
+}
+
+/// §96 thread exit with an optional join signal. If `done_addr != 0`, store
+/// `*done_addr = 1` and futex-wake it FIRST — done from kernel mode, when the
+/// thread is already off its user stack, so a joiner woken by this can free that
+/// stack without racing the exiting thread's last instructions. Then `exit_current`.
+pub fn thread_exit(done_addr: u64) -> ! {
+    if done_addr != 0 {
+        unsafe {
+            (done_addr as *mut u32).write_volatile(1);
+        }
+        futex_wake(done_addr, usize::MAX);
+    }
+    exit_current()
+}
+
 /// §96 futex wake — wake up to `count` threads of the caller's process that are
 /// blocked on `addr`. Returns how many were woken. A linear TCB scan (the pool is
 /// small), the same shape as `wake_expired`.

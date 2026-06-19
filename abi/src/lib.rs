@@ -197,6 +197,10 @@ pub const SYS_THREAD_SPAWN: u64 = 53; // (entry, user_rsp) -> tid. New thread in
 pub const SYS_THREAD_EXIT: u64 = 54; // () -> ! . Exit the calling thread (NOT the process).
 pub const SYS_FUTEX_WAIT: u64 = 55; // (addr: *u32, expected) -> 0. Block if *addr == expected.
 pub const SYS_FUTEX_WAKE: u64 = 56; // (addr: *u32, count) -> rax woken. Wake up to count waiters.
+pub const SYS_THREAD_ID: u64 = 57; // () -> rax tid of the calling thread (for keyed TLS).
+pub const SYS_YIELD: u64 = 58; // () -> 0. Voluntarily reschedule.
+// SYS_THREAD_EXIT(a1): if a1 != 0, the kernel stores *a1 = 1 and futex-wakes a1
+// AFTER the thread is off its user stack — so a joiner can free that stack safely.
 /// Capability kinds reported by SYS_CAP_TYPE (so recvmsg can reconstruct the
 /// right fd flavor from a passed handle). 0 = anything else.
 pub const CAP_OTHER: u64 = 0;

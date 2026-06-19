@@ -453,6 +453,60 @@ pub unsafe extern "C" fn __oxbow_walltime(secs: *mut u64, nanos: *mut u32) {
     }
 }
 
+// §96 hosted shims for std's pal thread + futex backend.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_futex_wait(addr: *const u32, expected: u32) {
+    unsafe { sys_futex_wait(addr, expected) };
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_futex_wake(addr: *const u32) -> u32 {
+    (unsafe { sys_futex_wake(addr, 1) }) as u32
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_futex_wake_all(addr: *const u32) {
+    unsafe { sys_futex_wake(addr, u32::MAX) };
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_thread_spawn(
+    stack_top: u64,
+    entry: extern "C" fn(u64) -> !,
+    arg: u64,
+) -> u64 {
+    let sp = ((stack_top as usize) & !0xF) - 16;
+    unsafe {
+        (sp as *mut u64).write(entry as u64);
+        ((sp + 8) as *mut u64).write(arg);
+        sys_thread_spawn(thread_trampoline as u64, sp as u64) as u64
+    }
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_thread_exit(done_addr: u64) -> ! {
+    unsafe {
+        syscall1(oxbow_abi::SYS_THREAD_EXIT, done_addr);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_thread_id() -> u64 {
+    let (tid, _) = unsafe { syscall1(oxbow_abi::SYS_THREAD_ID, 0) };
+    tid
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_yield() {
+    unsafe {
+        syscall1(oxbow_abi::SYS_YIELD, 0);
+    }
+}
+
 // --- Raw syscall stubs ----------------------------------------------------
 // nr in rax; args rdi, rsi, rdx, r10, r8, r9; returns rax (+ rdx). rcx/r11 are
 // clobbered by the `syscall` instruction. No `nomem`/`nostack` options: the

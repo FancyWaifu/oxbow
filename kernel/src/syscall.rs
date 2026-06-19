@@ -17,6 +17,7 @@ use oxbow_abi::{
     SYS_PROTECT, SYS_RECV, SYS_REPLY,
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_MEMINFO, SYS_UPTIME_MS,
     SYS_WALLTIME, SYS_THREAD_SPAWN, SYS_THREAD_EXIT, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE,
+    SYS_THREAD_ID, SYS_YIELD,
     SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_PIPE_EOF, CHAN_NONBLOCK, PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT,
     R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM, PLEDGE_SPAWN, PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
 };
@@ -145,7 +146,7 @@ pub extern "C" fn syscall_dispatch(
             let tid = crate::thread::spawn_thread_in_current(a1, a2);
             SyscallRet { rax: tid as u64, rdx: 0 }
         }
-        SYS_THREAD_EXIT => crate::thread::exit_current(),
+        SYS_THREAD_EXIT => crate::thread::thread_exit(a1),
         SYS_FUTEX_WAIT => {
             crate::thread::futex_wait(a1, a2 as u32);
             SyscallRet { rax: 0, rdx: 0 }
@@ -153,6 +154,11 @@ pub extern "C" fn syscall_dispatch(
         SYS_FUTEX_WAKE => {
             let woken = crate::thread::futex_wake(a1, a2 as usize);
             SyscallRet { rax: woken as u64, rdx: 0 }
+        }
+        SYS_THREAD_ID => SyscallRet { rax: crate::thread::current_tid() as u64, rdx: 0 },
+        SYS_YIELD => {
+            crate::thread::yield_now();
+            SyscallRet { rax: 0, rdx: 0 }
         }
         SYS_MEMINFO => {
             let (used, total) = crate::mm::pmm::stats();
@@ -1260,6 +1266,7 @@ fn pledge_class(nr: u64) -> u64 {
         SYS_EXIT | SYS_PLEDGE | SYS_CLOSE => 0,
         SYS_CONSOLE_WRITE | SYS_GETENTROPY | SYS_UPTIME_MS | SYS_WALLTIME | SYS_MEMINFO => PLEDGE_STDIO,
         SYS_THREAD_SPAWN | SYS_THREAD_EXIT | SYS_FUTEX_WAIT | SYS_FUTEX_WAKE => PLEDGE_STDIO,
+        SYS_THREAD_ID | SYS_YIELD => PLEDGE_STDIO,
         SYS_SEND | SYS_RECV | SYS_CALL | SYS_REPLY | SYS_EP_CREATE | SYS_MINT | SYS_PIPE
         | SYS_PIPE_READ | SYS_PIPE_WRITE | SYS_PIPE_EOF | SYS_CHANNEL_PAIR | SYS_CHANNEL_SEND
         | SYS_CHANNEL_RECV | SYS_CHANNEL_CLOSE | SYS_CHANNEL_POLL | SYS_CHAN_WAIT => PLEDGE_IPC,
