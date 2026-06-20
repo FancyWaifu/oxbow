@@ -1198,7 +1198,11 @@ fn sys_cap_dup(h: u64) -> SyscallRet {
         Err(e) => return SyscallRet { rax: e as u64, rdx: 0 },
     };
     match entry.obj {
-        ObjectRef::Shm(_) | ObjectRef::Channel { .. } => {}
+        // A second handle to the same Pipe object is sound: closing one only nulls its
+        // handle-table slot (the pipe object isn't freed on close, and EOF is explicit via
+        // SYS_PIPE_EOF), exactly like the attenuated read/write ends `sys_pipe` already
+        // hands out. Backs std `PipeReader/Writer::try_clone`.
+        ObjectRef::Shm(_) | ObjectRef::Channel { .. } | ObjectRef::Pipe(_) => {}
         _ => return SyscallRet { rax: SysError::BadType as u64, rdx: 0 },
     }
     match proc::with_current_mut(|p| p.alloc_slot(entry)) {

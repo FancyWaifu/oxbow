@@ -1193,6 +1193,17 @@ pub unsafe extern "C" fn __oxbow_pipe_write(pipe: u32, buf: *const u8, len: usiz
 pub extern "C" fn __oxbow_pipe_close(pipe: u32) {
     let _ = sys_close(pipe as Handle);
 }
+
+/// Duplicate a pipe handle: a fresh handle to the SAME pipe object (same rights), via
+/// SYS_CAP_DUP. Backs std `Pipe::try_clone`. Returns the new handle, or -1 on failure.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_pipe_dup(pipe: u32) -> i64 {
+    match sys_cap_dup(pipe as Handle) {
+        Ok(h) => h as i64,
+        Err(_) => -1,
+    }
+}
 // Mark the pipe's write side closed (readers drain remaining bytes, then get EOF).
 // The kernel has no writer-refcount, so closing the write-end handle alone does NOT
 // signal EOF — the holder must call this explicitly (mirrors the shell's $() capture).

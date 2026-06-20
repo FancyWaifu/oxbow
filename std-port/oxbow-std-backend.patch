@@ -2249,10 +2249,10 @@ index 85228963..433b164d 100644
          pub use unsupported::{Pipe, pipe};
 diff --git a/library/std/src/sys/pipe/oxbow.rs b/library/std/src/sys/pipe/oxbow.rs
 new file mode 100644
-index 00000000..7282301c
+index 00000000..859e50c5
 --- /dev/null
 +++ b/library/std/src/sys/pipe/oxbow.rs
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,114 @@
 +//! oxbow anonymous pipe — over SYS_PIPE (rt shims). A pipe is one kernel object
 +//! attenuated into a write-end (R_OUT|R_GRANT, handed to a child as stdout) and a
 +//! read-end (R_IN, read by the parent). EOF when all write-ends close (child exit).
@@ -2264,6 +2264,7 @@ index 00000000..7282301c
 +    fn __oxbow_pipe_read(pipe: u32, buf: *mut u8, len: usize) -> isize;
 +    fn __oxbow_pipe_write(pipe: u32, buf: *const u8, len: usize) -> isize;
 +    fn __oxbow_pipe_close(pipe: u32);
++    fn __oxbow_pipe_dup(pipe: u32) -> i64;
 +}
 +
 +pub struct Pipe(u32);
@@ -2273,7 +2274,15 @@ index 00000000..7282301c
 +        self.0
 +    }
 +    pub fn try_clone(&self) -> io::Result<Self> {
-+        Err(io::Error::new(io::ErrorKind::Unsupported, "oxbow: pipe try_clone"))
++        // A fresh kernel handle to the SAME pipe object (SYS_CAP_DUP). Both handles read
++        // or write the shared pipe; each closes its own handle on drop, and the pipe
++        // object survives until the last handle closes (close doesn't free it; EOF is
++        // explicit). So this matches POSIX dup semantics for a pipe end.
++        let h = unsafe { __oxbow_pipe_dup(self.0) };
++        if h < 0 {
++            return Err(io::Error::new(io::ErrorKind::Other, "oxbow: pipe try_clone"));
++        }
++        Ok(Pipe(h as u32))
 +    }
 +    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
 +        let n = unsafe { __oxbow_pipe_read(self.0, buf.as_mut_ptr(), buf.len()) };
