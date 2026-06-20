@@ -1875,10 +1875,12 @@ pub mod udp {
 
     /// Close a UDP socket: free the net server's socket slot AND the client cap.
     /// Always use this (not a bare sys_close) — the net slot table is small and a
-    /// bind without a matching close leaks a slot.
+    /// bind without a matching close leaks a slot. One-way SEND (we don't need the
+    /// reply): the net server is single-threaded and frees the slot by the message's
+    /// badge, so this is processed before any later bind that could reuse the slot.
     pub fn close(sock: Handle) {
-        let mut m = MsgBuf::new(TAG_UDP_CLOSE);
-        let _ = sys_call(sock, &mut m);
+        let m = MsgBuf::new(TAG_UDP_CLOSE);
+        let _ = crate::sys_send(sock, &m);
         let _ = crate::sys_close(sock);
     }
 
@@ -2149,10 +2151,13 @@ pub mod tcp {
         n
     }
 
-    /// Close a TCP socket cap and release the client handle.
+    /// Close a TCP socket cap and release the client handle. One-way SEND (reply unused):
+    /// a preceding send() CALL has already drained the data to the wire, and the net
+    /// server (single-threaded, frees the slot by badge) will run smoltcp's close → FIN
+    /// asynchronously. Returns as soon as the close is received, not after it's processed.
     pub fn close(sock: Handle) {
-        let mut m = MsgBuf::new(TAG_TCP_CLOSE);
-        let _ = sys_call(sock, &mut m);
+        let m = MsgBuf::new(TAG_TCP_CLOSE);
+        let _ = crate::sys_send(sock, &m);
         let _ = sys_close(sock);
     }
 }
