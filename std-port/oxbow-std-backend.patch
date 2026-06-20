@@ -1776,6 +1776,29 @@ index c4b14ab4..d0e8b2aa 100644
 +
 +#[cfg(target_os = "oxbow")]
 +pub mod futex;
+diff --git a/library/std/src/sys/path/unix.rs b/library/std/src/sys/path/unix.rs
+index b49c39a9..857e2cf6 100644
+--- a/library/std/src/sys/path/unix.rs
++++ b/library/std/src/sys/path/unix.rs
+@@ -58,7 +58,17 @@ pub(crate) fn absolute(path: &Path) -> io::Result<PathBuf> {
+ }
+ 
+ pub(crate) fn is_absolute(path: &Path) -> bool {
+-    if cfg!(any(unix, target_os = "hermit", target_os = "wasi", target_os = "motor")) {
++    // oxbow uses this (the `_ => mod unix`) path backend, so its paths are POSIX: a
++    // leading `/` is absolute and there are no drive prefixes. Without oxbow in this list
++    // it takes the prefix-requiring branch and reports `/` as non-absolute, which also
++    // breaks `absolute()`'s POSIX `//` handling (that branch is gated on `is_absolute`).
++    if cfg!(any(
++        unix,
++        target_os = "hermit",
++        target_os = "wasi",
++        target_os = "motor",
++        target_os = "oxbow"
++    )) {
+         path.has_root()
+     } else {
+         path.has_root() && path.prefix().is_some()
 diff --git a/library/std/src/sys/paths/mod.rs b/library/std/src/sys/paths/mod.rs
 index 8880a837..45266c31 100644
 --- a/library/std/src/sys/paths/mod.rs
