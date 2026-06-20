@@ -2844,10 +2844,10 @@ index 6cd1850e..e8b47cba 100644
          #[expect(unused)]
 diff --git a/library/std/src/sys/time/oxbow.rs b/library/std/src/sys/time/oxbow.rs
 new file mode 100644
-index 00000000..a7afb6c1
+index 00000000..92891ff2
 --- /dev/null
 +++ b/library/std/src/sys/time/oxbow.rs
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,60 @@
 +//! oxbow time: `Instant` from monotonic uptime (SYS_UPTIME_MS), `SystemTime` from
 +//! the CMOS RTC (SYS_WALLTIME), via oxbow-rt's hosted shims.
 +use crate::time::Duration;
@@ -2865,9 +2865,17 @@ index 00000000..a7afb6c1
 +
 +pub const UNIX_EPOCH: SystemTime = SystemTime(Duration::from_secs(0));
 +
++/// Monotonic-clock origin. The kernel's uptime counter starts at 0 at boot, but `Instant`
++/// is an opaque monotonic value and both std and real platforms (whose monotonic clocks
++/// have a large, arbitrary origin) assume an instant can be computed for a point *before*
++/// program start — e.g. `Instant::now() - Duration::from_days(1)`. Shifting the origin a
++/// year forward keeps such subtractions from underflowing the backing `Duration`; only
++/// differences between `Instant`s are ever observable, so the constant offset cancels out.
++const MONO_ORIGIN: Duration = Duration::from_secs(60 * 60 * 24 * 365);
++
 +impl Instant {
 +    pub fn now() -> Instant {
-+        Instant(Duration::from_millis(unsafe { __oxbow_uptime_ms() }))
++        Instant(MONO_ORIGIN + Duration::from_millis(unsafe { __oxbow_uptime_ms() }))
 +    }
 +    pub fn checked_sub_instant(&self, other: &Instant) -> Option<Duration> {
 +        self.0.checked_sub(other.0)
