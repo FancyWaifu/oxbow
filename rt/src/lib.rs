@@ -942,20 +942,55 @@ pub extern "C" fn __oxbow_udp_close(sock: i64) {
 // for the common single-A response; very large responses can truncate at 56 bytes.)
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
+/// The shared UDP transfer frame, mapped once (per process) and reused — a single
+/// global, so DNS is serialized with `DNS_LOCK`.
+#[cfg(feature = "hosted")]
+static DNS_FRAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "hosted")]
+static DNS_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __oxbow_dns_resolve(name: *const u8, len: usize, out_ip: *mut u32) -> i32 {
+    use core::sync::atomic::Ordering;
     let bytes = unsafe { core::slice::from_raw_parts(name, len) };
     let Ok(name) = core::str::from_utf8(bytes) else { return -1 };
+
+    // Serialize: the transfer frame is one global buffer.
+    while DNS_LOCK.swap(true, Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    // Attach the shared frame once (mapped at UDP_XFER), reuse the pointer thereafter.
+    let frame = {
+        let cached = DNS_FRAME.load(Ordering::Relaxed);
+        if cached != 0 {
+            cached as *mut u8
+        } else if let Some(f) = udp::attach(oxbow_abi::BOOT_NET_EP) {
+            DNS_FRAME.store(f as u64, Ordering::Relaxed);
+            f
+        } else {
+            DNS_LOCK.store(false, Ordering::Release);
+            return -1;
+        }
+    };
     let server = udp::dns_server(oxbow_abi::BOOT_NET_EP);
-    let Some((sock, _)) = udp::bind(oxbow_abi::BOOT_NET_EP, 0) else { return -1 };
+    let Some((sock, _)) = udp::bind(oxbow_abi::BOOT_NET_EP, 0) else {
+        DNS_LOCK.store(false, Ordering::Release);
+        return -1;
+    };
     let mut rc = -1;
     let query = dns::query(0x1234, name);
-    if udp::sendto(sock, server, 53, &query) {
+    let qn = query.len().min(1472);
+    // Stage the query in the shared frame and send it from there; the reply (up to
+    // ~1472 B) lands back in the frame — no 56-byte inline cap.
+    unsafe { core::ptr::copy_nonoverlapping(query.as_ptr(), frame, qn) };
+    if udp::sendv(sock, server, 53, qn) {
         let start = sys_uptime_ms();
-        let mut buf = [0u8; 56];
         loop {
-            let n = udp::recvfrom(sock, &mut buf);
+            let n = udp::recvv(sock);
             if n > 0 {
-                if let Some(ip) = dns::first_a(&buf[..n]) {
+                let resp = unsafe { core::slice::from_raw_parts(frame as *const u8, n) };
+                if let Some(ip) = dns::first_a(resp) {
                     unsafe { out_ip.write(u32::from_be_bytes(ip)) };
                     rc = 0;
                 }
@@ -967,6 +1002,7 @@ pub unsafe extern "C" fn __oxbow_dns_resolve(name: *const u8, len: usize, out_ip
         }
     }
     udp::close(sock);
+    DNS_LOCK.store(false, Ordering::Release);
     rc
 }
 // §100 piped Command stdio: a pipe → a grantable write-end (R_OUT|R_GRANT) the

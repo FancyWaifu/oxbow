@@ -325,10 +325,19 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     IPv6 is genuine. 37 loopback tcp tests stay green (no regression from the connect/accept
     refactor). Note: SLIRP `ipv6=on` disrupts the net server's IPv4 DHCP loop, so the capture runs
     on the plain netdev (the guest transmits v6 regardless).
+  - ✅ **Large DNS replies via the shared frame.** `__oxbow_dns_resolve` moved off the inline UDP
+    path (56-byte reply cap) onto the **shared transfer frame** (`rt::udp::attach`/`sendv`/`recvv`,
+    ~1472 B — the same path c-ares uses): stage the query in the frame, `sendv` it, the reply lands
+    back in the frame, `dns::first_a` parses the full thing. The frame is attached once (cached in a
+    static) and DNS is serialized with a spinlock (single global buffer). No net-server/ISO change.
+    **Verified by capture:** resolving `example.com`/`google.com`/`www.microsoft.com` succeeded, and
+    a `filter-dump` of net0 showed the responses were **61 B, 44 B, and 138 B** — `www.microsoft.com`'s
+    138-byte CNAME-chain reply is well past the old 56-byte cap, yet resolved correctly
+    (`dns-large-test.rs` + `dns-capture-harness.py`).
   Net std surface: UDP (loopback + external + sender addr), TCP (loopback + external client + wire
-  listener/accept + **IPv6 connect**), DNS, and **IPv6 on the wire**. Remaining: a reachable v6 peer
-  to complete a v6 handshake (environment limitation, not a code gap); large DNS replies (shared
-  frame); SLIRP-v6/DHCP coexistence.
+  listener/accept + IPv6 connect), DNS (**incl. large replies via the shared frame**), and IPv6 on
+  the wire. Remaining: a reachable v6 peer to complete a v6 handshake (environment, not code);
+  SLIRP-v6/DHCP coexistence; AAAA (IPv6 DNS) records.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 
