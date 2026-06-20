@@ -977,10 +977,10 @@ index 84b53fd3..6ee45989 100644
          pub use unsupported::*;
 diff --git a/library/std/src/sys/net/connection/oxbow.rs b/library/std/src/sys/net/connection/oxbow.rs
 new file mode 100644
-index 00000000..78ee1cd7
+index 00000000..58b9173f
 --- /dev/null
 +++ b/library/std/src/sys/net/connection/oxbow.rs
-@@ -0,0 +1,938 @@
+@@ -0,0 +1,980 @@
 +//! oxbow network backend.
 +//!
 +//! oxbow's kernel net stack (e1000 → ARP/IPv4/UDP, smoltcp TCP) is reached by C/libc
@@ -1005,11 +1005,12 @@ index 00000000..78ee1cd7
 +use crate::collections::VecDeque;
 +use crate::fmt;
 +use crate::io::{self, BorrowedCursor, ErrorKind, IoSlice, IoSliceMut};
-+use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
++use crate::net::{
++    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs,
++};
 +use crate::sync::Arc;
 +use crate::sync::Mutex;
 +use crate::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-+use crate::sys::unsupported;
 +use crate::time::{Duration, Instant};
 +
 +// rt hosted shims onto the net server's socket-capability API (NET_CTL = handle 20).
@@ -1085,6 +1086,9 @@ index 00000000..78ee1cd7
 +    // Lazily-bound net-server UDP socket: created the first time this socket sends to a
 +    // non-loopback address, so loopback-only sockets never touch the net server.
 +    net_sock: Mutex<Option<i64>>,
++    // Multicast groups this socket has joined (tracked for leave/idempotency). On oxbow
++    // joining binds the net socket so the group's datagrams are delivered; see join_*.
++    joined: Mutex<Vec<IpAddr>>,
 +}
 +
 +impl UdpSocket {
@@ -1130,6 +1134,7 @@ index 00000000..78ee1cd7
 +            write_timeout: Mutex::new(None),
 +            ttl: AtomicU32::new(64),
 +            net_sock: Mutex::new(None),
++            joined: Mutex::new(Vec::new()),
 +        })
 +    }
 +
@@ -1247,6 +1252,7 @@ index 00000000..78ee1cd7
 +            ttl: AtomicU32::new(self.ttl.load(Ordering::Relaxed)),
 +            // Clones don't share the net socket; a clone re-binds on its own external send.
 +            net_sock: Mutex::new(None),
++            joined: Mutex::new(self.joined.lock().unwrap().clone()),
 +        })
 +    }
 +
@@ -1300,17 +1306,43 @@ index 00000000..78ee1cd7
 +    pub fn multicast_loop_v6(&self) -> io::Result<bool> {
 +        Ok(false)
 +    }
-+    pub fn join_multicast_v4(&self, _: &Ipv4Addr, _: &Ipv4Addr) -> io::Result<()> {
-+        unsupported()
++    // Joining a multicast group on oxbow: the e1000 is in multicast-promiscuous mode
++    // (RCTL_MPE) and the net server's UDP demux matches on destination PORT only, so once
++    // a net-server UDP socket exists for this port, datagrams sent to the group (on the
++    // local link) are delivered to `recv_from`. `join` therefore forces that net binding
++    // (`ensure_net_sock`) and records membership. NOTE: no IGMP/MLD membership report is
++    // emitted upstream — local-link / QEMU delivery works, but a multicast router will not
++    // be told to forward the group. The interface argument is ignored (oxbow has one NIC).
++    fn join_group(&self, group: IpAddr) -> io::Result<()> {
++        let mut g = self.joined.lock().unwrap();
++        if g.contains(&group) {
++            return Err(io::const_error!(ErrorKind::AddrInUse, "already a member of the group"));
++        }
++        self.ensure_net_sock()?;
++        g.push(group);
++        Ok(())
 +    }
-+    pub fn join_multicast_v6(&self, _: &Ipv6Addr, _: u32) -> io::Result<()> {
-+        unsupported()
++    fn leave_group(&self, group: IpAddr) -> io::Result<()> {
++        let mut g = self.joined.lock().unwrap();
++        match g.iter().position(|a| *a == group) {
++            Some(i) => {
++                g.remove(i);
++                Ok(())
++            }
++            None => Err(io::const_error!(ErrorKind::AddrNotAvailable, "not a member of the group")),
++        }
 +    }
-+    pub fn leave_multicast_v4(&self, _: &Ipv4Addr, _: &Ipv4Addr) -> io::Result<()> {
-+        unsupported()
++    pub fn join_multicast_v4(&self, multiaddr: &Ipv4Addr, _interface: &Ipv4Addr) -> io::Result<()> {
++        self.join_group(IpAddr::V4(*multiaddr))
 +    }
-+    pub fn leave_multicast_v6(&self, _: &Ipv6Addr, _: u32) -> io::Result<()> {
-+        unsupported()
++    pub fn join_multicast_v6(&self, multiaddr: &Ipv6Addr, _interface: u32) -> io::Result<()> {
++        self.join_group(IpAddr::V6(*multiaddr))
++    }
++    pub fn leave_multicast_v4(&self, multiaddr: &Ipv4Addr, _interface: &Ipv4Addr) -> io::Result<()> {
++        self.leave_group(IpAddr::V4(*multiaddr))
++    }
++    pub fn leave_multicast_v6(&self, multiaddr: &Ipv6Addr, _interface: u32) -> io::Result<()> {
++        self.leave_group(IpAddr::V6(*multiaddr))
 +    }
 +    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
 +        self.ttl.store(ttl, Ordering::Relaxed);
@@ -1845,11 +1877,21 @@ index 00000000..78ee1cd7
 +            ListenerKind::Net(_) => Ok(64),
 +        }
 +    }
-+    pub fn set_only_v6(&self, _: bool) -> io::Result<()> {
-+        unsupported()
++    pub fn set_only_v6(&self, only_v6: bool) -> io::Result<()> {
++        // oxbow has no dual-stack v4-mapped sockets: a `[::]` listener is IPv6-only and a
++        // `0.0.0.0` listener is IPv4-only. So V6ONLY is effectively always on; accept
++        // setting it true (no-op) and reject false (dual-stack is not available).
++        if only_v6 {
++            Ok(())
++        } else {
++            Err(io::const_error!(
++                ErrorKind::Unsupported,
++                "oxbow net: dual-stack (IPV6_V6ONLY=false) is not supported",
++            ))
++        }
 +    }
 +    pub fn only_v6(&self) -> io::Result<bool> {
-+        unsupported()
++        Ok(true)
 +    }
 +    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
 +        Ok(None)
