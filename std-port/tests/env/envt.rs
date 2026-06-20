@@ -30,7 +30,7 @@ fn split_paths_windows() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "oxbow"))]
 fn split_paths_unix() {
     use std::path::PathBuf;
 
@@ -64,7 +64,7 @@ fn split_paths_uefi() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "oxbow"))]
 fn join_paths_unix() {
     use std::ffi::OsStr;
 

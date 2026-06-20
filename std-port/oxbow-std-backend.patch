@@ -1800,10 +1800,10 @@ index b49c39a9..857e2cf6 100644
      } else {
          path.has_root() && path.prefix().is_some()
 diff --git a/library/std/src/sys/paths/mod.rs b/library/std/src/sys/paths/mod.rs
-index 8880a837..45266c31 100644
+index 8880a837..a0c94e83 100644
 --- a/library/std/src/sys/paths/mod.rs
 +++ b/library/std/src/sys/paths/mod.rs
-@@ -17,6 +17,15 @@ mod imp {
+@@ -17,6 +17,18 @@ mod imp {
              pub use super::unsupported::{SplitPaths, split_paths, JoinPathsError, join_paths, home_dir};
          }
      }
@@ -1812,8 +1812,11 @@ index 8880a837..45266c31 100644
 +        #[expect(dead_code)]
 +        mod unsupported;
 +        mod imp {
-+            pub use super::oxbow::{getcwd, chdir, current_exe, temp_dir};
-+            pub use super::unsupported::{SplitPaths, split_paths, JoinPathsError, join_paths, home_dir};
++            pub use super::oxbow::{
++                getcwd, chdir, current_exe, temp_dir, SplitPaths, split_paths, JoinPathsError,
++                join_paths,
++            };
++            pub use super::unsupported::home_dir;
 +        }
 +    }
      all(target_vendor = "fortanix", target_env = "sgx") => {
@@ -1821,10 +1824,10 @@ index 8880a837..45266c31 100644
          #[expect(dead_code)]
 diff --git a/library/std/src/sys/paths/oxbow.rs b/library/std/src/sys/paths/oxbow.rs
 new file mode 100644
-index 00000000..cc8bea76
+index 00000000..f66d7cc2
 --- /dev/null
 +++ b/library/std/src/sys/paths/oxbow.rs
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,143 @@
 +//! oxbow working-directory + executable-path backend.
 +//!
 +//! oxbow has no global filesystem namespace: a process's working directory is a
@@ -1842,9 +1845,11 @@ index 00000000..cc8bea76
 +//!   (`sys_spawn_bytes`), not from a named, re-openable file, so there is no
 +//!   canonical executable path. std explicitly permits `Err` here.
 +
++use crate::ffi::{OsStr, OsString};
 +use crate::io;
 +use crate::path::{self, Component, PathBuf};
 +use crate::sync::Mutex;
++use crate::{fmt, iter, slice};
 +
 +unsafe extern "C" {
 +    /// Re-root the cwd capability to `path` (relative to the current cwd). Returns 0
@@ -1908,6 +1913,64 @@ index 00000000..cc8bea76
 +pub fn temp_dir() -> PathBuf {
 +    PathBuf::from("/tmp")
 +}
++
++// --- PATH-list handling ---
++// oxbow is POSIX-style: a PATH-like variable separates entries with ':' and an entry
++// may not itself contain ':'. This mirrors `sys/paths/unix.rs` but goes through the
++// cross-platform `OsStr`<->bytes encoding (oxbow has no `os::unix::OsStrExt`) and uses
++// `fn` pointers so the public `SplitPaths` alias needs no opaque-type feature.
++const PATH_SEPARATOR: u8 = b':';
++
++pub type SplitPaths<'a> =
++    iter::Map<slice::Split<'a, u8, fn(&u8) -> bool>, fn(&[u8]) -> PathBuf>;
++
++pub fn split_paths(unparsed: &OsStr) -> SplitPaths<'_> {
++    fn is_separator(b: &u8) -> bool {
++        *b == PATH_SEPARATOR
++    }
++    fn into_pathbuf(part: &[u8]) -> PathBuf {
++        // SAFETY: `part` is a sub-slice of `as_encoded_bytes()` split on the ASCII byte
++        // `:`. Splitting an encoded `OsStr` at an ASCII boundary yields bytes that are
++        // themselves a valid encoding, as required by `from_encoded_bytes_unchecked`.
++        PathBuf::from(unsafe { OsStr::from_encoded_bytes_unchecked(part) }.to_os_string())
++    }
++    unparsed
++        .as_encoded_bytes()
++        .split(is_separator as fn(&u8) -> bool)
++        .map(into_pathbuf as fn(&[u8]) -> PathBuf)
++}
++
++#[derive(Debug)]
++pub struct JoinPathsError;
++
++pub fn join_paths<I, T>(paths: I) -> Result<OsString, JoinPathsError>
++where
++    I: Iterator<Item = T>,
++    T: AsRef<OsStr>,
++{
++    let mut joined = Vec::new();
++    for (i, path) in paths.enumerate() {
++        let path = path.as_ref().as_encoded_bytes();
++        if i > 0 {
++            joined.push(PATH_SEPARATOR);
++        }
++        if path.contains(&PATH_SEPARATOR) {
++            return Err(JoinPathsError);
++        }
++        joined.extend_from_slice(path);
++    }
++    // SAFETY: each segment is valid encoded-`OsStr` bytes and the joins are the ASCII
++    // byte `:`, so the concatenation is itself a valid encoding.
++    Ok(unsafe { OsString::from_encoded_bytes_unchecked(joined) })
++}
++
++impl fmt::Display for JoinPathsError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "path segment contains separator `{}`", char::from(PATH_SEPARATOR))
++    }
++}
++
++impl crate::error::Error for JoinPathsError {}
 diff --git a/library/std/src/sys/personality/mod.rs b/library/std/src/sys/personality/mod.rs
 index eabef922..c881f4cc 100644
 --- a/library/std/src/sys/personality/mod.rs
