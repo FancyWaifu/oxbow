@@ -816,6 +816,34 @@ pub extern "C" fn __oxbow_kill(notif: i64, code: i32) -> i32 {
         Err(_) => -1,
     }
 }
+// §101 std::net external-TCP client shims onto the net server (NET_CTL = BOOT_NET_EP).
+// std's loopback TCP is handled in-process; these back `TcpStream::connect` to a real
+// (non-loopback) host via smoltcp in the net server.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_tcp_connect(ip_be: u32, port: u16) -> i64 {
+    match tcp::connect(oxbow_abi::BOOT_NET_EP, ip_be.to_be_bytes(), port) {
+        Some(h) => h as i64,
+        None => -1,
+    }
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_tcp_send(sock: i64, buf: *const u8, len: usize) -> isize {
+    let data = unsafe { core::slice::from_raw_parts(buf, len) };
+    if tcp::send(sock as Handle, data) { len as isize } else { -1 }
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_tcp_recv(sock: i64, buf: *mut u8, len: usize) -> isize {
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    tcp::recv(sock as Handle, out) as isize
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_tcp_close(sock: i64) {
+    tcp::close(sock as Handle);
+}
 // §100 piped Command stdio: a pipe → a grantable write-end (R_OUT|R_GRANT) the
 // child gets as stdout, and a read-end (R_IN) the parent reads.
 #[cfg(feature = "hosted")]

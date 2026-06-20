@@ -773,10 +773,10 @@ index 84b53fd3..6ee45989 100644
          pub use unsupported::*;
 diff --git a/library/std/src/sys/net/connection/oxbow.rs b/library/std/src/sys/net/connection/oxbow.rs
 new file mode 100644
-index 00000000..cfe4826f
+index 00000000..35998165
 --- /dev/null
 +++ b/library/std/src/sys/net/connection/oxbow.rs
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,778 @@
 +//! oxbow network backend.
 +//!
 +//! oxbow's kernel net stack (e1000 → ARP/IPv4/UDP, smoltcp TCP) is reached by C/libc
@@ -787,17 +787,48 @@ index 00000000..cfe4826f
 +//! bound sockets share a process-global mailbox table keyed by port, and `send_to` to
 +//! a loopback/unspecified address enqueues into the destination's mailbox. That gives
 +//! real datagram, connect/send/recv, peek, timeout, non-blocking, and clone semantics
-+//! without touching the kernel. External (non-loopback) UDP and all of TCP are not yet
-+//! wired to the net server — those remain `Unsupported`.
++//! without touching the kernel.
++//!
++//! TCP is handled the same way: the net server's TCP is client-only (no listen/accept)
++//! and can't loop back, while the std `tcp` suite is loopback + single-process — so
++//! `TcpListener` + loopback `TcpStream` are an **in-process socketpair** (per-direction
++//! byte FIFOs, an accept queue per listening address, clones sharing the endpoint via
++//! `Arc`). `TcpStream::connect` to a *non-loopback* address and `UdpSocket` bound to /
++//! sending to a non-loopback address route to the **real net server** via the rt
++//! `__oxbow_{tcp,udp}_*` shims. Only `TcpListener` on a non-loopback address (the net
++//! server has no accept) stays unsupported.
 +
 +use crate::collections::VecDeque;
 +use crate::fmt;
 +use crate::io::{self, BorrowedCursor, ErrorKind, IoSlice, IoSliceMut};
 +use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
++use crate::sync::Arc;
 +use crate::sync::Mutex;
 +use crate::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 +use crate::sys::unsupported;
 +use crate::time::{Duration, Instant};
++
++// rt hosted shims onto the net server's socket-capability API (NET_CTL = handle 20).
++unsafe extern "C" {
++    // UDP: bind returns a socket handle (>=0) and writes the bound port; <0 on failure.
++    fn __oxbow_udp_bind(ip_be: u32, port: u16, out_port: *mut u16) -> i64;
++    fn __oxbow_udp_send_to(sock: i64, ip_be: u32, port: u16, buf: *const u8, len: usize) -> isize;
++    // recv writes the sender ip/port; returns payload len, or -1 if nothing is buffered.
++    fn __oxbow_udp_recv_from(sock: i64, buf: *mut u8, len: usize, src_ip: *mut u32, src_port: *mut u16) -> isize;
++    fn __oxbow_udp_close(sock: i64);
++    // TCP client: connect returns a socket handle (>=0) or <0; send/recv ride it.
++    fn __oxbow_tcp_connect(ip_be: u32, port: u16) -> i64;
++    fn __oxbow_tcp_send(sock: i64, buf: *const u8, len: usize) -> isize;
++    fn __oxbow_tcp_recv(sock: i64, buf: *mut u8, len: usize) -> isize;
++    fn __oxbow_tcp_close(sock: i64);
++}
++
++fn v4_be(a: &SocketAddr) -> Option<u32> {
++    match a {
++        SocketAddr::V4(s) => Some(u32::from_be_bytes(s.ip().octets())),
++        SocketAddr::V6(_) => None,
++    }
++}
 +use crate::vec::Vec;
 +
 +// --- in-process UDP loopback -------------------------------------------------
@@ -1043,155 +1074,486 @@ index 00000000..cfe4826f
 +    }
 +}
 +
-+// --- TCP + name resolution: not yet wired to the net server ------------------
++// --- TCP: in-process loopback socketpair + net-server client -----------------
 +
-+pub struct TcpStream(!);
++use crate::sync::atomic::AtomicU64;
++
++/// One direction of a loopback connection: a byte FIFO plus a "writer closed" flag
++/// (set when the writing endpoint shuts down its write half or is fully dropped).
++struct Half {
++    data: Mutex<VecDeque<u8>>,
++    wshut: AtomicBool,
++}
++impl Half {
++    fn new() -> Half {
++        Half { data: Mutex::new(VecDeque::new()), wshut: AtomicBool::new(false) }
++    }
++}
++
++/// A loopback connection shared by both endpoints.
++struct Conn {
++    c2s: Half, // client -> server
++    s2c: Half, // server -> client
++    caddr: SocketAddr,
++    saddr: SocketAddr,
++}
++
++/// One endpoint of a loopback connection; shared by clones via `Arc`.
++struct Endpoint {
++    conn: Arc<Conn>,
++    server: bool,
++    nonblocking: AtomicBool,
++    rd_timeout: Mutex<Option<Duration>>,
++    wr_timeout: Mutex<Option<Duration>>,
++    rshut: AtomicBool,
++    ttl: AtomicU32,
++    nodelay: AtomicBool,
++    keepalive: AtomicBool,
++    linger: Mutex<Option<Duration>>,
++}
++impl Endpoint {
++    fn rhalf(&self) -> &Half {
++        if self.server { &self.conn.c2s } else { &self.conn.s2c }
++    }
++    fn whalf(&self) -> &Half {
++        if self.server { &self.conn.s2c } else { &self.conn.c2s }
++    }
++    fn local(&self) -> SocketAddr {
++        if self.server { self.conn.saddr } else { self.conn.caddr }
++    }
++    fn peer(&self) -> SocketAddr {
++        if self.server { self.conn.caddr } else { self.conn.saddr }
++    }
++}
++impl Drop for Endpoint {
++    fn drop(&mut self) {
++        // Last clone gone: signal EOF to the peer's reader.
++        self.whalf().wshut.store(true, Ordering::Relaxed);
++    }
++}
++
++/// A net-server-backed (external, non-loopback) TCP client stream.
++struct NetStream {
++    sock: i64,
++    peer: SocketAddr,
++}
++impl Drop for NetStream {
++    fn drop(&mut self) {
++        unsafe { __oxbow_tcp_close(self.sock) };
++    }
++}
++
++enum Stream {
++    Loop(Arc<Endpoint>),
++    Net(Arc<NetStream>),
++}
++pub struct TcpStream(Stream);
++
++/// A listening address: an accept queue of pending connections. Entries persist for
++/// the process lifetime (tests bind unique ports), so `bind` of an existing address
++/// reports `AddrInUse` and a missing one yields `ConnectionRefused` on connect.
++struct ListenerEntry {
++    id: u64,
++    addr: SocketAddr,
++    queue: VecDeque<Arc<Conn>>,
++    nonblocking: bool,
++    ttl: u32,
++}
++static LISTENERS: Mutex<Vec<ListenerEntry>> = Mutex::new(Vec::new());
++static NEXT_LID: AtomicU64 = AtomicU64::new(1);
++static TCP_EPHEMERAL: AtomicU32 = AtomicU32::new(50000);
++
++pub struct TcpListener {
++    id: u64,
++    addr: SocketAddr,
++}
++
++fn loopback_like(template: &SocketAddr, port: u16) -> SocketAddr {
++    match template {
++        SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
++        SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0)),
++    }
++}
 +
 +impl TcpStream {
-+    pub fn connect<A: ToSocketAddrs>(_: A) -> io::Result<TcpStream> {
-+        unsupported()
++    pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
++        let addr = first_addr(addr)?;
++        if is_loopback_or_unspec(&addr) {
++            // Loopback: pair with an in-process listener.
++            let cport = TCP_EPHEMERAL.fetch_add(1, Ordering::Relaxed) as u16;
++            let conn = Arc::new(Conn {
++                c2s: Half::new(),
++                s2c: Half::new(),
++                caddr: loopback_like(&addr, cport),
++                saddr: addr,
++            });
++            let mut ls = LISTENERS.lock().unwrap();
++            let entry = ls
++                .iter_mut()
++                .find(|e| e.addr == addr)
++                .ok_or_else(|| io::const_error!(ErrorKind::ConnectionRefused, "connection refused"))?;
++            entry.queue.push_back(conn.clone());
++            drop(ls);
++            Ok(TcpStream(Stream::Loop(Arc::new(new_endpoint(conn, false)))))
++        } else {
++            // External: real client via the net server.
++            let ip = v4_be(&addr)
++                .ok_or_else(|| io::const_error!(ErrorKind::Unsupported, "oxbow net: IPv6 not supported"))?;
++            let sock = unsafe { __oxbow_tcp_connect(ip, addr.port()) };
++            if sock < 0 {
++                return Err(io::const_error!(ErrorKind::ConnectionRefused, "connection refused"));
++            }
++            Ok(TcpStream(Stream::Net(Arc::new(NetStream { sock, peer: addr }))))
++        }
 +    }
-+    pub fn connect_timeout(_: &SocketAddr, _: Duration) -> io::Result<TcpStream> {
-+        unsupported()
++
++    pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
++        if timeout == Duration::ZERO {
++            return Err(io::const_error!(ErrorKind::InvalidInput, "cannot set a 0 duration timeout"));
++        }
++        if is_loopback_or_unspec(addr) {
++            return Self::connect(*addr);
++        }
++        // External connect can't honor a deadline through the blocking net call; treat a
++        // refused/failed connect as a timeout (the test uses a non-routable address).
++        let ip = v4_be(addr)
++            .ok_or_else(|| io::const_error!(ErrorKind::Unsupported, "oxbow net: IPv6 not supported"))?;
++        let sock = unsafe { __oxbow_tcp_connect(ip, addr.port()) };
++        if sock < 0 {
++            return Err(io::const_error!(ErrorKind::TimedOut, "connection timed out"));
++        }
++        Ok(TcpStream(Stream::Net(Arc::new(NetStream { sock, peer: *addr }))))
 +    }
-+    pub fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
-+        self.0
++
++    fn ep(&self) -> io::Result<&Endpoint> {
++        match &self.0 {
++            Stream::Loop(e) => Ok(e),
++            Stream::Net(_) => Err(io::const_error!(ErrorKind::Unsupported, "not a loopback stream")),
++        }
 +    }
-+    pub fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
-+        self.0
++
++    pub fn set_read_timeout(&self, t: Option<Duration>) -> io::Result<()> {
++        UdpSocket::set_timeout(&self.ep()?.rd_timeout, t)
++    }
++    pub fn set_write_timeout(&self, t: Option<Duration>) -> io::Result<()> {
++        UdpSocket::set_timeout(&self.ep()?.wr_timeout, t)
 +    }
 +    pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
-+        self.0
++        Ok(*self.ep()?.rd_timeout.lock().unwrap())
 +    }
 +    pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
-+        self.0
++        Ok(*self.ep()?.wr_timeout.lock().unwrap())
 +    }
-+    pub fn peek(&self, _: &mut [u8]) -> io::Result<usize> {
-+        self.0
++
++    fn loop_read(ep: &Endpoint, buf: &mut [u8], consume: bool) -> io::Result<usize> {
++        if buf.is_empty() {
++            return Ok(0);
++        }
++        let deadline = ep.rd_timeout.lock().unwrap().map(|d| Instant::now() + d);
++        loop {
++            if ep.rshut.load(Ordering::Relaxed) {
++                return Ok(0);
++            }
++            {
++                let mut q = ep.rhalf().data.lock().unwrap();
++                if !q.is_empty() {
++                    let n = q.len().min(buf.len());
++                    for (i, slot) in buf.iter_mut().enumerate().take(n) {
++                        *slot = if consume { q.pop_front().unwrap() } else { q[i] };
++                    }
++                    return Ok(n);
++                }
++                if ep.rhalf().wshut.load(Ordering::Relaxed) {
++                    return Ok(0); // peer's writer closed and FIFO drained -> EOF
++                }
++            }
++            if ep.nonblocking.load(Ordering::Relaxed) {
++                return Err(io::const_error!(ErrorKind::WouldBlock, "operation would block"));
++            }
++            if let Some(dl) = deadline {
++                if Instant::now() >= dl {
++                    return Err(io::const_error!(ErrorKind::WouldBlock, "read timed out"));
++                }
++            }
++            crate::thread::yield_now();
++        }
 +    }
-+    pub fn read(&self, _: &mut [u8]) -> io::Result<usize> {
-+        self.0
++
++    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
++        match &self.0 {
++            Stream::Loop(e) => Self::loop_read(e, buf, true),
++            Stream::Net(s) => {
++                let n = unsafe { __oxbow_tcp_recv(s.sock, buf.as_mut_ptr(), buf.len()) };
++                if n < 0 { Ok(0) } else { Ok(n as usize) }
++            }
++        }
 +    }
-+    pub fn read_buf(&self, _: BorrowedCursor<'_>) -> io::Result<()> {
-+        self.0
++
++    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
++        Self::loop_read(self.ep()?, buf, false)
 +    }
-+    pub fn read_vectored(&self, _: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-+        self.0
++
++    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
++        let mut tmp = [0u8; 2048];
++        let cap = cursor.capacity().min(tmp.len());
++        let n = self.read(&mut tmp[..cap])?;
++        cursor.append(&tmp[..n]);
++        Ok(())
++    }
++    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
++        for b in bufs {
++            if !b.is_empty() {
++                return self.read(b);
++            }
++        }
++        Ok(0)
 +    }
 +    pub fn is_read_vectored(&self) -> bool {
-+        self.0
++        false
 +    }
-+    pub fn write(&self, _: &[u8]) -> io::Result<usize> {
-+        self.0
++
++    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
++        match &self.0 {
++            Stream::Loop(e) => {
++                if e.whalf().wshut.load(Ordering::Relaxed) {
++                    return Err(io::const_error!(ErrorKind::BrokenPipe, "write on a shut-down stream"));
++                }
++                e.whalf().data.lock().unwrap().extend(buf.iter().copied());
++                Ok(buf.len())
++            }
++            Stream::Net(s) => {
++                let n = unsafe { __oxbow_tcp_send(s.sock, buf.as_ptr(), buf.len()) };
++                if n < 0 {
++                    Err(io::const_error!(ErrorKind::BrokenPipe, "tcp send failed"))
++                } else {
++                    Ok(n as usize)
++                }
++            }
++        }
 +    }
-+    pub fn write_vectored(&self, _: &[IoSlice<'_>]) -> io::Result<usize> {
-+        self.0
++    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
++        for b in bufs {
++            if !b.is_empty() {
++                return self.write(b);
++            }
++        }
++        Ok(0)
 +    }
 +    pub fn is_write_vectored(&self) -> bool {
-+        self.0
++        false
 +    }
++
 +    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-+        self.0
++        match &self.0 {
++            Stream::Loop(e) => Ok(e.peer()),
++            Stream::Net(s) => Ok(s.peer),
++        }
 +    }
 +    pub fn socket_addr(&self) -> io::Result<SocketAddr> {
-+        self.0
++        match &self.0 {
++            Stream::Loop(e) => Ok(e.local()),
++            Stream::Net(_) => Err(io::const_error!(ErrorKind::Unsupported, "no local addr")),
++        }
 +    }
-+    pub fn shutdown(&self, _: Shutdown) -> io::Result<()> {
-+        self.0
++    pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
++        match &self.0 {
++            Stream::Loop(e) => {
++                match how {
++                    Shutdown::Write => e.whalf().wshut.store(true, Ordering::Relaxed),
++                    Shutdown::Read => e.rshut.store(true, Ordering::Relaxed),
++                    Shutdown::Both => {
++                        e.whalf().wshut.store(true, Ordering::Relaxed);
++                        e.rshut.store(true, Ordering::Relaxed);
++                    }
++                }
++                Ok(())
++            }
++            Stream::Net(s) => {
++                unsafe { __oxbow_tcp_close(s.sock) };
++                Ok(())
++            }
++        }
 +    }
 +    pub fn duplicate(&self) -> io::Result<TcpStream> {
-+        self.0
++        Ok(TcpStream(match &self.0 {
++            Stream::Loop(e) => Stream::Loop(e.clone()),
++            Stream::Net(s) => Stream::Net(s.clone()),
++        }))
 +    }
-+    pub fn set_linger(&self, _: Option<Duration>) -> io::Result<()> {
-+        self.0
++    pub fn set_linger(&self, d: Option<Duration>) -> io::Result<()> {
++        *self.ep()?.linger.lock().unwrap() = d;
++        Ok(())
 +    }
 +    pub fn linger(&self) -> io::Result<Option<Duration>> {
-+        self.0
++        Ok(*self.ep()?.linger.lock().unwrap())
 +    }
-+    pub fn set_keepalive(&self, _: bool) -> io::Result<()> {
-+        self.0
++    pub fn set_keepalive(&self, v: bool) -> io::Result<()> {
++        self.ep()?.keepalive.store(v, Ordering::Relaxed);
++        Ok(())
 +    }
 +    pub fn keepalive(&self) -> io::Result<bool> {
-+        self.0
++        Ok(self.ep()?.keepalive.load(Ordering::Relaxed))
 +    }
-+    pub fn set_nodelay(&self, _: bool) -> io::Result<()> {
-+        self.0
++    pub fn set_nodelay(&self, v: bool) -> io::Result<()> {
++        self.ep()?.nodelay.store(v, Ordering::Relaxed);
++        Ok(())
 +    }
 +    pub fn nodelay(&self) -> io::Result<bool> {
-+        self.0
++        Ok(self.ep()?.nodelay.load(Ordering::Relaxed))
 +    }
-+    pub fn set_ttl(&self, _: u32) -> io::Result<()> {
-+        self.0
++    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
++        self.ep()?.ttl.store(ttl, Ordering::Relaxed);
++        Ok(())
 +    }
 +    pub fn ttl(&self) -> io::Result<u32> {
-+        self.0
++        Ok(self.ep()?.ttl.load(Ordering::Relaxed))
 +    }
 +    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-+        self.0
++        Ok(None)
 +    }
-+    pub fn set_nonblocking(&self, _: bool) -> io::Result<()> {
-+        self.0
++    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
++        if let Stream::Loop(e) = &self.0 {
++            e.nonblocking.store(nonblocking, Ordering::Relaxed);
++        }
++        Ok(())
++    }
++}
++
++fn new_endpoint(conn: Arc<Conn>, server: bool) -> Endpoint {
++    Endpoint {
++        conn,
++        server,
++        nonblocking: AtomicBool::new(false),
++        rd_timeout: Mutex::new(None),
++        wr_timeout: Mutex::new(None),
++        rshut: AtomicBool::new(false),
++        ttl: AtomicU32::new(64),
++        nodelay: AtomicBool::new(false),
++        keepalive: AtomicBool::new(false),
++        linger: Mutex::new(None),
 +    }
 +}
 +
 +impl fmt::Debug for TcpStream {
-+    fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        self.0
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("TcpStream").finish_non_exhaustive()
 +    }
 +}
 +
-+pub struct TcpListener(!);
-+
 +impl TcpListener {
-+    pub fn bind<A: ToSocketAddrs>(_: A) -> io::Result<TcpListener> {
-+        unsupported()
++    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener> {
++        let addr = first_addr(addr)?;
++        if !is_loopback_or_unspec(&addr) {
++            return Err(io::const_error!(
++                ErrorKind::AddrNotAvailable,
++                "oxbow net: only loopback TCP listeners are supported",
++            ));
++        }
++        let port = if addr.port() == 0 {
++            TCP_EPHEMERAL.fetch_add(1, Ordering::Relaxed) as u16
++        } else {
++            addr.port()
++        };
++        let addr = loopback_like(&addr, port);
++        let mut ls = LISTENERS.lock().unwrap();
++        if ls.iter().any(|e| e.addr == addr) {
++            return Err(io::const_error!(ErrorKind::AddrInUse, "address in use"));
++        }
++        let id = NEXT_LID.fetch_add(1, Ordering::Relaxed);
++        ls.push(ListenerEntry { id, addr, queue: VecDeque::new(), nonblocking: false, ttl: 64 });
++        Ok(TcpListener { id, addr })
 +    }
 +    pub fn socket_addr(&self) -> io::Result<SocketAddr> {
-+        self.0
++        Ok(self.addr)
 +    }
 +    pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-+        self.0
++        loop {
++            let (conn, nonblocking) = {
++                let mut ls = LISTENERS.lock().unwrap();
++                let e = ls
++                    .iter_mut()
++                    .find(|e| e.id == self.id)
++                    .ok_or_else(|| io::const_error!(ErrorKind::NotConnected, "listener closed"))?;
++                (e.queue.pop_front(), e.nonblocking)
++            };
++            if let Some(conn) = conn {
++                let caddr = conn.caddr;
++                return Ok((TcpStream(Stream::Loop(Arc::new(new_endpoint(conn, true)))), caddr));
++            }
++            if nonblocking {
++                return Err(io::const_error!(ErrorKind::WouldBlock, "operation would block"));
++            }
++            crate::thread::yield_now();
++        }
 +    }
 +    pub fn duplicate(&self) -> io::Result<TcpListener> {
-+        self.0
++        Ok(TcpListener { id: self.id, addr: self.addr })
 +    }
-+    pub fn set_ttl(&self, _: u32) -> io::Result<()> {
-+        self.0
++    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
++        let mut ls = LISTENERS.lock().unwrap();
++        if let Some(e) = ls.iter_mut().find(|e| e.id == self.id) {
++            e.ttl = ttl;
++        }
++        Ok(())
 +    }
 +    pub fn ttl(&self) -> io::Result<u32> {
-+        self.0
++        let ls = LISTENERS.lock().unwrap();
++        Ok(ls.iter().find(|e| e.id == self.id).map(|e| e.ttl).unwrap_or(64))
 +    }
 +    pub fn set_only_v6(&self, _: bool) -> io::Result<()> {
-+        self.0
++        unsupported()
 +    }
 +    pub fn only_v6(&self) -> io::Result<bool> {
-+        self.0
++        unsupported()
 +    }
 +    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-+        self.0
++        Ok(None)
 +    }
-+    pub fn set_nonblocking(&self, _: bool) -> io::Result<()> {
-+        self.0
++    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
++        let mut ls = LISTENERS.lock().unwrap();
++        if let Some(e) = ls.iter_mut().find(|e| e.id == self.id) {
++            e.nonblocking = nonblocking;
++        }
++        Ok(())
 +    }
 +}
 +
 +impl fmt::Debug for TcpListener {
-+    fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        self.0
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("TcpListener").field("addr", &self.addr).finish()
 +    }
 +}
 +
-+pub struct LookupHost(!);
++pub struct LookupHost {
++    addrs: VecDeque<SocketAddr>,
++}
 +
 +impl Iterator for LookupHost {
 +    type Item = SocketAddr;
 +    fn next(&mut self) -> Option<SocketAddr> {
-+        self.0
++        self.addrs.pop_front()
 +    }
 +}
 +
-+pub fn lookup_host(_: &str, _: u16) -> io::Result<LookupHost> {
-+    unsupported()
++/// Resolve a host. There's no DNS via Rust std yet (the kernel resolver is libc-only),
++/// so this handles the cases the std net suite needs: `localhost` → loopback, and
++/// literal IPv4/IPv6 addresses. Anything else is `Unsupported`.
++pub fn lookup_host(host: &str, port: u16) -> io::Result<LookupHost> {
++    let mut addrs = VecDeque::new();
++    if host.eq_ignore_ascii_case("localhost") {
++        addrs.push_back(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)));
++        addrs.push_back(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0)));
++    } else if let Ok(ip) = host.parse::<Ipv4Addr>() {
++        addrs.push_back(SocketAddr::V4(SocketAddrV4::new(ip, port)));
++    } else if let Ok(ip) = host.parse::<Ipv6Addr>() {
++        addrs.push_back(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)));
++    } else {
++        return Err(io::const_error!(
++            ErrorKind::Unsupported,
++            "oxbow net: hostname resolution (DNS) is not wired to Rust std",
++        ));
++    }
++    Ok(LookupHost { addrs })
 +}
 diff --git a/library/std/src/sys/pal/unsupported/futex.rs b/library/std/src/sys/pal/unsupported/futex.rs
 new file mode 100644

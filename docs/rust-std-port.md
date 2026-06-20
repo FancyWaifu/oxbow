@@ -264,10 +264,24 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     including `udp_clone_two_read/two_write` (concurrent threads), the timeout tests, and
     `connect_send_recv` (a socket sending to its own bound port). **No kernel/ISO change**
     (net server untouched) — only the std backend + test crate. Excluded: `debug` (asserts
-    the exact fd-based `Debug` format — oxbow's loopback socket has no raw fd). Not yet
-    wired: external (non-loopback) UDP via the net server, and all of TCP (`TcpStream`/
-    `TcpListener` stay `Unsupported` stubs) — the natural next net step.
-  Next: external UDP + TCP over the net server, or the pure `socket_addr`/`ip_addr` parse tests.
+    the exact fd-based `Debug` format — oxbow's loopback socket has no raw fd).
+  - ✅ **TCP broadened — 37/37 real-std `tcp/tests.rs` pass** (same `oxbow.rs` backend). The
+    net server's TCP is **client-only** (connect/send/recv/close — no listen/accept) and can't
+    loop back, but the std `tcp` suite is loopback + single-process, so `TcpListener` + loopback
+    `TcpStream` are an **in-process socketpair**: per-direction byte FIFOs in an `Arc<Conn>`, an
+    accept queue per listening address (`LISTENERS`), clones sharing the endpoint via `Arc`,
+    `Drop` signalling EOF to the peer. Implements connect/accept, read/write (+ vectored +
+    `read_buf`), `peek`, half-close `shutdown` (read-shutdown wakes a blocked reader — passes
+    `close_read_wakes_up`), `Instant` timeouts, non-blocking, linger/keepalive/nodelay/ttl, and
+    clone semantics — passing the concurrency-heavy `clone_accept_concurrent`/`clone_while_reading`/
+    `multiple_connect_*` tests. `lookup_host` resolves `localhost` → loopback (+ literal IPs) so
+    `connect(("localhost", port))` works; full DNS stays unsupported. **`TcpStream::connect` to a
+    non-loopback host is wired to the real net server** via new rt `__oxbow_tcp_*` shims (smoltcp
+    client) — compiled + linked, exercised by real-network use (not the loopback suite). No
+    kernel/ISO change. Excluded: `debug` (fd-based `Debug` format).
+  Next: external (non-loopback) UDP via the net server (needs the server to return the sender's
+    address on recv + rt `__oxbow_udp_*` shims); `TcpListener` on the wire would need server-side
+    TCP (listen/accept) in the net server.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 

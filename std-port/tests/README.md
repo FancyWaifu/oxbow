@@ -105,5 +105,18 @@ mailbox; `recv` polls it with `Instant`-based timeout / non-blocking semantics; 
 the bound port (same mailbox). v4 and v6 loopback both work. **No kernel/ISO rebuild** — build
 the libtest crate (`udp-harness-main.rs` provides a `crate::net` that globs `std::net` + adds
 the `net::test` helpers), inject, run via `udp-harness.py`. Excluded: `debug` (asserts the
-fd-based `Debug` format; oxbow's loopback socket has no raw fd). Not wired yet: external
-(non-loopback) UDP via the net server, and TCP (`TcpStream`/`TcpListener` are `Unsupported`).
+fd-based `Debug` format; oxbow's loopback socket has no raw fd).
+
+## net (TCP) — 37/37 real-std `tcp/tests.rs` pass (`tcp-tests.rs`)
+
+Same backend, same approach. The net server's TCP is client-only (no listen/accept), so
+`TcpListener` + loopback `TcpStream` are an **in-process socketpair** (per-direction byte
+FIFOs in an `Arc<Conn>`, an accept queue per listening addr, `Arc`-shared clones, `Drop`
+→ peer EOF). Implements connect/accept, read/write/vectored/`read_buf`, `peek`, half-close
+`shutdown` (read-shutdown wakes a blocked reader), timeouts, non-blocking, linger/keepalive/
+nodelay/ttl, clone — passing the concurrency-heavy clone/accept/multiple-connect tests.
+`lookup_host` resolves `localhost`→loopback (+ literal IPs) so `connect(("localhost", port))`
+works. `TcpStream::connect` to a non-loopback host routes to the real net server via new rt
+`__oxbow_tcp_*` shims (smoltcp client). Build adds features `read_buf`/`borrowed_buf_init`/
+`io_error_uncategorized`/`tcp_linger`/`tcp_keepalive`. Excluded: `debug` (fd-based format).
+Not wired: external UDP recv-with-source, and wire `TcpListener` (needs net-server accept).
