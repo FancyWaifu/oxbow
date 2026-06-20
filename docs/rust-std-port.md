@@ -290,9 +290,21 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     a real DNS query to slirp's resolver (`10.0.2.3:53`) sends, the reply is received, and
     `recv_from`'s returned source is exactly `10.0.2.3:53` (`external_udp_dns` test) — alongside the
     16 loopback udp tests still green (17/17).
-  Net std surface now: UDP (loopback in-process + external via net server, with sender address),
-  TCP (loopback in-process socketpair + external client via net server). Remaining: wire
-  `TcpListener` (needs server-side listen/accept in the net server) and DNS resolution in std.
+  - ✅ **Wire `TcpListener` — server-side TCP, verified end-to-end.** Added **listen/accept to the
+    net server's smoltcp stack** (`servers/net`): a backlog of `tcp::Socket`s in `listen(port)`
+    (`TcpStack::listen`), and a **non-blocking** `accept(port)` that polls until one reaches
+    `Established`, returns it as the connection with the peer address, and replenishes a fresh
+    listening socket. New ABI tags `TAG_TCP_LISTEN`/`TAG_TCP_ACCEPT` + `Sock::TcpListen` +
+    rt `__oxbow_tcp_listen`/`__oxbow_tcp_accept` shims. std `TcpListener` became loopback-or-wire:
+    bind to `127.x`/`::1` → in-process (the test suite); bind to `0.0.0.0` → a real net-server
+    listener; a specific foreign IP → `AddrNotAvailable` (keeps `bind_error` green). `accept`
+    polls the net server and yields a net-backed `TcpStream`. **Verified on QEMU with slirp
+    `hostfwd`:** a guest listener on `0.0.0.0:8080` accepted a connection from the host
+    (`10.0.2.2`), read "PING" off the wire, replied "PONG" — the host client received it — while
+    the 37 loopback tcp tests stayed green (no regression from the enum refactor).
+  Net std surface now: UDP (loopback + external w/ sender address) and TCP (loopback socketpair +
+  external client + **wire listener/accept**). Remaining: DNS resolution in Rust std (kernel
+  resolver is libc-only); IPv6 on the wire (the stack is v4-only).
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 

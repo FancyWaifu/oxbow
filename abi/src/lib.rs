@@ -568,6 +568,13 @@ pub const TAG_TCP_SEND: u64 = u32::from_le_bytes(*b"TSND") as u64;
 pub const TAG_TCP_RECV: u64 = u32::from_le_bytes(*b"TRCV") as u64;
 /// Close a TCP socket cap. Reply: data[0]=status.
 pub const TAG_TCP_CLOSE: u64 = u32::from_le_bytes(*b"TCLO") as u64;
+/// Listen: request on NET_CTL, data[0]=port. Opens a backlog of smoltcp listening
+/// sockets on `port`. Reply: data[0]=status (0=ok), handles[0]=badged listener cap.
+pub const TAG_TCP_LISTEN: u64 = u32::from_le_bytes(*b"TLIS") as u64;
+/// Accept on a listener cap (non-blocking — the client polls). Reply: data[0]=status
+/// (0=connection accepted, 1=none pending yet), data[1]=peer IPv4 (BE), data[2]=peer
+/// port; on status 0, handles[0]=a badged TCP-socket cap for the accepted connection.
+pub const TAG_TCP_ACCEPT: u64 = u32::from_le_bytes(*b"TACC") as u64;
 
 // --- Large UDP via a shared frame (§25) ------------------------------------
 // The inline UDP path caps a datagram at ~40 bytes — too small for DNS with

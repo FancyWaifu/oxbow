@@ -844,6 +844,34 @@ pub unsafe extern "C" fn __oxbow_tcp_recv(sock: i64, buf: *mut u8, len: usize) -
 pub extern "C" fn __oxbow_tcp_close(sock: i64) {
     tcp::close(sock as Handle);
 }
+// §102 std::net wire-TcpListener shims: a real listening socket + non-blocking accept
+// in the net server's smoltcp stack.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_tcp_listen(port: u16) -> i64 {
+    match tcp::listen(oxbow_abi::BOOT_NET_EP, port) {
+        Some(h) => h as i64,
+        None => -1,
+    }
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_tcp_accept(
+    listener: i64,
+    peer_ip: *mut u32,
+    peer_port: *mut u16,
+) -> i64 {
+    match tcp::accept(listener as Handle) {
+        Some((h, ip, port)) => {
+            unsafe {
+                peer_ip.write(u32::from_be_bytes(ip));
+                peer_port.write(port);
+            }
+            h as i64
+        }
+        None => -1,
+    }
+}
 // §101 std::net external-UDP shims. std handles loopback UDP in-process; a socket that
 // sends to / binds a non-loopback address gets a real net-server UDP socket via these.
 #[cfg(feature = "hosted")]
@@ -1728,7 +1756,33 @@ pub mod dns {
 /// `close` ride that cap (badge = socket id), same shape as UDP.
 pub mod tcp {
     use crate::{sys_call, sys_close, Handle};
-    use oxbow_abi::{MsgBuf, TAG_TCP_CLOSE, TAG_TCP_CONNECT, TAG_TCP_RECV, TAG_TCP_SEND};
+    use oxbow_abi::{
+        MsgBuf, TAG_TCP_ACCEPT, TAG_TCP_CLOSE, TAG_TCP_CONNECT, TAG_TCP_LISTEN, TAG_TCP_RECV,
+        TAG_TCP_SEND,
+    };
+
+    /// Start listening on `port` via control cap `ctl`; returns a badged listener cap.
+    pub fn listen(ctl: Handle, port: u16) -> Option<Handle> {
+        let mut m = MsgBuf::new(TAG_TCP_LISTEN);
+        m.data[0] = port as u64;
+        m.data_len = 1;
+        if sys_call(ctl, &mut m).is_err() || m.data[0] != 0 || m.handle_count == 0 {
+            return None;
+        }
+        Some(m.handles[0])
+    }
+
+    /// Non-blocking accept on a listener cap: returns (socket cap, peer IPv4, peer port)
+    /// when a connection is pending, else None (the caller polls).
+    pub fn accept(listener: Handle) -> Option<(Handle, [u8; 4], u16)> {
+        let mut m = MsgBuf::new(TAG_TCP_ACCEPT);
+        if sys_call(listener, &mut m).is_err() || m.data[0] != 0 || m.handle_count == 0 {
+            return None;
+        }
+        let ip = (m.data[1] as u32).to_be_bytes();
+        let port = m.data[2] as u16;
+        Some((m.handles[0], ip, port))
+    }
 
     /// Open a TCP connection to `ip:port` via control cap `ctl`; returns a socket
     /// cap once the handshake completes (None on refusal/timeout).

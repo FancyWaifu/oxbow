@@ -83,6 +83,10 @@ pub struct TcpStack {
     iface: Interface,
     sockets: SocketSet<'static>,
     next_port: u16,
+    /// Sockets currently in LISTEN state, with the port they listen on. A backlog of
+    /// these per port lets several incoming connections be accepted; each is removed
+    /// (and replenished) when it transitions to ESTABLISHED.
+    listeners: alloc::vec::Vec<(u16, SocketHandle)>,
 }
 
 impl TcpStack {
@@ -98,7 +102,61 @@ impl TcpStack {
         let _ = iface
             .routes_mut()
             .add_default_ipv4_route(Ipv4Address::new(gw[0], gw[1], gw[2], gw[3]));
-        TcpStack { device, iface, sockets: SocketSet::new(vec![]), next_port: 49152 }
+        TcpStack {
+            device,
+            iface,
+            sockets: SocketSet::new(vec![]),
+            next_port: 49152,
+            listeners: vec![],
+        }
+    }
+
+    fn new_listening_socket(&mut self, port: u16) -> Option<SocketHandle> {
+        let rx = tcp::SocketBuffer::new(vec![0u8; 4096]);
+        let tx = tcp::SocketBuffer::new(vec![0u8; 4096]);
+        let mut sock = tcp::Socket::new(rx, tx);
+        if sock.listen(port).is_err() {
+            return None;
+        }
+        Some(self.sockets.add(sock))
+    }
+
+    /// Open a `backlog` of listening sockets on `port`. Returns false if none started.
+    pub fn listen(&mut self, port: u16, backlog: usize) -> bool {
+        let mut any = false;
+        for _ in 0..backlog {
+            if let Some(h) = self.new_listening_socket(port) {
+                self.listeners.push((port, h));
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// Non-blocking accept: poll the stack; if a listening socket on `port` has reached
+    /// ESTABLISHED, hand it back as the accepted connection with the peer address, and
+    /// replenish a fresh listening socket. `None` = nothing pending this poll.
+    pub fn accept(&mut self, port: u16) -> Option<(SocketHandle, [u8; 4], u16)> {
+        self.poll();
+        let idx = self.listeners.iter().position(|&(p, h)| {
+            p == port && self.sockets.get::<tcp::Socket>(h).state() == tcp::State::Established
+        })?;
+        let (p, h) = self.listeners.remove(idx);
+        let (ip, peer_port) = match self.sockets.get::<tcp::Socket>(h).remote_endpoint() {
+            Some(ep) => {
+                let ip = match ep.addr {
+                    IpAddress::Ipv4(v4) => v4.octets(),
+                    #[allow(unreachable_patterns)]
+                    _ => [0; 4],
+                };
+                (ip, ep.port)
+            }
+            None => ([0; 4], 0),
+        };
+        if let Some(nh) = self.new_listening_socket(p) {
+            self.listeners.push((p, nh));
+        }
+        Some((h, ip, peer_port))
     }
 
     fn poll(&mut self) {

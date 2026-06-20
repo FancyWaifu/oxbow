@@ -119,4 +119,17 @@ nodelay/ttl, clone — passing the concurrency-heavy clone/accept/multiple-conne
 works. `TcpStream::connect` to a non-loopback host routes to the real net server via new rt
 `__oxbow_tcp_*` shims (smoltcp client). Build adds features `read_buf`/`borrowed_buf_init`/
 `io_error_uncategorized`/`tcp_linger`/`tcp_keepalive`. Excluded: `debug` (fd-based format).
-Not wired: external UDP recv-with-source, and wire `TcpListener` (needs net-server accept).
+External `TcpStream::connect` (non-loopback) rides the net server.
+
+## net (wire TcpListener) — server-side TCP, verified e2e (`wire-listener.rs`)
+
+Server-side TCP added to the net server's smoltcp stack: `TcpStack::listen(port, backlog)` opens
+a pool of sockets in `listen()`, and non-blocking `accept(port)` polls until one reaches
+`Established`, returns it + the peer address, and replenishes the pool. ABI `TAG_TCP_LISTEN`/
+`TAG_TCP_ACCEPT`, `Sock::TcpListen`, rt `__oxbow_tcp_listen`/`_accept` shims. std `TcpListener`
+is loopback-or-wire: `127.x`/`::1` → in-process; `0.0.0.0` → real net-server listener; a specific
+foreign IP → `AddrNotAvailable`. `wire-listener.rs` (plain program, `build-std=std,panic_unwind`)
+binds `0.0.0.0:8080`, accepts one connection, echoes PONG. Run via `wire-listener-harness.py`,
+which launches QEMU with `hostfwd=tcp:127.0.0.1:5555-:8080` and connects from the host —
+verified: the guest accepted from `10.0.2.2`, read PING, replied PONG, host got it. The 37
+loopback tcp tests stay green (no regression).

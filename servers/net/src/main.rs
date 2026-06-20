@@ -27,7 +27,8 @@ use core::sync::atomic::{fence, Ordering};
 use eth::{ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use oxbow_abi::{
     MsgBuf, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_NET_IRQ, BOOT_PCI, NET_DMA, NET_MMIO, NET_SHARED,
-    PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_NET_DNS, TAG_TCP_CLOSE, TAG_TCP_CONNECT,
+    PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_NET_DNS, TAG_TCP_ACCEPT, TAG_TCP_CLOSE,
+    TAG_TCP_CONNECT, TAG_TCP_LISTEN,
     TAG_TCP_RECV, TAG_TCP_SEND, TAG_UDP_ATTACH, TAG_UDP_BIND, TAG_UDP_CLOSE, TAG_UDP_RECVFROM,
     TAG_UDP_RECVV, TAG_UDP_SENDTO, TAG_UDP_SENDV,
 };
@@ -42,6 +43,7 @@ enum Sock {
     Free,
     Udp(u16),          // bound port
     Tcp(SocketHandle), // smoltcp socket
+    TcpListen(u16),    // a listening port (backlog lives in the TcpStack)
 }
 
 /// Resolve a 1-based socket badge to its table slot (copied out).
@@ -828,16 +830,90 @@ pub extern "C" fn oxbow_main() -> ! {
                 }
                 let _ = rt::sys_reply(reply, &r);
             }
-            // TCP socket channel: close + free the slot.
+            // TCP socket channel: close + free the slot (a socket or a listener).
             TAG_TCP_CLOSE => {
                 let sid = m.badge as usize;
-                if let Some(Sock::Tcp(handle)) = slot_of(&sockets, sid) {
-                    tcp_stack.close(handle);
-                    sockets[sid - 1] = Sock::Free;
+                match slot_of(&sockets, sid) {
+                    Some(Sock::Tcp(handle)) => {
+                        tcp_stack.close(handle);
+                        sockets[sid - 1] = Sock::Free;
+                    }
+                    Some(Sock::TcpListen(_)) => {
+                        // Free the listener slot; its backlog sockets stay in the stack.
+                        sockets[sid - 1] = Sock::Free;
+                    }
+                    _ => {}
                 }
                 r.data[0] = 0;
                 r.data_len = 1;
                 let _ = rt::sys_reply(reply, &r);
+            }
+            // Control channel: start listening on a port; mint a badged listener cap.
+            TAG_TCP_LISTEN => {
+                let port = m.data[0] as u16;
+                let free = sockets.iter().position(|s| matches!(s, Sock::Free));
+                match free {
+                    Some(idx) if tcp_stack.listen(port, 4) => {
+                        sockets[idx] = Sock::TcpListen(port);
+                        match rt::sys_mint(BOOT_EP, (idx + 1) as u64, R_SEND | R_GRANT) {
+                            Ok(cap) => {
+                                r.data[0] = 0;
+                                r.data_len = 1;
+                                r.handle_count = 1;
+                                r.handles[0] = cap;
+                                let _ = rt::sys_reply(reply, &r);
+                                let _ = rt::sys_close(cap);
+                            }
+                            Err(_) => {
+                                sockets[idx] = Sock::Free;
+                                r.data[0] = 1;
+                                r.data_len = 1;
+                                let _ = rt::sys_reply(reply, &r);
+                            }
+                        }
+                    }
+                    _ => {
+                        r.data[0] = 1;
+                        r.data_len = 1;
+                        let _ = rt::sys_reply(reply, &r);
+                    }
+                }
+            }
+            // Listener channel: non-blocking accept — the client polls. On a pending
+            // connection, mint a socket cap and report the peer address.
+            TAG_TCP_ACCEPT => {
+                let sid = m.badge as usize;
+                let mut replied = false;
+                if let Some(Sock::TcpListen(port)) = slot_of(&sockets, sid) {
+                    if let Some((handle, ip, peer_port)) = tcp_stack.accept(port) {
+                        match sockets.iter().position(|s| matches!(s, Sock::Free)) {
+                            Some(idx) => {
+                                sockets[idx] = Sock::Tcp(handle);
+                                if let Ok(cap) = rt::sys_mint(BOOT_EP, (idx + 1) as u64, R_SEND | R_GRANT)
+                                {
+                                    r.data[0] = 0;
+                                    r.data[1] = u32::from_be_bytes(ip) as u64;
+                                    r.data[2] = peer_port as u64;
+                                    r.data_len = 3;
+                                    r.handle_count = 1;
+                                    r.handles[0] = cap;
+                                    let _ = rt::sys_reply(reply, &r);
+                                    let _ = rt::sys_close(cap);
+                                    replied = true;
+                                } else {
+                                    tcp_stack.close(handle);
+                                    sockets[idx] = Sock::Free;
+                                }
+                            }
+                            None => tcp_stack.close(handle), // no free slot — drop it
+                        }
+                    }
+                }
+                if !replied {
+                    r.data[0] = 1; // nothing pending yet (or not a listener)
+                    r.data_len = 1;
+                    let _ = rt::sys_reply(reply, &r);
+                }
             }
             _ => {
                 r.data[0] = 1;
