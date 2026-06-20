@@ -1717,10 +1717,10 @@ index 00000000..78ee1cd7
 +}
 diff --git a/library/std/src/sys/pal/unsupported/futex.rs b/library/std/src/sys/pal/unsupported/futex.rs
 new file mode 100644
-index 00000000..1fb50a88
+index 00000000..0bdb62a1
 --- /dev/null
 +++ b/library/std/src/sys/pal/unsupported/futex.rs
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,44 @@
 +//! oxbow futex — std's generic Mutex/Condvar/RwLock/Once/parking run on this,
 +//! backed by oxbow-rt's hosted shims over SYS_FUTEX_WAIT/WAKE.
 +#![cfg(target_os = "oxbow")]
@@ -1744,8 +1744,10 @@ index 00000000..1fb50a88
 +    futex as *const Atomic<u32> as *const u32
 +}
 +
-+/// Waits while `*futex == expected`. Returns false on timeout — oxbow has no futex
-+/// timeout yet, so a `Some(timeout)` currently blocks until woken (TODO: timed wait).
++/// Waits while `*futex == expected`. Returns false on timeout. The oxbow kernel arms a
++/// PIT-tick deadline for a `Some(timeout)` and wakes the thread when it passes; a huge
++/// timeout (std passes `u64::MAX` for an effectively-infinite `wait_timeout`) stays parked
++/// until a real `futex_wake`.
 +pub fn futex_wait(futex: &Atomic<u32>, expected: u32, timeout: Option<Duration>) -> bool {
 +    // ms == 0 means "no timeout" to the kernel, so a Some(_) is floored at 1 ms.
 +    let ms = match timeout {

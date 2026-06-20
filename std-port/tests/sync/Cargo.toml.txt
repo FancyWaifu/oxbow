@@ -1,0 +1,15 @@
+[package]
+name = "oxtest"
+version = "0.0.0"
+edition = "2021"
+[workspace]
+[[bin]]
+name = "oxtest"
+path = "src/main.rs"
+[dependencies]
+oxbow-rt = { path = "/Users/5speeddeasil/oxbow/rt", features = ["hosted"] }
+rand = { version = "0.8", default-features = false }
+rand_xorshift = { version = "0.3", default-features = false }
+[profile.release]
+opt-level = "z"
+panic = "unwind"

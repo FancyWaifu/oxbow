@@ -744,7 +744,12 @@ pub fn futex_wait(addr: u64, expected: u32, timeout_ms: u64) -> bool {
     // §97 timeout: arm a timer deadline; `wake_expired` (timer IRQ) wakes us when it
     // passes. 100 Hz PIT → 1 tick = 10 ms; round up, at least 1 tick. 0 = no timeout.
     let deadline = if timeout_ms != 0 {
-        let d = crate::arch::ticks() + (timeout_ms + 9) / 10;
+        // Overflow-safe: `(timeout_ms + 9)` wraps for huge values (std passes u64::MAX
+        // for an "infinite" wait_timeout), which would set the deadline to ~now and make
+        // every wait time out immediately — std then busy-loops re-waiting and starves the
+        // waker. `div_ceil` + `saturating_add` keep a huge timeout effectively infinite, so
+        // the thread blocks until a real `futex_wake`.
+        let d = crate::arch::ticks().saturating_add(timeout_ms.div_ceil(10));
         set_wake_at(cur, d);
         d
     } else {
