@@ -741,11 +741,16 @@ pub unsafe extern "C" fn __oxbow_fs_pwrite(file: i64, buf: *const u8, len: usize
 #[unsafe(no_mangle)]
 pub extern "C" fn __oxbow_fs_close(file: i64) {
     // Tell fsd we're done with this path (drops its intern refcount so the slot is
-    // reclaimed), THEN drop the capability. A best-effort call: a failed send just means
-    // the slot is freed later (on unlink) as before.
+    // reclaimed), THEN drop the capability. ONE-WAY send, not a call: we don't need fsd's
+    // reply, and SEND returns as soon as fsd receives the message (immediately when fsd is
+    // idle in recv — the common case) instead of waiting for it to process + reply. Safe:
+    // fsd is single-threaded and receives in arrival order, so this RELEASE is always
+    // processed before our next OPEN (sent later in program order) — the intern slot is
+    // freed before any reusing open. Best-effort: a failed send just defers the reclaim to
+    // unlink, as before. fsd replies to the (null) reply cap harmlessly.
     let mut m = MsgBuf::new(oxbow_abi::TAG_FS_RELEASE);
     m.data_len = 0;
-    let _ = sys_call(file as Handle, &mut m);
+    let _ = sys_send(file as Handle, &m);
     let _ = sys_close(file as Handle);
 }
 /// std::fs::create_dir — TAG_FS_MKDIR(name) to the cwd dir cap (slot 1).
