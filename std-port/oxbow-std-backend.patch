@@ -2067,10 +2067,10 @@ index 8880a837..dfe0ab11 100644
          #[expect(dead_code)]
 diff --git a/library/std/src/sys/paths/oxbow.rs b/library/std/src/sys/paths/oxbow.rs
 new file mode 100644
-index 00000000..96f5cf56
+index 00000000..5ec46f36
 --- /dev/null
 +++ b/library/std/src/sys/paths/oxbow.rs
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,156 @@
 +//! oxbow working-directory + executable-path backend.
 +//!
 +//! oxbow has no global filesystem namespace: a process's working directory is a
@@ -2149,8 +2149,15 @@ index 00000000..96f5cf56
 +}
 +
 +pub fn current_exe() -> io::Result<PathBuf> {
-+    // No exe-path concept on oxbow — see the module docs.
-+    crate::sys::pal::unsupported()
++    // oxbow has no current-executable path: a process is spawned from raw ELF *bytes*
++    // (`sys_spawn_bytes`), not from a named file the kernel records, so there is nothing
++    // to resolve back to. `std::env::current_exe` documents that an `Err` is permitted;
++    // return a specific, self-explanatory one instead of the generic platform error.
++    Err(io::const_error!(
++        io::ErrorKind::Unsupported,
++        "current_exe: oxbow spawns processes from raw ELF bytes, so there is no \
++         executable path to report",
++    ))
 +}
 +
 +pub fn temp_dir() -> PathBuf {
