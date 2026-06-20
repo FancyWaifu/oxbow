@@ -380,6 +380,13 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     `PING6`/`PONG6` both ways (`ipv6-two-vm-handshake.py`). So oxbow answers inbound NDP (the
     multicast + solicited-node join from before) **and** resolves on-link peers — a wire v6
     `TcpListener` accepts real inbound IPv6 connections.
+    **Confirmed via the on-link route** (`ipv6-onlink-capture.py`): a packet capture on the
+    connector shows it sends the Neighbor Solicitation for the listener's address `fec0::a`
+    *directly* — `NS targets {'fec0::a': 1}`, `NA received: 1`, `SYN-ACK received: 1` — **not** for
+    the default gateway `fec0::2` (which is what happened pre-fix, NS ×9 to `fec0::2`, when the
+    connector lacked its global address). With `iface-max-addr-count-4` holding `fec0::b/64`,
+    smoltcp's `in_same_network` makes `fec0::a` on-link, so the connector NDP-resolves the listener
+    itself and the handshake rides the on-link route end to end.
   Net std surface — complete: UDP (loopback + external + sender addr), TCP (loopback + external
   client + wire listener/accept, **IPv4 and IPv6**, full handshakes verified both directions), DNS
   (real, A + AAAA, large replies via the shared frame), and IPv6 on the wire — all coexisting under
