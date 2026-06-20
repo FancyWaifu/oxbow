@@ -355,10 +355,24 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     unbounded blocking loop — the actual stall). Verified IPv6-only mode now boots cleanly: DHCP
     falls back to the static lease and the gateway ARP gives up gracefully (zero MAC), still reaching
     `[net] ready` (`dual-stack-harness.py`).
-  Net std surface: UDP (loopback + external + sender addr), TCP (loopback + external client + wire
-  listener/accept + IPv6 connect), DNS (real, A + AAAA, large replies via the shared frame), and
-  IPv6 on the wire — all coexisting under dual-stack SLIRP. Remaining: a reachable v6 peer to
-  complete a v6 handshake (environment, not code).
+  - ✅ **Full IPv6 TCP handshake against a reachable peer — verified.** This host has no IPv6 and
+    SLIRP forwarding is v4-only, so the peer is a **scapy responder** on a QEMU `socket` netdev (a
+    virtual wire): one oxbow VM runs `TcpStream::connect("[fec0::a]:9090")` and scapy answers NDP +
+    the TCP handshake. oxbow **completes the whole exchange end-to-end** — NDP Neighbor
+    Advertisement, **SYN → SYN-ACK → ACK**, **PING6 → PONG6** (bidirectional data), clean **FIN** —
+    `V6PEER: connected to Ok([fec0::a]:9090)` + `got PONG6` (`ipv6-peer-handshake.py`). oxbow's IPv6
+    client (connect/read/write/close) is real and proven over the wire. Changes/findings: oxbow
+    routes global `fec0::` dests via the **default gateway** (`fec0::2`), so the peer answers as the
+    gateway; the global address is now **per-MAC** (`fec0::<last MAC byte>`); enabled smoltcp's
+    `multicast` feature + join the **solicited-node multicast** for our addresses (oxbow now emits
+    MLD reports + receives solicited-node multicast). **Known gap:** oxbow's smoltcp as a *server*
+    doesn't yet answer an inbound Neighbor Solicitation (two oxbow VMs can't NDP-resolve each
+    other), so a *wire* v6 `TcpListener` accepting an inbound connection isn't proven — the client
+    direction is.
+  Net std surface: UDP (loopback + external + sender addr), TCP (loopback + external client + IPv6
+  connect [full handshake verified] + wire listener/accept for v4), DNS (real, A + AAAA, large
+  replies via the shared frame), and IPv6 on the wire, all coexisting under dual-stack SLIRP.
+  Remaining: smoltcp server-side NDP (answer inbound NS) for a wire v6 `TcpListener`.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 

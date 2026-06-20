@@ -114,7 +114,7 @@ impl TcpStack {
         let mut gl = [0u8; 16];
         gl[0] = 0xfe;
         gl[1] = 0xc0;
-        gl[15] = 0x15; // fec0::15 — matches the v4 .15 host id; SLIRP routes the whole /64
+        gl[15] = mac[5]; // fec0::<last MAC byte> — unique per host (distinct VMs differ)
         iface.update_ip_addrs(|a| {
             let _ = a.push(IpCidr::new(IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), 24));
             let _ = a.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::from(ll)), 64));
@@ -131,6 +131,21 @@ impl TcpStack {
         let _ = iface
             .routes_mut()
             .add_default_ipv6_route(Ipv6Address::from(r6));
+        // Join the solicited-node multicast group for each address so incoming Neighbor
+        // Solicitations for us are accepted (smoltcp drops packets to un-joined groups)
+        // and answered with a Neighbor Advertisement — without this, peers can't resolve
+        // our MAC and no IPv6 connection can complete.
+        for a in [&ll, &gl] {
+            let mut sn = [0u8; 16];
+            sn[0] = 0xff;
+            sn[1] = 0x02;
+            sn[11] = 0x01;
+            sn[12] = 0xff;
+            sn[13] = a[13];
+            sn[14] = a[14];
+            sn[15] = a[15];
+            let _ = iface.join_multicast_group(Ipv6Address::from(sn));
+        }
         TcpStack {
             device,
             iface,
