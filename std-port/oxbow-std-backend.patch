@@ -2040,13 +2040,14 @@ index 3eb20dae..63e444e3 100644
          use unsupported as imp;
 diff --git a/library/std/src/sys/process/oxbow.rs b/library/std/src/sys/process/oxbow.rs
 new file mode 100644
-index 00000000..ccc8576e
+index 00000000..e81abc83
 --- /dev/null
 +++ b/library/std/src/sys/process/oxbow.rs
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,382 @@
 +//! oxbow std::process — spawn a child program (std reads its ELF via std::fs),
 +//! inheriting the parent's stdio/cwd/net caps, and wait on its exit notification.
-+//! Piped stdio (output capture) + kill + try_wait are not wired yet.
++//! Wired: spawn, wait, try_wait, kill, and `MakePipe` stdout capture for `output()`
++//! (no separate stderr — the child folds stderr into stdout).
 +use super::env::{CommandEnv, CommandEnvs, CommandResolvedEnvs};
 +pub use crate::ffi::OsString as EnvKey;
 +use crate::ffi::{OsStr, OsString};
