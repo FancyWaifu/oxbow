@@ -1107,7 +1107,7 @@ fn dns_cmd(name: &[u8]) {
         tw(b"dns: bind failed (no net server?)\n");
         return;
     };
-    let q = rt::dns::query(0x1234, name_str);
+    let q = rt::dns::query(0x1234, name_str, rt::dns::TYPE_A);
     let server = rt::udp::dns_server(BOOT_NET_EP); // DHCP-leased resolver, not hardcoded
     // Query + response ride the shared frame (large path — no 40-byte inline cap).
     unsafe { core::ptr::copy_nonoverlapping(q.as_ptr(), buf, q.len()) };

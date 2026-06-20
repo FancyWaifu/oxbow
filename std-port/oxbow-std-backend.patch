@@ -773,10 +773,10 @@ index 84b53fd3..6ee45989 100644
          pub use unsupported::*;
 diff --git a/library/std/src/sys/net/connection/oxbow.rs b/library/std/src/sys/net/connection/oxbow.rs
 new file mode 100644
-index 00000000..9283dec0
+index 00000000..78ee1cd7
 --- /dev/null
 +++ b/library/std/src/sys/net/connection/oxbow.rs
-@@ -0,0 +1,930 @@
+@@ -0,0 +1,938 @@
 +//! oxbow network backend.
 +//!
 +//! oxbow's kernel net stack (e1000 → ARP/IPv4/UDP, smoltcp TCP) is reached by C/libc
@@ -827,8 +827,9 @@ index 00000000..9283dec0
 +    fn __oxbow_tcp_listen(port: u16) -> i64;
 +    // accept writes the 16-byte peer address (v4 in the first 4), an is_v6 flag, the port.
 +    fn __oxbow_tcp_accept(listener: i64, peer_ip16: *mut u8, is_v6: *mut u8, peer_port: *mut u16) -> i64;
-+    // DNS: resolve a hostname to a big-endian IPv4; 0 on success, -1 on failure.
++    // DNS: resolve a hostname to a big-endian IPv4 (A) / 16-byte IPv6 (AAAA); 0 on success.
 +    fn __oxbow_dns_resolve(name: *const u8, len: usize, out_ip: *mut u32) -> i32;
++    fn __oxbow_dns_resolve6(name: *const u8, len: usize, out_ip16: *mut u8) -> i32;
 +}
 +
 +fn v4_be(a: &SocketAddr) -> Option<u32> {
@@ -1693,17 +1694,24 @@ index 00000000..9283dec0
 +    } else if let Ok(ip) = host.parse::<Ipv6Addr>() {
 +        addrs.push_back(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)));
 +    } else {
-+        // Real DNS: query the resolver for an A record (IPv4 only).
++        // Real DNS: query both A (IPv4) and AAAA (IPv6). v4 first so callers that try
++        // addresses in order reach a working route in IPv4-only environments.
 +        let mut ip_be = 0u32;
-+        let rc = unsafe { __oxbow_dns_resolve(host.as_ptr(), host.len(), &mut ip_be) };
-+        if rc != 0 {
++        if unsafe { __oxbow_dns_resolve(host.as_ptr(), host.len(), &mut ip_be) } == 0 {
++            let ip = Ipv4Addr::from(ip_be.to_be_bytes());
++            addrs.push_back(SocketAddr::V4(SocketAddrV4::new(ip, port)));
++        }
++        let mut ip16 = [0u8; 16];
++        if unsafe { __oxbow_dns_resolve6(host.as_ptr(), host.len(), ip16.as_mut_ptr()) } == 0 {
++            let ip = Ipv6Addr::from(ip16);
++            addrs.push_back(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)));
++        }
++        if addrs.is_empty() {
 +            return Err(io::const_error!(
 +                ErrorKind::Uncategorized,
 +                "oxbow net: DNS resolution failed",
 +            ));
 +        }
-+        let ip = Ipv4Addr::from(ip_be.to_be_bytes());
-+        addrs.push_back(SocketAddr::V4(SocketAddrV4::new(ip, port)));
 +    }
 +    Ok(LookupHost { addrs })
 +}

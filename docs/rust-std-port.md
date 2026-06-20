@@ -334,10 +334,19 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     a `filter-dump` of net0 showed the responses were **61 B, 44 B, and 138 B** — `www.microsoft.com`'s
     138-byte CNAME-chain reply is well past the old 56-byte cap, yet resolved correctly
     (`dns-large-test.rs` + `dns-capture-harness.py`).
+  - ✅ **AAAA (IPv6 DNS) records.** `rt::dns::query` gained a `qtype` arg (A=1 / AAAA=28) + a
+    `first_aaaa` parser (type-28, 16-byte rdata); the resolver transport was factored into
+    `dns_transport(name, qtype, out)` over the shared frame, with `__oxbow_dns_resolve` (A) and a
+    new `__oxbow_dns_resolve6` (AAAA). std `lookup_host` now queries **both** and returns the v4 + v6
+    addresses (v4 first, so callers reach a working route in IPv4-only environments). **Verified**:
+    `("example.com"/"google.com"/"cloudflare.com", 80).to_socket_addrs()` each returned an A *and* a
+    real AAAA — e.g. `example.com -> [104.20.23.154:80, [2606:4700:10::6814:179a]:80]`
+    (`dns-aaaa-test.rs`). (Resolving AAAA needs only a DNS round-trip, so it works here even though
+    connecting to those v6 addresses wouldn't — no host IPv6.)
   Net std surface: UDP (loopback + external + sender addr), TCP (loopback + external client + wire
-  listener/accept + IPv6 connect), DNS (**incl. large replies via the shared frame**), and IPv6 on
-  the wire. Remaining: a reachable v6 peer to complete a v6 handshake (environment, not code);
-  SLIRP-v6/DHCP coexistence; AAAA (IPv6 DNS) records.
+  listener/accept + IPv6 connect), DNS (real, **A + AAAA**, large replies via the shared frame), and
+  IPv6 on the wire. Remaining: a reachable v6 peer to complete a v6 handshake (environment, not
+  code); SLIRP-v6/DHCP coexistence.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 

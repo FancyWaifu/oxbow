@@ -951,12 +951,12 @@ static DNS_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool
 
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __oxbow_dns_resolve(name: *const u8, len: usize, out_ip: *mut u32) -> i32 {
+/// Send a DNS query of `qtype` for `name` over the shared transfer frame and copy the
+/// response into `out`, returning its length (0 = fail/timeout). Serialized + attaches
+/// the frame once (the frame is a single per-process global).
+#[cfg(feature = "hosted")]
+unsafe fn dns_transport(name: &str, qtype: u16, out: &mut [u8]) -> usize {
     use core::sync::atomic::Ordering;
-    let bytes = unsafe { core::slice::from_raw_parts(name, len) };
-    let Ok(name) = core::str::from_utf8(bytes) else { return -1 };
-
-    // Serialize: the transfer frame is one global buffer.
     while DNS_LOCK.swap(true, Ordering::Acquire) {
         core::hint::spin_loop();
     }
@@ -970,30 +970,27 @@ pub unsafe extern "C" fn __oxbow_dns_resolve(name: *const u8, len: usize, out_ip
             f
         } else {
             DNS_LOCK.store(false, Ordering::Release);
-            return -1;
+            return 0;
         }
     };
     let server = udp::dns_server(oxbow_abi::BOOT_NET_EP);
     let Some((sock, _)) = udp::bind(oxbow_abi::BOOT_NET_EP, 0) else {
         DNS_LOCK.store(false, Ordering::Release);
-        return -1;
+        return 0;
     };
-    let mut rc = -1;
-    let query = dns::query(0x1234, name);
+    let mut got = 0;
+    let query = dns::query(0x1234, name, qtype);
     let qn = query.len().min(1472);
-    // Stage the query in the shared frame and send it from there; the reply (up to
-    // ~1472 B) lands back in the frame — no 56-byte inline cap.
+    // Stage the query in the shared frame; the reply (up to ~1472 B) lands back in it.
     unsafe { core::ptr::copy_nonoverlapping(query.as_ptr(), frame, qn) };
     if udp::sendv(sock, server, 53, qn) {
         let start = sys_uptime_ms();
         loop {
             let n = udp::recvv(sock);
             if n > 0 {
-                let resp = unsafe { core::slice::from_raw_parts(frame as *const u8, n) };
-                if let Some(ip) = dns::first_a(resp) {
-                    unsafe { out_ip.write(u32::from_be_bytes(ip)) };
-                    rc = 0;
-                }
+                let m = n.min(out.len());
+                unsafe { core::ptr::copy_nonoverlapping(frame as *const u8, out.as_mut_ptr(), m) };
+                got = m;
                 break;
             }
             if sys_uptime_ms().wrapping_sub(start) > 4000 {
@@ -1003,7 +1000,41 @@ pub unsafe extern "C" fn __oxbow_dns_resolve(name: *const u8, len: usize, out_ip
     }
     udp::close(sock);
     DNS_LOCK.store(false, Ordering::Release);
-    rc
+    got
+}
+
+/// Resolve `name` to an IPv4 (A record); writes a big-endian IPv4 to `out_ip`.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_dns_resolve(name: *const u8, len: usize, out_ip: *mut u32) -> i32 {
+    let bytes = unsafe { core::slice::from_raw_parts(name, len) };
+    let Ok(name) = core::str::from_utf8(bytes) else { return -1 };
+    let mut buf = [0u8; 512];
+    let n = unsafe { dns_transport(name, dns::TYPE_A, &mut buf) };
+    if n > 0 {
+        if let Some(ip) = dns::first_a(&buf[..n]) {
+            unsafe { out_ip.write(u32::from_be_bytes(ip)) };
+            return 0;
+        }
+    }
+    -1
+}
+
+/// Resolve `name` to an IPv6 (AAAA record); writes the 16 address bytes to `out_ip16`.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_dns_resolve6(name: *const u8, len: usize, out_ip16: *mut u8) -> i32 {
+    let bytes = unsafe { core::slice::from_raw_parts(name, len) };
+    let Ok(name) = core::str::from_utf8(bytes) else { return -1 };
+    let mut buf = [0u8; 512];
+    let n = unsafe { dns_transport(name, dns::TYPE_AAAA, &mut buf) };
+    if n > 0 {
+        if let Some(ip) = dns::first_aaaa(&buf[..n]) {
+            unsafe { core::ptr::copy_nonoverlapping(ip.as_ptr(), out_ip16, 16) };
+            return 0;
+        }
+    }
+    -1
 }
 // §100 piped Command stdio: a pipe → a grantable write-end (R_OUT|R_GRANT) the
 // child gets as stdout, and a read-end (R_IN) the parent reads.
@@ -1771,8 +1802,11 @@ pub mod udp {
 pub mod dns {
     use alloc::vec::Vec;
 
-    /// Build a standard recursive A-record query for `name` (e.g. "example.com").
-    pub fn query(id: u16, name: &str) -> Vec<u8> {
+    pub const TYPE_A: u16 = 1;
+    pub const TYPE_AAAA: u16 = 28;
+
+    /// Build a standard recursive query for `name` of record type `qtype` (A or AAAA).
+    pub fn query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
         let mut q = Vec::new();
         q.extend_from_slice(&id.to_be_bytes());
         q.extend_from_slice(&0x0100u16.to_be_bytes()); // recursion desired
@@ -1785,7 +1819,7 @@ pub mod dns {
             q.extend_from_slice(label.as_bytes());
         }
         q.push(0);
-        q.extend_from_slice(&1u16.to_be_bytes()); // QTYPE = A
+        q.extend_from_slice(&qtype.to_be_bytes()); // QTYPE
         q.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
         q
     }
@@ -1825,6 +1859,36 @@ pub mod dns {
             off += 10;
             if typ == 1 && rdlen == 4 && off + 4 <= resp.len() {
                 return Some([resp[off], resp[off + 1], resp[off + 2], resp[off + 3]]);
+            }
+            off += rdlen;
+        }
+        None
+    }
+
+    /// Parse the first AAAA (IPv6) answer out of a DNS response.
+    pub fn first_aaaa(resp: &[u8]) -> Option<[u8; 16]> {
+        if resp.len() < 12 {
+            return None;
+        }
+        let qd = u16::from_be_bytes([resp[4], resp[5]]);
+        let an = u16::from_be_bytes([resp[6], resp[7]]);
+        let mut off = 12;
+        for _ in 0..qd {
+            off = skip_name(resp, off)?;
+            off += 4;
+        }
+        for _ in 0..an {
+            off = skip_name(resp, off)?;
+            if off + 10 > resp.len() {
+                return None;
+            }
+            let typ = u16::from_be_bytes([resp[off], resp[off + 1]]);
+            let rdlen = u16::from_be_bytes([resp[off + 8], resp[off + 9]]) as usize;
+            off += 10;
+            if typ == TYPE_AAAA && rdlen == 16 && off + 16 <= resp.len() {
+                let mut a = [0u8; 16];
+                a.copy_from_slice(&resp[off..off + 16]);
+                return Some(a);
             }
             off += rdlen;
         }
