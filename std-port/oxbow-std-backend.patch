@@ -2040,10 +2040,10 @@ index 3eb20dae..63e444e3 100644
          use unsupported as imp;
 diff --git a/library/std/src/sys/process/oxbow.rs b/library/std/src/sys/process/oxbow.rs
 new file mode 100644
-index 00000000..1a00306b
+index 00000000..ccc8576e
 --- /dev/null
 +++ b/library/std/src/sys/process/oxbow.rs
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,381 @@
 +//! oxbow std::process — spawn a child program (std reads its ELF via std::fs),
 +//! inheriting the parent's stdio/cwd/net caps, and wait on its exit notification.
 +//! Piped stdio (output capture) + kill + try_wait are not wired yet.
@@ -2150,6 +2150,32 @@ index 00000000..1a00306b
 +        default: Stdio,
 +        _needs_stdin: bool,
 +    ) -> io::Result<(Process, StdioPipes)> {
++        // std contract: a program name, argument, cwd, or env var containing an interior
++        // NUL byte is rejected with InvalidInput. Other platforms catch this implicitly in
++        // `CString::new`; oxbow passes length-prefixed strings to the kernel, so the NUL is
++        // otherwise silently embedded — check explicitly before doing anything observable.
++        fn has_nul(s: &OsStr) -> bool {
++            s.as_encoded_bytes().contains(&0)
++        }
++        let invalid = |what| Err(io::Error::new(io::ErrorKind::InvalidInput, what));
++        if has_nul(&self.program) {
++            return invalid("nul byte in program name");
++        }
++        for a in &self.args {
++            if has_nul(a) {
++                return invalid("nul byte in command argument");
++            }
++        }
++        if let Some(cwd) = &self.cwd {
++            if has_nul(cwd) {
++                return invalid("nul byte in working directory");
++            }
++        }
++        for (key, val) in self.env.iter() {
++            if has_nul(key) || val.is_some_and(has_nul) {
++                return invalid("nul byte in environment variable");
++            }
++        }
 +        // Resolve a bare program name to /bin/<name> (a path passes through).
 +        // Resolve relative to the program's cwd cap (the user namespace). /bin
 +        // (the shell's system tools) is NOT reachable from a user process.
