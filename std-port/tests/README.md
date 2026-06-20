@@ -133,3 +133,12 @@ binds `0.0.0.0:8080`, accepts one connection, echoes PONG. Run via `wire-listene
 which launches QEMU with `hostfwd=tcp:127.0.0.1:5555-:8080` and connects from the host —
 verified: the guest accepted from `10.0.2.2`, read PING, replied PONG, host got it. The 37
 loopback tcp tests stay green (no regression).
+
+## net (DNS) — resolution in Rust std, verified vs the real internet (`dns-test.rs`)
+
+`lookup_host` resolves real hostnames via a new rt `__oxbow_dns_resolve` shim: an A-record query
+to the leased resolver over UDP (reusing `rt::dns::query`/`first_a` + `rt::udp` + `TAG_NET_DNS`),
+returning the IPv4 that `lookup_host` wraps as a `SocketAddr`. No net-server/ISO change. `dns-test.rs`
+(plain program) resolves `example.com`/`one.one.one.one` and does `TcpStream::connect("example.com:80")`
++ HTTP HEAD. Run via `fsh.py` (slirp gives real internet) — verified: `example.com` → `104.20.23.154`,
+`HTTP/1.1 200 OK`. Inline UDP reply caps at 56 B (single-A responses); IPv4-only.

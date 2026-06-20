@@ -924,6 +924,39 @@ pub unsafe extern "C" fn __oxbow_udp_recv_from(
 pub extern "C" fn __oxbow_udp_close(sock: i64) {
     udp::close(sock as Handle);
 }
+// §103 std::net DNS resolution: resolve a hostname to an IPv4 by querying the leased
+// resolver over UDP, reusing the rt dns query/parse helpers. Writes a big-endian IPv4
+// to `out_ip` and returns 0 on success; -1 on failure/timeout. (Inline UDP path — fine
+// for the common single-A response; very large responses can truncate at 56 bytes.)
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_dns_resolve(name: *const u8, len: usize, out_ip: *mut u32) -> i32 {
+    let bytes = unsafe { core::slice::from_raw_parts(name, len) };
+    let Ok(name) = core::str::from_utf8(bytes) else { return -1 };
+    let server = udp::dns_server(oxbow_abi::BOOT_NET_EP);
+    let Some((sock, _)) = udp::bind(oxbow_abi::BOOT_NET_EP, 0) else { return -1 };
+    let mut rc = -1;
+    let query = dns::query(0x1234, name);
+    if udp::sendto(sock, server, 53, &query) {
+        let start = sys_uptime_ms();
+        let mut buf = [0u8; 56];
+        loop {
+            let n = udp::recvfrom(sock, &mut buf);
+            if n > 0 {
+                if let Some(ip) = dns::first_a(&buf[..n]) {
+                    unsafe { out_ip.write(u32::from_be_bytes(ip)) };
+                    rc = 0;
+                }
+                break;
+            }
+            if sys_uptime_ms().wrapping_sub(start) > 4000 {
+                break; // timeout
+            }
+        }
+    }
+    udp::close(sock);
+    rc
+}
 // §100 piped Command stdio: a pipe → a grantable write-end (R_OUT|R_GRANT) the
 // child gets as stdout, and a read-end (R_IN) the parent reads.
 #[cfg(feature = "hosted")]

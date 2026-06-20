@@ -302,9 +302,18 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     `hostfwd`:** a guest listener on `0.0.0.0:8080` accepted a connection from the host
     (`10.0.2.2`), read "PING" off the wire, replied "PONG" — the host client received it — while
     the 37 loopback tcp tests stayed green (no regression from the enum refactor).
-  Net std surface now: UDP (loopback + external w/ sender address) and TCP (loopback socketpair +
-  external client + **wire listener/accept**). Remaining: DNS resolution in Rust std (kernel
-  resolver is libc-only); IPv6 on the wire (the stack is v4-only).
+  - ✅ **DNS resolution in Rust std — verified against the real internet.** `lookup_host` now
+    resolves real hostnames (not just `localhost`/literals): a new rt `__oxbow_dns_resolve` shim
+    sends an A-record query to the leased resolver over UDP (reusing `rt::dns::query`/`first_a` +
+    `rt::udp` + `TAG_NET_DNS` for the server IP) and returns the IPv4; `lookup_host` wraps it into
+    a `SocketAddr`. No net-server/ISO change — pure rt + std over the existing UDP path. **Verified
+    on QEMU (slirp → real internet):** `example.com` → `104.20.23.154`, `one.one.one.one` →
+    `1.0.0.1`, and `TcpStream::connect("example.com:80")` (resolve-by-name + wire TCP) returned
+    `HTTP/1.1 200 OK`. (Inline UDP path caps the reply at 56 B — fine for a single-A response;
+    IPv4-only, matching the stack.)
+  Net std surface now: UDP (loopback + external w/ sender address), TCP (loopback socketpair +
+  external client + wire listener/accept), and **DNS**. Remaining: IPv6 on the wire (v4-only stack);
+  large DNS replies (would need the shared-frame UDP path).
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 

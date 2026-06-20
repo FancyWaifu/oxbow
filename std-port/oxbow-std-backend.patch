@@ -773,10 +773,10 @@ index 84b53fd3..6ee45989 100644
          pub use unsupported::*;
 diff --git a/library/std/src/sys/net/connection/oxbow.rs b/library/std/src/sys/net/connection/oxbow.rs
 new file mode 100644
-index 00000000..00a8307d
+index 00000000..dfb4f4ef
 --- /dev/null
 +++ b/library/std/src/sys/net/connection/oxbow.rs
-@@ -0,0 +1,905 @@
+@@ -0,0 +1,913 @@
 +//! oxbow network backend.
 +//!
 +//! oxbow's kernel net stack (e1000 → ARP/IPv4/UDP, smoltcp TCP) is reached by C/libc
@@ -825,6 +825,8 @@ index 00000000..00a8307d
 +    // returns a connected socket handle (>=0) + writes the peer, or <0 if none pending.
 +    fn __oxbow_tcp_listen(port: u16) -> i64;
 +    fn __oxbow_tcp_accept(listener: i64, peer_ip: *mut u32, peer_port: *mut u16) -> i64;
++    // DNS: resolve a hostname to a big-endian IPv4; 0 on success, -1 on failure.
++    fn __oxbow_dns_resolve(name: *const u8, len: usize, out_ip: *mut u32) -> i32;
 +}
 +
 +fn v4_be(a: &SocketAddr) -> Option<u32> {
@@ -1662,9 +1664,8 @@ index 00000000..00a8307d
 +    }
 +}
 +
-+/// Resolve a host. There's no DNS via Rust std yet (the kernel resolver is libc-only),
-+/// so this handles the cases the std net suite needs: `localhost` → loopback, and
-+/// literal IPv4/IPv6 addresses. Anything else is `Unsupported`.
++/// Resolve a host: `localhost` → loopback, literal IPv4/IPv6 directly, and any other
++/// name via a real DNS A-record query to the leased resolver (the net server's UDP path).
 +pub fn lookup_host(host: &str, port: u16) -> io::Result<LookupHost> {
 +    let mut addrs = VecDeque::new();
 +    if host.eq_ignore_ascii_case("localhost") {
@@ -1675,10 +1676,17 @@ index 00000000..00a8307d
 +    } else if let Ok(ip) = host.parse::<Ipv6Addr>() {
 +        addrs.push_back(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)));
 +    } else {
-+        return Err(io::const_error!(
-+            ErrorKind::Unsupported,
-+            "oxbow net: hostname resolution (DNS) is not wired to Rust std",
-+        ));
++        // Real DNS: query the resolver for an A record (IPv4 only).
++        let mut ip_be = 0u32;
++        let rc = unsafe { __oxbow_dns_resolve(host.as_ptr(), host.len(), &mut ip_be) };
++        if rc != 0 {
++            return Err(io::const_error!(
++                ErrorKind::Uncategorized,
++                "oxbow net: DNS resolution failed",
++            ));
++        }
++        let ip = Ipv4Addr::from(ip_be.to_be_bytes());
++        addrs.push_back(SocketAddr::V4(SocketAddrV4::new(ip, port)));
 +    }
 +    Ok(LookupHost { addrs })
 +}
