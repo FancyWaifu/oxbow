@@ -241,14 +241,14 @@ fn fs_large_file_byte_exact() {
 
 #[test]
 fn fs_many_files() {
-    // NOTE: this passed the intern-exhaustion fix (slots are reclaimed on close, so
-    // sequential opens reuse them). Held at 400 because ~540+ files exposes a SEPARATE,
-    // still-open fsd write-buffer/block-cache integrity bug (a file reads back with wrong
-    // content at scale). Raise N to 600 to reproduce that bug.
+    // Stresses the fsd path-intern table (reclaimed on close), large-scale write/read
+    // integrity (this once exposed a stale-read-cache bug: wbuf_flush wrote through to disk
+    // without invalidating the read block cache, so a file read right after its write
+    // returned a stale 0-byte block — fixed by invalidating the cache on flush).
     let dir = "/stress_many";
     let _ = fs::remove_dir_all(dir);
     fs::create_dir_all(dir).unwrap();
-    const N: usize = 400;
+    const N: usize = 600;
     for i in 0..N {
         let p = format!("{dir}/f{i}.txt");
         fs::write(&p, format!("content-{i}").as_bytes()).unwrap();

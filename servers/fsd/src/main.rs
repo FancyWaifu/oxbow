@@ -129,6 +129,11 @@ unsafe fn wbuf_flush() {
         );
         oxfs_flush();
         let _ = wr;
+        // The flush changed the on-disk bytes of W_PATH, so any block the read cache holds
+        // for that file is now stale. Invalidate it — otherwise a read right after a write
+        // (write -> wbuf -> flush-on-next-open -> read) can serve a stale block, e.g. the
+        // empty block from when the file was just created, yielding a 0-byte read.
+        cache_invalidate();
     }
     W_DIRTY = false;
     W_BLK = u64::MAX;
