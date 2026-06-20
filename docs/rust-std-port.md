@@ -311,9 +311,24 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     `1.0.0.1`, and `TcpStream::connect("example.com:80")` (resolve-by-name + wire TCP) returned
     `HTTP/1.1 200 OK`. (Inline UDP path caps the reply at 56 B — fine for a single-A response;
     IPv4-only, matching the stack.)
-  Net std surface now: UDP (loopback + external w/ sender address), TCP (loopback socketpair +
-  external client + wire listener/accept), and **DNS**. Remaining: IPv6 on the wire (v4-only stack);
-  large DNS replies (would need the shared-frame UDP path).
+  - ✅ **IPv6 on the wire — the guest emits real IPv6 (verified by packet capture).** Enabled
+    smoltcp's `proto-ipv6` and gave the interface a link-local `fe80::` (EUI-64 from the MAC, for
+    NDP) + a global in SLIRP's `fec0::/64` + a default v6 route; smoltcp runs IPv6 + Neighbor
+    Discovery itself. The TCP plumbing carries v6 both ways: `accept` returns a family flag + the
+    16-byte peer (net server → rt → std builds `SocketAddr::V6`), and a new `TAG_TCP_CONNECT6`
+    (+ `TcpStack::connect6`, rt `__oxbow_tcp_connect6`) lets `TcpStream::connect` to a v6 address.
+    `TcpListener::bind("[::]")` listens on the wire (port-only). **Verified**: `TcpStream::connect
+    ("[2606:4700:4700::1111]:80")` drove std→rt→net server→smoltcp→e1000 and a `filter-dump` of
+    net0 captured **18 IPv6 frames from the guest** — an ICMPv6 Neighbor Solicitation and TCP SYN
+    segments over IPv6 (`ipv6-capture-harness.py`). The connect returns refused (this host/QEMU has
+    no reachable v6 peer — no host IPv6, and SLIRP forwarding is IPv4-only), but the wire-level
+    IPv6 is genuine. 37 loopback tcp tests stay green (no regression from the connect/accept
+    refactor). Note: SLIRP `ipv6=on` disrupts the net server's IPv4 DHCP loop, so the capture runs
+    on the plain netdev (the guest transmits v6 regardless).
+  Net std surface: UDP (loopback + external + sender addr), TCP (loopback + external client + wire
+  listener/accept + **IPv6 connect**), DNS, and **IPv6 on the wire**. Remaining: a reachable v6 peer
+  to complete a v6 handshake (environment limitation, not a code gap); large DNS replies (shared
+  frame); SLIRP-v6/DHCP coexistence.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 

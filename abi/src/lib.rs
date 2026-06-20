@@ -560,6 +560,9 @@ pub const TAG_UDP_RECVFROM: u64 = u32::from_le_bytes(*b"URCV") as u64;
 /// Connect: request on NET_CTL, data[0]=dst IPv4 (BE u32), data[1]=dst port.
 /// Reply: data[0]=status (0=ok), handles[0]=badged TCP-socket cap.
 pub const TAG_TCP_CONNECT: u64 = u32::from_le_bytes(*b"TCON") as u64;
+/// Connect over IPv6: request on NET_CTL, data[0]=dst port, 16 address bytes at byte
+/// offset 8 (data[1..3]). Reply same as TAG_TCP_CONNECT.
+pub const TAG_TCP_CONNECT6: u64 = u32::from_le_bytes(*b"TCN6") as u64;
 /// Send on a TCP socket cap: data[0]=len, bytes from offset 8 (<=48).
 /// Reply: data[0]=status.
 pub const TAG_TCP_SEND: u64 = u32::from_le_bytes(*b"TSND") as u64;

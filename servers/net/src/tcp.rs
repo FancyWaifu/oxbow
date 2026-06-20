@@ -11,10 +11,17 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address,
+};
 
 fn now() -> Instant {
     Instant::from_millis(rt::sys_uptime_ms() as i64)
+}
+
+/// The Modified EUI-64 interface identifier for a MAC (insert ff:fe, flip the U/L bit).
+fn eui64(mac: [u8; 6]) -> [u8; 8] {
+    [mac[0] ^ 0x02, mac[1], mac[2], 0xff, 0xfe, mac[3], mac[4], mac[5]]
 }
 
 // --- the e1000 as a smoltcp phy::Device ------------------------------------
@@ -96,12 +103,34 @@ impl TcpStack {
         let mut device = PhyDevice { nic };
         let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         let mut iface = Interface::new(config, &mut device, now());
+        // IPv6 (§104): a link-local fe80::/64 (EUI-64 from the MAC, for NDP) and a global
+        // in SLIRP's default fec0::/64 prefix. smoltcp runs IPv6 + Neighbor Discovery
+        // itself; we just assign the addresses and a default route via SLIRP's v6 host.
+        let eui = eui64(mac);
+        let mut ll = [0u8; 16];
+        ll[0] = 0xfe;
+        ll[1] = 0x80;
+        ll[8..16].copy_from_slice(&eui);
+        let mut gl = [0u8; 16];
+        gl[0] = 0xfe;
+        gl[1] = 0xc0;
+        gl[15] = 0x15; // fec0::15 — matches the v4 .15 host id; SLIRP routes the whole /64
         iface.update_ip_addrs(|a| {
             let _ = a.push(IpCidr::new(IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), 24));
+            let _ = a.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::from(ll)), 64));
+            let _ = a.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::from(gl)), 64));
         });
         let _ = iface
             .routes_mut()
             .add_default_ipv4_route(Ipv4Address::new(gw[0], gw[1], gw[2], gw[3]));
+        // SLIRP's IPv6 host/router is fec0::2.
+        let mut r6 = [0u8; 16];
+        r6[0] = 0xfe;
+        r6[1] = 0xc0;
+        r6[15] = 0x02;
+        let _ = iface
+            .routes_mut()
+            .add_default_ipv6_route(Ipv6Address::from(r6));
         TcpStack {
             device,
             iface,
@@ -136,42 +165,60 @@ impl TcpStack {
     /// Non-blocking accept: poll the stack; if a listening socket on `port` has reached
     /// ESTABLISHED, hand it back as the accepted connection with the peer address, and
     /// replenish a fresh listening socket. `None` = nothing pending this poll.
-    pub fn accept(&mut self, port: u16) -> Option<(SocketHandle, [u8; 4], u16)> {
+    /// Returns `(socket, peer_addr_16, is_v6, peer_port)`. For an IPv4 peer the address
+    /// occupies the first 4 bytes; for IPv6 it is the full 16 bytes.
+    pub fn accept(&mut self, port: u16) -> Option<(SocketHandle, [u8; 16], bool, u16)> {
         self.poll();
         let idx = self.listeners.iter().position(|&(p, h)| {
             p == port && self.sockets.get::<tcp::Socket>(h).state() == tcp::State::Established
         })?;
         let (p, h) = self.listeners.remove(idx);
-        let (ip, peer_port) = match self.sockets.get::<tcp::Socket>(h).remote_endpoint() {
+        let (addr, is_v6, peer_port) = match self.sockets.get::<tcp::Socket>(h).remote_endpoint() {
             Some(ep) => {
-                let ip = match ep.addr {
-                    IpAddress::Ipv4(v4) => v4.octets(),
-                    #[allow(unreachable_patterns)]
-                    _ => [0; 4],
+                let mut a = [0u8; 16];
+                let v6 = match ep.addr {
+                    IpAddress::Ipv4(v4) => {
+                        a[..4].copy_from_slice(&v4.octets());
+                        false
+                    }
+                    IpAddress::Ipv6(v6) => {
+                        a.copy_from_slice(&v6.octets());
+                        true
+                    }
                 };
-                (ip, ep.port)
+                (a, v6, ep.port)
             }
-            None => ([0; 4], 0),
+            None => ([0u8; 16], false, 0),
         };
         if let Some(nh) = self.new_listening_socket(p) {
             self.listeners.push((p, nh));
         }
-        Some((h, ip, peer_port))
+        Some((h, addr, is_v6, peer_port))
     }
 
     fn poll(&mut self) {
         let _ = self.iface.poll(now(), &mut self.device, &mut self.sockets);
     }
 
-    /// Open a connection to `dst:port`. Returns the socket handle once the
-    /// three-way handshake completes, or None on refusal/timeout.
+    /// Open a connection to an IPv4 `dst:port`. Handle once established, else None.
     pub fn connect(&mut self, dst: [u8; 4], port: u16) -> Option<SocketHandle> {
+        let remote = IpEndpoint::new(IpAddress::v4(dst[0], dst[1], dst[2], dst[3]), port);
+        self.connect_endpoint(remote)
+    }
+
+    /// Open a connection to an IPv6 `dst:port`. smoltcp drives Neighbor Discovery to
+    /// resolve the next hop and emits the SYN over IPv6.
+    pub fn connect6(&mut self, dst: [u8; 16], port: u16) -> Option<SocketHandle> {
+        let remote = IpEndpoint::new(IpAddress::Ipv6(Ipv6Address::from(dst)), port);
+        self.connect_endpoint(remote)
+    }
+
+    fn connect_endpoint(&mut self, remote: IpEndpoint) -> Option<SocketHandle> {
         let rx = tcp::SocketBuffer::new(vec![0u8; 4096]);
         let tx = tcp::SocketBuffer::new(vec![0u8; 4096]);
         let mut sock = tcp::Socket::new(rx, tx);
         let local = self.next_port;
         self.next_port = if self.next_port >= 65000 { 49152 } else { self.next_port + 1 };
-        let remote = IpEndpoint::new(IpAddress::v4(dst[0], dst[1], dst[2], dst[3]), port);
         if sock.connect(self.iface.context(), remote, local).is_err() {
             return None;
         }

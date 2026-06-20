@@ -829,6 +829,16 @@ pub extern "C" fn __oxbow_tcp_connect(ip_be: u32, port: u16) -> i64 {
 }
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_tcp_connect6(addr16: *const u8, port: u16) -> i64 {
+    let mut addr = [0u8; 16];
+    unsafe { core::ptr::copy_nonoverlapping(addr16, addr.as_mut_ptr(), 16) };
+    match tcp::connect6(oxbow_abi::BOOT_NET_EP, addr, port) {
+        Some(h) => h as i64,
+        None => -1,
+    }
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __oxbow_tcp_send(sock: i64, buf: *const u8, len: usize) -> isize {
     let data = unsafe { core::slice::from_raw_parts(buf, len) };
     if tcp::send(sock as Handle, data) { len as isize } else { -1 }
@@ -858,13 +868,15 @@ pub extern "C" fn __oxbow_tcp_listen(port: u16) -> i64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __oxbow_tcp_accept(
     listener: i64,
-    peer_ip: *mut u32,
+    peer_ip16: *mut u8,
+    is_v6: *mut u8,
     peer_port: *mut u16,
 ) -> i64 {
     match tcp::accept(listener as Handle) {
-        Some((h, ip, port)) => {
+        Some((h, addr, v6, port)) => {
             unsafe {
-                peer_ip.write(u32::from_be_bytes(ip));
+                core::ptr::copy_nonoverlapping(addr.as_ptr(), peer_ip16, 16);
+                is_v6.write(v6 as u8);
                 peer_port.write(port);
             }
             h as i64
@@ -1790,9 +1802,23 @@ pub mod dns {
 pub mod tcp {
     use crate::{sys_call, sys_close, Handle};
     use oxbow_abi::{
-        MsgBuf, TAG_TCP_ACCEPT, TAG_TCP_CLOSE, TAG_TCP_CONNECT, TAG_TCP_LISTEN, TAG_TCP_RECV,
-        TAG_TCP_SEND,
+        MsgBuf, TAG_TCP_ACCEPT, TAG_TCP_CLOSE, TAG_TCP_CONNECT, TAG_TCP_CONNECT6, TAG_TCP_LISTEN,
+        TAG_TCP_RECV, TAG_TCP_SEND,
     };
+
+    /// Open an IPv6 TCP connection to `addr:port`; returns a socket cap once the
+    /// handshake completes (None on refusal/timeout).
+    pub fn connect6(ctl: Handle, addr: [u8; 16], port: u16) -> Option<Handle> {
+        let mut m = MsgBuf::new(TAG_TCP_CONNECT6);
+        m.data[0] = port as u64;
+        let dst = m.data.as_mut_ptr() as *mut u8;
+        unsafe { core::ptr::copy_nonoverlapping(addr.as_ptr(), dst.add(8), 16) };
+        m.data_len = 3;
+        if sys_call(ctl, &mut m).is_err() || m.data[0] != 0 || m.handle_count == 0 {
+            return None;
+        }
+        Some(m.handles[0])
+    }
 
     /// Start listening on `port` via control cap `ctl`; returns a badged listener cap.
     pub fn listen(ctl: Handle, port: u16) -> Option<Handle> {
@@ -1805,16 +1831,19 @@ pub mod tcp {
         Some(m.handles[0])
     }
 
-    /// Non-blocking accept on a listener cap: returns (socket cap, peer IPv4, peer port)
-    /// when a connection is pending, else None (the caller polls).
-    pub fn accept(listener: Handle) -> Option<(Handle, [u8; 4], u16)> {
+    /// Non-blocking accept on a listener cap: returns (socket cap, peer addr (16 bytes;
+    /// v4 in the first 4), is_v6, peer port) when a connection is pending, else None.
+    pub fn accept(listener: Handle) -> Option<(Handle, [u8; 16], bool, u16)> {
         let mut m = MsgBuf::new(TAG_TCP_ACCEPT);
         if sys_call(listener, &mut m).is_err() || m.data[0] != 0 || m.handle_count == 0 {
             return None;
         }
-        let ip = (m.data[1] as u32).to_be_bytes();
+        let is_v6 = m.data[1] == 6;
         let port = m.data[2] as u16;
-        Some((m.handles[0], ip, port))
+        let mut addr = [0u8; 16];
+        let src = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(24), 16) };
+        addr.copy_from_slice(src);
+        Some((m.handles[0], addr, is_v6, port))
     }
 
     /// Open a TCP connection to `ip:port` via control cap `ctl`; returns a socket

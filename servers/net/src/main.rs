@@ -28,7 +28,7 @@ use eth::{ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use oxbow_abi::{
     MsgBuf, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_NET_IRQ, BOOT_PCI, NET_DMA, NET_MMIO, NET_SHARED,
     PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_NET_DNS, TAG_TCP_ACCEPT, TAG_TCP_CLOSE,
-    TAG_TCP_CONNECT, TAG_TCP_LISTEN,
+    TAG_TCP_CONNECT, TAG_TCP_CONNECT6, TAG_TCP_LISTEN,
     TAG_TCP_RECV, TAG_TCP_SEND, TAG_UDP_ATTACH, TAG_UDP_BIND, TAG_UDP_CLOSE, TAG_UDP_RECVFROM,
     TAG_UDP_RECVV, TAG_UDP_SENDTO, TAG_UDP_SENDV,
 };
@@ -796,6 +796,43 @@ pub extern "C" fn oxbow_main() -> ! {
                     }
                 }
             }
+            // Control channel: open an IPv6 TCP connection. data[0]=port, 16 addr bytes
+            // at byte offset 8.
+            TAG_TCP_CONNECT6 => {
+                let dport = m.data[0] as u16;
+                let mut addr = [0u8; 16];
+                let src =
+                    unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), 16) };
+                addr.copy_from_slice(src);
+                let free = sockets.iter().position(|s| matches!(s, Sock::Free));
+                match free.and_then(|idx| tcp_stack.connect6(addr, dport).map(|h| (idx, h))) {
+                    Some((idx, handle)) => {
+                        sockets[idx] = Sock::Tcp(handle);
+                        match rt::sys_mint(BOOT_EP, (idx + 1) as u64, R_SEND | R_GRANT) {
+                            Ok(cap) => {
+                                r.data[0] = 0;
+                                r.data_len = 1;
+                                r.handle_count = 1;
+                                r.handles[0] = cap;
+                                let _ = rt::sys_reply(reply, &r);
+                                let _ = rt::sys_close(cap);
+                            }
+                            Err(_) => {
+                                tcp_stack.close(handle);
+                                sockets[idx] = Sock::Free;
+                                r.data[0] = 1;
+                                r.data_len = 1;
+                                let _ = rt::sys_reply(reply, &r);
+                            }
+                        }
+                    }
+                    None => {
+                        r.data[0] = 1;
+                        r.data_len = 1;
+                        let _ = rt::sys_reply(reply, &r);
+                    }
+                }
+            }
             // TCP socket channel: send bytes.
             TAG_TCP_SEND => {
                 let sid = m.badge as usize;
@@ -885,16 +922,20 @@ pub extern "C" fn oxbow_main() -> ! {
                 let sid = m.badge as usize;
                 let mut replied = false;
                 if let Some(Sock::TcpListen(port)) = slot_of(&sockets, sid) {
-                    if let Some((handle, ip, peer_port)) = tcp_stack.accept(port) {
+                    if let Some((handle, addr, is_v6, peer_port)) = tcp_stack.accept(port) {
                         match sockets.iter().position(|s| matches!(s, Sock::Free)) {
                             Some(idx) => {
                                 sockets[idx] = Sock::Tcp(handle);
                                 if let Ok(cap) = rt::sys_mint(BOOT_EP, (idx + 1) as u64, R_SEND | R_GRANT)
                                 {
+                                    // data[0]=status, [1]=family(4/6), [2]=port, 16 peer
+                                    // address bytes at byte offset 24 (data[3..5]).
                                     r.data[0] = 0;
-                                    r.data[1] = u32::from_be_bytes(ip) as u64;
+                                    r.data[1] = if is_v6 { 6 } else { 4 };
                                     r.data[2] = peer_port as u64;
-                                    r.data_len = 3;
+                                    let dst = r.data.as_mut_ptr() as *mut u8;
+                                    unsafe { core::ptr::copy_nonoverlapping(addr.as_ptr(), dst.add(24), 16) };
+                                    r.data_len = 5;
                                     r.handle_count = 1;
                                     r.handles[0] = cap;
                                     let _ = rt::sys_reply(reply, &r);
