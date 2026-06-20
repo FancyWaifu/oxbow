@@ -384,6 +384,14 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
   client + wire listener/accept, **IPv4 and IPv6**, full handshakes verified both directions), DNS
   (real, A + AAAA, large replies via the shared frame), and IPv6 on the wire — all coexisting under
   dual-stack SLIRP.
+  - ✅ **Full net suite, end to end — 5/5.** `std-port/tests/net-suite.py` boots oxbow and runs the
+    whole surface in one pass: (1) **53/53** loopback UDP+TCP std libtests (`net-libtest-main.rs` =
+    udp-tests 16 + tcp-tests 37), (2) **DNS** A+AAAA against the real internet, (3) **IPv4 wire
+    `TcpListener`** accepting an inbound connection from the host (slirp hostfwd), (4) **IPv6
+    two-VM full handshake** (one oxbow listens, another connects — `accepted from [fec0::b]`,
+    PING6/PONG6), (5) **dual-stack SLIRP** (real DHCP lease + DNS with IPv6 enabled). All green
+    in a single run (the harness retries transient QEMU boot stalls and boots the two VMs
+    sequentially).
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 
