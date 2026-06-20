@@ -222,10 +222,10 @@ index 0c297c57..a1404d0b 100644
          use vexos as imp;
 diff --git a/library/std/src/sys/fs/oxbow.rs b/library/std/src/sys/fs/oxbow.rs
 new file mode 100644
-index 00000000..40eb6c3c
+index 00000000..34e58eda
 --- /dev/null
 +++ b/library/std/src/sys/fs/oxbow.rs
-@@ -0,0 +1,668 @@
+@@ -0,0 +1,681 @@
 +//! oxbow std::fs — real File open/read/write/seek + stat over the fsd protocol
 +//! (oxbow-rt's `__oxbow_fs_*` shims), relative to the program's cwd dir cap.
 +//! Directory listing, symlinks, rename/unlink, timestamps and permissions are not
@@ -237,6 +237,7 @@ index 00000000..40eb6c3c
 +use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
 +use crate::path::{Path, PathBuf};
 +pub use crate::sys::fs::common::Dir;
++use crate::sync::Arc;
 +use crate::sync::atomic::{AtomicU64, Ordering};
 +use crate::sys::time::SystemTime;
 +use crate::sys::unsupported;
@@ -278,13 +279,27 @@ index 00000000..40eb6c3c
 +    io::Error::new(kind, msg)
 +}
 +
-+pub struct File {
++/// The shared file state. `File::try_clone`/`duplicate` hand out another `File`
++/// pointing at the SAME `FileInner` (an `Arc`), so both handles share the fd, the
++/// client-side cursor, and the cached size — POSIX dup semantics — and the fd is
++/// closed once, when the last clone drops.
++struct FileInner {
 +    fd: i64,
 +    pos: AtomicU64,
 +    size: AtomicU64,
 +    kind: u32, // FS_DIR / FS_FILE / FS_SYMLINK
 +    mtime: u32,
 +    atime: u32,
++}
++
++impl Drop for FileInner {
++    fn drop(&mut self) {
++        unsafe { __oxbow_fs_close(self.fd) };
++    }
++}
++
++pub struct File {
++    inner: Arc<FileInner>,
 +}
 +
 +#[derive(Clone)]
@@ -505,21 +520,23 @@ index 00000000..40eb6c3c
 +        }
 +        let start = if opts.append { size } else { 0 };
 +        Ok(File {
-+            fd,
-+            pos: AtomicU64::new(start),
-+            size: AtomicU64::new(size),
-+            kind: kind as u32,
-+            mtime,
-+            atime,
++            inner: Arc::new(FileInner {
++                fd,
++                pos: AtomicU64::new(start),
++                size: AtomicU64::new(size),
++                kind: kind as u32,
++                mtime,
++                atime,
++            }),
 +        })
 +    }
 +
 +    pub fn file_attr(&self) -> io::Result<FileAttr> {
 +        Ok(FileAttr {
-+            size: self.size.load(Ordering::Relaxed),
-+            kind: self.kind,
-+            mtime: self.mtime,
-+            atime: self.atime,
++            size: self.inner.size.load(Ordering::Relaxed),
++            kind: self.inner.kind,
++            mtime: self.inner.mtime,
++            atime: self.inner.atime,
 +        })
 +    }
 +    pub fn fsync(&self) -> io::Result<()> {
@@ -544,21 +561,21 @@ index 00000000..40eb6c3c
 +        Ok(())
 +    }
 +    pub fn truncate(&self, size: u64) -> io::Result<()> {
-+        if unsafe { __oxbow_fs_truncate(self.fd, size) } != 0 {
++        if unsafe { __oxbow_fs_truncate(self.inner.fd, size) } != 0 {
 +            return Err(ioerr(io::ErrorKind::Other, "oxbow fs: truncate failed"));
 +        }
 +        // Keep the cached size coherent so a following metadata()/seek sees it.
-+        self.size.store(size, Ordering::Relaxed);
++        self.inner.size.store(size, Ordering::Relaxed);
 +        Ok(())
 +    }
 +
 +    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-+        let off = self.pos.load(Ordering::Relaxed);
-+        let n = unsafe { __oxbow_fs_pread(self.fd, buf.as_mut_ptr(), buf.len(), off) };
++        let off = self.inner.pos.load(Ordering::Relaxed);
++        let n = unsafe { __oxbow_fs_pread(self.inner.fd, buf.as_mut_ptr(), buf.len(), off) };
 +        if n < 0 {
 +            return Err(ioerr(io::ErrorKind::Other, "oxbow fs: read failed"));
 +        }
-+        self.pos.store(off + n as u64, Ordering::Relaxed);
++        self.inner.pos.store(off + n as u64, Ordering::Relaxed);
 +        Ok(n as usize)
 +    }
 +    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
@@ -581,14 +598,14 @@ index 00000000..40eb6c3c
 +    }
 +
 +    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-+        let off = self.pos.load(Ordering::Relaxed);
-+        let n = unsafe { __oxbow_fs_pwrite(self.fd, buf.as_ptr(), buf.len(), off) };
++        let off = self.inner.pos.load(Ordering::Relaxed);
++        let n = unsafe { __oxbow_fs_pwrite(self.inner.fd, buf.as_ptr(), buf.len(), off) };
 +        if n < 0 {
 +            return Err(ioerr(io::ErrorKind::Other, "oxbow fs: write failed"));
 +        }
 +        let end = off + n as u64;
-+        self.pos.store(end, Ordering::Relaxed);
-+        let _ = self.size.fetch_max(end, Ordering::Relaxed);
++        self.inner.pos.store(end, Ordering::Relaxed);
++        let _ = self.inner.size.fetch_max(end, Ordering::Relaxed);
 +        Ok(n as usize)
 +    }
 +    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
@@ -609,32 +626,28 @@ index 00000000..40eb6c3c
 +    pub fn seek(&self, pos: SeekFrom) -> io::Result<u64> {
 +        let new = match pos {
 +            SeekFrom::Start(o) => o,
-+            SeekFrom::End(o) => (self.size.load(Ordering::Relaxed) as i64 + o) as u64,
-+            SeekFrom::Current(o) => (self.pos.load(Ordering::Relaxed) as i64 + o) as u64,
++            SeekFrom::End(o) => (self.inner.size.load(Ordering::Relaxed) as i64 + o) as u64,
++            SeekFrom::Current(o) => (self.inner.pos.load(Ordering::Relaxed) as i64 + o) as u64,
 +        };
-+        self.pos.store(new, Ordering::Relaxed);
++        self.inner.pos.store(new, Ordering::Relaxed);
 +        Ok(new)
 +    }
 +    pub fn size(&self) -> Option<io::Result<u64>> {
-+        Some(Ok(self.size.load(Ordering::Relaxed)))
++        Some(Ok(self.inner.size.load(Ordering::Relaxed)))
 +    }
 +    pub fn tell(&self) -> io::Result<u64> {
-+        Ok(self.pos.load(Ordering::Relaxed))
++        Ok(self.inner.pos.load(Ordering::Relaxed))
 +    }
 +    pub fn duplicate(&self) -> io::Result<File> {
-+        unsupported()
++        // Share the same FileInner: both handles use one fd + one cursor + one cached
++        // size (POSIX dup semantics), and the fd is closed only when the last clone drops.
++        Ok(File { inner: self.inner.clone() })
 +    }
 +    pub fn set_permissions(&self, _perm: FilePermissions) -> io::Result<()> {
 +        Ok(())
 +    }
 +    pub fn set_times(&self, times: FileTimes) -> io::Result<()> {
-+        set_times_fd(self.fd, times)
-+    }
-+}
-+
-+impl Drop for File {
-+    fn drop(&mut self) {
-+        unsafe { __oxbow_fs_close(self.fd) };
++        set_times_fd(self.inner.fd, times)
 +    }
 +}
 +
@@ -658,7 +671,7 @@ index 00000000..40eb6c3c
 +
 +impl fmt::Debug for File {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        f.debug_struct("File").field("fd", &self.fd).finish()
++        f.debug_struct("File").field("fd", &self.inner.fd).finish()
 +    }
 +}
 +
@@ -772,7 +785,7 @@ index 00000000..40eb6c3c
 +    // fsd resolves the capability back to the on-disk path; oxbow has no symlinks, so
 +    // `set_times_nofollow` is identical.
 +    let f = File::open(p, &OpenOptions { read: true, ..OpenOptions::new() })?;
-+    let r = set_times_fd(f.fd, times);
++    let r = set_times_fd(f.inner.fd, times);
 +    drop(f);
 +    r
 +}
