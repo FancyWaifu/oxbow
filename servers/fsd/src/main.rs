@@ -863,13 +863,13 @@ pub extern "C" fn oxbow_main() -> ! {
             TAG_FS_WRITE => {
                 cache_invalidate(); // §94: read cache may hold blocks we're changing
                 let off = m.data[0];
-                let count = (m.data[1] as usize).min(48);
+                let count = (m.data[1] as usize).min(480); // payload past the 16 B header
                 let mut full = [0u8; 256];
                 let mut written = 0usize;
                 if valid && full_path(id, &mut full).is_some() {
                     let src = unsafe { (m.data.as_ptr() as *const u8).add(16) };
                     // §94: coalesce into 4 KiB blocks instead of open+write+flush
-                    // per 48 bytes — the difference between seconds and minutes for
+                    // per write — the difference between seconds and minutes for
                     // a multi-MiB file.
                     written = unsafe { wbuf_write(&full, off, src, count) };
                 }

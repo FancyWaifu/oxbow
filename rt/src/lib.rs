@@ -721,14 +721,17 @@ pub unsafe extern "C" fn __oxbow_fs_pread(file: i64, buf: *mut u8, len: usize, o
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __oxbow_fs_pwrite(file: i64, buf: *const u8, len: usize, off: u64) -> isize {
-    let n = len.min(48);
+    // Up to 480 payload bytes ride one message (the 512 B inline area past the
+    // offset+count header at byte 16), ~10x fewer round trips than the old 48 B cap.
+    // std's write_all loops on the returned count, so a short write here is fine.
+    let n = len.min(480);
     let mut m = MsgBuf::new(oxbow_abi::TAG_FS_WRITE);
     m.data[0] = off;
     m.data[1] = n as u64;
     unsafe {
         core::ptr::copy_nonoverlapping(buf, (m.data.as_mut_ptr() as *mut u8).add(16), n);
     }
-    m.data_len = 8;
+    m.data_len = ((16 + n + 7) / 8) as u32; // words covering the header + payload
     if sys_call(file as Handle, &mut m).is_err() {
         return -1;
     }
