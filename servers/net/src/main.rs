@@ -130,10 +130,20 @@ fn dhcp_send(nic: &mut Nic, payload: &[u8]) {
 
 /// Wait for a DHCP reply of `want_type` matching `xid` (servicing background
 /// traffic). Bounded so a non-answering network can't wedge boot forever.
-fn dhcp_recv(nic: &mut Nic, cache: &mut arp::Cache, xid: u32, want_type: u8) -> Option<dhcp::Reply> {
+fn dhcp_recv(
+    nic: &mut Nic,
+    cache: &mut arp::Cache,
+    xid: u32,
+    want_type: u8,
+    timeout_ms: u64,
+) -> Option<dhcp::Reply> {
     let mut buf = [0u8; BUF];
-    for _ in 0..32 {
-        let n = nic.recv_blocking(&mut buf);
+    // Bound by TIME via NON-BLOCKING polls: a blocking read parks on an empty ring (so
+    // the deadline could never fire), so poll until the reply lands or `timeout_ms`
+    // elapse, servicing background traffic (ARP/ICMP/NDP) meanwhile.
+    let start = rt::sys_uptime_ms();
+    while rt::sys_uptime_ms().wrapping_sub(start) < timeout_ms {
+        let Some(n) = nic.recv_poll(&mut buf) else { continue };
         handle_background(nic, cache, &buf[..n]);
         let Some((_, _, et, off)) = eth::parse(&buf[..n]) else { continue };
         if et != ETHERTYPE_IPV4 {
@@ -157,17 +167,24 @@ fn dhcp_recv(nic: &mut Nic, cache: &mut arp::Cache, xid: u32, want_type: u8) -> 
     None
 }
 
-/// Run the DHCP DORA handshake: DISCOVER -> OFFER -> REQUEST -> ACK.
+/// Run the DHCP DORA handshake: DISCOVER -> OFFER -> REQUEST -> ACK. RETRIES the
+/// DISCOVER: SLIRP with `ipv6=on` brings its IPv4 DHCP server up a beat late and drops
+/// the first DISCOVER, so a single shot would silently fall back to the static lease.
 fn dhcp_acquire(nic: &mut Nic, cache: &mut arp::Cache) -> Option<dhcp::Reply> {
     let xid = 0x6F78_626F; // "oxbo"
     let mac = nic.mac;
-    dhcp_send(nic, &dhcp::message(xid, &mac, dhcp::DISCOVER, None, None));
-    let offer = dhcp_recv(nic, cache, xid, dhcp::OFFER)?;
-    dhcp_send(
-        nic,
-        &dhcp::message(xid, &mac, dhcp::REQUEST, Some(offer.yiaddr), Some(offer.server_id)),
-    );
-    dhcp_recv(nic, cache, xid, dhcp::ACK)
+    for _ in 0..8 {
+        dhcp_send(nic, &dhcp::message(xid, &mac, dhcp::DISCOVER, None, None));
+        let Some(offer) = dhcp_recv(nic, cache, xid, dhcp::OFFER, 1200) else { continue };
+        dhcp_send(
+            nic,
+            &dhcp::message(xid, &mac, dhcp::REQUEST, Some(offer.yiaddr), Some(offer.server_id)),
+        );
+        if let Some(ack) = dhcp_recv(nic, cache, xid, dhcp::ACK, 1200) {
+            return Some(ack);
+        }
+    }
+    None
 }
 
 // The SLIRP gateway (also our DHCP server + router). Our own IP is leased via
@@ -422,15 +439,23 @@ fn arp_resolve(nic: &mut Nic, cache: &mut arp::Cache, target: [u8; 4]) -> [u8; 6
     }
     let pkt = arp::packet(arp::OP_REQUEST, nic.mac, nic.our_ip, [0; 6], target);
     let req = eth::frame(eth::BROADCAST, nic.mac, ETHERTYPE_ARP, &pkt);
-    nic.tx(&req);
     let mut buf = [0u8; BUF];
-    loop {
-        let n = nic.recv_blocking(&mut buf);
+    // Time-bounded + retransmitting so a silent peer (e.g. SLIRP in IPv6-only mode, where
+    // there is no IPv4 host to answer) can't wedge boot. Returns the zero MAC on give-up.
+    let start = rt::sys_uptime_ms();
+    let mut last_tx = 0u64;
+    while rt::sys_uptime_ms().wrapping_sub(start) < 4000 {
+        if rt::sys_uptime_ms().wrapping_sub(last_tx) > 500 {
+            nic.tx(&req);
+            last_tx = rt::sys_uptime_ms();
+        }
+        let Some(n) = nic.recv_poll(&mut buf) else { continue };
         handle_background(nic, cache, &buf[..n]);
         if let Some(mac) = cache.lookup(target) {
             return mac;
         }
     }
+    [0; 6]
 }
 
 #[no_mangle]

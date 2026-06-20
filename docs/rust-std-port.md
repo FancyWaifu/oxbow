@@ -343,10 +343,22 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     real AAAA — e.g. `example.com -> [104.20.23.154:80, [2606:4700:10::6814:179a]:80]`
     (`dns-aaaa-test.rs`). (Resolving AAAA needs only a DNS round-trip, so it works here even though
     connecting to those v6 addresses wouldn't — no host IPv6.)
+  - ✅ **SLIRP-v6 / DHCP coexistence + net-server boot hardening.** Root cause of the earlier
+    "`ipv6=on` breaks the net server" was a **netdev-config gotcha**, not an oxbow bug: QEMU's
+    `-netdev user,ipv6=on` makes slirp **IPv6-only** (it disables IPv4, so there is no IPv4 DHCP
+    server to answer) — true dual-stack needs **`ipv4=on,ipv6=on`**. Verified: with that, DHCP gets
+    a real lease (`10.0.2.15`, gw `10.0.2.2`, dns `10.0.2.3`), `[net] ready`, and DNS resolves A+AAAA
+    — IPv4 and IPv6 coexist. Hardened the net server so it **never hangs at boot in any config**:
+    `dhcp_recv` now polls non-blocking against a time bound (was a blocking read + fixed 32-packet
+    budget that parked on an empty ring), `dhcp_acquire` **retries the DISCOVER** (8×, slirp can be
+    slow to bring IPv4 DHCP up), and `arp_resolve` is time-bounded + retransmitting (was an
+    unbounded blocking loop — the actual stall). Verified IPv6-only mode now boots cleanly: DHCP
+    falls back to the static lease and the gateway ARP gives up gracefully (zero MAC), still reaching
+    `[net] ready` (`dual-stack-harness.py`).
   Net std surface: UDP (loopback + external + sender addr), TCP (loopback + external client + wire
-  listener/accept + IPv6 connect), DNS (real, **A + AAAA**, large replies via the shared frame), and
-  IPv6 on the wire. Remaining: a reachable v6 peer to complete a v6 handshake (environment, not
-  code); SLIRP-v6/DHCP coexistence.
+  listener/accept + IPv6 connect), DNS (real, A + AAAA, large replies via the shared frame), and
+  IPv6 on the wire — all coexisting under dual-stack SLIRP. Remaining: a reachable v6 peer to
+  complete a v6 handshake (environment, not code).
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 
