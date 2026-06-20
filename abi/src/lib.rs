@@ -482,6 +482,10 @@ pub const TAG_FS_RENAME: u64 = u32::from_le_bytes(*b"FSMV") as u64;
 /// the tree survives a reboot. Sent on the root dir cap. Reply: data[0]=status
 /// (0 ok), data[1]=entries written. The fs auto-restores from disk at boot.
 pub const TAG_FS_SYNC: u64 = u32::from_le_bytes(*b"FSSY") as u64;
+/// Release one reference to the path interned behind the message's capability (sent when
+/// a File/ReadDir cap is dropped). When the last reference goes, fsd frees the intern slot
+/// so opening many distinct files over a session doesn't exhaust the table.
+pub const TAG_FS_RELEASE: u64 = u32::from_le_bytes(*b"FRLS") as u64;
 /// Truncate the file behind the message's capability to `data[0]` bytes (set_len).
 pub const TAG_FS_TRUNCATE: u64 = u32::from_le_bytes(*b"FTRN") as u64;
 /// Set mtime (`data[0]`) / atime (`data[1]`) on the file capability; `data[2]` bit0=set

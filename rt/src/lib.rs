@@ -736,6 +736,12 @@ pub unsafe extern "C" fn __oxbow_fs_pwrite(file: i64, buf: *const u8, len: usize
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
 pub extern "C" fn __oxbow_fs_close(file: i64) {
+    // Tell fsd we're done with this path (drops its intern refcount so the slot is
+    // reclaimed), THEN drop the capability. A best-effort call: a failed send just means
+    // the slot is freed later (on unlink) as before.
+    let mut m = MsgBuf::new(oxbow_abi::TAG_FS_RELEASE);
+    m.data_len = 0;
+    let _ = sys_call(file as Handle, &mut m);
     let _ = sys_close(file as Handle);
 }
 /// std::fs::create_dir — TAG_FS_MKDIR(name) to the cwd dir cap (slot 1).
@@ -1892,15 +1898,22 @@ pub mod udp {
     }
 
     /// Send `payload` (<=40 bytes inline) to `ip:dport` on socket cap `sock`.
+    /// Send one UDP datagram (≤480 payload bytes — the inline message area past the
+    /// addr/port/len header). A datagram cannot be split, so an oversized payload is
+    /// REJECTED (returns false) rather than silently truncated. Sends the WHOLE payload
+    /// for sizes that fit.
     pub fn sendto(sock: Handle, ip: [u8; 4], dport: u16, payload: &[u8]) -> bool {
-        let n = payload.len().min(40);
+        if payload.len() > 480 {
+            return false; // too large for one inline datagram; don't truncate
+        }
+        let n = payload.len();
         let mut m = MsgBuf::new(TAG_UDP_SENDTO);
         m.data[0] = u32::from_be_bytes(ip) as u64;
         m.data[1] = dport as u64;
         m.data[2] = n as u64;
         let dst = m.data.as_mut_ptr() as *mut u8;
         unsafe { core::ptr::copy_nonoverlapping(payload.as_ptr(), dst.add(24), n) };
-        m.data_len = 8;
+        m.data_len = 64; // up to the full 512-byte inline area
         sys_call(sock, &mut m).is_ok() && m.data[0] == 0
     }
 

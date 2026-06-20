@@ -222,10 +222,10 @@ index 0c297c57..a1404d0b 100644
          use vexos as imp;
 diff --git a/library/std/src/sys/fs/oxbow.rs b/library/std/src/sys/fs/oxbow.rs
 new file mode 100644
-index 00000000..34e58eda
+index 00000000..410e2fbb
 --- /dev/null
 +++ b/library/std/src/sys/fs/oxbow.rs
-@@ -0,0 +1,681 @@
+@@ -0,0 +1,689 @@
 +//! oxbow std::fs — real File open/read/write/seek + stat over the fsd protocol
 +//! (oxbow-rt's `__oxbow_fs_*` shims), relative to the program's cwd dir cap.
 +//! Directory listing, symlinks, rename/unlink, timestamps and permissions are not
@@ -500,14 +500,22 @@ index 00000000..34e58eda
 +impl File {
 +    pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
 +        let b = pbytes(path);
-+        // create_new is O_EXCL: fsd's open is create-or-truncate (no exclusivity), so
-+        // enforce it here — fail if the path already exists.
-+        if opts.create_new && stat(path).is_ok() {
++        // fsd's primitive open is "open existing" (create=0) or "create-or-truncate"
++        // (create=1). std's OpenOptions split create-if-missing from truncation, so map
++        // them onto stat + the right primitive instead of conflating them (which used to
++        // truncate every create-flagged open — breaking append and create-without-trunc).
++        let existed = stat(path).is_ok();
++        if opts.create_new && existed {
 +            return Err(ioerr(io::ErrorKind::AlreadyExists, "oxbow fs: create_new on existing path"));
 +        }
-+        // fsd has open (existing) and create-or-truncate. Map: any create flag ->
-+        // create-or-truncate; otherwise open the existing node.
-+        let create = (opts.create || opts.create_new) as i32;
++        if !existed && !(opts.create || opts.create_new) {
++            return Err(ioerr(io::ErrorKind::NotFound, "oxbow fs: open of missing file"));
++        }
++        // fsd's create=1 primitive is "create-or-TRUNCATE", create=0 is "open existing in
++        // place". So request create-or-truncate when the file is missing (make it) OR a
++        // truncation was explicitly asked for; otherwise open the existing node untouched
++        // (this is what makes append + create-without-truncate keep their contents).
++        let create = (!existed || opts.truncate) as i32;
 +        let mut size = 0u64;
 +        let mut kind = 0i32;
 +        let mut mtime = 0u32;

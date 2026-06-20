@@ -25,8 +25,8 @@ use oxbow_abi::{
     FS_DIR, FS_FILE, FS_INITRD, FS_ROOT, FS_SYMLINK, PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_BLK_ATTACH,
     TAG_BLK_FLUSH, TAG_BLK_READ, TAG_BLK_READN, TAG_BLK_WRITE, TAG_BLK_WRITEN, TAG_FS_CREATE,
     TAG_FS_LINK, TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_FS_READLINK,
-    TAG_FS_RENAME, TAG_FS_SETTIMES, TAG_FS_SYMLINK, TAG_FS_SYNC, TAG_FS_TRUNCATE, TAG_FS_UNLINK,
-    TAG_FS_WRITE,
+    TAG_FS_RELEASE, TAG_FS_RENAME, TAG_FS_SETTIMES, TAG_FS_SYMLINK, TAG_FS_SYNC, TAG_FS_TRUNCATE,
+    TAG_FS_UNLINK, TAG_FS_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -397,6 +397,10 @@ const PLEN: usize = 200;
 static mut PATHS: [[u8; PLEN]; MAXID] = [[0; PLEN]; MAXID];
 static mut PLENS: [u16; MAXID] = [0; MAXID];
 static mut USED: [bool; MAXID] = [false; MAXID];
+// Live capability references per intern id: bumped when OPEN mints a cap, dropped on
+// TAG_FS_RELEASE (client File/ReadDir close). The slot is reclaimed when this hits 0, so
+// only CONCURRENTLY-open paths occupy the table (sequential opens reuse slots).
+static mut REFS: [u16; MAXID] = [0; MAXID];
 
 fn rel(id: usize) -> &'static [u8] {
     unsafe { &PATHS[id][..PLENS[id] as usize] }
@@ -485,7 +489,22 @@ fn free_intern(relpath: &[u8]) {
             if USED[i] && &PATHS[i][..PLENS[i] as usize] == relpath {
                 USED[i] = false;
                 PLENS[i] = 0;
+                REFS[i] = 0;
                 return;
+            }
+        }
+    }
+}
+
+/// Drop one live-cap reference to intern id `id`; reclaim the slot at zero. Called from
+/// the TAG_FS_RELEASE handler when a client closes a File/ReadDir cap.
+fn release_intern(id: usize) {
+    unsafe {
+        if id >= 2 && id < MAXID && USED[id] && REFS[id] > 0 {
+            REFS[id] -= 1;
+            if REFS[id] == 0 {
+                USED[id] = false;
+                PLENS[id] = 0;
             }
         }
     }
@@ -693,6 +712,10 @@ pub extern "C" fn oxbow_main() -> ! {
                                     if let Ok(cap) =
                                         rt::sys_mint(BOOT_EP, cid as u64, R_SEND | R_GRANT)
                                     {
+                                        // This OPEN hands out a live cap for `cid`; count it
+                                        // so the slot is reclaimed only when the client's
+                                        // matching FS_RELEASE (cap drop) brings refs to 0.
+                                        unsafe { REFS[cid] += 1 };
                                         // kind: 1=FS_DIR, 2=FS_FILE, 3=FS_SYMLINK (no follow).
                                         let kind_tag = match kind {
                                             1 => FS_DIR,
@@ -773,6 +796,7 @@ pub extern "C" fn oxbow_main() -> ! {
                             if cid != 0 {
                                 if let Ok(cap) = rt::sys_mint(BOOT_EP, cid as u64, R_SEND | R_GRANT)
                                 {
+                                    unsafe { REFS[cid] += 1 }; // live cap; released on close
                                     r.data[0] = 0;
                                     r.data_len = 1;
                                     r.handle_count = 1;
@@ -888,6 +912,14 @@ pub extern "C" fn oxbow_main() -> ! {
                 r.data[1] = 0;
                 r.data_len = 2;
                 let _ = rt::sys_reply(reply, &r);
+            }
+            TAG_FS_RELEASE => {
+                // A client closed a File/ReadDir cap: drop its reference to the interned
+                // path so the slot can be reused. `id` is the cap badge (the intern id).
+                if valid {
+                    release_intern(id);
+                }
+                reply_status(reply, 0);
             }
             TAG_FS_TRUNCATE => {
                 // set_len on the file behind this capability. Flush buffered writes first

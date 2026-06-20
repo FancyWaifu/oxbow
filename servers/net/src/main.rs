@@ -755,7 +755,8 @@ pub extern "C" fn oxbow_main() -> ! {
                 if let Some(Sock::Udp(src_port)) = slot_of(&sockets, sid) {
                     let dst_ip = (m.data[0] as u32).to_be_bytes();
                     let dport = m.data[1] as u16;
-                    let len = (m.data[2] as usize).min(40);
+                    // Payload rides the inline area past the 24-byte addr/port/len header.
+                    let len = (m.data[2] as usize).min(480);
                     let bytes =
                         unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(24), len) };
                     let payload: Vec<u8> = bytes.to_vec();
