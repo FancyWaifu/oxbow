@@ -20,4 +20,7 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "proto-ipv4",
     "proto-ipv6",
     "socket-tcp",
+    # Hold IPv4 + IPv6 link-local + IPv6 global at once (default cap is 2, which would
+    # silently drop the global address — making on-link IPv6 dests route via the gateway).
+    "iface-max-addr-count-4",
 ] }

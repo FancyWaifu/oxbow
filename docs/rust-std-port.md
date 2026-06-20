@@ -369,10 +369,21 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     doesn't yet answer an inbound Neighbor Solicitation (two oxbow VMs can't NDP-resolve each
     other), so a *wire* v6 `TcpListener` accepting an inbound connection isn't proven — the client
     direction is.
-  Net std surface: UDP (loopback + external + sender addr), TCP (loopback + external client + IPv6
-  connect [full handshake verified] + wire listener/accept for v4), DNS (real, A + AAAA, large
-  replies via the shared frame), and IPv6 on the wire, all coexisting under dual-stack SLIRP.
-  Remaining: smoltcp server-side NDP (answer inbound NS) for a wire v6 `TcpListener`.
+  - ✅ **Wire v6 `TcpListener` — two oxbow VMs do a full IPv6 handshake (gap closed).** The earlier
+    "server doesn't answer NDP" was a **misdiagnosis**: the real cause was smoltcp's
+    `IFACE_MAX_ADDR_COUNT` defaulting to **2**, so pushing IPv4 + link-local + global silently
+    **dropped the global address** — the connector then had no `fec0::/64` address, so `fec0::a`
+    wasn't on-link and it ARP/NDP'd the (nonexistent) gateway instead of the listener. Fixed by
+    enabling smoltcp's `iface-max-addr-count-4`. Now **two oxbow VMs on a QEMU `socket` wire**
+    (distinct MACs → distinct `fec0::<mac>` addresses) complete the whole exchange with oxbow's own
+    stack on *both* ends: VM-B `connected to Ok([fec0::a]:9090)`, VM-A `accepted from [fec0::b]…`,
+    `PING6`/`PONG6` both ways (`ipv6-two-vm-handshake.py`). So oxbow answers inbound NDP (the
+    multicast + solicited-node join from before) **and** resolves on-link peers — a wire v6
+    `TcpListener` accepts real inbound IPv6 connections.
+  Net std surface — complete: UDP (loopback + external + sender addr), TCP (loopback + external
+  client + wire listener/accept, **IPv4 and IPv6**, full handshakes verified both directions), DNS
+  (real, A + AAAA, large replies via the shared frame), and IPv6 on the wire — all coexisting under
+  dual-stack SLIRP.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 
