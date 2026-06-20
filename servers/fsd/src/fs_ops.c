@@ -137,3 +137,62 @@ int oxfs_readdir(const char *path, uint32_t cursor, char *name_out, uint32_t cap
 	ext4_dir_close(&d);
 	return found;
 }
+
+/* Read ext2 second-resolution mtime/atime (Unix epoch). Best-effort: a missing
+ * time leaves the out-param at 0. */
+int oxfs_times(const char *path, uint32_t *mtime, uint32_t *atime)
+{
+	uint32_t m = 0, a = 0;
+	ext4_mtime_get(path, &m);
+	ext4_atime_get(path, &a);
+	*mtime = m;
+	*atime = a;
+	return 0;
+}
+
+/* set_len: truncate (or extend) the file to `size` bytes. */
+int oxfs_truncate(const char *path, uint64_t size)
+{
+	ext4_file f;
+	int r = ext4_fopen(&f, path, "r+b");
+	if (r != EOK)
+		return r;
+	uint64_t cur = ext4_fsize(&f);
+	if (size <= cur) {
+		/* lwext4's ext4_ftruncate only shrinks. */
+		r = ext4_ftruncate(&f, size);
+	} else {
+		/* Grow: ext4_fseek won't go past EOF, so append zero bytes from the
+		 * current end up to `size` (POSIX set_len zero-extends). */
+		static const uint8_t zeros[512] = {0};
+		r = ext4_fseek(&f, (int64_t)cur, SEEK_SET);
+		uint64_t remaining = size - cur;
+		while (r == EOK && remaining > 0) {
+			size_t chunk = remaining > sizeof(zeros) ? sizeof(zeros) : (size_t)remaining;
+			size_t wr = 0;
+			r = ext4_fwrite(&f, zeros, chunk, &wr);
+			if (wr == 0)
+				break;
+			remaining -= wr;
+		}
+	}
+	ext4_fclose(&f);
+	return r;
+}
+
+/* Set mtime and/or atime (Unix epoch seconds), gated by set_m/set_a. */
+int oxfs_set_times(const char *path, uint32_t mtime, uint32_t atime, int set_m, int set_a)
+{
+	int r = EOK;
+	if (set_m) {
+		int rr = ext4_mtime_set(path, mtime);
+		if (rr != EOK)
+			r = rr;
+	}
+	if (set_a) {
+		int rr = ext4_atime_set(path, atime);
+		if (rr != EOK)
+			r = rr;
+	}
+	return r;
+}

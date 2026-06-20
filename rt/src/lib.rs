@@ -307,6 +307,9 @@ pub mod fs {
         pub cap: Handle,
         pub kind: u64,
         pub size: usize,
+        /// ext2 mtime/atime (Unix epoch seconds, 0 if the server didn't report them).
+        pub mtime: u32,
+        pub atime: u32,
     }
 
     fn pack(m: &mut MsgBuf, path: &[u8]) {
@@ -330,6 +333,8 @@ pub mod fs {
             cap: m.handles[0],
             kind: m.data[1],
             size: m.data[2] as usize,
+            mtime: if m.data_len >= 4 { m.data[3] as u32 } else { 0 },
+            atime: if m.data_len >= 5 { m.data[4] as u32 } else { 0 },
         })
     }
 
@@ -556,6 +561,8 @@ pub unsafe extern "C" fn __oxbow_fs_open(
     create: i32,
     size_out: *mut u64,
     is_dir_out: *mut i32,
+    mtime_out: *mut u32,
+    atime_out: *mut u32,
 ) -> i64 {
     let p = unsafe { core::slice::from_raw_parts(path, path_len) };
     let cwd: Handle = cwd_handle(); // current cwd dir cap (slot 1, or re-rooted)
@@ -565,6 +572,8 @@ pub unsafe extern "C" fn __oxbow_fs_open(
                 unsafe {
                     size_out.write(0);
                     is_dir_out.write(0);
+                    mtime_out.write(0);
+                    atime_out.write(0);
                 }
                 h as i64
             }
@@ -576,12 +585,42 @@ pub unsafe extern "C" fn __oxbow_fs_open(
                 unsafe {
                     size_out.write(n.size as u64);
                     is_dir_out.write((n.kind == oxbow_abi::FS_DIR) as i32);
+                    mtime_out.write(n.mtime);
+                    atime_out.write(n.atime);
                 }
                 n.cap as i64
             }
             None => -1,
         }
     }
+}
+
+/// set_len: truncate the file capability to `size` bytes. 0 ok, -1 on failure.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_fs_truncate(file: i64, size: u64) -> i32 {
+    let mut m = MsgBuf::new(oxbow_abi::TAG_FS_TRUNCATE);
+    m.data[0] = size;
+    m.data_len = 1;
+    if sys_call(file as Handle, &mut m).is_err() || m.data[0] != 0 { -1 } else { 0 }
+}
+
+/// Set mtime/atime (Unix epoch seconds) on the file capability; `set_m`/`set_a` gate each.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_fs_set_times(
+    file: i64,
+    mtime: u32,
+    atime: u32,
+    set_m: i32,
+    set_a: i32,
+) -> i32 {
+    let mut m = MsgBuf::new(oxbow_abi::TAG_FS_SETTIMES);
+    m.data[0] = mtime as u64;
+    m.data[1] = atime as u64;
+    m.data[2] = ((set_m != 0) as u64) | (((set_a != 0) as u64) << 1);
+    m.data_len = 3;
+    if sys_call(file as Handle, &mut m).is_err() || m.data[0] != 0 { -1 } else { 0 }
 }
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]

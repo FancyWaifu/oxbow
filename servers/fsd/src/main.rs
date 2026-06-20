@@ -24,8 +24,8 @@ use oxbow_abi::{
     Handle, MsgBuf, BLK_CHUNK, BLK_XFER_SECTORS, BOOT_BLK_EP, BOOT_CONSOLE, BOOT_EP, BOOT_MEM,
     FS_DIR, FS_FILE, FS_INITRD, FS_ROOT, PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_BLK_ATTACH,
     TAG_BLK_FLUSH, TAG_BLK_READ, TAG_BLK_READN, TAG_BLK_WRITE, TAG_BLK_WRITEN, TAG_FS_CREATE,
-    TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_FS_RENAME, TAG_FS_SYNC,
-    TAG_FS_UNLINK, TAG_FS_WRITE,
+    TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_FS_RENAME, TAG_FS_SETTIMES,
+    TAG_FS_SYNC, TAG_FS_TRUNCATE, TAG_FS_UNLINK, TAG_FS_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -364,6 +364,9 @@ extern "C" {
     fn oxfs_mkdir(path: *const u8) -> c_int;
     fn oxfs_remove(path: *const u8) -> c_int;
     fn oxfs_rename(path: *const u8, new_path: *const u8) -> c_int;
+    fn oxfs_times(path: *const u8, mtime: *mut u32, atime: *mut u32) -> c_int;
+    fn oxfs_truncate(path: *const u8, size: u64) -> c_int;
+    fn oxfs_set_times(path: *const u8, mtime: u32, atime: u32, set_m: c_int, set_a: c_int) -> c_int;
     fn oxfs_flush() -> c_int;
     fn oxfs_writeback(on: c_int) -> c_int;
     fn oxfs_readdir(
@@ -674,10 +677,15 @@ pub extern "C" fn oxbow_main() -> ! {
                                     if let Ok(cap) =
                                         rt::sys_mint(BOOT_EP, cid as u64, R_SEND | R_GRANT)
                                     {
+                                        let mut mtime = 0u32;
+                                        let mut atime = 0u32;
+                                        unsafe { oxfs_times(full.as_ptr(), &mut mtime, &mut atime) };
                                         r.data[0] = 0;
                                         r.data[1] = if is_dir != 0 { FS_DIR } else { FS_FILE };
                                         r.data[2] = size;
-                                        r.data_len = 3;
+                                        r.data[3] = mtime as u64;
+                                        r.data[4] = atime as u64;
+                                        r.data_len = 5;
                                         r.handle_count = 1;
                                         r.handles[0] = cap;
                                         let _ = rt::sys_reply(reply, &r);
@@ -861,6 +869,38 @@ pub extern "C" fn oxbow_main() -> ! {
                 r.data[1] = 0;
                 r.data_len = 2;
                 let _ = rt::sys_reply(reply, &r);
+            }
+            TAG_FS_TRUNCATE => {
+                // set_len on the file behind this capability. Flush buffered writes first
+                // so the truncate sees the real on-disk size, then persist the new length.
+                sync_writes();
+                let size = m.data[0];
+                let mut full = [0u8; 256];
+                let mut ok = false;
+                if valid && full_path(id, &mut full).is_some() {
+                    ok = unsafe { oxfs_truncate(full.as_ptr(), size) } == 0;
+                    if ok {
+                        unsafe { oxfs_flush() };
+                        cache_invalidate(); // §94: truncate changed size/content
+                    }
+                }
+                reply_status(reply, if ok { 0 } else { 1 });
+            }
+            TAG_FS_SETTIMES => {
+                let mtime = m.data[0] as u32;
+                let atime = m.data[1] as u32;
+                let flags = m.data[2];
+                let mut full = [0u8; 256];
+                let mut ok = false;
+                if valid && full_path(id, &mut full).is_some() {
+                    let set_m = (flags & 1) as c_int;
+                    let set_a = ((flags >> 1) & 1) as c_int;
+                    ok = unsafe { oxfs_set_times(full.as_ptr(), mtime, atime, set_m, set_a) } == 0;
+                    if ok {
+                        unsafe { oxfs_flush() };
+                    }
+                }
+                reply_status(reply, if ok { 0 } else { 1 });
             }
             _ => reply_status(reply, 1),
         }

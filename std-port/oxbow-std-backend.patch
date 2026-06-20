@@ -222,10 +222,10 @@ index 0c297c57..a1404d0b 100644
          use vexos as imp;
 diff --git a/library/std/src/sys/fs/oxbow.rs b/library/std/src/sys/fs/oxbow.rs
 new file mode 100644
-index 00000000..2ddd746e
+index 00000000..24f507c8
 --- /dev/null
 +++ b/library/std/src/sys/fs/oxbow.rs
-@@ -0,0 +1,477 @@
+@@ -0,0 +1,562 @@
 +//! oxbow std::fs — real File open/read/write/seek + stat over the fsd protocol
 +//! (oxbow-rt's `__oxbow_fs_*` shims), relative to the program's cwd dir cap.
 +//! Directory listing, symlinks, rename/unlink, timestamps and permissions are not
@@ -240,6 +240,7 @@ index 00000000..2ddd746e
 +use crate::sync::atomic::{AtomicU64, Ordering};
 +use crate::sys::time::SystemTime;
 +use crate::sys::unsupported;
++use crate::time::Duration;
 +
 +unsafe extern "C" {
 +    fn __oxbow_fs_open(
@@ -248,7 +249,11 @@ index 00000000..2ddd746e
 +        create: i32,
 +        size_out: *mut u64,
 +        is_dir_out: *mut i32,
++        mtime_out: *mut u32,
++        atime_out: *mut u32,
 +    ) -> i64;
++    fn __oxbow_fs_truncate(file: i64, size: u64) -> i32;
++    fn __oxbow_fs_set_times(file: i64, mtime: u32, atime: u32, set_m: i32, set_a: i32) -> i32;
 +    fn __oxbow_fs_pread(file: i64, buf: *mut u8, len: usize, off: u64) -> isize;
 +    fn __oxbow_fs_pwrite(file: i64, buf: *const u8, len: usize, off: u64) -> isize;
 +    fn __oxbow_fs_close(file: i64);
@@ -273,12 +278,31 @@ index 00000000..2ddd746e
 +    pos: AtomicU64,
 +    size: AtomicU64,
 +    is_dir: bool,
++    mtime: u32,
++    atime: u32,
 +}
 +
 +#[derive(Clone)]
 +pub struct FileAttr {
 +    size: u64,
 +    is_dir: bool,
++    // ext2 mtime/atime, Unix epoch seconds (second resolution; 0 = not reported).
++    mtime: u32,
++    atime: u32,
++}
++
++/// ext2 epoch-seconds -> the platform `SystemTime`.
++fn systime_from_secs(secs: u32) -> SystemTime {
++    crate::sys::time::UNIX_EPOCH
++        .checked_add_duration(&Duration::from_secs(secs as u64))
++        .unwrap_or(crate::sys::time::UNIX_EPOCH)
++}
++/// A `SystemTime` -> ext2 epoch seconds (saturating; pre-epoch clamps to 0).
++fn secs_from_systime(t: SystemTime) -> u32 {
++    t.sub_time(&crate::sys::time::UNIX_EPOCH)
++        .map(|d| d.as_secs())
++        .unwrap_or(0)
++        .min(u32::MAX as u64) as u32
 +}
 +
 +pub struct ReadDir {
@@ -310,7 +334,10 @@ index 00000000..2ddd746e
 +}
 +
 +#[derive(Copy, Clone, Debug, Default)]
-+pub struct FileTimes {}
++pub struct FileTimes {
++    accessed: Option<SystemTime>,
++    modified: Option<SystemTime>,
++}
 +
 +#[derive(Clone, PartialEq, Eq, Debug)]
 +pub struct FilePermissions;
@@ -334,12 +361,14 @@ index 00000000..2ddd746e
 +        FileType { is_dir: self.is_dir }
 +    }
 +    pub fn modified(&self) -> io::Result<SystemTime> {
-+        unsupported()
++        Ok(systime_from_secs(self.mtime))
 +    }
 +    pub fn accessed(&self) -> io::Result<SystemTime> {
-+        unsupported()
++        Ok(systime_from_secs(self.atime))
 +    }
 +    pub fn created(&self) -> io::Result<SystemTime> {
++        // ext2 has no birth/creation time (only the change-time `ctime`), so std's
++        // `created()` is genuinely unavailable here.
 +        unsupported()
 +    }
 +}
@@ -352,8 +381,12 @@ index 00000000..2ddd746e
 +}
 +
 +impl FileTimes {
-+    pub fn set_accessed(&mut self, _t: SystemTime) {}
-+    pub fn set_modified(&mut self, _t: SystemTime) {}
++    pub fn set_accessed(&mut self, t: SystemTime) {
++        self.accessed = Some(t);
++    }
++    pub fn set_modified(&mut self, t: SystemTime) {
++        self.modified = Some(t);
++    }
 +}
 +
 +impl FileType {
@@ -457,7 +490,11 @@ index 00000000..2ddd746e
 +        let create = (opts.create || opts.create_new) as i32;
 +        let mut size = 0u64;
 +        let mut is_dir = 0i32;
-+        let fd = unsafe { __oxbow_fs_open(b.as_ptr(), b.len(), create, &mut size, &mut is_dir) };
++        let mut mtime = 0u32;
++        let mut atime = 0u32;
++        let fd = unsafe {
++            __oxbow_fs_open(b.as_ptr(), b.len(), create, &mut size, &mut is_dir, &mut mtime, &mut atime)
++        };
 +        if fd < 0 {
 +            return Err(ioerr(io::ErrorKind::NotFound, "oxbow fs: open failed"));
 +        }
@@ -467,11 +504,18 @@ index 00000000..2ddd746e
 +            pos: AtomicU64::new(start),
 +            size: AtomicU64::new(size),
 +            is_dir: is_dir != 0,
++            mtime,
++            atime,
 +        })
 +    }
 +
 +    pub fn file_attr(&self) -> io::Result<FileAttr> {
-+        Ok(FileAttr { size: self.size.load(Ordering::Relaxed), is_dir: self.is_dir })
++        Ok(FileAttr {
++            size: self.size.load(Ordering::Relaxed),
++            is_dir: self.is_dir,
++            mtime: self.mtime,
++            atime: self.atime,
++        })
 +    }
 +    pub fn fsync(&self) -> io::Result<()> {
 +        Ok(())
@@ -494,8 +538,13 @@ index 00000000..2ddd746e
 +    pub fn unlock(&self) -> io::Result<()> {
 +        Ok(())
 +    }
-+    pub fn truncate(&self, _size: u64) -> io::Result<()> {
-+        unsupported()
++    pub fn truncate(&self, size: u64) -> io::Result<()> {
++        if unsafe { __oxbow_fs_truncate(self.fd, size) } != 0 {
++            return Err(ioerr(io::ErrorKind::Other, "oxbow fs: truncate failed"));
++        }
++        // Keep the cached size coherent so a following metadata()/seek sees it.
++        self.size.store(size, Ordering::Relaxed);
++        Ok(())
 +    }
 +
 +    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -573,8 +622,8 @@ index 00000000..2ddd746e
 +    pub fn set_permissions(&self, _perm: FilePermissions) -> io::Result<()> {
 +        Ok(())
 +    }
-+    pub fn set_times(&self, _times: FileTimes) -> io::Result<()> {
-+        unsupported()
++    pub fn set_times(&self, times: FileTimes) -> io::Result<()> {
++        set_times_fd(self.fd, times)
 +    }
 +}
 +
@@ -612,12 +661,16 @@ index 00000000..2ddd746e
 +    let b = pbytes(p);
 +    let mut size = 0u64;
 +    let mut is_dir = 0i32;
-+    let fd = unsafe { __oxbow_fs_open(b.as_ptr(), b.len(), 0, &mut size, &mut is_dir) };
++    let mut mtime = 0u32;
++    let mut atime = 0u32;
++    let fd = unsafe {
++        __oxbow_fs_open(b.as_ptr(), b.len(), 0, &mut size, &mut is_dir, &mut mtime, &mut atime)
++    };
 +    if fd < 0 {
 +        return Err(ioerr(io::ErrorKind::NotFound, "oxbow fs: stat not found"));
 +    }
 +    unsafe { __oxbow_fs_close(fd) };
-+    Ok(FileAttr { size, is_dir: is_dir != 0 })
++    Ok(FileAttr { size, is_dir: is_dir != 0, mtime, atime })
 +}
 +pub fn lstat(p: &Path) -> io::Result<FileAttr> {
 +    stat(p)
@@ -630,7 +683,11 @@ index 00000000..2ddd746e
 +    let b = pbytes(p);
 +    let mut size = 0u64;
 +    let mut is_dir = 0i32;
-+    let cap = unsafe { __oxbow_fs_open(b.as_ptr(), b.len(), 0, &mut size, &mut is_dir) };
++    let mut mtime = 0u32;
++    let mut atime = 0u32;
++    let cap = unsafe {
++        __oxbow_fs_open(b.as_ptr(), b.len(), 0, &mut size, &mut is_dir, &mut mtime, &mut atime)
++    };
 +    if cap < 0 {
 +        return Err(ioerr(io::ErrorKind::NotFound, "oxbow fs: read_dir not found"));
 +    }
@@ -661,11 +718,39 @@ index 00000000..2ddd746e
 +pub fn set_perm(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
 +    Ok(())
 +}
-+pub fn set_times(_p: &Path, _times: FileTimes) -> io::Result<()> {
-+    unsupported()
++/// Apply a `FileTimes` to the file capability `fd`. A no-op (Ok) if neither time is set.
++fn set_times_fd(fd: i64, times: FileTimes) -> io::Result<()> {
++    let mtime = times.modified.map(secs_from_systime);
++    let atime = times.accessed.map(secs_from_systime);
++    if mtime.is_none() && atime.is_none() {
++        return Ok(());
++    }
++    let rc = unsafe {
++        __oxbow_fs_set_times(
++            fd,
++            mtime.unwrap_or(0),
++            atime.unwrap_or(0),
++            mtime.is_some() as i32,
++            atime.is_some() as i32,
++        )
++    };
++    if rc != 0 {
++        return Err(ioerr(io::ErrorKind::Other, "oxbow fs: set_times failed"));
++    }
++    Ok(())
 +}
-+pub fn set_times_nofollow(_p: &Path, _times: FileTimes) -> io::Result<()> {
-+    unsupported()
++
++pub fn set_times(p: &Path, times: FileTimes) -> io::Result<()> {
++    // Path-based: open the node (read) to get its capability, then set times through it.
++    // fsd resolves the capability back to the on-disk path; oxbow has no symlinks, so
++    // `set_times_nofollow` is identical.
++    let f = File::open(p, &OpenOptions { read: true, ..OpenOptions::new() })?;
++    let r = set_times_fd(f.fd, times);
++    drop(f);
++    r
++}
++pub fn set_times_nofollow(p: &Path, times: FileTimes) -> io::Result<()> {
++    set_times(p, times)
 +}
 +pub fn rmdir(p: &Path) -> io::Result<()> {
 +    // fsd's UNLINK (oxfs_remove) falls back to ext4_dir_rm, so it removes an

@@ -481,6 +481,11 @@ pub const TAG_FS_RENAME: u64 = u32::from_le_bytes(*b"FSMV") as u64;
 /// the tree survives a reboot. Sent on the root dir cap. Reply: data[0]=status
 /// (0 ok), data[1]=entries written. The fs auto-restores from disk at boot.
 pub const TAG_FS_SYNC: u64 = u32::from_le_bytes(*b"FSSY") as u64;
+/// Truncate the file behind the message's capability to `data[0]` bytes (set_len).
+pub const TAG_FS_TRUNCATE: u64 = u32::from_le_bytes(*b"FTRN") as u64;
+/// Set mtime (`data[0]`) / atime (`data[1]`) on the file capability; `data[2]` bit0=set
+/// mtime, bit1=set atime. ext2 second-resolution Unix epoch times.
+pub const TAG_FS_SETTIMES: u64 = u32::from_le_bytes(*b"FSTM") as u64;
 
 // --- Socket capability API (§21) -------------------------------------------
 /// A client's control capability to the net server: a BADGED endpoint with the
