@@ -844,6 +844,58 @@ pub unsafe extern "C" fn __oxbow_tcp_recv(sock: i64, buf: *mut u8, len: usize) -
 pub extern "C" fn __oxbow_tcp_close(sock: i64) {
     tcp::close(sock as Handle);
 }
+// §101 std::net external-UDP shims. std handles loopback UDP in-process; a socket that
+// sends to / binds a non-loopback address gets a real net-server UDP socket via these.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_udp_bind(_ip_be: u32, port: u16, out_port: *mut u16) -> i64 {
+    match udp::bind(oxbow_abi::BOOT_NET_EP, port) {
+        Some((h, p)) => {
+            unsafe { out_port.write(p) };
+            h as i64
+        }
+        None => -1,
+    }
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_udp_send_to(
+    sock: i64,
+    ip_be: u32,
+    port: u16,
+    buf: *const u8,
+    len: usize,
+) -> isize {
+    let payload = unsafe { core::slice::from_raw_parts(buf, len) };
+    if udp::sendto(sock as Handle, ip_be.to_be_bytes(), port, payload) {
+        len as isize
+    } else {
+        -1
+    }
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_udp_recv_from(
+    sock: i64,
+    buf: *mut u8,
+    len: usize,
+    src_ip: *mut u32,
+    src_port: *mut u16,
+) -> isize {
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    let (n, sip, sport) = udp::recvfrom_src(sock as Handle, out);
+    unsafe {
+        src_ip.write(u32::from_be_bytes(sip));
+        src_port.write(sport);
+    }
+    // 0 from a non-blocking recv means "nothing buffered"; report -1 so std can poll.
+    if n == 0 { -1 } else { n as isize }
+}
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_udp_close(sock: i64) {
+    udp::close(sock as Handle);
+}
 // §100 piped Command stdio: a pipe → a grantable write-end (R_OUT|R_GRANT) the
 // child gets as stdout, and a read-end (R_IN) the parent reads.
 #[cfg(feature = "hosted")]
@@ -1588,6 +1640,21 @@ pub mod udp {
         let src = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), n) };
         out[..n].copy_from_slice(src);
         n
+    }
+
+    /// Like [`recvfrom`] but also returns the sender's IPv4 + port (the net server
+    /// packs them at data[8]/data[9], past the payload window — §101).
+    pub fn recvfrom_src(sock: Handle, out: &mut [u8]) -> (usize, [u8; 4], u16) {
+        let mut m = MsgBuf::new(TAG_UDP_RECVFROM);
+        if sys_call(sock, &mut m).is_err() {
+            return (0, [0; 4], 0);
+        }
+        let n = (m.data[0] as usize).min(out.len()).min(56);
+        let src = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), n) };
+        out[..n].copy_from_slice(src);
+        let sip = (m.data[8] as u32).to_be_bytes();
+        let sport = m.data[9] as u16;
+        (n, sip, sport)
     }
 }
 

@@ -279,9 +279,20 @@ cargo +nightly build --target x86_64-unknown-oxbow.json \
     non-loopback host is wired to the real net server** via new rt `__oxbow_tcp_*` shims (smoltcp
     client) — compiled + linked, exercised by real-network use (not the loopback suite). No
     kernel/ISO change. Excluded: `debug` (fd-based `Debug` format).
-  Next: external (non-loopback) UDP via the net server (needs the server to return the sender's
-    address on recv + rt `__oxbow_udp_*` shims); `TcpListener` on the wire would need server-side
-    TCP (listen/accept) in the net server.
+  - ✅ **External UDP wired to the net server + verified on the wire.** A `UdpSocket` keeps its
+    in-process loopback mailbox but **lazily binds a real net-server UDP socket the first time it
+    sends to a non-loopback address** (so loopback-only sockets — the whole udp test-suite — never
+    touch the net server, no regression). `send_to`/`recv_from` to a non-loopback peer go through
+    new rt `__oxbow_udp_*` shims. The net server now **returns the sender's address on recv**:
+    `udp::parse` gained `src_port`, `recv_udp_for` returns `(len, src_ip, src_port)`, and
+    `TAG_UDP_RECVFROM` packs them at `data[8]`/`data[9]` — *past* the 56-byte payload window, so
+    existing libc readers (`data[0]` + payload@8) are byte-for-byte unaffected. Verified end-to-end:
+    a real DNS query to slirp's resolver (`10.0.2.3:53`) sends, the reply is received, and
+    `recv_from`'s returned source is exactly `10.0.2.3:53` (`external_udp_dns` test) — alongside the
+    16 loopback udp tests still green (17/17).
+  Net std surface now: UDP (loopback in-process + external via net server, with sender address),
+  TCP (loopback in-process socketpair + external client via net server). Remaining: wire
+  `TcpListener` (needs server-side listen/accept in the net server) and DNS resolution in std.
 
 ## What oxbow already provides (so the green rows are mostly plumbing)
 

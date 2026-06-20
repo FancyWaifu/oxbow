@@ -773,10 +773,10 @@ index 84b53fd3..6ee45989 100644
          pub use unsupported::*;
 diff --git a/library/std/src/sys/net/connection/oxbow.rs b/library/std/src/sys/net/connection/oxbow.rs
 new file mode 100644
-index 00000000..35998165
+index 00000000..da9ef73d
 --- /dev/null
 +++ b/library/std/src/sys/net/connection/oxbow.rs
-@@ -0,0 +1,778 @@
+@@ -0,0 +1,833 @@
 +//! oxbow network backend.
 +//!
 +//! oxbow's kernel net stack (e1000 → ARP/IPv4/UDP, smoltcp TCP) is reached by C/libc
@@ -869,9 +869,28 @@ index 00000000..35998165
 +    read_timeout: Mutex<Option<Duration>>,
 +    write_timeout: Mutex<Option<Duration>>,
 +    ttl: AtomicU32,
++    // Lazily-bound net-server UDP socket: created the first time this socket sends to a
++    // non-loopback address, so loopback-only sockets never touch the net server.
++    net_sock: Mutex<Option<i64>>,
 +}
 +
 +impl UdpSocket {
++    /// Ensure a net-server UDP socket exists for external (wire) traffic; returns its
++    /// handle, or an error if the net server can't allocate one.
++    fn ensure_net_sock(&self) -> io::Result<i64> {
++        let mut g = self.net_sock.lock().unwrap();
++        if let Some(h) = *g {
++            return Ok(h);
++        }
++        let mut out_port = 0u16;
++        let h = unsafe { __oxbow_udp_bind(0, self.local.port(), &mut out_port) };
++        if h < 0 {
++            return Err(io::const_error!(ErrorKind::AddrNotAvailable, "net: no udp socket"));
++        }
++        *g = Some(h);
++        Ok(h)
++    }
++
 +    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
 +        let addr = first_addr(addr)?;
 +        if !is_loopback_or_unspec(&addr) {
@@ -897,6 +916,7 @@ index 00000000..35998165
 +            read_timeout: Mutex::new(None),
 +            write_timeout: Mutex::new(None),
 +            ttl: AtomicU32::new(64),
++            net_sock: Mutex::new(None),
 +        })
 +    }
 +
@@ -917,18 +937,25 @@ index 00000000..35998165
 +    }
 +
 +    pub fn send_to(&self, buf: &[u8], dst: &SocketAddr) -> io::Result<usize> {
-+        if !is_loopback_or_unspec(dst) {
-+            return Err(io::const_error!(
-+                ErrorKind::AddrNotAvailable,
-+                "oxbow net: only loopback UDP is supported",
-+            ));
++        if is_loopback_or_unspec(dst) {
++            // Loopback: deliver in-process to the destination port's mailbox.
++            let mut lb = LOOPBACK.lock().unwrap();
++            if let Some(m) = lb.iter_mut().find(|m| m.port == dst.port()) {
++                m.queue.push_back((self.local, buf.to_vec()));
++            }
++            // A datagram to an unbound port is silently dropped (UDP semantics).
++            return Ok(buf.len());
 +        }
-+        let mut lb = LOOPBACK.lock().unwrap();
-+        if let Some(m) = lb.iter_mut().find(|m| m.port == dst.port()) {
-+            m.queue.push_back((self.local, buf.to_vec()));
++        // External: send on the wire through the net server.
++        let ip = v4_be(dst)
++            .ok_or_else(|| io::const_error!(ErrorKind::Unsupported, "oxbow net: IPv6 not supported"))?;
++        let sock = self.ensure_net_sock()?;
++        let n = unsafe { __oxbow_udp_send_to(sock, ip, dst.port(), buf.as_ptr(), buf.len()) };
++        if n < 0 {
++            Err(io::const_error!(ErrorKind::Other, "net: udp send failed"))
++        } else {
++            Ok(n as usize)
 +        }
-+        // A datagram to an unbound port is silently dropped (UDP semantics).
-+        Ok(buf.len())
 +    }
 +
 +    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
@@ -947,6 +974,24 @@ index 00000000..35998165
 +                        let n = data.len().min(buf.len());
 +                        buf[..n].copy_from_slice(&data[..n]);
 +                        return Ok((n, src));
++                    }
++                }
++            }
++            // If this socket has done external I/O, also poll the net server (with the
++            // sender address). recv consumes, so only for `recv_from` (consume), not peek.
++            if consume {
++                if let Some(sock) = *self.net_sock.lock().unwrap() {
++                    let mut sip = 0u32;
++                    let mut sport = 0u16;
++                    let n = unsafe {
++                        __oxbow_udp_recv_from(sock, buf.as_mut_ptr(), buf.len(), &mut sip, &mut sport)
++                    };
++                    if n >= 0 {
++                        let src = SocketAddr::V4(SocketAddrV4::new(
++                            Ipv4Addr::from(sip.to_be_bytes()),
++                            sport,
++                        ));
++                        return Ok((n as usize, src));
 +                    }
 +                }
 +            }
@@ -987,6 +1032,8 @@ index 00000000..35998165
 +            read_timeout: Mutex::new(*self.read_timeout.lock().unwrap()),
 +            write_timeout: Mutex::new(*self.write_timeout.lock().unwrap()),
 +            ttl: AtomicU32::new(self.ttl.load(Ordering::Relaxed)),
++            // Clones don't share the net socket; a clone re-binds on its own external send.
++            net_sock: Mutex::new(None),
 +        })
 +    }
 +
@@ -1071,6 +1118,14 @@ index 00000000..35998165
 +impl fmt::Debug for UdpSocket {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 +        f.debug_struct("UdpSocket").field("addr", &self.local).finish()
++    }
++}
++
++impl Drop for UdpSocket {
++    fn drop(&mut self) {
++        if let Some(sock) = *self.net_sock.lock().unwrap() {
++            unsafe { __oxbow_udp_close(sock) };
++        }
 +    }
 +}
 +

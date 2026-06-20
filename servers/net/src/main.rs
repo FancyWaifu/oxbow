@@ -86,7 +86,12 @@ fn send_udp(
 /// `port` (or 0 if none is buffered right now). The client polls with its own
 /// deadline — so a lost reply no longer blocks the server (or the caller) forever,
 /// and c-ares gets the non-blocking semantics it expects.
-fn recv_udp_for(nic: &mut Nic, cache: &mut arp::Cache, port: u16, out: &mut [u8]) -> usize {
+fn recv_udp_for(
+    nic: &mut Nic,
+    cache: &mut arp::Cache,
+    port: u16,
+    out: &mut [u8],
+) -> (usize, [u8; 4], u16) {
     let mut buf = [0u8; BUF];
     while let Some(n) = nic.recv_poll(&mut buf) {
         handle_background(nic, cache, &buf[..n]);
@@ -104,10 +109,10 @@ fn recv_udp_for(nic: &mut Nic, cache: &mut arp::Cache, port: u16, out: &mut [u8]
             let p = &buf[uoff + u.payload_off..n];
             let len = p.len().min(out.len());
             out[..len].copy_from_slice(&p[..len]);
-            return len;
+            return (len, ip.src, u.src_port);
         }
     }
-    0
+    (0, [0; 4], 0)
 }
 
 fn w(s: &[u8]) {
@@ -663,7 +668,7 @@ pub extern "C" fn oxbow_main() -> ! {
                     if let Some(Sock::Udp(port)) = slot_of(&sockets, sid) {
                         let out =
                             unsafe { core::slice::from_raw_parts_mut(NET_SHARED as *mut u8, 1472) };
-                        let n = recv_udp_for(&mut nic, &mut cache, port, out);
+                        let (n, _, _) = recv_udp_for(&mut nic, &mut cache, port, out);
                         r.data[0] = n as u64;
                     } else {
                         r.data[0] = 0;
@@ -740,11 +745,16 @@ pub extern "C" fn oxbow_main() -> ! {
                 let sid = m.badge as usize;
                 if let Some(Sock::Udp(port)) = slot_of(&sockets, sid) {
                     let mut out = [0u8; 56];
-                    let n = recv_udp_for(&mut nic, &mut cache, port, &mut out);
+                    let (n, sip, sport) = recv_udp_for(&mut nic, &mut cache, port, &mut out);
                     r.data[0] = n as u64;
                     let dst = r.data.as_mut_ptr() as *mut u8;
                     unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), dst.add(8), n) };
-                    r.data_len = 8;
+                    // §101 sender address for std recv_from, packed past the 56-B payload
+                    // window (data[1..8]) so existing libc readers (data[0]+payload@8) are
+                    // unaffected: src IPv4 (BE) at data[8], src port at data[9].
+                    r.data[8] = u32::from_be_bytes(sip) as u64;
+                    r.data[9] = sport as u64;
+                    r.data_len = 10;
                 } else {
                     r.data[0] = 0;
                     r.data_len = 1;
