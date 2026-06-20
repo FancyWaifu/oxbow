@@ -558,40 +558,41 @@ pub extern "C" fn __oxbow_argv(len: *mut usize) -> *const u8 {
 pub unsafe extern "C" fn __oxbow_fs_open(
     path: *const u8,
     path_len: usize,
-    create: i32,
+    flags: u32, // FS_O_CREATE | FS_O_EXCL | FS_O_TRUNC
     size_out: *mut u64,
     kind_out: *mut i32, // 1=FS_DIR, 2=FS_FILE, 3=FS_SYMLINK
     mtime_out: *mut u32,
     atime_out: *mut u32,
 ) -> i64 {
+    // One round trip: fsd applies the whole OpenOptions policy (create / exclusive /
+    // truncate) itself, so the client never has to stat first. Returns the file cap, or
+    // a negative status: -1 NotFound, -2 AlreadyExists (O_EXCL), -3 other error.
     let p = unsafe { core::slice::from_raw_parts(path, path_len) };
-    let cwd: Handle = cwd_handle(); // current cwd dir cap (slot 1, or re-rooted)
-    if create != 0 {
-        match fs::create(cwd, p) {
-            Some(h) => {
-                unsafe {
-                    size_out.write(0);
-                    kind_out.write(oxbow_abi::FS_FILE as i32);
-                    mtime_out.write(0);
-                    atime_out.write(0);
-                }
-                h as i64
+    let mut m = MsgBuf::new(oxbow_abi::TAG_FS_OPEN);
+    let n = core::cmp::min(p.len(), 56);
+    let dst = m.data.as_mut_ptr() as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(p.as_ptr(), dst, n);
+        *dst.add(n) = 0;
+    }
+    m.data[oxbow_abi::MSG_DATA_WORDS - 1] = flags as u64; // open flags ride in the last word
+    m.data_len = oxbow_abi::MSG_DATA_WORDS as u32; // transfer the whole inline area (path + flags)
+    if sys_call(cwd_handle(), &mut m).is_err() {
+        return -3;
+    }
+    match m.data[0] {
+        0 => {
+            unsafe {
+                size_out.write(m.data[2]);
+                kind_out.write(m.data[1] as i32);
+                mtime_out.write(m.data[3] as u32);
+                atime_out.write(m.data[4] as u32);
             }
-            None => -1,
+            m.handles[0] as i64
         }
-    } else {
-        match fs::open(cwd, p) {
-            Some(n) => {
-                unsafe {
-                    size_out.write(n.size as u64);
-                    kind_out.write(n.kind as i32);
-                    mtime_out.write(n.mtime);
-                    atime_out.write(n.atime);
-                }
-                n.cap as i64
-            }
-            None => -1,
-        }
+        2 => -2, // AlreadyExists
+        3 => -4, // IsADirectory (create/truncate/write on a directory)
+        _ => -1, // NotFound / generic
     }
 }
 

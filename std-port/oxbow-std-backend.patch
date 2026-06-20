@@ -222,10 +222,10 @@ index 0c297c57..a1404d0b 100644
          use vexos as imp;
 diff --git a/library/std/src/sys/fs/oxbow.rs b/library/std/src/sys/fs/oxbow.rs
 new file mode 100644
-index 00000000..410e2fbb
+index 00000000..f1af886f
 --- /dev/null
 +++ b/library/std/src/sys/fs/oxbow.rs
-@@ -0,0 +1,689 @@
+@@ -0,0 +1,700 @@
 +//! oxbow std::fs — real File open/read/write/seek + stat over the fsd protocol
 +//! (oxbow-rt's `__oxbow_fs_*` shims), relative to the program's cwd dir cap.
 +//! Directory listing, symlinks, rename/unlink, timestamps and permissions are not
@@ -247,7 +247,7 @@ index 00000000..410e2fbb
 +    fn __oxbow_fs_open(
 +        path: *const u8,
 +        path_len: usize,
-+        create: i32,
++        flags: u32, // FS_O_CREATE | FS_O_EXCL | FS_O_TRUNC
 +        size_out: *mut u64,
 +        kind_out: *mut i32, // 1=dir, 2=file, 3=symlink
 +        mtime_out: *mut u32,
@@ -270,6 +270,12 @@ index 00000000..410e2fbb
 +const FS_DIR: u32 = 1; // oxbow_abi::FS_DIR
 +const FS_FILE: u32 = 2; // oxbow_abi::FS_FILE
 +const FS_SYMLINK: u32 = 3; // oxbow_abi::FS_SYMLINK
++
++// Open flags handed to __oxbow_fs_open (mirror oxbow_abi::FS_O_*). fsd applies these,
++// so File::open is a single round trip with no client-side stat.
++const FS_O_CREATE: u32 = 1;
++const FS_O_EXCL: u32 = 2;
++const FS_O_TRUNC: u32 = 4;
 +
 +#[inline]
 +fn pbytes(p: &Path) -> &[u8] {
@@ -500,31 +506,36 @@ index 00000000..410e2fbb
 +impl File {
 +    pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
 +        let b = pbytes(path);
-+        // fsd's primitive open is "open existing" (create=0) or "create-or-truncate"
-+        // (create=1). std's OpenOptions split create-if-missing from truncation, so map
-+        // them onto stat + the right primitive instead of conflating them (which used to
-+        // truncate every create-flagged open — breaking append and create-without-trunc).
-+        let existed = stat(path).is_ok();
-+        if opts.create_new && existed {
-+            return Err(ioerr(io::ErrorKind::AlreadyExists, "oxbow fs: create_new on existing path"));
++        // The full OpenOptions policy (create / exclusive / truncate / open-in-place) is
++        // applied by fsd in a SINGLE round trip — no separate client-side stat. Truncation
++        // happens only when explicitly requested, so append and create-without-truncate
++        // keep an existing file's contents.
++        let mut flags = 0u32;
++        if opts.create || opts.create_new {
++            flags |= FS_O_CREATE;
 +        }
-+        if !existed && !(opts.create || opts.create_new) {
-+            return Err(ioerr(io::ErrorKind::NotFound, "oxbow fs: open of missing file"));
++        if opts.create_new {
++            flags |= FS_O_EXCL;
 +        }
-+        // fsd's create=1 primitive is "create-or-TRUNCATE", create=0 is "open existing in
-+        // place". So request create-or-truncate when the file is missing (make it) OR a
-+        // truncation was explicitly asked for; otherwise open the existing node untouched
-+        // (this is what makes append + create-without-truncate keep their contents).
-+        let create = (!existed || opts.truncate) as i32;
++        if opts.truncate {
++            flags |= FS_O_TRUNC;
++        }
 +        let mut size = 0u64;
 +        let mut kind = 0i32;
 +        let mut mtime = 0u32;
 +        let mut atime = 0u32;
 +        let fd = unsafe {
-+            __oxbow_fs_open(b.as_ptr(), b.len(), create, &mut size, &mut kind, &mut mtime, &mut atime)
++            __oxbow_fs_open(b.as_ptr(), b.len(), flags, &mut size, &mut kind, &mut mtime, &mut atime)
 +        };
 +        if fd < 0 {
-+            return Err(ioerr(io::ErrorKind::NotFound, "oxbow fs: open failed"));
++            // -2 = AlreadyExists (O_EXCL on existing), -4 = IsADirectory (write/create/trunc
++            // on a directory), else NotFound/other.
++            let (kind_e, msg) = match fd {
++                -2 => (io::ErrorKind::AlreadyExists, "oxbow fs: create_new on existing path"),
++                -4 => (io::ErrorKind::IsADirectory, "oxbow fs: cannot open a directory for writing"),
++                _ => (io::ErrorKind::NotFound, "oxbow fs: open failed"),
++            };
++            return Err(ioerr(kind_e, msg));
 +        }
 +        let start = if opts.append { size } else { 0 };
 +        Ok(File {

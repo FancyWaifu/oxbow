@@ -456,8 +456,16 @@ pub const FS_SYMLINK: u64 = 3;
 /// FS request tags (sent through a dir/file capability; the badge = the node).
 /// OPEN(dir): `data` = the name bytes (NUL-terminated). Reply: `data[0]` = status
 /// (0 ok / 1 not-found), `data[1]` = kind, `data[2]` = size, `handles[0]` = a
-/// freshly-minted badged capability to the resolved node.
+/// freshly-minted badged capability to the resolved node. Open flags ride in `data[63]`
+/// (`FS_O_*`), letting fsd apply the full OpenOptions semantics in one round trip so the
+/// client needs no separate stat. Reply `data[0]` = status (0 ok / 1 NotFound / 2
+/// AlreadyExists), `data[1]` = kind, `data[2]` = size, `data[3]`/`data[4]` = mtime/atime.
 pub const TAG_FS_OPEN: u64 = u32::from_le_bytes(*b"FSOP") as u64;
+/// Open flags (in `TAG_FS_OPEN` `data[63]`): create-if-missing, exclusive-create
+/// (fail if exists), truncate-existing-to-zero.
+pub const FS_O_CREATE: u64 = 1;
+pub const FS_O_EXCL: u64 = 2;
+pub const FS_O_TRUNC: u64 = 4;
 /// READ(file): `data[0]` = byte offset. Reply: `data[0]` = count (0 = EOF),
 /// `data[1..]` = up to 56 bytes of content.
 pub const TAG_FS_READ: u64 = u32::from_le_bytes(*b"FSRD") as u64;

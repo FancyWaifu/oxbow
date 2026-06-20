@@ -22,7 +22,8 @@ extern crate oxbow_libc as _;
 use core::ffi::{c_int, c_void};
 use oxbow_abi::{
     Handle, MsgBuf, BLK_CHUNK, BLK_XFER_SECTORS, BOOT_BLK_EP, BOOT_CONSOLE, BOOT_EP, BOOT_MEM,
-    FS_DIR, FS_FILE, FS_INITRD, FS_ROOT, FS_SYMLINK, PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_BLK_ATTACH,
+    FS_DIR, FS_FILE, FS_INITRD, FS_O_CREATE, FS_O_EXCL, FS_O_TRUNC, FS_ROOT, FS_SYMLINK,
+    MSG_DATA_WORDS, PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_BLK_ATTACH,
     TAG_BLK_FLUSH, TAG_BLK_READ, TAG_BLK_READN, TAG_BLK_WRITE, TAG_BLK_WRITEN, TAG_FS_CREATE,
     TAG_FS_LINK, TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_FS_READLINK,
     TAG_FS_RELEASE, TAG_FS_RENAME, TAG_FS_SETTIMES, TAG_FS_SYMLINK, TAG_FS_SYNC, TAG_FS_TRUNCATE,
@@ -696,55 +697,96 @@ pub extern "C" fn oxbow_main() -> ! {
 
         match m.tag {
             TAG_FS_OPEN => {
-                sync_writes(); // §94: a buffered write must be on disk before stat
+                // Flags-driven open: fsd applies the full OpenOptions semantics here (in
+                // one round trip) so the client needs no separate stat. data[63] = FS_O_*.
+                sync_writes(); // a buffered write must be on disk before we stat/serve
+                let flags = m.data[MSG_DATA_WORDS - 1];
                 let name = msg_name(&m);
                 let mut full = [0u8; 256];
                 let mut relbuf = [0u8; PLEN];
                 let mut r = MsgBuf::new(0);
-                if valid && name_ok(name) {
-                    if let Some(clen) = join_child(id, name, &mut relbuf) {
-                        if full_from_rel(&relbuf[..clen], &mut full).is_some() {
-                            let mut kind = 0;
-                            let mut size = 0u64;
-                            let mut mtime = 0u32;
-                            let mut atime = 0u32;
-                            if unsafe {
-                                oxfs_statx2(full.as_ptr(), &mut kind, &mut size, &mut mtime, &mut atime)
-                            } == 0
-                            {
-                                let cid = intern(&relbuf[..clen]);
-                                if cid != 0 {
-                                    if let Ok(cap) =
-                                        rt::sys_mint(BOOT_EP, cid as u64, R_SEND | R_GRANT)
-                                    {
-                                        // This OPEN hands out a live cap for `cid`; count it
-                                        // so the slot is reclaimed only when the client's
-                                        // matching FS_RELEASE (cap drop) brings refs to 0.
-                                        unsafe { REFS[cid] += 1 };
-                                        // kind: 1=FS_DIR, 2=FS_FILE, 3=FS_SYMLINK (no follow).
-                                        let kind_tag = match kind {
-                                            1 => FS_DIR,
-                                            3 => FS_SYMLINK,
-                                            _ => FS_FILE,
-                                        };
-                                        r.data[0] = 0;
-                                        r.data[1] = kind_tag;
-                                        r.data[2] = size;
-                                        r.data[3] = mtime as u64;
-                                        r.data[4] = atime as u64;
-                                        r.data_len = 5;
-                                        r.handle_count = 1;
-                                        r.handles[0] = cap;
-                                        let _ = rt::sys_reply(reply, &r);
-                                        let _ = rt::sys_close(cap);
-                                        continue;
-                                    }
-                                }
-                            }
+                let mut status = 1u64; // default NotFound
+                let mut done = false; // set once we've replied with the cap
+                'open: {
+                    if !(valid && name_ok(name)) {
+                        break 'open;
+                    }
+                    let Some(clen) = join_child(id, name, &mut relbuf) else { break 'open };
+                    if full_from_rel(&relbuf[..clen], &mut full).is_none() {
+                        break 'open;
+                    }
+                    let mut kind = 0;
+                    let mut size = 0u64;
+                    let mut mtime = 0u32;
+                    let mut atime = 0u32;
+                    let existed = unsafe {
+                        oxfs_statx2(full.as_ptr(), &mut kind, &mut size, &mut mtime, &mut atime)
+                    } == 0;
+
+                    // A directory can be opened read-only (flags=0, for readdir) but never
+                    // created/truncated or opened for write — `File::create` on a directory
+                    // must fail (EISDIR), like unix.
+                    if existed && kind == 1 && flags & (FS_O_CREATE | FS_O_TRUNC) != 0 {
+                        status = 3; // IsADirectory
+                        break 'open;
+                    }
+                    if flags & FS_O_EXCL != 0 && existed {
+                        status = 2; // AlreadyExists (O_EXCL)
+                        break 'open;
+                    }
+                    if !existed && flags & FS_O_CREATE == 0 {
+                        status = 1; // NotFound, no O_CREAT
+                        break 'open;
+                    }
+                    if !existed {
+                        // create-or-truncate makes an empty regular file
+                        if unsafe { oxfs_create(full.as_ptr()) } != 0 {
+                            break 'open;
+                        }
+                        flush();
+                        cache_invalidate();
+                        // The node is now a fresh empty file; read just its (cheap) times
+                        // rather than a second full statx2 (which would re-open it for fsize).
+                        kind = 2; // FS_FILE
+                        size = 0;
+                        unsafe { oxfs_times(full.as_ptr(), &mut mtime, &mut atime) };
+                    } else if flags & FS_O_TRUNC != 0 {
+                        if unsafe { oxfs_truncate(full.as_ptr(), 0) } == 0 {
+                            flush();
+                            cache_invalidate();
+                            size = 0;
                         }
                     }
+
+                    let cid = intern(&relbuf[..clen]);
+                    if cid == 0 {
+                        break 'open;
+                    }
+                    let Ok(cap) = rt::sys_mint(BOOT_EP, cid as u64, R_SEND | R_GRANT) else {
+                        break 'open;
+                    };
+                    // Live cap for `cid`; reclaimed only when its FS_RELEASE brings refs to 0.
+                    unsafe { REFS[cid] += 1 };
+                    let kind_tag = match kind {
+                        1 => FS_DIR,
+                        3 => FS_SYMLINK,
+                        _ => FS_FILE,
+                    };
+                    r.data[0] = 0; // ok
+                    r.data[1] = kind_tag;
+                    r.data[2] = size;
+                    r.data[3] = mtime as u64;
+                    r.data[4] = atime as u64;
+                    r.data_len = 5;
+                    r.handle_count = 1;
+                    r.handles[0] = cap;
+                    let _ = rt::sys_reply(reply, &r);
+                    let _ = rt::sys_close(cap);
+                    done = true;
                 }
-                reply_status(reply, 1);
+                if !done {
+                    reply_status(reply, status);
+                }
             }
             TAG_FS_READ => {
                 sync_writes(); // §94: reads must see buffered writes
