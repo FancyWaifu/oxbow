@@ -22,10 +22,11 @@ extern crate oxbow_libc as _;
 use core::ffi::{c_int, c_void};
 use oxbow_abi::{
     Handle, MsgBuf, BLK_CHUNK, BLK_XFER_SECTORS, BOOT_BLK_EP, BOOT_CONSOLE, BOOT_EP, BOOT_MEM,
-    FS_DIR, FS_FILE, FS_INITRD, FS_ROOT, PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_BLK_ATTACH,
+    FS_DIR, FS_FILE, FS_INITRD, FS_ROOT, FS_SYMLINK, PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_BLK_ATTACH,
     TAG_BLK_FLUSH, TAG_BLK_READ, TAG_BLK_READN, TAG_BLK_WRITE, TAG_BLK_WRITEN, TAG_FS_CREATE,
-    TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_FS_RENAME, TAG_FS_SETTIMES,
-    TAG_FS_SYNC, TAG_FS_TRUNCATE, TAG_FS_UNLINK, TAG_FS_WRITE,
+    TAG_FS_LINK, TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_FS_READLINK,
+    TAG_FS_RENAME, TAG_FS_SETTIMES, TAG_FS_SYMLINK, TAG_FS_SYNC, TAG_FS_TRUNCATE, TAG_FS_UNLINK,
+    TAG_FS_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -367,6 +368,16 @@ extern "C" {
     fn oxfs_times(path: *const u8, mtime: *mut u32, atime: *mut u32) -> c_int;
     fn oxfs_truncate(path: *const u8, size: u64) -> c_int;
     fn oxfs_set_times(path: *const u8, mtime: u32, atime: u32, set_m: c_int, set_a: c_int) -> c_int;
+    fn oxfs_statx2(
+        path: *const u8,
+        kind: *mut c_int,
+        size: *mut u64,
+        mtime: *mut u32,
+        atime: *mut u32,
+    ) -> c_int;
+    fn oxfs_symlink(target: *const u8, linkpath: *const u8) -> c_int;
+    fn oxfs_readlink(path: *const u8, buf: *mut u8, bufsize: usize, rcnt: *mut usize) -> c_int;
+    fn oxfs_link(src: *const u8, dst: *const u8) -> c_int;
     fn oxfs_flush() -> c_int;
     fn oxfs_writeback(on: c_int) -> c_int;
     fn oxfs_readdir(
@@ -669,19 +680,27 @@ pub extern "C" fn oxbow_main() -> ! {
                 if valid && name_ok(name) {
                     if let Some(clen) = join_child(id, name, &mut relbuf) {
                         if full_from_rel(&relbuf[..clen], &mut full).is_some() {
-                            let mut is_dir = 0;
+                            let mut kind = 0;
                             let mut size = 0u64;
-                            if unsafe { oxfs_stat(full.as_ptr(), &mut is_dir, &mut size) } == 0 {
+                            let mut mtime = 0u32;
+                            let mut atime = 0u32;
+                            if unsafe {
+                                oxfs_statx2(full.as_ptr(), &mut kind, &mut size, &mut mtime, &mut atime)
+                            } == 0
+                            {
                                 let cid = intern(&relbuf[..clen]);
                                 if cid != 0 {
                                     if let Ok(cap) =
                                         rt::sys_mint(BOOT_EP, cid as u64, R_SEND | R_GRANT)
                                     {
-                                        let mut mtime = 0u32;
-                                        let mut atime = 0u32;
-                                        unsafe { oxfs_times(full.as_ptr(), &mut mtime, &mut atime) };
+                                        // kind: 1=FS_DIR, 2=FS_FILE, 3=FS_SYMLINK (no follow).
+                                        let kind_tag = match kind {
+                                            1 => FS_DIR,
+                                            3 => FS_SYMLINK,
+                                            _ => FS_FILE,
+                                        };
                                         r.data[0] = 0;
-                                        r.data[1] = if is_dir != 0 { FS_DIR } else { FS_FILE };
+                                        r.data[1] = kind_tag;
                                         r.data[2] = size;
                                         r.data[3] = mtime as u64;
                                         r.data[4] = atime as u64;
@@ -901,6 +920,97 @@ pub extern "C" fn oxbow_main() -> ! {
                     }
                 }
                 reply_status(reply, if ok { 0 } else { 1 });
+            }
+            TAG_FS_SYMLINK => {
+                cache_invalidate();
+                sync_writes();
+                // data = target\0 linkpath\0. The target is stored literally (not resolved);
+                // linkpath is resolved against the cwd cap like create.
+                let win = ((m.data_len as usize) * 8).clamp(64, 512);
+                let bytes =
+                    unsafe { core::slice::from_raw_parts(m.data.as_ptr() as *const u8, win) };
+                let tlen = bytes.iter().position(|&b| b == 0).unwrap_or(0);
+                let target = &bytes[..tlen];
+                let lstart = tlen + 1;
+                let link = if lstart < win {
+                    let rest = &bytes[lstart..];
+                    let ll = rest.iter().position(|&b| b == 0).unwrap_or(0);
+                    &rest[..ll]
+                } else {
+                    &bytes[0..0]
+                };
+                let mut lf = [0u8; 256];
+                let mut rb = [0u8; PLEN];
+                let mut tbuf = [0u8; 256];
+                let mut status = 1u64;
+                if valid && name_ok(link) && tlen < tbuf.len() {
+                    if let Some(ll) = join_child(id, link, &mut rb) {
+                        full_from_rel(&rb[..ll], &mut lf);
+                        tbuf[..tlen].copy_from_slice(target);
+                        tbuf[tlen] = 0;
+                        if ll > 0 && unsafe { oxfs_symlink(tbuf.as_ptr(), lf.as_ptr()) } == 0 {
+                            status = 0;
+                            flush();
+                        }
+                    }
+                }
+                reply_status(reply, status);
+            }
+            TAG_FS_READLINK => {
+                sync_writes();
+                let name = msg_name(&m);
+                let mut full = [0u8; 256];
+                let mut relbuf = [0u8; PLEN];
+                let mut r = MsgBuf::new(0);
+                if valid && name_ok(name) {
+                    if let Some(clen) = join_child(id, name, &mut relbuf) {
+                        full_from_rel(&relbuf[..clen], &mut full);
+                        let dst = unsafe { (r.data.as_mut_ptr() as *mut u8).add(8) };
+                        let mut rcnt = 0usize;
+                        if clen > 0
+                            && unsafe { oxfs_readlink(full.as_ptr(), dst, 200, &mut rcnt) } == 0
+                        {
+                            r.data[0] = rcnt as u64; // 0 => error (a real target is non-empty)
+                            r.data_len = 64;
+                        }
+                    }
+                }
+                let _ = rt::sys_reply(reply, &r);
+            }
+            TAG_FS_LINK => {
+                cache_invalidate();
+                sync_writes();
+                let win = ((m.data_len as usize) * 8).clamp(64, 512);
+                let bytes =
+                    unsafe { core::slice::from_raw_parts(m.data.as_ptr() as *const u8, win) };
+                let slen = bytes.iter().position(|&b| b == 0).unwrap_or(0);
+                let src = &bytes[..slen];
+                let dstart = slen + 1;
+                let dst = if dstart < win {
+                    let rest = &bytes[dstart..];
+                    let dl = rest.iter().position(|&b| b == 0).unwrap_or(0);
+                    &rest[..dl]
+                } else {
+                    &bytes[0..0]
+                };
+                let mut sf = [0u8; 256];
+                let mut df = [0u8; 256];
+                let mut rb1 = [0u8; PLEN];
+                let mut rb2 = [0u8; PLEN];
+                let mut status = 1u64;
+                if valid && name_ok(src) && name_ok(dst) {
+                    let s = join_child(id, src, &mut rb1);
+                    let d = join_child(id, dst, &mut rb2);
+                    if let (Some(sl), Some(dl)) = (s, d) {
+                        full_from_rel(&rb1[..sl], &mut sf);
+                        full_from_rel(&rb2[..dl], &mut df);
+                        if sl > 0 && dl > 0 && unsafe { oxfs_link(sf.as_ptr(), df.as_ptr()) } == 0 {
+                            status = 0;
+                            flush();
+                        }
+                    }
+                }
+                reply_status(reply, status);
             }
             _ => reply_status(reply, 1),
         }

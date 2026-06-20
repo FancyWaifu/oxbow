@@ -452,6 +452,7 @@ pub const FS_INITRD: u64 = 0x1000_0000;
 /// Node kinds, reported by OPEN/READDIR.
 pub const FS_DIR: u64 = 1;
 pub const FS_FILE: u64 = 2;
+pub const FS_SYMLINK: u64 = 3;
 /// FS request tags (sent through a dir/file capability; the badge = the node).
 /// OPEN(dir): `data` = the name bytes (NUL-terminated). Reply: `data[0]` = status
 /// (0 ok / 1 not-found), `data[1]` = kind, `data[2]` = size, `handles[0]` = a
@@ -486,6 +487,13 @@ pub const TAG_FS_TRUNCATE: u64 = u32::from_le_bytes(*b"FTRN") as u64;
 /// Set mtime (`data[0]`) / atime (`data[1]`) on the file capability; `data[2]` bit0=set
 /// mtime, bit1=set atime. ext2 second-resolution Unix epoch times.
 pub const TAG_FS_SETTIMES: u64 = u32::from_le_bytes(*b"FSTM") as u64;
+/// Create a symlink: data = `target\0linkpath\0` (linkpath resolved vs the cwd cap,
+/// target stored literally).
+pub const TAG_FS_SYMLINK: u64 = u32::from_le_bytes(*b"FSLN") as u64;
+/// Read a symlink target: name = the link path; reply data[0]=len, target bytes @ data[1..].
+pub const TAG_FS_READLINK: u64 = u32::from_le_bytes(*b"FSRL") as u64;
+/// Create a hard link: data = `src\0dst\0` (both resolved vs the cwd cap).
+pub const TAG_FS_LINK: u64 = u32::from_le_bytes(*b"FSHL") as u64;
 
 // --- Socket capability API (§21) -------------------------------------------
 /// A client's control capability to the net server: a BADGED endpoint with the

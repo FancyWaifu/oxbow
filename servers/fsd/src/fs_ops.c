@@ -196,3 +196,63 @@ int oxfs_set_times(const char *path, uint32_t mtime, uint32_t atime, int set_m, 
 	}
 	return r;
 }
+
+/* Type-aware stat: kind (1=dir, 2=file, 3=symlink), size, mtime/atime. Uses
+ * ext4_mode_get for existence+type so a symlink is detected without following it. */
+int oxfs_statx2(const char *path, int *kind, uint64_t *size, uint32_t *mtime, uint32_t *atime)
+{
+	/* Dir-first: ext4_mode_get opens the path O_RDONLY as a file, which FAILS on a
+	 * directory, so detect dirs the same way oxfs_stat does. ext4_mode_get does work
+	 * on regular files and symlinks (it opens the inode and returns its mode). */
+	ext4_dir d;
+	if (ext4_dir_open(&d, path) == EOK) {
+		ext4_dir_close(&d);
+		*kind = 1; /* dir */
+		*size = 0;
+	} else {
+		uint32_t mode = 0;
+		if (ext4_mode_get(path, &mode) != EOK)
+			return -1; /* not found */
+		if ((mode & 0xF000) == 0xA000) { /* S_IFLNK */
+			*kind = 3;
+			char buf[256];
+			size_t rc = 0;
+			ext4_readlink(path, buf, sizeof(buf), &rc);
+			*size = rc;
+		} else { /* regular file */
+			*kind = 2;
+			ext4_file f;
+			if (ext4_fopen(&f, path, "rb") == EOK) {
+				*size = ext4_fsize(&f);
+				ext4_fclose(&f);
+			} else {
+				*size = 0;
+			}
+		}
+	}
+	uint32_t m = 0, a = 0;
+	ext4_mtime_get(path, &m);
+	ext4_atime_get(path, &a);
+	*mtime = m;
+	*atime = a;
+	return 0;
+}
+
+/* Create a symlink at `linkpath` whose contents are the literal `target`. */
+int oxfs_symlink(const char *target, const char *linkpath)
+{
+	return ext4_fsymlink(target, linkpath);
+}
+
+/* Read a symlink's target into `buf`; returns the byte count via `*rcnt` (0 on error). */
+int oxfs_readlink(const char *path, char *buf, size_t bufsize, size_t *rcnt)
+{
+	*rcnt = 0;
+	return ext4_readlink(path, buf, bufsize, rcnt);
+}
+
+/* Create a hard link `dst` referring to the same inode as `src`. */
+int oxfs_link(const char *src, const char *dst)
+{
+	return ext4_flink(src, dst);
+}

@@ -222,10 +222,10 @@ index 0c297c57..a1404d0b 100644
          use vexos as imp;
 diff --git a/library/std/src/sys/fs/oxbow.rs b/library/std/src/sys/fs/oxbow.rs
 new file mode 100644
-index 00000000..24f507c8
+index 00000000..40eb6c3c
 --- /dev/null
 +++ b/library/std/src/sys/fs/oxbow.rs
-@@ -0,0 +1,562 @@
+@@ -0,0 +1,668 @@
 +//! oxbow std::fs — real File open/read/write/seek + stat over the fsd protocol
 +//! (oxbow-rt's `__oxbow_fs_*` shims), relative to the program's cwd dir cap.
 +//! Directory listing, symlinks, rename/unlink, timestamps and permissions are not
@@ -248,12 +248,15 @@ index 00000000..24f507c8
 +        path_len: usize,
 +        create: i32,
 +        size_out: *mut u64,
-+        is_dir_out: *mut i32,
++        kind_out: *mut i32, // 1=dir, 2=file, 3=symlink
 +        mtime_out: *mut u32,
 +        atime_out: *mut u32,
 +    ) -> i64;
 +    fn __oxbow_fs_truncate(file: i64, size: u64) -> i32;
 +    fn __oxbow_fs_set_times(file: i64, mtime: u32, atime: u32, set_m: i32, set_a: i32) -> i32;
++    fn __oxbow_fs_symlink(target: *const u8, target_len: usize, link: *const u8, link_len: usize) -> i32;
++    fn __oxbow_fs_readlink(path: *const u8, path_len: usize, buf: *mut u8, buf_cap: usize) -> isize;
++    fn __oxbow_fs_link(src: *const u8, src_len: usize, dst: *const u8, dst_len: usize) -> i32;
 +    fn __oxbow_fs_pread(file: i64, buf: *mut u8, len: usize, off: u64) -> isize;
 +    fn __oxbow_fs_pwrite(file: i64, buf: *const u8, len: usize, off: u64) -> isize;
 +    fn __oxbow_fs_close(file: i64);
@@ -264,6 +267,8 @@ index 00000000..24f507c8
 +}
 +
 +const FS_DIR: u32 = 1; // oxbow_abi::FS_DIR
++const FS_FILE: u32 = 2; // oxbow_abi::FS_FILE
++const FS_SYMLINK: u32 = 3; // oxbow_abi::FS_SYMLINK
 +
 +#[inline]
 +fn pbytes(p: &Path) -> &[u8] {
@@ -277,7 +282,7 @@ index 00000000..24f507c8
 +    fd: i64,
 +    pos: AtomicU64,
 +    size: AtomicU64,
-+    is_dir: bool,
++    kind: u32, // FS_DIR / FS_FILE / FS_SYMLINK
 +    mtime: u32,
 +    atime: u32,
 +}
@@ -285,7 +290,7 @@ index 00000000..24f507c8
 +#[derive(Clone)]
 +pub struct FileAttr {
 +    size: u64,
-+    is_dir: bool,
++    kind: u32, // FS_DIR / FS_FILE / FS_SYMLINK (the node itself, no follow)
 +    // ext2 mtime/atime, Unix epoch seconds (second resolution; 0 = not reported).
 +    mtime: u32,
 +    atime: u32,
@@ -344,7 +349,7 @@ index 00000000..24f507c8
 +
 +#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 +pub struct FileType {
-+    is_dir: bool,
++    kind: u32, // FS_DIR / FS_FILE / FS_SYMLINK
 +}
 +
 +#[derive(Debug)]
@@ -358,7 +363,7 @@ index 00000000..24f507c8
 +        FilePermissions
 +    }
 +    pub fn file_type(&self) -> FileType {
-+        FileType { is_dir: self.is_dir }
++        FileType { kind: self.kind }
 +    }
 +    pub fn modified(&self) -> io::Result<SystemTime> {
 +        Ok(systime_from_secs(self.mtime))
@@ -391,13 +396,13 @@ index 00000000..24f507c8
 +
 +impl FileType {
 +    pub fn is_dir(&self) -> bool {
-+        self.is_dir
++        self.kind == FS_DIR
 +    }
 +    pub fn is_file(&self) -> bool {
-+        !self.is_dir
++        self.kind == FS_FILE
 +    }
 +    pub fn is_symlink(&self) -> bool {
-+        false
++        self.kind == FS_SYMLINK
 +    }
 +}
 +
@@ -425,7 +430,7 @@ index 00000000..24f507c8
 +            }
 +            return Some(Ok(DirEntry {
 +                name,
-+                kind: FileType { is_dir: kind == FS_DIR },
++                kind: FileType { kind },
 +                base: self.base.clone(),
 +            }));
 +        }
@@ -489,11 +494,11 @@ index 00000000..24f507c8
 +        // create-or-truncate; otherwise open the existing node.
 +        let create = (opts.create || opts.create_new) as i32;
 +        let mut size = 0u64;
-+        let mut is_dir = 0i32;
++        let mut kind = 0i32;
 +        let mut mtime = 0u32;
 +        let mut atime = 0u32;
 +        let fd = unsafe {
-+            __oxbow_fs_open(b.as_ptr(), b.len(), create, &mut size, &mut is_dir, &mut mtime, &mut atime)
++            __oxbow_fs_open(b.as_ptr(), b.len(), create, &mut size, &mut kind, &mut mtime, &mut atime)
 +        };
 +        if fd < 0 {
 +            return Err(ioerr(io::ErrorKind::NotFound, "oxbow fs: open failed"));
@@ -503,7 +508,7 @@ index 00000000..24f507c8
 +            fd,
 +            pos: AtomicU64::new(start),
 +            size: AtomicU64::new(size),
-+            is_dir: is_dir != 0,
++            kind: kind as u32,
 +            mtime,
 +            atime,
 +        })
@@ -512,7 +517,7 @@ index 00000000..24f507c8
 +    pub fn file_attr(&self) -> io::Result<FileAttr> {
 +        Ok(FileAttr {
 +            size: self.size.load(Ordering::Relaxed),
-+            is_dir: self.is_dir,
++            kind: self.kind,
 +            mtime: self.mtime,
 +            atime: self.atime,
 +        })
@@ -657,23 +662,45 @@ index 00000000..24f507c8
 +    }
 +}
 +
-+pub fn stat(p: &Path) -> io::Result<FileAttr> {
++/// `lstat`: attributes of the node at `p` itself — does NOT follow a final symlink.
++/// (fsd's statx2 reports the symlink's own kind/size; lwext4 never auto-follows.)
++pub fn lstat(p: &Path) -> io::Result<FileAttr> {
 +    let b = pbytes(p);
 +    let mut size = 0u64;
-+    let mut is_dir = 0i32;
++    let mut kind = 0i32;
 +    let mut mtime = 0u32;
 +    let mut atime = 0u32;
 +    let fd = unsafe {
-+        __oxbow_fs_open(b.as_ptr(), b.len(), 0, &mut size, &mut is_dir, &mut mtime, &mut atime)
++        __oxbow_fs_open(b.as_ptr(), b.len(), 0, &mut size, &mut kind, &mut mtime, &mut atime)
 +    };
 +    if fd < 0 {
 +        return Err(ioerr(io::ErrorKind::NotFound, "oxbow fs: stat not found"));
 +    }
 +    unsafe { __oxbow_fs_close(fd) };
-+    Ok(FileAttr { size, is_dir: is_dir != 0, mtime, atime })
++    Ok(FileAttr { size, kind: kind as u32, mtime, atime })
 +}
-+pub fn lstat(p: &Path) -> io::Result<FileAttr> {
-+    stat(p)
++
++/// `stat`: follows symlinks. lwext4 never follows on its own, so resolve the chain in
++/// std — readlink + re-stat the target (absolute, or relative to the link's parent),
++/// bounded to guard against cycles.
++pub fn stat(p: &Path) -> io::Result<FileAttr> {
++    let mut cur = p.to_path_buf();
++    for _ in 0..40 {
++        let a = lstat(&cur)?;
++        if a.kind != FS_SYMLINK {
++            return Ok(a);
++        }
++        let target = readlink(&cur)?;
++        cur = if target.is_absolute() {
++            target
++        } else {
++            match cur.parent() {
++                Some(parent) => parent.join(&target),
++                None => target,
++            }
++        };
++    }
++    Err(ioerr(io::ErrorKind::FilesystemLoop, "oxbow fs: too many symbolic links"))
 +}
 +pub fn exists(p: &Path) -> io::Result<bool> {
 +    Ok(stat(p).is_ok())
@@ -682,16 +709,16 @@ index 00000000..24f507c8
 +pub fn readdir(p: &Path) -> io::Result<ReadDir> {
 +    let b = pbytes(p);
 +    let mut size = 0u64;
-+    let mut is_dir = 0i32;
++    let mut kind = 0i32;
 +    let mut mtime = 0u32;
 +    let mut atime = 0u32;
 +    let cap = unsafe {
-+        __oxbow_fs_open(b.as_ptr(), b.len(), 0, &mut size, &mut is_dir, &mut mtime, &mut atime)
++        __oxbow_fs_open(b.as_ptr(), b.len(), 0, &mut size, &mut kind, &mut mtime, &mut atime)
 +    };
 +    if cap < 0 {
 +        return Err(ioerr(io::ErrorKind::NotFound, "oxbow fs: read_dir not found"));
 +    }
-+    if is_dir == 0 {
++    if kind as u32 != FS_DIR {
 +        unsafe { __oxbow_fs_close(cap) };
 +        return Err(ioerr(io::ErrorKind::NotADirectory, "oxbow fs: not a directory"));
 +    }
@@ -773,17 +800,96 @@ index 00000000..24f507c8
 +    }
 +    rmdir(path)
 +}
-+pub fn readlink(_p: &Path) -> io::Result<PathBuf> {
-+    unsupported()
++pub fn readlink(p: &Path) -> io::Result<PathBuf> {
++    let b = pbytes(p);
++    let mut buf = [0u8; 256];
++    let n = unsafe { __oxbow_fs_readlink(b.as_ptr(), b.len(), buf.as_mut_ptr(), buf.len()) };
++    if n < 0 {
++        return Err(ioerr(io::ErrorKind::InvalidInput, "oxbow fs: readlink (not a symlink?)"));
++    }
++    // SAFETY: the bytes are a stored path; reinterpret as encoded OsStr bytes.
++    let os = unsafe { crate::ffi::OsStr::from_encoded_bytes_unchecked(&buf[..n as usize]) };
++    Ok(PathBuf::from(os))
 +}
-+pub fn symlink(_original: &Path, _link: &Path) -> io::Result<()> {
-+    unsupported()
++pub fn symlink(original: &Path, link: &Path) -> io::Result<()> {
++    let t = pbytes(original);
++    let l = pbytes(link);
++    if unsafe { __oxbow_fs_symlink(t.as_ptr(), t.len(), l.as_ptr(), l.len()) } != 0 {
++        return Err(ioerr(io::ErrorKind::Other, "oxbow fs: symlink failed"));
++    }
++    Ok(())
 +}
-+pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
-+    unsupported()
++pub fn link(src: &Path, dst: &Path) -> io::Result<()> {
++    let s = pbytes(src);
++    let d = pbytes(dst);
++    if unsafe { __oxbow_fs_link(s.as_ptr(), s.len(), d.as_ptr(), d.len()) } != 0 {
++        return Err(ioerr(io::ErrorKind::Other, "oxbow fs: hard link failed"));
++    }
++    Ok(())
 +}
-+pub fn canonicalize(_p: &Path) -> io::Result<PathBuf> {
-+    unsupported()
++/// Push a path's components onto `todo` as owned tokens (`/` marks an absolute reset).
++/// `front` splices them ahead of the remaining work (used when expanding a symlink).
++fn push_components(buf: &Path, todo: &mut crate::collections::VecDeque<OsString>, front: bool) {
++    use crate::path::Component;
++    let toks: Vec<OsString> = buf
++        .components()
++        .filter_map(|c| match c {
++            Component::RootDir => Some(OsString::from("/")),
++            Component::Normal(s) => Some(s.to_os_string()),
++            Component::ParentDir => Some(OsString::from("..")),
++            Component::CurDir => Some(OsString::from(".")),
++            Component::Prefix(_) => None,
++        })
++        .collect();
++    if front {
++        for t in toks.into_iter().rev() {
++            todo.push_front(t);
++        }
++    } else {
++        for t in toks {
++            todo.push_back(t);
++        }
++    }
++}
++
++pub fn canonicalize(p: &Path) -> io::Result<PathBuf> {
++    // realpath: absolute, symlink-free, `.`/`..`-free. Walk components in order; on a
++    // symlink, splice its (resolved) target ahead of the remaining work. Every prefix
++    // must exist. oxbow has only the cwd cap, so a relative input anchors at current_dir.
++    use crate::collections::VecDeque;
++    let mut out = if p.is_absolute() { PathBuf::from("/") } else { crate::env::current_dir()? };
++    let mut todo: VecDeque<OsString> = VecDeque::new();
++    push_components(p, &mut todo, false);
++    let mut links = 0u32;
++    while let Some(c) = todo.pop_front() {
++        if c == "/" {
++            out = PathBuf::from("/");
++        } else if c == "." {
++            // skip
++        } else if c == ".." {
++            out.pop();
++        } else {
++            let cand = out.join(&c);
++            let a = lstat(&cand)?;
++            if a.kind == FS_SYMLINK {
++                links += 1;
++                if links > 40 {
++                    return Err(ioerr(
++                        io::ErrorKind::FilesystemLoop,
++                        "oxbow fs: too many symbolic links",
++                    ));
++                }
++                let target = readlink(&cand)?;
++                if target.is_absolute() {
++                    out = PathBuf::from("/");
++                }
++                push_components(&target, &mut todo, true);
++            } else {
++                out = cand;
++            }
++        }
++    }
++    Ok(out)
 +}
 +pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
 +    crate::sys::fs::common::copy(from, to)

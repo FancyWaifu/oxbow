@@ -560,7 +560,7 @@ pub unsafe extern "C" fn __oxbow_fs_open(
     path_len: usize,
     create: i32,
     size_out: *mut u64,
-    is_dir_out: *mut i32,
+    kind_out: *mut i32, // 1=FS_DIR, 2=FS_FILE, 3=FS_SYMLINK
     mtime_out: *mut u32,
     atime_out: *mut u32,
 ) -> i64 {
@@ -571,7 +571,7 @@ pub unsafe extern "C" fn __oxbow_fs_open(
             Some(h) => {
                 unsafe {
                     size_out.write(0);
-                    is_dir_out.write(0);
+                    kind_out.write(oxbow_abi::FS_FILE as i32);
                     mtime_out.write(0);
                     atime_out.write(0);
                 }
@@ -584,7 +584,7 @@ pub unsafe extern "C" fn __oxbow_fs_open(
             Some(n) => {
                 unsafe {
                     size_out.write(n.size as u64);
-                    is_dir_out.write((n.kind == oxbow_abi::FS_DIR) as i32);
+                    kind_out.write(n.kind as i32);
                     mtime_out.write(n.mtime);
                     atime_out.write(n.atime);
                 }
@@ -621,6 +621,84 @@ pub unsafe extern "C" fn __oxbow_fs_set_times(
     m.data[2] = ((set_m != 0) as u64) | (((set_a != 0) as u64) << 1);
     m.data_len = 3;
     if sys_call(file as Handle, &mut m).is_err() || m.data[0] != 0 { -1 } else { 0 }
+}
+
+/// Pack two NUL-terminated byte strings `a\0b\0` into a message's inline data area
+/// (each capped at fsd's PLEN=200), returning the data_len in words.
+#[cfg(feature = "hosted")]
+unsafe fn pack_two(m: &mut MsgBuf, a: &[u8], b: &[u8]) {
+    let al = a.len().min(200);
+    let bl = b.len().min(200);
+    let dst = m.data.as_mut_ptr() as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(a.as_ptr(), dst, al);
+        *dst.add(al) = 0;
+        core::ptr::copy_nonoverlapping(b.as_ptr(), dst.add(al + 1), bl);
+        *dst.add(al + 1 + bl) = 0;
+    }
+    m.data_len = (((al + 1 + bl + 1) + 7) / 8) as u32;
+}
+
+/// Create a symlink at `link` containing the literal `target`. 0 ok, -1 on failure.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_fs_symlink(
+    target: *const u8,
+    target_len: usize,
+    link: *const u8,
+    link_len: usize,
+) -> i32 {
+    let t = unsafe { core::slice::from_raw_parts(target, target_len) };
+    let l = unsafe { core::slice::from_raw_parts(link, link_len) };
+    let mut m = MsgBuf::new(oxbow_abi::TAG_FS_SYMLINK);
+    unsafe { pack_two(&mut m, t, l) };
+    if sys_call(cwd_handle(), &mut m).is_err() || m.data[0] != 0 { -1 } else { 0 }
+}
+
+/// Read the symlink at `path` into `buf` (cap `buf_cap`). Returns the byte count, or -1.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_fs_readlink(
+    path: *const u8,
+    path_len: usize,
+    buf: *mut u8,
+    buf_cap: usize,
+) -> isize {
+    let mut m = MsgBuf::new(oxbow_abi::TAG_FS_READLINK);
+    let n = path_len.min(56);
+    let dst = m.data.as_mut_ptr() as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(path, dst, n);
+        *dst.add(n) = 0;
+    }
+    m.data_len = ((n + 1 + 7) / 8) as u32;
+    if sys_call(cwd_handle(), &mut m).is_err() {
+        return -1;
+    }
+    let len = m.data[0] as usize;
+    if len == 0 {
+        return -1; // a real symlink target is non-empty; 0 signals error
+    }
+    let copy = len.min(buf_cap);
+    let src = unsafe { (m.data.as_ptr() as *const u8).add(8) };
+    unsafe { core::ptr::copy_nonoverlapping(src, buf, copy) };
+    copy as isize
+}
+
+/// Create a hard link `dst` referring to the same inode as `src`. 0 ok, -1 on failure.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_fs_link(
+    src: *const u8,
+    src_len: usize,
+    dst: *const u8,
+    dst_len: usize,
+) -> i32 {
+    let s = unsafe { core::slice::from_raw_parts(src, src_len) };
+    let d = unsafe { core::slice::from_raw_parts(dst, dst_len) };
+    let mut m = MsgBuf::new(oxbow_abi::TAG_FS_LINK);
+    unsafe { pack_two(&mut m, s, d) };
+    if sys_call(cwd_handle(), &mut m).is_err() || m.data[0] != 0 { -1 } else { 0 }
 }
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
