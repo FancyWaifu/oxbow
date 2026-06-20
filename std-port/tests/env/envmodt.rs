@@ -99,6 +99,22 @@ fn test_env_set_var() {
     assert!(vars_os().any(|(k, v)| { &*k == &*n && &*v == "VALUE" }));
 }
 
+// oxbow-native: home_dir() reflects $HOME (seeded /home), no passwd-db fallback.
+#[test]
+fn oxbow_home_dir() {
+    use std::path::PathBuf;
+    assert_eq!(home_dir(), Some(PathBuf::from("/home"))); // env table seeds HOME=/home
+    unsafe {
+        set_var("HOME", "/home/bryson");
+        assert_eq!(home_dir(), Some(PathBuf::from("/home/bryson")));
+        set_var("HOME", ""); // empty HOME is filtered out
+        assert_eq!(home_dir(), None);
+        remove_var("HOME");
+        assert_eq!(home_dir(), None); // no fallback on oxbow
+        set_var("HOME", "/home"); // restore the seed for other tests
+    }
+}
+
 #[test]
 #[cfg_attr(not(any(unix, windows)), ignore, allow(unused))]
 fn env_home_dir() {

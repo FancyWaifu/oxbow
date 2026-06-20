@@ -1800,23 +1800,20 @@ index b49c39a9..857e2cf6 100644
      } else {
          path.has_root() && path.prefix().is_some()
 diff --git a/library/std/src/sys/paths/mod.rs b/library/std/src/sys/paths/mod.rs
-index 8880a837..a0c94e83 100644
+index 8880a837..dfe0ab11 100644
 --- a/library/std/src/sys/paths/mod.rs
 +++ b/library/std/src/sys/paths/mod.rs
-@@ -17,6 +17,18 @@ mod imp {
+@@ -17,6 +17,15 @@ mod imp {
              pub use super::unsupported::{SplitPaths, split_paths, JoinPathsError, join_paths, home_dir};
          }
      }
 +    target_os = "oxbow" => {
 +        mod oxbow;
-+        #[expect(dead_code)]
-+        mod unsupported;
 +        mod imp {
 +            pub use super::oxbow::{
-+                getcwd, chdir, current_exe, temp_dir, SplitPaths, split_paths, JoinPathsError,
-+                join_paths,
++                getcwd, chdir, current_exe, temp_dir, home_dir, SplitPaths, split_paths,
++                JoinPathsError, join_paths,
 +            };
-+            pub use super::unsupported::home_dir;
 +        }
 +    }
      all(target_vendor = "fortanix", target_env = "sgx") => {
@@ -1824,10 +1821,10 @@ index 8880a837..a0c94e83 100644
          #[expect(dead_code)]
 diff --git a/library/std/src/sys/paths/oxbow.rs b/library/std/src/sys/paths/oxbow.rs
 new file mode 100644
-index 00000000..f66d7cc2
+index 00000000..96f5cf56
 --- /dev/null
 +++ b/library/std/src/sys/paths/oxbow.rs
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,149 @@
 +//! oxbow working-directory + executable-path backend.
 +//!
 +//! oxbow has no global filesystem namespace: a process's working directory is a
@@ -1912,6 +1909,12 @@ index 00000000..f66d7cc2
 +
 +pub fn temp_dir() -> PathBuf {
 +    PathBuf::from("/tmp")
++}
++
++pub fn home_dir() -> Option<PathBuf> {
++    // oxbow has no passwd database, so `$HOME` (seeded to `/home` by the env table) is
++    // the sole source — matching the unix `$HOME`-first path, minus the getpwuid fallback.
++    crate::env::var_os("HOME").filter(|s| !s.is_empty()).map(PathBuf::from)
 +}
 +
 +// --- PATH-list handling ---
