@@ -1,0 +1,13 @@
+[package]
+name = "oxio"
+version = "0.0.0"
+edition = "2021"
+[workspace]
+[[bin]]
+name = "oxio"
+path = "src/main.rs"
+[dependencies]
+oxbow-rt = { path = "/Users/5speeddeasil/oxbow/rt", features = ["hosted"] }
+[profile.release]
+opt-level = "z"
+panic = "unwind"
