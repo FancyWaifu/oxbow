@@ -862,14 +862,25 @@ pub extern "C" fn oxbow_main() -> ! {
             TAG_TCP_SEND => {
                 let sid = m.badge as usize;
                 if let Some(Sock::Tcp(handle)) = slot_of(&sockets, sid) {
-                    let len = (m.data[0] as usize).min(48);
+                    // Up to 504 payload bytes ride the inline data area (512 B - 8 B count).
+                    let len = (m.data[0] as usize).min(504);
                     let bytes =
                         unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), len) };
-                    r.data[0] = if tcp_stack.send(handle, bytes) { 0 } else { 1 };
+                    match tcp_stack.send(handle, bytes) {
+                        Some(sent) => {
+                            r.data[0] = 0; // ok
+                            r.data[1] = sent as u64; // bytes actually accepted (may be < len)
+                        }
+                        None => {
+                            r.data[0] = 1; // socket can't send
+                            r.data[1] = 0;
+                        }
+                    }
                 } else {
                     r.data[0] = 1;
+                    r.data[1] = 0;
                 }
-                r.data_len = 1;
+                r.data_len = 2;
                 let _ = rt::sys_reply(reply, &r);
             }
             // TCP socket channel: receive bytes (blocks until data or close).

@@ -1,0 +1,18 @@
+[package]
+name = "httpd"
+version = "0.1.0"
+edition = "2021"
+description = "A small HTTP file server — a real Rust std program running on oxbow"
+
+[workspace]
+
+[[bin]]
+name = "httpd"
+path = "src/main.rs"
+
+[dependencies]
+oxbow-rt = { path = "/Users/5speeddeasil/oxbow/rt", features = ["hosted"] }
+
+[profile.release]
+opt-level = "z"
+panic = "unwind"

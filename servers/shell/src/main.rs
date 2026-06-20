@@ -1206,7 +1206,7 @@ fn http_cmd(args: &[u8]) {
         return;
     };
     tw(b"http: connected, GET /\n");
-    if !rt::tcp::send(sock, b"GET / HTTP/1.0\r\n\r\n") {
+    if rt::tcp::send(sock, b"GET / HTTP/1.0\r\n\r\n").is_none() {
         tw(b"http: send failed\n");
         rt::tcp::close(sock);
         return;

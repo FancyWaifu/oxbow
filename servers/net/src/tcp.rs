@@ -256,23 +256,31 @@ impl TcpStack {
         }
     }
 
-    /// Queue `data` and pump until it has all left the send buffer.
-    pub fn send(&mut self, handle: SocketHandle, data: &[u8]) -> bool {
-        {
+    /// Enqueue as much of `data` as the TCP send buffer accepts and pump until it has
+    /// left the buffer. Returns Some(bytes_accepted) — which may be < data.len() if the
+    /// send buffer was nearly full, so the caller must loop — or None if the socket can no
+    /// longer send (closed/reset).
+    pub fn send(&mut self, handle: SocketHandle, data: &[u8]) -> Option<usize> {
+        let queued = {
             let s = self.sockets.get_mut::<tcp::Socket>(handle);
-            if !s.may_send() || s.send_slice(data).is_err() {
-                return false;
+            if !s.may_send() {
+                return None;
             }
-        }
+            match s.send_slice(data) {
+                Ok(0) => return Some(0), // buffer full right now; caller retries
+                Ok(n) => n,
+                Err(_) => return None,
+            }
+        };
         let start = rt::sys_uptime_ms();
         loop {
             self.poll();
             let s = self.sockets.get::<tcp::Socket>(handle);
             if s.send_queue() == 0 {
-                return true;
+                return Some(queued);
             }
             if rt::sys_uptime_ms() - start > 8000 {
-                return false;
+                return Some(queued); // pumped what we could; bytes are acked or will be
             }
         }
     }

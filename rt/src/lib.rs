@@ -958,7 +958,13 @@ pub unsafe extern "C" fn __oxbow_tcp_connect6(addr16: *const u8, port: u16) -> i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __oxbow_tcp_send(sock: i64, buf: *const u8, len: usize) -> isize {
     let data = unsafe { core::slice::from_raw_parts(buf, len) };
-    if tcp::send(sock as Handle, data) { len as isize } else { -1 }
+    // Return the ACTUAL bytes accepted (one inline message ≤504 B), so std's `write_all`
+    // loops over the rest. Previously this returned `len` while the server only took the
+    // first 48 bytes — silently dropping the tail of any larger write.
+    match tcp::send(sock as Handle, data) {
+        Some(n) => n as isize,
+        None => -1,
+    }
 }
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
@@ -2087,15 +2093,20 @@ pub mod tcp {
         Some(m.handles[0])
     }
 
-    /// Send up to 48 bytes on a TCP socket cap. Returns false on error.
-    pub fn send(sock: Handle, data: &[u8]) -> bool {
-        let n = data.len().min(48);
+    /// Send up to 504 bytes (one inline message) on a TCP socket cap. Returns the number
+    /// of bytes the server accepted (may be < offered if its send buffer is near full),
+    /// or None on error. Callers must loop to send the rest.
+    pub fn send(sock: Handle, data: &[u8]) -> Option<usize> {
+        let n = data.len().min(504);
         let mut m = MsgBuf::new(TAG_TCP_SEND);
         m.data[0] = n as u64;
         let dst = m.data.as_mut_ptr() as *mut u8;
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst.add(8), n) };
-        m.data_len = 8;
-        sys_call(sock, &mut m).is_ok() && m.data[0] == 0
+        m.data_len = 64; // up to all 512 inline bytes carry the count + payload
+        if sys_call(sock, &mut m).is_err() || m.data[0] != 0 {
+            return None;
+        }
+        Some(m.data[1] as usize)
     }
 
     /// Receive on a TCP socket cap into `out` (blocks server-side until data or

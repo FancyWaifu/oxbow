@@ -380,18 +380,18 @@ pub unsafe extern "C" fn connect(fd: i32, addr: *const SockAddrIn, _len: u32) ->
     }
 }
 
-/// Loop `rt::tcp::send` (48-byte chunks) until all of `data` is sent.
+/// Loop `rt::tcp::send` until all of `data` is sent. Each call sends up to one inline
+/// message (≤504 B) and reports how many bytes it accepted, so advance by that.
 unsafe fn sock_send(sock: Handle, data: &[u8]) -> isize {
     if sock == 0 {
         return -1;
     }
     let mut i = 0usize;
     while i < data.len() {
-        let n = core::cmp::min(48, data.len() - i);
-        if !rt::tcp::send(sock, &data[i..i + n]) {
-            break;
+        match rt::tcp::send(sock, &data[i..]) {
+            Some(0) | None => break,
+            Some(n) => i += n,
         }
-        i += n;
     }
     i as isize
 }
