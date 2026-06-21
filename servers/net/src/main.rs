@@ -27,11 +27,12 @@ use core::sync::atomic::{fence, Ordering};
 use eth::{ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use oxbow_abi::{
     MsgBuf, MSG_DATA_WORDS, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_NET_IRQ, BOOT_PCI, NET_DMA, NET_MMIO, NET_SHARED,
-    PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_NET_DNS, TAG_TCP_ACCEPT, TAG_TCP_CLOSE,
+    PROT_READ, PROT_WRITE, R_GRANT, R_SEND, RING_HDR_BYTES, RING_PAYLOAD_MAX, RING_SLOTS,
+    RING_SLOT_STRIDE, TAG_NET_DNS, TAG_TCP_ACCEPT, TAG_TCP_CLOSE,
     TAG_TCP_CONNECT, TAG_TCP_CONNECT6, TAG_TCP_LISTEN,
     TAG_TCP_RECV, TAG_TCP_RECVV, TAG_TCP_SEND, TAG_TCP_SENDV, TAG_UDP_ATTACH, TAG_UDP_BIND,
-    TAG_UDP_CLOSE, TAG_UDP_RECVFROM,
-    TAG_UDP_RECVV, TAG_UDP_SENDTO, TAG_UDP_SENDV,
+    TAG_UDP_CLOSE, TAG_UDP_KICK, TAG_UDP_RECVFROM,
+    TAG_UDP_RECVV, TAG_UDP_RING, TAG_UDP_SENDTO, TAG_UDP_SENDV,
 };
 use oxbow_rt as rt;
 use smoltcp::iface::SocketHandle;
@@ -53,6 +54,38 @@ enum Sock {
 /// between NET_DMA (0x4010_0000) and the next region.
 fn frame_vaddr(sid: usize) -> u64 {
     NET_SHARED + (sid as u64) * 4096
+}
+
+/// Server-side base of the per-socket batch rings (netmap Stage 3), 1 MiB above the
+/// Stage 2 frames so the two regions never overlap.
+const RING_BASE: u64 = NET_SHARED + 0x10_0000;
+fn ring_vaddr(sid: usize) -> u64 {
+    RING_BASE + (sid as u64) * 4096
+}
+/// Load one of the ring's u32 indices (byte offset 0/4/8/12 in the header).
+fn ring_idx_load(base: u64, off: u64) -> u32 {
+    unsafe { ((base + off) as *const u32).read_volatile() }
+}
+/// Store one of the ring's u32 indices.
+fn ring_idx_store(base: u64, off: u64, val: u32) {
+    unsafe { ((base + off) as *mut u32).write_volatile(val) };
+}
+/// Read a slot descriptor: (ip BE-u32, port, len).
+fn ring_slot_desc(slot: u64) -> (u32, u16, u16) {
+    unsafe {
+        let ip = (slot as *const u32).read_unaligned();
+        let port = ((slot + 4) as *const u16).read_unaligned();
+        let len = ((slot + 6) as *const u16).read_unaligned();
+        (ip, port, len)
+    }
+}
+/// Write a slot descriptor (ip BE-u32, port, len).
+fn ring_slot_write_desc(slot: u64, ip: u32, port: u16, len: u16) {
+    unsafe {
+        (slot as *mut u32).write_unaligned(ip);
+        ((slot + 4) as *mut u16).write_unaligned(port);
+        ((slot + 6) as *mut u16).write_unaligned(len);
+    }
 }
 
 /// Resolve a 1-based socket badge to its table slot (copied out).
@@ -635,6 +668,9 @@ pub extern "C" fn oxbow_main() -> ! {
     // page with its new owner, so the table never leaks past 16 frames.
     let mut socket_frames: [Option<oxbow_abi::Handle>; MAX_SOCKETS + 1] =
         [None; MAX_SOCKETS + 1];
+    // Per-socket batch rings (netmap Stage 3): a second page per UDP socket, mapped at
+    // ring_vaddr(sid), holding a TX + RX ring. Same lazy-alloc/keep-forever discipline.
+    let mut ring_frames: [Option<oxbow_abi::Handle>; MAX_SOCKETS + 1] = [None; MAX_SOCKETS + 1];
     loop {
         let mut m = MsgBuf::new(0);
         let reply = match rt::sys_recv(BOOT_EP, &mut m) {
@@ -735,6 +771,105 @@ pub extern "C" fn oxbow_main() -> ! {
                     r.data[0] = 0;
                 }
                 r.data_len = 3;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            // Socket channel: map this UDP socket's batch ring page (netmap Stage 3).
+            TAG_UDP_RING => {
+                let sid = m.badge as usize;
+                if (1..=MAX_SOCKETS).contains(&sid)
+                    && matches!(slot_of(&sockets, sid), Some(Sock::Udp(_)))
+                {
+                    if ring_frames[sid].is_none() {
+                        if let Ok(f) = rt::sys_frame_alloc(BOOT_MEM) {
+                            let va = ring_vaddr(sid);
+                            if rt::sys_frame_map(f, va, PROT_READ | PROT_WRITE).is_ok() {
+                                // A fresh frame may be dirty — zero the four indices.
+                                ring_idx_store(va, 0, 0);
+                                ring_idx_store(va, 4, 0);
+                                ring_idx_store(va, 8, 0);
+                                ring_idx_store(va, 12, 0);
+                                ring_frames[sid] = Some(f);
+                            }
+                        }
+                    }
+                    match ring_frames[sid] {
+                        Some(f) => {
+                            r.data[0] = 0;
+                            r.data[1] = sid as u64;
+                            r.data_len = 2;
+                            r.handle_count = 1;
+                            r.handles[0] = f;
+                        }
+                        None => {
+                            r.data[0] = 1;
+                            r.data_len = 1;
+                        }
+                    }
+                } else {
+                    r.data[0] = 1;
+                    r.data_len = 1;
+                }
+                let _ = rt::sys_reply(reply, &r);
+            }
+            // Socket channel: the doorbell. Drain ALL posted TX slots and harvest any
+            // buffered RX into the RX ring — one crossing amortizes the whole batch.
+            TAG_UDP_KICK => {
+                let sid = m.badge as usize;
+                let mut sent = 0u64;
+                let mut harvested = 0u64;
+                if sid <= MAX_SOCKETS && ring_frames[sid].is_some() {
+                    if let Some(Sock::Udp(src_port)) = slot_of(&sockets, sid) {
+                        let base = ring_vaddr(sid);
+                        let slot_at = |i: u32| base + RING_HDR_BYTES as u64 + i as u64 * RING_SLOT_STRIDE as u64;
+                        // Drain TX: tx_head..tx_tail (mod RING_SLOTS).
+                        let mut tx_head = ring_idx_load(base, 0);
+                        let tx_tail = ring_idx_load(base, 4);
+                        while tx_head != tx_tail {
+                            let slot = slot_at(tx_head);
+                            let (ip, port, len) = ring_slot_desc(slot);
+                            let len = (len as usize).min(RING_PAYLOAD_MAX);
+                            let payload = unsafe {
+                                core::slice::from_raw_parts((slot + 8) as *const u8, len)
+                            }
+                            .to_vec();
+                            send_udp(&mut nic, &mut cache, src_port, ip.to_be_bytes(), port, &payload);
+                            tx_head = (tx_head + 1) % RING_SLOTS;
+                            sent += 1;
+                        }
+                        ring_idx_store(base, 0, tx_head);
+                        // Harvest RX: fill until the RX ring is full or nothing is buffered.
+                        let rx_head = ring_idx_load(base, 8);
+                        let mut rx_tail = ring_idx_load(base, 12);
+                        loop {
+                            let next = (rx_tail + 1) % RING_SLOTS;
+                            if next == rx_head {
+                                break; // RX ring full — app must drain + kick again
+                            }
+                            let mut buf = [0u8; RING_PAYLOAD_MAX];
+                            let (n, sip, sport) =
+                                recv_udp_for(&mut nic, &mut cache, src_port, &mut buf);
+                            if n == 0 {
+                                break; // nothing more buffered right now
+                            }
+                            let n = n.min(RING_PAYLOAD_MAX);
+                            let slot = slot_at(RING_SLOTS + rx_tail);
+                            ring_slot_write_desc(slot, u32::from_be_bytes(sip), sport, n as u16);
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    buf.as_ptr(),
+                                    (slot + 8) as *mut u8,
+                                    n,
+                                );
+                            }
+                            rx_tail = next;
+                            harvested += 1;
+                        }
+                        ring_idx_store(base, 12, rx_tail);
+                    }
+                }
+                r.data[0] = sent;
+                r.data[1] = harvested;
+                r.data_len = 2;
                 let _ = rt::sys_reply(reply, &r);
             }
             // Socket channel: free the UDP socket slot (else binds leak slots).

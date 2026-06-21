@@ -2084,6 +2084,116 @@ pub mod udp {
     }
 }
 
+/// Per-socket batched ring + doorbell (netmap Stage 3). Queue K datagrams into the
+/// TX ring with plain memory writes, then `kick` ONCE — the server drains the whole
+/// batch and harvests buffered RX in a single domain crossing (vs one crossing per
+/// packet). For the small-packet / high-pps case; large datagrams use `udp::sendv`.
+pub mod ring {
+    use crate::{sys_call, sys_frame_map, Handle};
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use oxbow_abi::{
+        MsgBuf, PROT_READ, PROT_WRITE, RING_HDR_BYTES, RING_PAYLOAD_MAX, RING_SLOTS,
+        RING_SLOT_STRIDE, TAG_UDP_KICK, TAG_UDP_RING,
+    };
+
+    /// Client-side base vaddr of the per-socket ring pages (1 MiB above `UDP_XFER`).
+    pub const RING_XFER: u64 = 0x3E10_0000;
+    /// Per-sid one-time mapping record (a reused sid re-shares the same page → map once).
+    static RING_MAPPED: [AtomicU64; (RING_SLOTS as usize) * 2 + 1] =
+        [const { AtomicU64::new(0) }; (RING_SLOTS as usize) * 2 + 1];
+
+    /// A mapped per-socket ring: `push` to queue TX, `kick` the doorbell, `pop` RX.
+    pub struct Ring {
+        base: u64,
+        sock: Handle,
+    }
+
+    /// Attach socket `sock`'s batch ring (maps the ring page once per sid). `None` if
+    /// the server can't provide one (e.g. not a UDP socket).
+    pub fn attach(sock: Handle) -> Option<Ring> {
+        let mut m = MsgBuf::new(TAG_UDP_RING);
+        if sys_call(sock, &mut m).is_err() || m.data[0] != 0 || m.handle_count == 0 {
+            return None;
+        }
+        let frame = m.handles[0];
+        let sid = m.data[1] as usize;
+        if sid == 0 || sid >= RING_MAPPED.len() {
+            return None;
+        }
+        let vaddr = RING_XFER + sid as u64 * 4096;
+        if RING_MAPPED[sid].load(Ordering::Acquire) == 0 {
+            if sys_frame_map(frame, vaddr, PROT_READ | PROT_WRITE).is_err() {
+                return None;
+            }
+            RING_MAPPED[sid].store(vaddr, Ordering::Release);
+        }
+        Some(Ring { base: vaddr, sock })
+    }
+
+    impl Ring {
+        fn idx(&self, off: u64) -> &AtomicU32 {
+            unsafe { &*((self.base + off) as *const AtomicU32) }
+        }
+        fn slot(&self, i: u32) -> u64 {
+            self.base + RING_HDR_BYTES as u64 + i as u64 * RING_SLOT_STRIDE as u64
+        }
+
+        /// Queue one datagram into the TX ring — a plain memory write, NO IPC. Returns
+        /// false if the ring is full (`kick` to drain). Payload truncated to the slot.
+        pub fn push(&self, ip: [u8; 4], port: u16, payload: &[u8]) -> bool {
+            let tx_tail = self.idx(4).load(Ordering::Relaxed);
+            let tx_head = self.idx(0).load(Ordering::Acquire);
+            let next = (tx_tail + 1) % RING_SLOTS;
+            if next == tx_head {
+                return false; // full
+            }
+            let n = payload.len().min(RING_PAYLOAD_MAX);
+            let slot = self.slot(tx_tail);
+            unsafe {
+                (slot as *mut u32).write_unaligned(u32::from_be_bytes(ip));
+                ((slot + 4) as *mut u16).write_unaligned(port);
+                ((slot + 6) as *mut u16).write_unaligned(n as u16);
+                core::ptr::copy_nonoverlapping(payload.as_ptr(), (slot + 8) as *mut u8, n);
+            }
+            self.idx(4).store(next, Ordering::Release); // publish to the server
+            true
+        }
+
+        /// Ring the doorbell: the server drains every posted TX slot and harvests any
+        /// buffered RX into the RX ring. Returns `(sent, harvested)`. ONE crossing.
+        pub fn kick(&self) -> (usize, usize) {
+            let mut m = MsgBuf::new(TAG_UDP_KICK);
+            if sys_call(self.sock, &mut m).is_err() {
+                return (0, 0);
+            }
+            (m.data[0] as usize, m.data[1] as usize)
+        }
+
+        /// Pop one received datagram from the RX ring into `out`. Returns
+        /// `(src_ip, src_port, len)`, or `None` when the RX ring is empty.
+        pub fn pop(&self, out: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
+            let rx_head = self.idx(8).load(Ordering::Relaxed);
+            let rx_tail = self.idx(12).load(Ordering::Acquire);
+            if rx_head == rx_tail {
+                return None; // empty
+            }
+            let slot = self.slot(RING_SLOTS + rx_head);
+            let (ip, port, len) = unsafe {
+                let ip = (slot as *const u32).read_unaligned();
+                let port = ((slot + 4) as *const u16).read_unaligned();
+                let len = ((slot + 6) as *const u16).read_unaligned() as usize;
+                (ip, port, len)
+            };
+            let n = len.min(RING_PAYLOAD_MAX).min(out.len());
+            unsafe {
+                core::ptr::copy_nonoverlapping((slot + 8) as *const u8, out.as_mut_ptr(), n);
+            }
+            self.idx(8).store((rx_head + 1) % RING_SLOTS, Ordering::Release); // free slot
+            Some((ip.to_be_bytes(), port, n))
+        }
+    }
+}
+
 /// Minimal DNS A-record client: build a recursive query, parse the first answer.
 pub mod dns {
     use alloc::vec::Vec;

@@ -640,6 +640,35 @@ pub const TAG_TCP_SENDV: u64 = u32::from_le_bytes(*b"TSNV") as u64;
 /// the stream INTO the socket's frame. Reply: data[0]=len (0 = closed/none).
 pub const TAG_TCP_RECVV: u64 = u32::from_le_bytes(*b"TRVV") as u64;
 
+// --- netmap Stage 3 — per-socket batched ring + doorbell --------------------
+// A UDP socket maps a second per-socket page laid out as a TX ring + an RX ring
+// (SPSC, head/tail indices in the header). The app fills K TX slots with pure
+// memory writes (no IPC), then rings the doorbell ONCE (TAG_UDP_KICK); the server
+// drains all posted TX slots and harvests any buffered RX into the RX ring in that
+// single handler — ONE domain crossing amortizes the whole batch. Single page, so
+// slots are small (the small-packet/high-pps case netmap targets); large datagrams
+// still go through the Stage 2 single-frame sendv. Layout (4096 B):
+//   [0]  tx_head u32 (server advances)   [4]  tx_tail u32 (app advances)
+//   [8]  rx_head u32 (app advances)      [12] rx_tail u32 (server advances)
+//   [64 + i*RING_SLOT_STRIDE]            TX slot i  (i < RING_SLOTS)
+//   [64 + (RING_SLOTS+i)*RING_SLOT_STRIDE] RX slot i
+// Each slot: ip u32 (BE; dst for TX, src for RX) @0, port u16 @4, len u16 @6,
+// payload @8 (<= RING_PAYLOAD_MAX).
+/// RING (udp socket cap): map this socket's batch ring page. Reply: data[0]=status,
+/// data[1]=sid; handles[0]=ring frame cap.
+pub const TAG_UDP_RING: u64 = u32::from_le_bytes(*b"URNG") as u64;
+/// KICK (udp socket cap): the doorbell. Drain all posted TX slots, harvest buffered
+/// RX into the RX ring. Reply: data[0]=sent, data[1]=harvested.
+pub const TAG_UDP_KICK: u64 = u32::from_le_bytes(*b"UKIK") as u64;
+/// Slots per direction (TX and RX each).
+pub const RING_SLOTS: u32 = 8;
+/// Byte stride of one ring slot (8-byte descriptor + payload). 64 + 16*252 = 4096.
+pub const RING_SLOT_STRIDE: usize = 252;
+/// Max payload bytes carried in one ring slot.
+pub const RING_PAYLOAD_MAX: usize = RING_SLOT_STRIDE - 8;
+/// Bytes reserved for the ring header (the four u32 indices), before slot 0.
+pub const RING_HDR_BYTES: usize = 64;
+
 /// `sys_spawn` grant convention: the handles in the spawn MsgBuf land in the
 /// child's table at these slots, in order (HANDLE_NULL entries are skipped).
 /// Slot 3 is always the child's fresh Memory budget, so it is not in this list.

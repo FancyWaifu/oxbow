@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 oxbow-rt = { path = "/Users/5speeddeasil/oxbow/rt", features = ["hosted"] }
+oxbow-abi = { path = "/Users/5speeddeasil/oxbow/abi" }
 
 [profile.release]
 opt-level = "z"

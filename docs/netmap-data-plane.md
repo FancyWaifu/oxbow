@@ -116,15 +116,43 @@ rest, which TLS needs).
 Stage 2 is now complete for both UDP and TCP. Next is Stage 3 (multi-slot ring +
 batched doorbell) — the line-rate lever.
 
-### Stage 3 — a multi-slot ring + batched doorbell (the real netmap)
+### Stage 3 — a multi-slot ring + batched doorbell (DONE — UDP)
 Replace the single frame with a **ring of N fixed-size slots** + a TX and RX
-descriptor ring (head/tail indices) in the shared region, plus a **notification
-capability as the doorbell**. The app fills K slots, advances the TX head, and signals
-the doorbell *once*; the net server drains K slots per wakeup. Likewise RX: the server
-fills slots, signals once, the app drains a batch. **One crossing per *batch*.** Define
-the slot-ownership protocol (an owner bit or the head/tail discipline) so neither side
-touches a slot the other owns — Rust's type system can enforce a lot of this (a
-`Slot<Owned>` vs `Slot<Posted>` typestate). *Effort: high. This is the line-rate lever.*
+descriptor ring (head/tail indices) in the shared region. The app fills K slots,
+advances the TX tail, and rings the doorbell *once*; the net server drains all posted
+TX slots and harvests buffered RX in that single handler. **One crossing per *batch*.**
+
+**Built + validated (2026-06-20).** A second per-socket page (`ring_vaddr(sid)` =
+`RING_BASE + sid*4096`, 1 MiB above the Stage 2 frames), attached with `TAG_UDP_RING`,
+laid out as a TX ring + an RX ring (SPSC; the four u32 head/tail indices live in a
+64-byte header, then `RING_SLOTS` TX slots and `RING_SLOTS` RX slots of
+`RING_SLOT_STRIDE` bytes each — a single 4 KiB page, so slots are small: the
+small-packet / high-pps case netmap actually targets). Layout + slot descriptor
+(`ip`/`port`/`len`) are normative in `abi/src/lib.rs`.
+
+- **Doorbell = a `TAG_UDP_KICK` sys_call** — which *is* netmap's model ("one syscall
+  tells the NIC I queued N packets"), and fits oxbow's single-wait-source server loop
+  without multiplexing a notification into it. The kick handler drains `tx_head..tx_tail`
+  (one `send_udp` per slot) and harvests RX with the non-blocking `recv_udp_for` until
+  the RX ring is full or nothing is buffered, then replies `(sent, harvested)`.
+- **No data race:** the kick is a synchronous rendezvous, so the app is blocked while
+  the server touches the ring — the two sides strictly alternate. Indices still use
+  `AtomicU32` acquire/release for cross-process visibility (belt-and-suspenders over the
+  syscall barrier); the head==tail-empty / (tail+1)==head-full discipline gives each
+  ring a capacity of `RING_SLOTS-1`.
+- **rt** (`rt::ring`): `attach(sock)→Ring`; `Ring::push(ip,port,payload)→bool` (pure
+  memory write, NO IPC), `Ring::kick()→(sent,harvested)`, `Ring::pop(&mut buf)`. A
+  native batch API — std's `UdpSocket` has no batch verb, so this is the layer where the
+  per-batch win is expressible.
+- **Validated:** `std-port/apps/udpmtu` queues 7 datagrams, kicks **once** (server sends
+  all 7 in one crossing), and harvests all 7 echoes back through the RX ring byte-exact
+  off the host echo at 10.0.2.2 — "7 sends, 1 TX crossing."
+
+*Remaining for a fuller Stage 3:* MTU-sized slots need a multi-page ring (`MSG_HANDLES=4`
+lets one attach carry up to 4 frame caps) — small slots were the deliberate first cut
+(high-pps is the point). An async RX wakeup (the `SYS_NOTIF_*` doorbell, so the app
+needn't poll-kick) is the other refinement. Slot typestate (`Slot<Owned>`/`Slot<Posted>`)
+is a nicety the rendezvous alternation already makes safe.
 
 ### Stage 4 — NIC DMA directly into the shared ring (true zero-copy end-to-end)
 Today the net server copies between its e1000 DMA rings and the client frame. Stage 4
@@ -149,9 +177,11 @@ makes "14.88 Mpps" plausible. Do only after Stage 3 proves out.*
 
 ## Bottom line
 
-Stage 2 (per-socket zero-copy MTU frame) is the right *next* concrete build — it's the
-DNS path generalized, fixes the last truncation limit, and removes the payload copy.
-Stage 3 (the batched ring) is the line-rate lever and a real project. Together they
-are how oxbow's networking goes from "correct and decent" to "competitive," and they
-are the *only* honest way to get FreeBSD-class network performance into a microkernel —
-by copying netmap's **data-plane design**, not its (or any) C network stack.
+Stages 1–3 are built and validated. Stage 2 (per-socket zero-copy MTU frame, UDP + TCP)
+generalized the DNS path, fixed the last truncation limit, and removed the payload copy.
+Stage 3 (the batched ring + doorbell, UDP) is the line-rate lever: one domain crossing
+amortizes a whole batch of datagrams (proven: 7 sends, 1 crossing). Together they took
+oxbow's networking from "correct and decent" toward "competitive" — by copying netmap's
+**data-plane design**, not its (or any) C network stack. What's left is depth, not
+direction: MTU-sized multi-page rings, an async notif doorbell, and Stage 4 (NIC DMA
+straight into the ring slots — true zero-copy wire-to-app).

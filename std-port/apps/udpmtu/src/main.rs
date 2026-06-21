@@ -58,6 +58,77 @@ fn tcp_echo(len: usize) -> Result<(), String> {
     Ok(())
 }
 
+// Stage 3: the batched ring + doorbell. Queue 8 datagrams into the TX ring (pure
+// memory writes), then kick ONCE — the server sends all 8 in a single domain
+// crossing. Harvest the 8 echoes back through the RX ring over follow-up kicks, and
+// verify each round-trips. Proves "one crossing per batch": 8 sends, 1 TX kick.
+fn ring_batch() -> Result<(), String> {
+    use oxbow_abi::BOOT_NET_EP;
+    use oxbow_rt::{ring, udp};
+
+    // A ring of RING_SLOTS holds RING_SLOTS-1 entries (the classic head==tail-is-empty
+    // discipline sacrifices one slot), so 7 fit before a drain.
+    const N: usize = 7;
+    const PLEN: usize = 200;
+    let dst = [10, 0, 2, 2];
+
+    let (sock, _port) = udp::bind(BOOT_NET_EP, 0).ok_or("ring: bind failed")?;
+    let r = match ring::attach(sock) {
+        Some(r) => r,
+        None => {
+            udp::close(sock);
+            return Err("ring: attach failed".into());
+        }
+    };
+    // Queue N distinct datagrams: payload[0] = marker, rest = pattern.
+    for i in 0..N {
+        let mut p = pattern(PLEN);
+        p[0] = i as u8;
+        if !r.push(dst, ECHO_PORT, &p) {
+            udp::close(sock);
+            return Err(format!("ring: push {i} (ring full?)"));
+        }
+    }
+    // One doorbell sends the whole batch.
+    let (sent, _) = r.kick();
+    if sent != N {
+        udp::close(sock);
+        return Err(format!("ring: kick sent {sent} (expected {N})"));
+    }
+    // Harvest the echoes over follow-up kicks (they arrive over the wire).
+    let mut seen = [false; N];
+    let mut got = 0;
+    let mut buf = [0u8; 256];
+    for _ in 0..200 {
+        let _ = r.kick(); // doorbell: harvest whatever has arrived
+        while let Some((_src, _port, len)) = r.pop(&mut buf) {
+            if len != PLEN {
+                udp::close(sock);
+                return Err(format!("ring: echo len {len} (expected {PLEN})"));
+            }
+            let marker = buf[0] as usize;
+            let mut p = pattern(PLEN);
+            p[0] = marker as u8;
+            if marker >= N || seen[marker] || buf[..len] != p[..] {
+                udp::close(sock);
+                return Err(format!("ring: bad/dup echo marker {marker}"));
+            }
+            seen[marker] = true;
+            got += 1;
+        }
+        if got == N {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    udp::close(sock);
+    if got != N {
+        return Err(format!("ring: harvested {got}/{N} echoes"));
+    }
+    println!("UDPMTU: ring ok ({N} datagrams, 1 TX kick, {got} echoes harvested)");
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind {e}"))?;
     sock.set_read_timeout(Some(Duration::from_secs(5)))
@@ -70,6 +141,8 @@ fn run() -> Result<(), String> {
     for len in [200usize, 1400, 4000] {
         tcp_echo(len)?;
     }
+    // Stage 3: batched ring + doorbell.
+    ring_batch()?;
     Ok(())
 }
 
