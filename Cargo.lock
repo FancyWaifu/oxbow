@@ -881,6 +881,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sort"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+]
+
+[[package]]
 name = "spin"
 version = "0.0.0"
 dependencies = [
