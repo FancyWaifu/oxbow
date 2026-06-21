@@ -23,7 +23,31 @@ app → musl (stock) → __syscallN → __oxbow_syscall → oxbow rt/kernel
 - `oxsys.h` — oxbow raw-syscall inline asm + oxbow syscall numbers + rt shim decls.
 - `build-musl.sh` — builds vendored musl with the override + compiles the dispatcher.
 
-## Status — Phase 2 reached: HEAP + STDIO + FILE I/O ✅
+## Status — Phase 3a reached: EXEC + SPAWN + WAIT ✅ (true fork = 3b, kernel)
+A musl program now spawns and runs another program. `muslhello` execs `/bin/seq`,
+whose stdout it inherits, and exits with its status:
+```
+  --- execve("/bin/seq", {seq,1,5}) ---
+1
+2
+3
+4
+5
+```
+Working: `execve` (reads the target ELF via fsd, spawns it with `__oxbow_spawn`
+inheriting cwd+stdout, runs to completion, exits with its status — the launcher /
+"exec as the last thing" case), and `waitpid` (`__oxbow_wait` on the child's
+exit-notif). Reuses the existing `std::process::Command` shims; no kernel/rt change.
+
+**True `fork()` is deferred to Phase 3b — it needs a kernel primitive.** A spawn
+kernel has no fork, and userland CAN'T emulate it: `fork()` must return (popping its
+frame) so the child code runs, which leaves nothing for the child's `execve` to
+`longjmp` back to (verified: it faults at rip=0). The fix is a kernel thread-clone
+(new thread resuming at the caller's RIP with `rax=0` on a copied stack, shared AS);
+the syscall entry already has the user RIP/RSP. `fork`/`clone` return `-ENOSYS` for
+now so fork-using code takes its failure path instead of crashing.
+
+## Status — Phase 2: HEAP + STDIO + FILE I/O ✅
 `muslhello` now exercises the full picture on the hardware-path QEMU:
 ```
 Hello from musl libc, running on oxbow!

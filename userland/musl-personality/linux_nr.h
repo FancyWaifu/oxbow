@@ -28,7 +28,11 @@
 #define NR_dup2              33
 #define NR_nanosleep         35
 #define NR_getpid            39
+#define NR_clone             56
+#define NR_fork              57
+#define NR_execve            59
 #define NR_exit              60
+#define NR_wait4             61
 #define NR_uname             63
 #define NR_fcntl             72
 #define NR_getcwd            79

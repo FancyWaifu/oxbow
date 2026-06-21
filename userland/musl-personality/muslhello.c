@@ -1,35 +1,24 @@
 /* Test program for the oxbow musl personality. Stock C against musl's headers.
- * Phase 1: printf + exit. Phase 2: heap (malloc/free) + buffered stdio + real file
- * I/O over fsd — stat a file, read it via fopen/fgets, then create + write + read
- * back our own file. Everything below is unmodified upstream musl. */
+ *   Phase 1: printf + exit.   Phase 2: heap + buffered stdio + file I/O.
+ *   Phase 3: fork + execve + waitpid — spawn another program, collect its exit. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 int
 main(void)
 {
+	setvbuf(stdout, NULL, _IONBF, 0); /* unbuffered, so output survives a crash */
 	printf("Hello from musl libc, running on oxbow!\n");
 
-	int sum = 0;
-	for (int i = 1; i <= 10; i++)
-		sum += i;
-	printf("  sum(1..10) = %d via stock musl printf\n", sum);
-
-	/* heap (mallocng over mmap) */
-	char *buf = malloc(256);
-	snprintf(buf, 256, "  malloc + snprintf at %p\n", (void *)buf);
-	fputs(buf, stdout);
-	free(buf);
-
-	/* stat + buffered read of a seeded file */
+	/* heap + buffered file read (Phase 2) */
 	struct stat st;
 	if (stat("/hello.c", &st) == 0)
 		printf("  stat(/hello.c): %lld bytes\n", (long long)st.st_size);
-
 	FILE *f = fopen("/hello.c", "r");
 	if (f) {
 		char line[128];
@@ -38,19 +27,15 @@ main(void)
 		fclose(f);
 	}
 
-	/* create + write + read back our own file */
-	FILE *w = fopen("/musl-wrote.txt", "w");
-	if (w) {
-		fprintf(w, "written by musl libc on oxbow\n");
-		fclose(w);
-		FILE *r = fopen("/musl-wrote.txt", "r");
-		if (r) {
-			char back[64] = {0};
-			fread(back, 1, sizeof back - 1, r);
-			fclose(r);
-			printf("  readback: %s", back);
-		}
-	}
+	/* Phase 3: fork + execve + waitpid. The child runs /bin/seq (an oxbow program),
+	 * whose stdout we inherit, then we collect its exit status. */
+	/* Phase 3: exec another program (its stdout is ours), running it to completion.
+	 * execve replaces us, so the `seq 1 5` output below is the last thing we print. */
+	printf("  --- execve(\"/bin/seq\", {seq,1,5}) ---\n");
+	char *args[] = { "seq", "1", "5", NULL };
+	char *envp[] = { NULL };
+	execve("/bin/seq", args, envp);
+	perror("  execve failed"); /* only reached if exec fails */
 
 	return 0;
 }

@@ -16,6 +16,9 @@
 #include <stdarg.h>
 #include <stdint.h>
 
+extern void *malloc(unsigned long);
+extern void free(void *);
+
 struct ox_timespec { long tv_sec; long tv_nsec; };
 
 /* monotonic + realtime clocks via oxbow */
@@ -154,10 +157,121 @@ static long stat_path(const char *path, unsigned char *kst)
 	return 0;
 }
 
+/* ----------------------- process: exec/wait -------------------------------- */
+/* oxbow has no fork (it spawns from an ELF), and userland can't emulate fork purely
+ * — fork() must return (popping its frame) to run the child, leaving nothing to
+ * longjmp back to; true fork needs a kernel thread-clone primitive (Phase 3b). What
+ * works WITHOUT that: execve (spawn the program via __oxbow_spawn, run it to
+ * completion, exit with its status — the "exec as the last thing" / launcher case)
+ * and waitpid (block on a child's exit-notif). fork()/clone() return -ENOSYS. */
+#define MAXCHILD 32
+static struct child { int used; unsigned int pid; long notif; } children[MAXCHILD];
+
+static void remember_child(unsigned int pid, long notif)
+{
+	for (int i = 0; i < MAXCHILD; i++)
+		if (!children[i].used) {
+			children[i].used = 1;
+			children[i].pid = pid;
+			children[i].notif = notif;
+			return;
+		}
+}
+static long child_notif(unsigned int pid)
+{
+	for (int i = 0; i < MAXCHILD; i++)
+		if (children[i].used && children[i].pid == pid)
+			return children[i].notif;
+	return -1;
+}
+static void forget_child(unsigned int pid)
+{
+	for (int i = 0; i < MAXCHILD; i++)
+		if (children[i].used && children[i].pid == pid) {
+			children[i].used = 0;
+			return;
+		}
+}
+
+/* Read `path`'s ELF and spawn it with argv[1..] joined as the oxbow arg blob,
+ * inheriting stdout (slot 2). Returns the new pid (>=0) or -errno. */
+static long do_exec_spawn(const char *path, char *const argv[])
+{
+	static char blob[1024];
+	int bl = 0;
+	if (argv)
+		for (int i = 1; argv[i]; i++) {
+			if (bl && bl < 1023)
+				blob[bl++] = ' ';
+			for (const char *s = argv[i]; *s && bl < 1023; s++)
+				blob[bl++] = *s;
+		}
+	blob[bl < 1024 ? bl : 1023] = 0;
+
+	unsigned long sz = 0;
+	int kd = 0;
+	unsigned int mt = 0, at = 0;
+	long h = __oxbow_fs_open(path, slen(path), 0, &sz, &kd, &mt, &at);
+	if (h < 0)
+		return -E_NOENT;
+	void *elf = malloc(sz ? sz : 1);
+	if (!elf) {
+		__oxbow_fs_close(h);
+		return -E_NOSYS;
+	}
+	unsigned long got = 0;
+	while (got < sz) {
+		long r = __oxbow_fs_pread(h, (char *)elf + got, sz - got, got);
+		if (r <= 0)
+			break;
+		got += (unsigned long)r;
+	}
+	__oxbow_fs_close(h);
+
+	unsigned int pid = 0;
+	long notif = __oxbow_spawn(elf, got, blob, (unsigned long)bl, 2 /*SPAWN_STDOUT*/, &pid);
+	free(elf);
+	if (notif < 0)
+		return -E_NOENT;
+	remember_child(pid, notif);
+	return (long)pid;
+}
+
 long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6)
 {
 	(void)a6;
 	switch (n) {
+
+	/* ---- process ---- */
+	case NR_fork:
+	case NR_clone:
+		/* No fork yet — needs a kernel thread-clone primitive (Phase 3b). Returning
+		 * -ENOSYS lets fork-using code take its failure path instead of crashing. */
+		return -E_NOSYS;
+	case NR_execve: {
+		/* Spawn the program, run it to completion, and exit with its status. This
+		 * covers the launcher / "exec as the last thing" case on a spawn kernel. */
+		long pid = do_exec_spawn((const char *)a1, (char *const *)a2);
+		if (pid < 0)
+			return pid; /* exec failed; caller typically _exit(127) */
+		long nf = child_notif((unsigned int)pid);
+		int code = __oxbow_wait(nf);
+		forget_child((unsigned int)pid);
+		ox_syscall1(OX_SYS_EXIT, code);
+		__builtin_unreachable();
+	}
+	case NR_wait4: {
+		unsigned int pid = (unsigned int)a1;
+		int *status = (int *)a2;
+		long nf = child_notif(pid);
+		if (nf < 0)
+			return -E_NOSYS; /* no such child */
+		int code = __oxbow_wait(nf);
+		forget_child(pid);
+		if (status)
+			*status = (code & 0xff) << 8; /* WIFEXITED|WEXITSTATUS encoding */
+		return (long)pid;
+	}
 
 	/* ---- I/O on fds ---- */
 	case NR_read:

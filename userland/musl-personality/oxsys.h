@@ -74,4 +74,13 @@ extern long __oxbow_fs_pread(long file, void *buf, unsigned long len, unsigned l
 extern long __oxbow_fs_pwrite(long file, const void *buf, unsigned long len, unsigned long off);
 extern void __oxbow_fs_close(long file);
 
+/* process spawn/wait (Phase 3), reusing the std::process::Command shims. spawn
+ * loads `elf` via SYS_SPAWN_BYTES inheriting cwd+stdout, returns the exit-notif
+ * handle (>=0) + writes the child pid; wait blocks on the notif and returns the
+ * exit status. */
+extern long __oxbow_spawn(const void *elf, unsigned long elf_len, const void *argv,
+                          unsigned long argv_len, unsigned int stdout_cap,
+                          unsigned int *pid_out);
+extern int  __oxbow_wait(long notif);
+
 #endif
