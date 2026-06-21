@@ -32,7 +32,7 @@ use oxbow_abi::{
     TAG_TCP_CONNECT, TAG_TCP_CONNECT6, TAG_TCP_LISTEN,
     TAG_TCP_RECV, TAG_TCP_RECVV, TAG_TCP_SEND, TAG_TCP_SENDV, TAG_UDP_ATTACH, TAG_UDP_BIND,
     TAG_UDP_CLOSE, TAG_UDP_KICK, TAG_UDP_RECVFROM,
-    TAG_UDP_RECVV, TAG_UDP_RING, TAG_UDP_SENDTO, TAG_UDP_SENDV,
+    TAG_UDP_RECVV, TAG_UDP_RING, TAG_UDP_RXNOTIF, TAG_UDP_SENDTO, TAG_UDP_SENDV,
 };
 use oxbow_rt as rt;
 use smoltcp::iface::SocketHandle;
@@ -86,6 +86,72 @@ fn ring_slot_write_desc(slot: u64, ip: u32, port: u16, len: u16) {
         ((slot + 4) as *mut u16).write_unaligned(port);
         ((slot + 6) as *mut u16).write_unaligned(len);
     }
+}
+
+/// Push one received datagram into the RX ring at `base` (= ring_vaddr(sid)). Returns
+/// false if the RX ring is full. Shared by the KICK harvest and the async pump.
+fn ring_rx_push(base: u64, payload: &[u8], sip: [u8; 4], sport: u16) -> bool {
+    let rx_head = ring_idx_load(base, 8);
+    let rx_tail = ring_idx_load(base, 12);
+    let next = (rx_tail + 1) % RING_SLOTS;
+    if next == rx_head {
+        return false; // full
+    }
+    let n = payload.len().min(RING_PAYLOAD_MAX);
+    let slot = base + RING_HDR_BYTES as u64 + (RING_SLOTS + rx_tail) as u64 * RING_SLOT_STRIDE as u64;
+    ring_slot_write_desc(slot, u32::from_be_bytes(sip), sport, n as u16);
+    unsafe { core::ptr::copy_nonoverlapping(payload.as_ptr(), (slot + 8) as *mut u8, n) };
+    ring_idx_store(base, 12, next);
+    true
+}
+
+/// IRQ-driven async pump: drain the NIC once and route each UDP datagram to the ring
+/// socket bound to its dst port that registered an RX notif, filling that socket's RX
+/// ring; `got[sid]` is set for sockets that received data (the caller signals their
+/// notifs). ARP/ICMP go through `handle_background`; TCP and non-ring UDP are NOT fed
+/// here (async-RX mode is for ring sockets), so they're dropped — concurrent TCP while
+/// a ring socket is in async mode degrades, the documented Stage-3 limitation. Re-arms
+/// the NIC IRQ line at the end.
+fn pump_ring_rx(
+    nic: &mut Nic,
+    cache: &mut arp::Cache,
+    sockets: &[Sock; MAX_SOCKETS],
+    ring_frames: &[Option<oxbow_abi::Handle>; MAX_SOCKETS + 1],
+    rx_notif: &[Option<oxbow_abi::Handle>; MAX_SOCKETS + 1],
+    got: &mut [bool; MAX_SOCKETS + 1],
+) {
+    let mut buf = [0u8; BUF];
+    while let Some(n) = nic.recv_poll(&mut buf) {
+        handle_background(nic, cache, &buf[..n]);
+        let Some((_, _, et, off)) = eth::parse(&buf[..n]) else { continue };
+        if et != ETHERTYPE_IPV4 {
+            continue;
+        }
+        let Some(ip) = ipv4::parse(&buf[off..n]) else { continue };
+        if ip.proto != ipv4::PROTO_UDP {
+            continue;
+        }
+        let uoff = off + ip.payload_off;
+        let Some(u) = udp::parse(&buf[uoff..n]) else { continue };
+        for sid in 1..=MAX_SOCKETS {
+            if rx_notif[sid].is_none() || ring_frames[sid].is_none() {
+                continue;
+            }
+            if let Sock::Udp(port) = sockets[sid - 1] {
+                if port == u.dst_port {
+                    let p = &buf[uoff + u.payload_off..n];
+                    if ring_rx_push(ring_vaddr(sid), p, ip.src, u.src_port) {
+                        got[sid] = true;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    unsafe {
+        let _ = reg(ICR); // deassert the level-triggered line
+    }
+    let _ = rt::sys_irq_ack(BOOT_NET_IRQ);
 }
 
 /// Resolve a 1-based socket badge to its table slot (copied out).
@@ -671,11 +737,47 @@ pub extern "C" fn oxbow_main() -> ! {
     // Per-socket batch rings (netmap Stage 3): a second page per UDP socket, mapped at
     // ring_vaddr(sid), holding a TX + RX ring. Same lazy-alloc/keep-forever discipline.
     let mut ring_frames: [Option<oxbow_abi::Handle>; MAX_SOCKETS + 1] = [None; MAX_SOCKETS + 1];
+    // Async RX (Stage 3): a per-socket signal cap the IRQ pump fires when a datagram
+    // lands for that ring socket while the server is idle. `async_count` > 0 switches
+    // the main loop into event-driven mode (recv_notif on BOOT_EP + the NIC IRQ); at 0
+    // the loop is byte-for-byte today's request-driven path, so non-async clients
+    // (curl/DNS/TCP) see no change.
+    let mut rx_notif: [Option<oxbow_abi::Handle>; MAX_SOCKETS + 1] = [None; MAX_SOCKETS + 1];
+    let mut async_count: u32 = 0;
     loop {
         let mut m = MsgBuf::new(0);
-        let reply = match rt::sys_recv(BOOT_EP, &mut m) {
-            Ok(r) => r,
-            Err(_) => continue,
+        // Event-driven ONLY while a ring socket is in async-RX mode: wake on a client
+        // request OR the NIC IRQ. With async_count == 0 this is exactly today's
+        // request-driven recv, so non-async clients are unaffected.
+        let reply = if async_count > 0 {
+            // ~20 ms timeout: pump even if the NIC RX IRQ (shared with virtio-blk on
+            // IRQ 11) doesn't fire — a polling fallback layered under the event path.
+            match rt::sys_recv_notif(BOOT_EP, nic.notif, &mut m, 2) {
+                Ok(rt::RecvNotif::Message(r)) => r,
+                Ok(rt::RecvNotif::Notified) => {
+                    // NIC IRQ (or the poll-fallback timeout): drain + route RX to ring
+                    // sockets, then signal each socket whose ring got data so a blocked
+                    // app wakes.
+                    let mut got = [false; MAX_SOCKETS + 1];
+                    pump_ring_rx(
+                        &mut nic, &mut cache, &sockets, &ring_frames, &rx_notif, &mut got,
+                    );
+                    for sid in 1..=MAX_SOCKETS {
+                        if got[sid] {
+                            if let Some(nt) = rx_notif[sid] {
+                                let _ = rt::sys_notif_signal(nt);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                Err(_) => continue,
+            }
+        } else {
+            match rt::sys_recv(BOOT_EP, &mut m) {
+                Ok(r) => r,
+                Err(_) => continue,
+            }
         };
         let mut r = MsgBuf::new(0);
         match m.tag {
@@ -837,39 +939,48 @@ pub extern "C" fn oxbow_main() -> ! {
                             sent += 1;
                         }
                         ring_idx_store(base, 0, tx_head);
-                        // Harvest RX: fill until the RX ring is full or nothing is buffered.
-                        let rx_head = ring_idx_load(base, 8);
-                        let mut rx_tail = ring_idx_load(base, 12);
-                        loop {
-                            let next = (rx_tail + 1) % RING_SLOTS;
-                            if next == rx_head {
-                                break; // RX ring full — app must drain + kick again
+                        // Harvest RX inline ONLY for poll-driven sockets. An async socket
+                        // (rx_notif registered) gets RX exclusively from the IRQ pump,
+                        // which signals its notif — harvesting here would race the pump and
+                        // strand datagrams in the ring with no wakeup.
+                        if rx_notif[sid].is_none() {
+                            loop {
+                                let mut buf = [0u8; RING_PAYLOAD_MAX];
+                                let (n, sip, sport) =
+                                    recv_udp_for(&mut nic, &mut cache, src_port, &mut buf);
+                                if n == 0 {
+                                    break; // nothing more buffered right now
+                                }
+                                if !ring_rx_push(base, &buf[..n.min(RING_PAYLOAD_MAX)], sip, sport)
+                                {
+                                    break; // RX ring full — app must drain + kick again
+                                }
+                                harvested += 1;
                             }
-                            let mut buf = [0u8; RING_PAYLOAD_MAX];
-                            let (n, sip, sport) =
-                                recv_udp_for(&mut nic, &mut cache, src_port, &mut buf);
-                            if n == 0 {
-                                break; // nothing more buffered right now
-                            }
-                            let n = n.min(RING_PAYLOAD_MAX);
-                            let slot = slot_at(RING_SLOTS + rx_tail);
-                            ring_slot_write_desc(slot, u32::from_be_bytes(sip), sport, n as u16);
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(
-                                    buf.as_ptr(),
-                                    (slot + 8) as *mut u8,
-                                    n,
-                                );
-                            }
-                            rx_tail = next;
-                            harvested += 1;
                         }
-                        ring_idx_store(base, 12, rx_tail);
                     }
                 }
                 r.data[0] = sent;
                 r.data[1] = harvested;
                 r.data_len = 2;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            // Socket channel: register an async RX notification (handles[0] = signal cap).
+            TAG_UDP_RXNOTIF => {
+                let sid = m.badge as usize;
+                if (1..=MAX_SOCKETS).contains(&sid)
+                    && matches!(slot_of(&sockets, sid), Some(Sock::Udp(_)))
+                    && m.handle_count > 0
+                {
+                    if rx_notif[sid].is_none() {
+                        async_count += 1;
+                    }
+                    rx_notif[sid] = Some(m.handles[0]);
+                    r.data[0] = 0;
+                } else {
+                    r.data[0] = 1;
+                }
+                r.data_len = 1;
                 let _ = rt::sys_reply(reply, &r);
             }
             // Socket channel: free the UDP socket slot (else binds leak slots).
@@ -878,6 +989,10 @@ pub extern "C" fn oxbow_main() -> ! {
                 if (1..=MAX_SOCKETS).contains(&sid) {
                     if let Sock::Udp(_) = sockets[sid - 1] {
                         sockets[sid - 1] = Sock::Free;
+                    }
+                    if rx_notif[sid].is_some() {
+                        rx_notif[sid] = None;
+                        async_count = async_count.saturating_sub(1);
                     }
                 }
                 r.data[0] = 0;

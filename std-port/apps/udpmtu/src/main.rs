@@ -129,6 +129,82 @@ fn ring_batch() -> Result<(), String> {
     Ok(())
 }
 
+// Stage 3 async RX: register a notification, send a TX batch, then BLOCK on the notif
+// (no poll-kick) until the server's IRQ-driven pump fills the RX ring and signals us.
+// Proves the kernel bound-notification (sys_recv_notif) end-to-end: the net server is
+// idle in a multiplexed wait and the NIC IRQ wakes it to deliver our datagrams.
+fn ring_async() -> Result<(), String> {
+    use oxbow_abi::BOOT_NET_EP;
+    use oxbow_rt::{ring, sys_notif_create, sys_notif_wait, udp};
+
+    const N: usize = 7;
+    const PLEN: usize = 200;
+    let dst = [10, 0, 2, 2];
+
+    let (sock, _port) = udp::bind(BOOT_NET_EP, 0).ok_or("async: bind failed")?;
+    let r = match ring::attach(sock) {
+        Some(r) => r,
+        None => {
+            udp::close(sock);
+            return Err("async: ring attach failed".into());
+        }
+    };
+    let notif = match sys_notif_create() {
+        Ok(n) => n,
+        Err(_) => {
+            udp::close(sock);
+            return Err("async: notif_create failed".into());
+        }
+    };
+    if !r.set_rxnotif(notif) {
+        udp::close(sock);
+        return Err("async: set_rxnotif failed".into());
+    }
+    for i in 0..N {
+        let mut p = pattern(PLEN);
+        p[0] = i as u8;
+        if !r.push(dst, ECHO_PORT, &p) {
+            udp::close(sock);
+            return Err(format!("async: push {i}"));
+        }
+    }
+    let (sent, _) = r.kick(); // TX only — RX arrives via the pump + notif
+    if sent != N {
+        udp::close(sock);
+        return Err(format!("async: kick sent {sent}"));
+    }
+    let mut seen = [false; N];
+    let mut got = 0;
+    let mut buf = [0u8; 256];
+    let mut waits = 0;
+    while got < N && waits < 64 {
+        // BLOCK until the server's pump signals RX (async — no busy poll-kick).
+        let _ = sys_notif_wait(notif);
+        waits += 1;
+        while let Some((_src, _port, len)) = r.pop(&mut buf) {
+            if len != PLEN {
+                udp::close(sock);
+                return Err(format!("async: echo len {len}"));
+            }
+            let marker = buf[0] as usize;
+            let mut p = pattern(PLEN);
+            p[0] = marker as u8;
+            if marker >= N || seen[marker] || buf[..len] != p[..] {
+                udp::close(sock);
+                return Err(format!("async: bad/dup marker {marker}"));
+            }
+            seen[marker] = true;
+            got += 1;
+        }
+    }
+    udp::close(sock);
+    if got != N {
+        return Err(format!("async: harvested {got}/{N} (waits {waits})"));
+    }
+    println!("UDPMTU: async ok ({N} datagrams via notif wait, {waits} wakeups)");
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind {e}"))?;
     sock.set_read_timeout(Some(Duration::from_secs(5)))
@@ -143,6 +219,8 @@ fn run() -> Result<(), String> {
     }
     // Stage 3: batched ring + doorbell.
     ring_batch()?;
+    // Stage 3 async RX: block on a notif, woken by the server's IRQ pump.
+    ring_async()?;
     Ok(())
 }
 

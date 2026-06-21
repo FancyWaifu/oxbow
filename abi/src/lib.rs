@@ -200,6 +200,15 @@ pub const SYS_FUTEX_WAKE: u64 = 56; // (addr: *u32, count) -> rax woken. Wake up
 pub const SYS_THREAD_ID: u64 = 57; // () -> rax tid of the calling thread (for keyed TLS).
 pub const SYS_YIELD: u64 = 58; // () -> 0. Voluntarily reschedule.
 pub const SYS_PROC_KILL: u64 = 59; // (exit_notif, code) -> kill the child the notif belongs to. needs R_WAIT
+// Multiplexed wait (event-driven servers): block until EITHER a message arrives on
+// `ep` OR `notif` is signalled. On a message: rax=0, rdx=reply cap (like sys_recv).
+// On a notif wake: rax=0, rdx has RECV_NOTIF_FIRED set. The notif wakes the receiver
+// WITHOUT depositing a return (mirrors the timer wake), so a concurrent sender
+// handoff can't be corrupted; the notif count stays latched if the sender wins.
+pub const SYS_RECV_NOTIF: u64 = 60; // (ep, notif, &MsgBuf) -> see above. needs R_RECV + R_WAIT
+/// Set in `rdx` when SYS_RECV_NOTIF returned because the notification fired (not a
+/// message). Reply caps are small handle indices, so the top bit is always free.
+pub const RECV_NOTIF_FIRED: u64 = 1 << 63;
 // SYS_THREAD_EXIT(a1): if a1 != 0, the kernel stores *a1 = 1 and futex-wakes a1
 // AFTER the thread is off its user stack — so a joiner can free that stack safely.
 /// Capability kinds reported by SYS_CAP_TYPE (so recvmsg can reconstruct the
@@ -660,6 +669,11 @@ pub const TAG_UDP_RING: u64 = u32::from_le_bytes(*b"URNG") as u64;
 /// KICK (udp socket cap): the doorbell. Drain all posted TX slots, harvest buffered
 /// RX into the RX ring. Reply: data[0]=sent, data[1]=harvested.
 pub const TAG_UDP_KICK: u64 = u32::from_le_bytes(*b"UKIK") as u64;
+/// RXNOTIF (udp socket cap): register an async RX notification — handles[0] = a
+/// signal cap on a notification the app waits on. When a datagram arrives for this
+/// socket while the server is idle, the server's IRQ-driven pump fills the RX ring and
+/// signals the notif, so the app blocks instead of poll-kicking. Reply: data[0]=status.
+pub const TAG_UDP_RXNOTIF: u64 = u32::from_le_bytes(*b"URXN") as u64;
 /// Slots per direction (TX and RX each).
 pub const RING_SLOTS: u32 = 8;
 /// Byte stride of one ring slot (8-byte descriptor + payload). 64 + 16*252 = 4096.

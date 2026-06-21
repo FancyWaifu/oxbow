@@ -42,6 +42,10 @@ struct Notif {
     in_use: bool,
     count: u64,
     waiter: Option<usize>, // tid of the (single) blocked waiter
+    /// tid of a bound receiver blocked in `sys_recv_notif`. Woken WITHOUT a deposited
+    /// return (like the timer wake), so a concurrent endpoint handoff to the same
+    /// thread can't be corrupted; the count stays latched if the sender wins the race.
+    bound_waiter: Option<usize>,
     /// Last exit code delivered by `signal_exit` (an exit notification, §81). Read
     /// with `status` after waiting, so a shell can do `cmd1 && cmd2`. 0 otherwise.
     exit_code: i32,
@@ -52,6 +56,7 @@ static POOL: DiagMutex<[Notif; POOL_SIZE]> = DiagMutex::new("POOL",
         in_use: false,
         count: 0,
         waiter: None,
+        bound_waiter: None,
         exit_code: 0,
     }; POOL_SIZE],
 );
@@ -65,6 +70,7 @@ pub fn create() -> Option<u8> {
                 in_use: true,
                 count: 0,
                 waiter: None,
+                bound_waiter: None,
                 exit_code: 0,
             };
             return Some(i as u8);
@@ -73,12 +79,49 @@ pub fn create() -> Option<u8> {
     None
 }
 
+/// Arm a bound receiver (`sys_recv_notif`): if the count is already latched, return
+/// `false` (the caller returns "notif fired" at once without blocking); else register
+/// `tid` so a later `signal` wakes it. The caller has ALREADY `prepare_block`ed, so a
+/// signal between that and here is caught by the count re-check (returns false).
+pub fn arm_bound(idx: u8, tid: usize) -> bool {
+    let mut p = POOL.lock();
+    let n = &mut p[idx as usize];
+    if n.count > 0 {
+        return false; // already signalled — don't block
+    }
+    n.bound_waiter = Some(tid);
+    true
+}
+
+/// Clear `tid` as the bound receiver (on resume, if a message woke us instead).
+pub fn clear_bound(idx: u8, tid: usize) {
+    let mut p = POOL.lock();
+    if p[idx as usize].bound_waiter == Some(tid) {
+        p[idx as usize].bound_waiter = None;
+    }
+}
+
+/// Drain the latched count to 0 (the bound receiver consumed the wake). Returns the
+/// count that was latched.
+pub fn drain(idx: u8) -> u64 {
+    core::mem::take(&mut POOL.lock()[idx as usize].count)
+}
+
 /// Signal: bump the latched count, and hand it to a waiter if one is parked.
 /// Safe from IRQ context — wake() only flips Blocked→Ready, no switch.
 pub fn signal(idx: u8) {
     let mut p = POOL.lock();
     let n = &mut p[idx as usize];
     n.count = n.count.saturating_add(1);
+    // A bound receiver (sys_recv_notif) is woken WITHOUT a deposited return — the count
+    // stays latched and it drains it on resume. This asymmetry (a sender deposits, the
+    // notif does not) is what makes a concurrent sender-vs-notif wake of the same thread
+    // race-free: only the sender ever writes the thread's return slot.
+    if let Some(tid) = n.bound_waiter.take() {
+        drop(p);
+        thread::wake(tid);
+        return;
+    }
     if let Some(tid) = n.waiter.take() {
         let c = core::mem::take(&mut n.count);
         drop(p);
@@ -142,6 +185,9 @@ pub fn clear_waiter(tid: usize) {
     for n in p.iter_mut() {
         if n.waiter == Some(tid) {
             n.waiter = None;
+        }
+        if n.bound_waiter == Some(tid) {
+            n.bound_waiter = None;
         }
     }
 }

@@ -20,7 +20,7 @@ use crate::sync::DiagMutex;
 
 use crate::object::{HandleEntry, ObjectRef};
 use crate::thread::{self, MAX_THREADS};
-use crate::{println, proc, usermem};
+use crate::{notif, println, proc, usermem};
 
 /// Endpoint pool index of the boot endpoint EP0.
 pub const EP0: u8 = 0;
@@ -413,6 +413,118 @@ pub fn recv(ep_idx: u8, msg_uptr: u64) -> (u64, u64) {
         drop(eps);
         thread::block_current(); // woken by a sender depositing into our staging
         return resume_epilogue(me);
+    }
+}
+
+/// Clear `tid` as `ep_idx`'s receiver (used by `recv_notif` to back out of a block
+/// it didn't complete via the endpoint).
+fn clear_recv_waiter(ep_idx: u8, tid: usize) {
+    let mut eps = ENDPOINTS.lock();
+    if eps[ep_idx as usize].recv_waiter == Some(tid) {
+        eps[ep_idx as usize].recv_waiter = None;
+    }
+}
+
+/// Multiplexed wait (§sys_recv_notif): block until EITHER a message arrives on
+/// `ep_idx` OR `notif_idx` is signalled. Returns `(0, reply_cap)` for a message (like
+/// `recv`) or `(0, RECV_NOTIF_FIRED)` for a notif wake. Race-safety: we register as the
+/// endpoint receiver and `prepare_block` FIRST (covers the sender, §70), then arm the
+/// notif (covers the signal — `arm_bound` re-checks the latched count). A notif signal
+/// wakes us WITHOUT depositing, so a concurrent sender handoff (which DOES deposit) is
+/// never corrupted; if the sender wins, the notif count stays latched for the next call.
+pub fn recv_notif(ep_idx: u8, notif_idx: u8, msg_uptr: u64, timeout_ticks: u64) -> (u64, u64) {
+    let me = thread::current();
+
+    loop {
+        let mut eps = ENDPOINTS.lock();
+        let ep = &mut eps[ep_idx as usize];
+        if !ep.in_use {
+            return (SysError::Gone as u64, HANDLE_NULL as u64);
+        }
+
+        if let Some(s) = ep.send_q.pop() {
+            // ---- sender-first: identical to `recv` ----
+            let is_call = unsafe { (*slot(s)).is_call };
+            if let Err(e) = transfer_into(thread::process_of(s), thread::current_proc(), s) {
+                unsafe {
+                    (*slot(s)).ret_rax = e as u64;
+                    (*slot(s)).ret_rdx = HANDLE_NULL as u64;
+                    (*slot(s)).copy_out = false;
+                }
+                thread::wake(s);
+                continue;
+            }
+            let reply_rdx = if is_call {
+                match mint_reply(s, thread::current_proc()) {
+                    Ok((h, _idx)) => h,
+                    Err(e) => {
+                        unsafe {
+                            (*slot(s)).ret_rax = e as u64;
+                            (*slot(s)).ret_rdx = HANDLE_NULL as u64;
+                            (*slot(s)).copy_out = false;
+                        }
+                        thread::wake(s);
+                        continue;
+                    }
+                }
+            } else {
+                unsafe {
+                    (*slot(s)).ret_rax = 0;
+                    (*slot(s)).ret_rdx = HANDLE_NULL as u64;
+                    (*slot(s)).copy_out = false;
+                }
+                thread::wake(s);
+                HANDLE_NULL
+            };
+            drop(eps);
+            let staged = unsafe { (*slot(s)).staging };
+            return match copy_msg_to_user(msg_uptr, &staged) {
+                Ok(()) => (0, reply_rdx as u64),
+                Err(e) => (e as u64, HANDLE_NULL as u64),
+            };
+        }
+
+        // ---- no sender: register on the endpoint, then arm the notif ----
+        if ep.recv_waiter.is_some() {
+            drop(eps);
+            return (SysError::NoMem as u64, HANDLE_NULL as u64);
+        }
+        ep.recv_waiter = Some(me);
+        unsafe { (*slot(me)).msg_uptr = msg_uptr };
+        thread::prepare_block(); // Blocked under the ENDPOINTS interlock (covers senders)
+        drop(eps);
+
+        if !notif::arm_bound(notif_idx, me) {
+            // The notif was already latched — don't sleep. Undo the endpoint block.
+            thread::cancel_block();
+            clear_recv_waiter(ep_idx, me);
+            let _ = notif::drain(notif_idx);
+            return (0, oxbow_abi::RECV_NOTIF_FIRED);
+        }
+
+        // Optional timeout: the timer IRQ (wake_expired) wakes us at the deadline with a
+        // plain CAS (no deposit), so a server can pump periodically even if a device IRQ
+        // is shared/throttled and its notif doesn't fire. Treated like a notif wake.
+        if timeout_ticks > 0 {
+            thread::set_wake_at(me, crate::arch::ticks() + timeout_ticks);
+        }
+        thread::block_current(); // woken by a sender (deposits), a notif signal, or the timer
+        if timeout_ticks > 0 {
+            thread::set_wake_at(me, 0); // disarm on every exit
+        }
+
+        if unsafe { (*slot(me)).copy_out } {
+            // A sender delivered a message — drop our notif arming, return the message.
+            notif::clear_bound(notif_idx, me);
+            return resume_epilogue(me);
+        }
+        // Notif fired, timed out, or a spurious wake: drop BOTH registrations + drain,
+        // so no stale waiter survives this call (else a later signal could wake an
+        // unrelated `recv`/`recv_notif` on this thread).
+        clear_recv_waiter(ep_idx, me);
+        notif::clear_bound(notif_idx, me);
+        let _ = notif::drain(notif_idx);
+        return (0, oxbow_abi::RECV_NOTIF_FIRED);
     }
 }
 

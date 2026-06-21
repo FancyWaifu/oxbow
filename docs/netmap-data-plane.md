@@ -148,11 +148,37 @@ small-packet / high-pps case netmap actually targets). Layout + slot descriptor
   all 7 in one crossing), and harvests all 7 echoes back through the RX ring byte-exact
   off the host echo at 10.0.2.2 — "7 sends, 1 TX crossing."
 
+**Async RX wakeup — built + validated (2026-06-20).** So a ring app blocks instead of
+poll-kicking for RX, the net server became **event-driven**, which needed a new kernel
+primitive: **`sys_recv_notif(ep, notif, msg, timeout)`** — a multiplexed wait that blocks
+until a message arrives on `ep` OR `notif` is signalled OR a timeout elapses. It's
+race-safe by an asymmetry: a sender handoff deposits a return, but a notif/timer wake
+only flips the thread Ready (no deposit) — mirroring the existing timer wake — so two
+concurrent wakers of the same thread can't corrupt its return slot (if the sender wins,
+the notif count just stays latched for the next call).
+- **Kernel:** `notif` gains a `bound_waiter`; `signal` wakes it without depositing; the
+  IPC `recv_notif` registers on the endpoint (covers senders, §70) then arms the notif,
+  and on resume returns the message or `RECV_NOTIF_FIRED`.
+- **Net server:** while a ring socket has a registered RX notif (`TAG_UDP_RXNOTIF`,
+  `async_count > 0`) the main loop waits with `sys_recv_notif(BOOT_EP, nic.notif, …)`; on
+  a NIC-IRQ/timeout wake it runs the pump (`pump_ring_rx`) to demux RX into the ring
+  sockets and signals each one's notif. With `async_count == 0` the loop is byte-for-byte
+  today's `sys_recv`, so non-async clients (curl/DNS/TCP) are unaffected. The KICK skips
+  inline RX harvest for async sockets (RX is the pump's job — else it races it).
+- **Two real-hardware gotchas fixed:** the e1000 RX IRQ is **shared (IRQ 11 with
+  virtio-blk)** and doesn't fire reliably → the `timeout` arg gives a ~20 ms polling
+  fallback layered under the IRQ. And fast localhost echoes were being grabbed by the
+  KICK's own harvest before the pump saw them → KICK is TX-only for async sockets.
+- **rt:** `sys_recv_notif` + `Ring::set_rxnotif(notif)`. **Validated:** the app registers
+  a notif, sends a TX batch, blocks in `sys_notif_wait` (no poll-kick), and the pump
+  delivers all 7 echoes + signals it — one wakeup, all 7 popped byte-exact.
+
 *Remaining for a fuller Stage 3:* MTU-sized slots need a multi-page ring (`MSG_HANDLES=4`
 lets one attach carry up to 4 frame caps) — small slots were the deliberate first cut
-(high-pps is the point). An async RX wakeup (the `SYS_NOTIF_*` doorbell, so the app
-needn't poll-kick) is the other refinement. Slot typestate (`Slot<Owned>`/`Slot<Posted>`)
-is a nicety the rendezvous alternation already makes safe.
+(high-pps is the point). The pump dropping non-ring frames (TCP) while async means
+concurrent TCP degrades during async-RX mode — feeding smoltcp from the pump (a software
+rx queue) is the next refinement. Slot typestate (`Slot<Owned>`/`Slot<Posted>`) is a
+nicety the rendezvous alternation already makes safe.
 
 ### Stage 4 — NIC DMA directly into the shared ring (true zero-copy end-to-end)
 Today the net server copies between its e1000 DMA rings and the client frame. Stage 4

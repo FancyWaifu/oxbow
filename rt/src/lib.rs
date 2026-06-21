@@ -1370,6 +1370,36 @@ pub fn sys_recv(ep: Handle, msg: *mut MsgBuf) -> SysResult<Handle> {
     SysError::from_raw(rax).map(|_| rdx as Handle)
 }
 
+/// Outcome of [`sys_recv_notif`]: either a message arrived (with its reply cap) or the
+/// bound notification fired.
+pub enum RecvNotif {
+    Message(Handle),
+    Notified,
+}
+
+/// Multiplexed wait: block until EITHER a message arrives on `ep` OR `notif` is
+/// signalled. Lets a single-threaded server be event-driven (e.g. wake on client
+/// requests AND a device IRQ notification). `timeout_ticks` (0 = none; 1 tick ≈ 10 ms)
+/// also wakes with `Notified` at the deadline — a polling fallback when a device IRQ is
+/// shared/throttled and its notif can't be relied on to fire.
+pub fn sys_recv_notif(
+    ep: Handle,
+    notif: Handle,
+    msg: *mut MsgBuf,
+    timeout_ticks: u64,
+) -> SysResult<RecvNotif> {
+    let (rax, rdx) = unsafe {
+        syscall4(oxbow_abi::SYS_RECV_NOTIF, ep as u64, notif as u64, msg as u64, timeout_ticks)
+    };
+    SysError::from_raw(rax).map(|_| {
+        if rdx & oxbow_abi::RECV_NOTIF_FIRED != 0 {
+            RecvNotif::Notified
+        } else {
+            RecvNotif::Message(rdx as Handle)
+        }
+    })
+}
+
 pub fn sys_call(ep: Handle, msg: *mut MsgBuf) -> SysResult {
     let (rax, _) = unsafe { syscall2(SYS_CALL, ep as u64, msg as u64) };
     SysError::from_raw(rax)
@@ -2093,7 +2123,7 @@ pub mod ring {
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use oxbow_abi::{
         MsgBuf, PROT_READ, PROT_WRITE, RING_HDR_BYTES, RING_PAYLOAD_MAX, RING_SLOTS,
-        RING_SLOT_STRIDE, TAG_UDP_KICK, TAG_UDP_RING,
+        RING_SLOT_STRIDE, TAG_UDP_KICK, TAG_UDP_RING, TAG_UDP_RXNOTIF,
     };
 
     /// Client-side base vaddr of the per-socket ring pages (1 MiB above `UDP_XFER`).
@@ -2157,6 +2187,18 @@ pub mod ring {
             }
             self.idx(4).store(next, Ordering::Release); // publish to the server
             true
+        }
+
+        /// Register an async RX notification (Stage 3): pass a `notif` cap (from
+        /// `sys_notif_create`) the server will signal when a datagram lands for this
+        /// socket while it's idle. After this, queue TX + `kick`, then block in
+        /// `sys_notif_wait(notif)` and `pop` on wake — no busy poll-kick. Returns true
+        /// if the server accepted it.
+        pub fn set_rxnotif(&self, notif: Handle) -> bool {
+            let mut m = MsgBuf::new(TAG_UDP_RXNOTIF);
+            m.handles[0] = notif;
+            m.handle_count = 1;
+            crate::sys_call(self.sock, &mut m).is_ok() && m.data[0] == 0
         }
 
         /// Ring the doorbell: the server drains every posted TX slot and harvests any

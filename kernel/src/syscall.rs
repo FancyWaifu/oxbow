@@ -14,7 +14,7 @@ use oxbow_abi::{
     SYS_CAP_TYPE, SYS_CAP_DUP, SYS_CHAN_WAIT, SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_POLL, SYS_CHANNEL_RECV,
     SYS_CHANNEL_SEND, SYS_DMA_ALLOC, SYS_DMA_ALLOC_CONTIG, SYS_SHM_CREATE, SYS_SHM_MAP, SYS_SHM_PHYS, CAP_CHANNEL, CAP_OTHER, CAP_SHM,
     SYS_FB_INFO, SYS_FB_MAP, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE,
-    SYS_PROTECT, SYS_RECV, SYS_REPLY,
+    SYS_PROTECT, SYS_RECV, SYS_RECV_NOTIF, SYS_REPLY,
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_MEMINFO, SYS_UPTIME_MS,
     SYS_WALLTIME, SYS_THREAD_SPAWN, SYS_THREAD_EXIT, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE,
     SYS_THREAD_ID, SYS_YIELD, SYS_PROC_KILL,
@@ -93,6 +93,7 @@ pub extern "C" fn syscall_dispatch(
     match nr {
         SYS_SEND => sys_ipc(a1, a2, false),
         SYS_RECV => sys_recv(a1, a2),
+        SYS_RECV_NOTIF => sys_recv_notif(a1, a2, a3, a4),
         SYS_CALL => sys_ipc(a1, a2, true),
         SYS_REPLY => sys_reply(a1, a2),
         SYS_MAP => sys_map(a1, a2, a3, a4),
@@ -833,6 +834,36 @@ fn sys_recv(ep: u64, msg_ptr: u64) -> SyscallRet {
     }
 }
 
+/// `sys_recv_notif(ep, notif, &MsgBuf)` — block until a message arrives on `ep` OR
+/// `notif` is signalled (multiplexed wait, for event-driven servers). Validates R_RECV
+/// on the endpoint and R_WAIT on the notification. Returns like `sys_recv` for a
+/// message, or rdx = RECV_NOTIF_FIRED for a notif wake.
+fn sys_recv_notif(ep: u64, notif_h: u64, msg_ptr: u64, timeout_ticks: u64) -> SyscallRet {
+    let validated = (|| -> SysResult<(u8, u8)> {
+        let e = proc::with_current(|p| p.lookup(ep as Handle, ObjType::Endpoint, R_RECV))?;
+        let ObjectRef::Endpoint(eidx) = e.obj else {
+            return Err(SysError::BadType);
+        };
+        let n =
+            proc::with_current(|p| p.lookup(notif_h as Handle, ObjType::Notification, R_WAIT))?;
+        let ObjectRef::Notification(nidx) = n.obj else {
+            return Err(SysError::BadType);
+        };
+        if msg_ptr & 7 != 0 {
+            return Err(SysError::Fault);
+        }
+        usermem::check_user(msg_ptr, size_of::<MsgBuf>(), true)?;
+        Ok((eidx, nidx))
+    })();
+    match validated {
+        Ok((eidx, nidx)) => {
+            let (rax, rdx) = ipc::recv_notif(eidx, nidx, msg_ptr, timeout_ticks);
+            SyscallRet { rax, rdx }
+        }
+        Err(e) => SyscallRet::err(e),
+    }
+}
+
 /// Reply to a pending call via a one-shot Reply handle. Consumes the handle on
 /// success (frees the pool slot + our table slot); not consumed on validation
 /// errors (ABI §4.3). Never blocks.
@@ -1301,7 +1332,7 @@ fn pledge_class(nr: u64) -> u64 {
         SYS_CONSOLE_WRITE | SYS_GETENTROPY | SYS_UPTIME_MS | SYS_WALLTIME | SYS_MEMINFO => PLEDGE_STDIO,
         SYS_THREAD_SPAWN | SYS_THREAD_EXIT | SYS_FUTEX_WAIT | SYS_FUTEX_WAKE => PLEDGE_STDIO,
         SYS_THREAD_ID | SYS_YIELD => PLEDGE_STDIO,
-        SYS_SEND | SYS_RECV | SYS_CALL | SYS_REPLY | SYS_EP_CREATE | SYS_MINT | SYS_PIPE
+        SYS_SEND | SYS_RECV | SYS_RECV_NOTIF | SYS_CALL | SYS_REPLY | SYS_EP_CREATE | SYS_MINT | SYS_PIPE
         | SYS_PIPE_READ | SYS_PIPE_WRITE | SYS_PIPE_EOF | SYS_CHANNEL_PAIR | SYS_CHANNEL_SEND
         | SYS_CHANNEL_RECV | SYS_CHANNEL_CLOSE | SYS_CHANNEL_POLL | SYS_CHAN_WAIT => PLEDGE_IPC,
         SYS_MAP | SYS_PROTECT | SYS_IMMUTABLE | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC
