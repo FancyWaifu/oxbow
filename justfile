@@ -53,6 +53,9 @@ build-server:
     # FPU + does per-thread FXSAVE), and the non-SIMD curve25519 backend.
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2 --cfg curve25519_dalek_backend="serial"' cargo build -p drift
     RUSTFLAGS="-C relocation-model=static" cargo build -p cc-hello
+    RUSTFLAGS="-C relocation-model=static" cargo build -p wc
+    RUSTFLAGS="-C relocation-model=static" cargo build -p head
+    RUSTFLAGS="-C relocation-model=static" cargo build -p tail
     RUSTFLAGS="-C relocation-model=static" cargo build -p oxtcc
     # Lua uses doubles heavily; its clang-compiled C passes floats in XMM
     # (hardware SSE), so oxbow-libc must too — build with soft-float OFF + SSE ON
@@ -169,7 +172,7 @@ _iso:
     # bare command names here (PATH), reachable by every logged-in user. Stripped
     # (llvm-strip; Apple strip can't touch ELF) so the 56-byte FS_READ loop is quick.
     STRIP=$(find $(rustc --print sysroot) -name llvm-strip | head -1); \
-    for t in hello ls cat mkdir touch rm mv cp thrtest; do \
+    for t in hello ls cat mkdir touch rm mv cp thrtest wc head tail; do \
       cp target/x86_64-unknown-none/debug/$t build/initrd/bin/$t; \
       "$STRIP" --strip-all build/initrd/bin/$t; \
     done
