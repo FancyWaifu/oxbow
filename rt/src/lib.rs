@@ -972,6 +972,18 @@ pub unsafe extern "C" fn __oxbow_tcp_connect6(addr16: *const u8, port: u16) -> i
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __oxbow_tcp_send(sock: i64, buf: *const u8, len: usize) -> isize {
+    // Large chunk: zero-copy via the socket's frame (up to a full MTU per IPC vs the
+    // 504-byte inline cap — netmap Stage 2). On attach failure, fall through to inline.
+    if len > 504 {
+        if let Some(frame) = udp::attach_sock(sock as Handle) {
+            let n = len.min(1472);
+            unsafe { core::ptr::copy_nonoverlapping(buf, frame, n) };
+            match tcp::sendv(sock as Handle, n) {
+                Some(sent) => return sent as isize,
+                None => return -1,
+            }
+        }
+    }
     let data = unsafe { core::slice::from_raw_parts(buf, len) };
     // Return the ACTUAL bytes accepted (one inline message ≤504 B), so std's `write_all`
     // loops over the rest. Previously this returned `len` while the server only took the
@@ -984,6 +996,18 @@ pub unsafe extern "C" fn __oxbow_tcp_send(sock: i64, buf: *const u8, len: usize)
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __oxbow_tcp_recv(sock: i64, buf: *mut u8, len: usize) -> isize {
+    // Large read: zero-copy via the socket's frame (up to a full MTU per IPC). n == 0
+    // means the connection closed (server-side recv blocks until data or close), same
+    // as the inline path. On attach failure, fall through to inline.
+    if len > 504 {
+        if let Some(frame) = udp::attach_sock(sock as Handle) {
+            let n = tcp::recvv(sock as Handle, len);
+            if n > 0 {
+                unsafe { core::ptr::copy_nonoverlapping(frame as *const u8, buf, n) };
+            }
+            return n as isize;
+        }
+    }
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
     tcp::recv(sock as Handle, out) as isize
 }
@@ -1935,7 +1959,8 @@ pub mod udp {
 
     /// Drop a socket's cache entry on close so a future bind that reuses the cap value
     /// re-attaches cleanly (the underlying per-sid mapping is intentionally kept).
-    fn frame_drop(sock: Handle) {
+    /// `pub` because the TCP path shares this per-socket frame machinery.
+    pub fn frame_drop(sock: Handle) {
         while FRAME_LOCK.swap(true, Ordering::Acquire) {
             spin_loop();
         }
@@ -2164,7 +2189,7 @@ pub mod tcp {
     use crate::{sys_call, sys_close, Handle};
     use oxbow_abi::{
         MsgBuf, TAG_TCP_ACCEPT, TAG_TCP_CLOSE, TAG_TCP_CONNECT, TAG_TCP_CONNECT6, TAG_TCP_LISTEN,
-        TAG_TCP_RECV, TAG_TCP_SEND,
+        TAG_TCP_RECV, TAG_TCP_RECVV, TAG_TCP_SEND, TAG_TCP_SENDV,
     };
 
     /// Open an IPv6 TCP connection to `addr:port`; returns a socket cap once the
@@ -2255,6 +2280,32 @@ pub mod tcp {
         n
     }
 
+    /// Send the first `len` bytes (≤1472) of the socket's transfer frame on `sock`
+    /// (netmap Stage 2 — zero-copy stream chunk). Returns the bytes smoltcp accepted
+    /// (may be < len if its tx buffer is full), or None if the socket can't send.
+    /// Requires a prior `crate::udp::attach_sock(sock)`.
+    pub fn sendv(sock: Handle, len: usize) -> Option<usize> {
+        let mut m = MsgBuf::new(TAG_TCP_SENDV);
+        m.data[0] = len.min(1472) as u64;
+        m.data_len = 1;
+        if sys_call(sock, &mut m).is_err() || m.data[0] != 0 {
+            return None;
+        }
+        Some(m.data[1] as usize)
+    }
+
+    /// Receive up to `want` (≤1472) bytes on `sock` INTO the socket's transfer frame;
+    /// returns the byte count (0 = closed/none). Requires a prior `attach_sock`.
+    pub fn recvv(sock: Handle, want: usize) -> usize {
+        let mut m = MsgBuf::new(TAG_TCP_RECVV);
+        m.data[0] = want.clamp(1, 1472) as u64;
+        m.data_len = 1;
+        if sys_call(sock, &mut m).is_err() {
+            return 0;
+        }
+        (m.data[0] as usize).min(want).min(1472)
+    }
+
     /// Close a TCP socket cap and release the client handle. One-way SEND (reply unused):
     /// a preceding send() CALL has already drained the data to the wire, and the net
     /// server (single-threaded, frees the slot by badge) will run smoltcp's close → FIN
@@ -2262,6 +2313,7 @@ pub mod tcp {
     pub fn close(sock: Handle) {
         let m = MsgBuf::new(TAG_TCP_CLOSE);
         let _ = crate::sys_send(sock, &m);
+        crate::udp::frame_drop(sock); // shared per-socket frame cache
         let _ = sys_close(sock);
     }
 }

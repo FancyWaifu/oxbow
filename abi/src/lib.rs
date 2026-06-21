@@ -627,6 +627,19 @@ pub const TAG_UDP_RECVV: u64 = u32::from_le_bytes(*b"URVB") as u64;
 /// many UDP sockets per resolve, which starved later TCP connects. Reply: status.
 pub const TAG_UDP_CLOSE: u64 = u32::from_le_bytes(*b"UCLO") as u64;
 
+// --- Large TCP via the same per-socket frame (netmap Stage 2) ---------------
+// TCP is a byte stream, so the frame just lets each send/recv move up to a full
+// MTU per IPC (vs the 504-byte inline cap) — ~3x fewer domain crossings. A TCP
+// socket attaches its frame with TAG_UDP_ATTACH (the attach is socket-type
+// agnostic) and then uses SENDV/RECVV below. The frame is the same per-sid page.
+/// TCP SENDV (tcp socket cap): data[0]=len. Net sends `len` bytes from the
+/// socket's frame via smoltcp. Reply: data[0]=status (0 ok), data[1]=bytes
+/// actually accepted (may be < len if the tx buffer is full).
+pub const TAG_TCP_SENDV: u64 = u32::from_le_bytes(*b"TSNV") as u64;
+/// TCP RECVV (tcp socket cap): data[0]=want. Net consumes up to `want` bytes from
+/// the stream INTO the socket's frame. Reply: data[0]=len (0 = closed/none).
+pub const TAG_TCP_RECVV: u64 = u32::from_le_bytes(*b"TRVV") as u64;
+
 /// `sys_spawn` grant convention: the handles in the spawn MsgBuf land in the
 /// child's table at these slots, in order (HANDLE_NULL entries are skipped).
 /// Slot 3 is always the child's fresh Memory budget, so it is not in this list.

@@ -59,7 +59,7 @@ Raise the per-IPC caps to the full message (TCP 504, UDP 480), make socket close
 one-way send. *Effect:* ~9× fewer round trips for small/medium packets; still one
 crossing per packet, still two copies. Committed.
 
-### Stage 2 — one shared frame per socket, MTU-sized, zero-copy payload (UDP: DONE)
+### Stage 2 — one shared frame per socket, MTU-sized, zero-copy payload (DONE — UDP + TCP)
 Generalize the DNS `sendv`/`recvv` shared-frame path to every wire UDP/TCP socket: on
 bind/connect, map a per-socket shared frame (a `NET_SHARED`-style region) into both the
 app and the net server. `send`/`recv` write/read the payload *in the frame*; the IPC
@@ -95,11 +95,26 @@ binding sidesteps `frame_unmap`/remap/sender-badge entirely.
   datagrams byte-for-byte off a host echo at 10.0.2.2 — the 800/1400 cases are the
   >480 frame path that previously truncated/rejected.
 
-**TCP — pending.** TCP is a byte stream, so the frame win is zero-copy + batching the
-segment I/O, not a packet ring. Add `TAG_TCP_SENDV/RECVV` + frame send/recv in `tcp.rs`
-and wire `TcpStream`. Lower urgency than UDP: TCP's inline 504-B chunking is already
-*correct* (no truncation), so this is a throughput optimization, not a fix.
-*Effort: medium.*
+**TCP — built + validated (2026-06-20).** Same per-socket frame, generalized to the
+byte stream: a connected TCP socket attaches its frame with `TAG_UDP_ATTACH` (the attach
+is socket-type agnostic), then `TAG_TCP_SENDV`/`RECVV` move up to a full MTU per IPC
+instead of the 504-B inline cap (~3× fewer domain crossings on bulk transfer). `SENDV`
+returns smoltcp's accepted count (may be < requested when the tx buffer is full, so
+`write_all` loops); `RECVV` consumes only `want` bytes (byte-exact — smoltcp keeps the
+rest, which TLS needs).
+- **Server** (`servers/net`): `TAG_UDP_ATTACH` now accepts `Sock::Tcp`; `TAG_TCP_SENDV`
+  reads `frame_vaddr(sid)` → `tcp_stack.send` → (status, sent); `TAG_TCP_RECVV` →
+  `tcp_stack.recv` into the frame.
+- **rt** (`rt::tcp`): `sendv(sock,len)→Option<usize>`, `recvv(sock,want)→usize`, reusing
+  `udp::attach_sock` + `udp::frame_drop` (the frame machinery is shared, type-agnostic);
+  `close` drops the cache entry. The hosted shims `__oxbow_tcp_send`/`recv` use the frame
+  for >504 B and stay inline for ≤504 (TLS's small header reads).
+- **Validated:** a std `TcpStream` echo (`std-port/apps/udpmtu`) round-trips 200/1400/
+  4000-byte payloads byte-for-byte off a host TCP echo at 10.0.2.2 — 1400 is one frame
+  chunk, 4000 spans three (1472+1472+1056) via `write_all`/`read_exact`.
+
+Stage 2 is now complete for both UDP and TCP. Next is Stage 3 (multi-slot ring +
+batched doorbell) — the line-rate lever.
 
 ### Stage 3 — a multi-slot ring + batched doorbell (the real netmap)
 Replace the single frame with a **ring of N fixed-size slots** + a TX and RX

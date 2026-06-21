@@ -7,10 +7,12 @@
 #![no_main]
 extern crate oxbow_rt;
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
 use std::time::Duration;
 
 const ECHO_PORT: u16 = 17171;
+const TCP_ECHO_PORT: u16 = 17172;
 
 fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8).collect()
@@ -35,6 +37,27 @@ fn echo_once(sock: &UdpSocket, dst: &SocketAddr, len: usize) -> Result<(), Strin
     Ok(())
 }
 
+// TCP: connect to the host echo, write `len` bytes (write_all loops over MTU-sized
+// frame chunks), read them all back, verify byte-for-byte. len > 504 exercises the
+// per-socket frame send AND recv paths; multi-MTU len spans several frame chunks.
+fn tcp_echo(len: usize) -> Result<(), String> {
+    let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 2), TCP_ECHO_PORT));
+    let mut s = TcpStream::connect(dst).map_err(|e| format!("tcp connect {e}"))?;
+    // Best-effort: wire TCP streams don't support read timeouts on oxbow; the server
+    // recv blocks until data/close and the echo replies promptly, so we don't need one.
+    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+    let tx = pattern(len);
+    s.write_all(&tx).map_err(|e| format!("tcp write_all({len}) {e}"))?;
+    let mut rx = vec![0u8; len];
+    s.read_exact(&mut rx).map_err(|e| format!("tcp read_exact({len}) {e}"))?;
+    if rx != tx {
+        let mismatch = (0..len).find(|&i| rx[i] != tx[i]).unwrap_or(len);
+        return Err(format!("tcp len {len}: byte mismatch at {mismatch}"));
+    }
+    println!("UDPMTU: tcp len={len} ok (echoed {len})");
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind {e}"))?;
     sock.set_read_timeout(Some(Duration::from_secs(5)))
@@ -42,6 +65,10 @@ fn run() -> Result<(), String> {
     let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 2), ECHO_PORT));
     for len in [400usize, 800, 1400] {
         echo_once(&sock, &dst, len)?;
+    }
+    // TCP frame path: 200 B (inline ≤504), 1400 B (one frame chunk), 4000 B (multi-MTU).
+    for len in [200usize, 1400, 4000] {
+        tcp_echo(len)?;
     }
     Ok(())
 }

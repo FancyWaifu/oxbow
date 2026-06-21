@@ -29,7 +29,8 @@ use oxbow_abi::{
     MsgBuf, MSG_DATA_WORDS, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_NET_IRQ, BOOT_PCI, NET_DMA, NET_MMIO, NET_SHARED,
     PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_NET_DNS, TAG_TCP_ACCEPT, TAG_TCP_CLOSE,
     TAG_TCP_CONNECT, TAG_TCP_CONNECT6, TAG_TCP_LISTEN,
-    TAG_TCP_RECV, TAG_TCP_SEND, TAG_UDP_ATTACH, TAG_UDP_BIND, TAG_UDP_CLOSE, TAG_UDP_RECVFROM,
+    TAG_TCP_RECV, TAG_TCP_RECVV, TAG_TCP_SEND, TAG_TCP_SENDV, TAG_UDP_ATTACH, TAG_UDP_BIND,
+    TAG_UDP_CLOSE, TAG_UDP_RECVFROM,
     TAG_UDP_RECVV, TAG_UDP_SENDTO, TAG_UDP_SENDV,
 };
 use oxbow_rt as rt;
@@ -658,9 +659,11 @@ pub extern "C" fn oxbow_main() -> ! {
             // vaddr. Per-socket => no two processes ever share a page.
             TAG_UDP_ATTACH => {
                 let sid = m.badge as usize;
-                if (1..=MAX_SOCKETS).contains(&sid)
-                    && matches!(slot_of(&sockets, sid), Some(Sock::Udp(_)))
-                {
+                // Attach is socket-type agnostic: a UDP or a connected TCP socket may
+                // claim its per-sid frame (TCP uses it for >504-byte stream chunks).
+                let bound =
+                    matches!(slot_of(&sockets, sid), Some(Sock::Udp(_)) | Some(Sock::Tcp(_)));
+                if (1..=MAX_SOCKETS).contains(&sid) && bound {
                     if socket_frames[sid].is_none() {
                         if let Ok(f) = rt::sys_frame_alloc(BOOT_MEM) {
                             if rt::sys_frame_map(f, frame_vaddr(sid), PROT_READ | PROT_WRITE).is_ok()
@@ -933,6 +936,58 @@ pub extern "C" fn oxbow_main() -> ! {
                     r.data[0] = 0;
                     r.data_len = 1;
                 }
+                let _ = rt::sys_reply(reply, &r);
+            }
+            // TCP socket channel: send up to a full MTU FROM the socket's frame
+            // (zero-copy stream chunk — netmap Stage 2). Reply: status + accepted count.
+            TAG_TCP_SENDV => {
+                let sid = m.badge as usize;
+                if sid <= MAX_SOCKETS && socket_frames[sid].is_some() {
+                    if let Some(Sock::Tcp(handle)) = slot_of(&sockets, sid) {
+                        let len = (m.data[0] as usize).min(1472);
+                        let bytes = unsafe {
+                            core::slice::from_raw_parts(frame_vaddr(sid) as *const u8, len)
+                        };
+                        match tcp_stack.send(handle, bytes) {
+                            Some(sent) => {
+                                r.data[0] = 0;
+                                r.data[1] = sent as u64;
+                            }
+                            None => {
+                                r.data[0] = 1;
+                                r.data[1] = 0;
+                            }
+                        }
+                    } else {
+                        r.data[0] = 1;
+                        r.data[1] = 0;
+                    }
+                } else {
+                    r.data[0] = 1;
+                    r.data[1] = 0;
+                }
+                r.data_len = 2;
+                let _ = rt::sys_reply(reply, &r);
+            }
+            // TCP socket channel: receive up to a full MTU INTO the socket's frame.
+            // Consumes only `want` bytes (byte-exact; smoltcp keeps the rest).
+            TAG_TCP_RECVV => {
+                let sid = m.badge as usize;
+                if sid <= MAX_SOCKETS && socket_frames[sid].is_some() {
+                    if let Some(Sock::Tcp(handle)) = slot_of(&sockets, sid) {
+                        let want = (m.data[0] as usize).clamp(1, 1472);
+                        let out = unsafe {
+                            core::slice::from_raw_parts_mut(frame_vaddr(sid) as *mut u8, want)
+                        };
+                        let n = tcp_stack.recv(handle, out);
+                        r.data[0] = n as u64;
+                    } else {
+                        r.data[0] = 0;
+                    }
+                } else {
+                    r.data[0] = 0;
+                }
+                r.data_len = 1;
                 let _ = rt::sys_reply(reply, &r);
             }
             // TCP socket channel: close + free the slot (a socket or a listener).
