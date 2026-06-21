@@ -182,15 +182,22 @@ smoltcp's `PhyDevice::receive` drains that queue before the NIC ring. Crucially 
 when `async_count > 0`), so the non-async TCP path is byte-for-byte the unchanged
 direct-from-NIC read — no regression. Validated: a 1000-byte TCP echo completes **while a
 ring socket is in async mode**, with the echo deliberately delayed so it lands during a pump
-tick — proving it flowed NIC → pump → `tcp_rx_q` → smoltcp. (Non-ring UDP, e.g. a DNS reply
-arriving mid-async, is still dropped by the pump — a second per-protocol queue would cover
-it, but TCP was the goal; rare in practice.)
+tick — proving it flowed NIC → pump → `tcp_rx_q` → smoltcp.
+
+**Non-ring UDP (the DNS case) too — built + validated (2026-06-20).** A sibling `udp_rx_q`
+in the `Nic`: the pump parks non-ring UDP datagrams keyed by dst port (already-parsed
+payload + source), and `recv_udp_for` **selectively** pulls only its own port (leaving other
+sockets' datagrams queued). Same empty-outside-async / no-regression property as `tcp_rx_q`.
+Validated by a 600-byte non-ring UDP echo completing while a ring socket is async (echo
+delayed to land during a pump tick → NIC → pump → `udp_rx_q` → `recv_from`). *Surfaced a real
+latent bug:* two live UDP sockets could share a port (oxbow std picks its own ephemeral and
+`TAG_UDP_BIND` did no collision check, so the pump misdelivered). Fixed — bind now searches
+upward for a free port and returns the actual one.
 
 *Remaining for a fuller Stage 3:* MTU-sized slots need a multi-page ring (`MSG_HANDLES=4`
 lets one attach carry up to 4 frame caps) — small slots were the deliberate first cut
-(high-pps is the point). A `udp_rx_q` sibling would keep non-ring UDP (DNS) alive mid-async.
-Slot typestate (`Slot<Owned>`/`Slot<Posted>`) is a nicety the rendezvous alternation already
-makes safe.
+(high-pps is the point). Slot typestate (`Slot<Owned>`/`Slot<Posted>`) is a nicety the
+rendezvous alternation already makes safe.
 
 ### Stage 4 — NIC DMA directly into the shared ring (true zero-copy end-to-end)
 Today the net server copies between its e1000 DMA rings and the client frame. Stage 4

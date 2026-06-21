@@ -141,19 +141,26 @@ fn pump_ring_rx(
         }
         let uoff = off + ip.payload_off;
         let Some(u) = udp::parse(&buf[uoff..n]) else { continue };
+        let p = &buf[uoff + u.payload_off..n];
+        let mut consumed = false;
         for sid in 1..=MAX_SOCKETS {
             if rx_notif[sid].is_none() || ring_frames[sid].is_none() {
                 continue;
             }
             if let Sock::Udp(port) = sockets[sid - 1] {
                 if port == u.dst_port {
-                    let p = &buf[uoff + u.payload_off..n];
                     if ring_rx_push(ring_vaddr(sid), p, ip.src, u.src_port) {
                         got[sid] = true;
                     }
+                    consumed = true;
                     break;
                 }
             }
+        }
+        if !consumed {
+            // Non-ring UDP (e.g. a DNS reply) — park it so the poll-driven recv path
+            // (recv_udp_for) can still find it while the pump owns the NIC.
+            nic.push_rx_udp(p, ip.src, u.src_port, u.dst_port);
         }
     }
     unsafe {
@@ -210,6 +217,11 @@ fn recv_udp_for(
     port: u16,
     out: &mut [u8],
 ) -> (usize, [u8; 4], u16) {
+    // First any datagram the async pump parked for this port (empty outside async mode,
+    // so this is a no-op on the normal path), then the NIC ring directly.
+    if let Some(r) = nic.pop_rx_udp_for(port, out) {
+        return r;
+    }
     let mut buf = [0u8; BUF];
     while let Some(n) = nic.recv_poll(&mut buf) {
         handle_background(nic, cache, &buf[..n]);
@@ -409,6 +421,19 @@ struct Nic {
     /// to smoltcp (TCP). `PhyDevice::receive` drains this before the NIC, so TCP isn't
     /// lost when the pump owns the NIC. Empty (and untouched) outside async-RX mode.
     tcp_rx_q: VecDeque<([u8; BUF], usize)>,
+    /// Sibling for non-ring UDP (e.g. a DNS reply) the pump drained: keyed by dst port so
+    /// `recv_udp_for` pulls only its own datagrams and leaves others queued. Empty outside
+    /// async-RX mode. Stores the already-parsed payload + source, so no re-parse on pop.
+    udp_rx_q: VecDeque<UdpRx>,
+}
+
+/// A non-ring UDP datagram parked by the async pump for the poll-driven UDP path.
+struct UdpRx {
+    payload: [u8; BUF],
+    len: usize,
+    sip: [u8; 4],
+    sport: u16,
+    dport: u16,
 }
 
 impl Nic {
@@ -460,6 +485,29 @@ impl Nic {
         let m = n.min(out.len());
         out[..m].copy_from_slice(&b[..m]);
         Some(m)
+    }
+
+    /// Park a non-ring UDP datagram (payload already extracted) for the poll path.
+    /// Bounded — drops the oldest if full.
+    fn push_rx_udp(&mut self, payload: &[u8], sip: [u8; 4], sport: u16, dport: u16) {
+        const UDP_RXQ_CAP: usize = 64;
+        if self.udp_rx_q.len() >= UDP_RXQ_CAP {
+            self.udp_rx_q.pop_front();
+        }
+        let mut p = [0u8; BUF];
+        let n = payload.len().min(BUF);
+        p[..n].copy_from_slice(&payload[..n]);
+        self.udp_rx_q.push_back(UdpRx { payload: p, len: n, sip, sport, dport });
+    }
+
+    /// Pull the oldest parked UDP datagram whose dst port is `port` into `out`, leaving
+    /// other ports' datagrams queued. Returns `(len, src_ip, src_port)` or None.
+    fn pop_rx_udp_for(&mut self, port: u16, out: &mut [u8]) -> Option<(usize, [u8; 4], u16)> {
+        let i = self.udp_rx_q.iter().position(|e| e.dport == port)?;
+        let e = self.udp_rx_q.remove(i)?;
+        let m = e.len.min(out.len());
+        out[..m].copy_from_slice(&e.payload[..m]);
+        Some((m, e.sip, e.sport))
     }
 
     /// Return the next received frame (copied into `out`), blocking on the NIC
@@ -714,6 +762,7 @@ pub extern "C" fn oxbow_main() -> ! {
         tx_buf_p,
         tx_cur: 0,
         tcp_rx_q: VecDeque::new(),
+        udp_rx_q: VecDeque::new(),
     };
     let mut cache = arp::Cache::new();
 
@@ -1039,7 +1088,18 @@ pub extern "C" fn oxbow_main() -> ! {
                 let req_port = m.data[0] as u16;
                 match sockets.iter().position(|s| matches!(s, Sock::Free)) {
                     Some(idx) => {
-                        let port = if req_port == 0 { 0xC000 + idx as u16 } else { req_port };
+                        // Two live UDP sockets must NOT share a port — else RX demux
+                        // (and the async pump) misdelivers. The client (oxbow std) may
+                        // pick its own ephemeral port and pass it, so even a non-zero
+                        // request can collide; search upward for a free one and return
+                        // the actual port (the client reads it back from the reply).
+                        let mut port = if req_port == 0 { 0xC000 + idx as u16 } else { req_port };
+                        let taken = |sks: &[Sock; MAX_SOCKETS], p: u16| {
+                            sks.iter().any(|s| matches!(s, Sock::Udp(q) if *q == p))
+                        };
+                        while taken(&sockets, port) {
+                            port = if port >= 0xFFFF { 0xC000 } else { port + 1 };
+                        }
                         sockets[idx] = Sock::Udp(port);
                         match rt::sys_mint(BOOT_EP, (idx + 1) as u64, R_SEND | R_GRANT) {
                             Ok(cap) => {

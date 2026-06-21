@@ -179,6 +179,26 @@ fn ring_async() -> Result<(), String> {
         }
         println!("UDPMTU: async+tcp ok (1000 B TCP echo through the pump while async)");
     }
+    // Concurrent NON-RING UDP (the DNS case) while async: send + sleep so the echo is
+    // parked in udp_rx_q during a pump window, then recv_from must pull it back. Without
+    // the udp_rx_q the pump drops it and this recv times out.
+    {
+        let usock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("async-udp bind {e}"))?;
+        usock
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|e| format!("async-udp rto {e}"))?;
+        let udst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 2), ECHO_PORT));
+        let tx = pattern(600);
+        usock.send_to(&tx, &udst).map_err(|e| format!("async-udp send {e}"))?;
+        std::thread::sleep(Duration::from_millis(80)); // echo parked during a pump tick
+        let mut rx = [0u8; 800];
+        let (rn, _) = usock.recv_from(&mut rx).map_err(|e| format!("async-udp recv {e}"))?;
+        if rn != 600 || rx[..600] != tx[..] {
+            udp::close(sock);
+            return Err(format!("async-udp: echo mismatch (got {rn})"));
+        }
+        println!("UDPMTU: async+udp ok (600 B non-ring UDP echo through the pump while async)");
+    }
     for i in 0..N {
         let mut p = pattern(PLEN);
         p[0] = i as u8;
