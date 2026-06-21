@@ -1928,30 +1928,31 @@ pub mod udp {
         sys_call(sock, &mut m).is_ok() && m.data[0] == 0
     }
 
-    /// Receive a datagram on `sock` into `out` (blocks); returns payload length.
+    /// Receive a datagram on `sock` into `out` (blocks); returns payload length. Up to
+    /// 480 bytes ride one inline reply (was 56, which truncated larger datagrams).
     pub fn recvfrom(sock: Handle, out: &mut [u8]) -> usize {
         let mut m = MsgBuf::new(TAG_UDP_RECVFROM);
         if sys_call(sock, &mut m).is_err() {
             return 0;
         }
-        let n = (m.data[0] as usize).min(out.len()).min(56);
+        let n = (m.data[0] as usize).min(out.len()).min(480);
         let src = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), n) };
         out[..n].copy_from_slice(src);
         n
     }
 
-    /// Like [`recvfrom`] but also returns the sender's IPv4 + port (the net server
-    /// packs them at data[8]/data[9], past the payload window — §101).
+    /// Like [`recvfrom`] but also returns the sender's IPv4 + port. The net server packs
+    /// them in the LAST two message words (clear of the up-to-480-byte payload) — §101.
     pub fn recvfrom_src(sock: Handle, out: &mut [u8]) -> (usize, [u8; 4], u16) {
         let mut m = MsgBuf::new(TAG_UDP_RECVFROM);
         if sys_call(sock, &mut m).is_err() {
             return (0, [0; 4], 0);
         }
-        let n = (m.data[0] as usize).min(out.len()).min(56);
+        let n = (m.data[0] as usize).min(out.len()).min(480);
         let src = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), n) };
         out[..n].copy_from_slice(src);
-        let sip = (m.data[8] as u32).to_be_bytes();
-        let sport = m.data[9] as u16;
+        let sip = (m.data[oxbow_abi::MSG_DATA_WORDS - 2] as u32).to_be_bytes();
+        let sport = m.data[oxbow_abi::MSG_DATA_WORDS - 1] as u16;
         (n, sip, sport)
     }
 }
@@ -2137,15 +2138,16 @@ pub mod tcp {
     /// close); returns the byte count (0 = connection closed).
     pub fn recv(sock: Handle, out: &mut [u8]) -> usize {
         let mut m = MsgBuf::new(TAG_TCP_RECV);
-        // Tell the server how many bytes we can take, so it consumes only that
-        // much from the TCP stream — a smaller read must NOT drop the rest (TLS
-        // reads 5-byte record headers; dropped bytes corrupt the stream).
-        m.data[0] = out.len().min(56) as u64;
+        // Tell the server how many bytes we can take, so it consumes only that much
+        // from the TCP stream — a smaller read must NOT drop the rest (TLS reads 5-byte
+        // record headers; dropped bytes corrupt the stream). Up to 504 bytes ride one
+        // inline reply (payload past the count word), ~9x fewer round trips than 56.
+        m.data[0] = out.len().min(504) as u64;
         m.data_len = 1;
         if sys_call(sock, &mut m).is_err() {
             return 0;
         }
-        let n = (m.data[0] as usize).min(out.len()).min(56);
+        let n = (m.data[0] as usize).min(out.len()).min(504);
         let src = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), n) };
         out[..n].copy_from_slice(src);
         n

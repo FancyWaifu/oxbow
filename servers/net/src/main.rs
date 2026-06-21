@@ -26,7 +26,7 @@ use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 use eth::{ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use oxbow_abi::{
-    MsgBuf, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_NET_IRQ, BOOT_PCI, NET_DMA, NET_MMIO, NET_SHARED,
+    MsgBuf, MSG_DATA_WORDS, BOOT_CONSOLE, BOOT_EP, BOOT_MEM, BOOT_NET_IRQ, BOOT_PCI, NET_DMA, NET_MMIO, NET_SHARED,
     PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_NET_DNS, TAG_TCP_ACCEPT, TAG_TCP_CLOSE,
     TAG_TCP_CONNECT, TAG_TCP_CONNECT6, TAG_TCP_LISTEN,
     TAG_TCP_RECV, TAG_TCP_SEND, TAG_UDP_ATTACH, TAG_UDP_BIND, TAG_UDP_CLOSE, TAG_UDP_RECVFROM,
@@ -772,17 +772,20 @@ pub extern "C" fn oxbow_main() -> ! {
             TAG_UDP_RECVFROM => {
                 let sid = m.badge as usize;
                 if let Some(Sock::Udp(port)) = slot_of(&sockets, sid) {
-                    let mut out = [0u8; 56];
+                    // Up to 480 payload bytes inline (was 56 — which silently TRUNCATED
+                    // any datagram > 56 B on receive). Payload at byte 8; the sender
+                    // address moves to the LAST two words so it never collides with the
+                    // bigger payload window.
+                    let mut out = [0u8; 480];
                     let (n, sip, sport) = recv_udp_for(&mut nic, &mut cache, port, &mut out);
                     r.data[0] = n as u64;
                     let dst = r.data.as_mut_ptr() as *mut u8;
                     unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), dst.add(8), n) };
-                    // §101 sender address for std recv_from, packed past the 56-B payload
-                    // window (data[1..8]) so existing libc readers (data[0]+payload@8) are
-                    // unaffected: src IPv4 (BE) at data[8], src port at data[9].
-                    r.data[8] = u32::from_be_bytes(sip) as u64;
-                    r.data[9] = sport as u64;
-                    r.data_len = 10;
+                    // §101 sender address (for std recv_from) at the high words, clear of
+                    // the payload: src IPv4 (BE) at data[62], src port at data[63].
+                    r.data[MSG_DATA_WORDS - 2] = u32::from_be_bytes(sip) as u64;
+                    r.data[MSG_DATA_WORDS - 1] = sport as u64;
+                    r.data_len = MSG_DATA_WORDS as u32;
                 } else {
                     r.data[0] = 0;
                     r.data_len = 1;
@@ -890,14 +893,14 @@ pub extern "C" fn oxbow_main() -> ! {
                 // Consume only as many bytes as the client can take this call;
                 // smoltcp keeps the rest buffered for the next recv (byte-exact,
                 // which TLS requires).
-                let want = (m.data[0] as usize).clamp(1, 56);
+                let want = (m.data[0] as usize).clamp(1, 504);
                 if let Some(Sock::Tcp(handle)) = slot_of(&sockets, sid) {
-                    let mut out = [0u8; 56];
+                    let mut out = [0u8; 504];
                     let n = tcp_stack.recv(handle, &mut out[..want]);
                     r.data[0] = n as u64;
                     let dst = r.data.as_mut_ptr() as *mut u8;
                     unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), dst.add(8), n) };
-                    r.data_len = 8;
+                    r.data_len = 64;
                 } else {
                     r.data[0] = 0;
                     r.data_len = 1;
