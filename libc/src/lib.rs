@@ -1214,13 +1214,153 @@ pub unsafe extern "C" fn fileno(stream: *mut FILE) -> i32 {
 pub extern "C" fn access(_path: *const u8, _mode: i32) -> i32 {
     -1
 }
-#[no_mangle]
-pub extern "C" fn stat(_path: *const u8, _st: *mut u8) -> i32 {
-    -1
+/// `struct stat` — field types match libc/include/sys/stat.h exactly (mode/uid/gid/
+/// nlink = unsigned int, dev/ino = unsigned long, the rest = long), so #[repr(C)]
+/// lays out identically to the C struct (st_mode @16, st_size @40).
+#[repr(C)]
+struct CStat {
+    st_dev: u64,
+    st_ino: u64,
+    st_mode: u32,
+    st_nlink: u32,
+    st_uid: u32,
+    st_gid: u32,
+    st_rdev: u64,
+    st_size: i64,
+    st_blksize: i64,
+    st_blocks: i64,
+    st_atime: i64,
+    st_mtime: i64,
+    st_ctime: i64,
 }
+
+unsafe fn fill_stat(st: *mut u8, kind: u64, size: u64, mtime: u32, atime: u32) {
+    core::ptr::write_bytes(st, 0, core::mem::size_of::<CStat>());
+    let s = st as *mut CStat;
+    (*s).st_mode = if kind == oxbow_abi::FS_DIR { 0o040000 } else { 0o100000 }; // S_IFDIR/S_IFREG
+    (*s).st_nlink = 1;
+    (*s).st_size = size as i64;
+    (*s).st_blksize = 4096;
+    (*s).st_blocks = ((size + 511) / 512) as i64;
+    (*s).st_atime = atime as i64;
+    (*s).st_mtime = mtime as i64;
+    (*s).st_ctime = mtime as i64;
+}
+
+/// `stat(path)` — resolve metadata via the fs server (rt::fs::open already returns
+/// kind/size/mtime/atime); fills `struct stat`. Closes the resolved cap.
 #[no_mangle]
-pub extern "C" fn fstat(_fd: i32, _st: *mut u8) -> i32 {
-    -1
+pub unsafe extern "C" fn stat(path: *const u8, st: *mut u8) -> i32 {
+    let n = cstr_len(path);
+    if n == 0 || st.is_null() {
+        return -1;
+    }
+    let p = core::slice::from_raw_parts(path, n);
+    match rt::fs::open(BOOT_EP, p) {
+        Some(node) => {
+            fill_stat(st, node.kind, node.size as u64, node.mtime, node.atime);
+            let _ = rt::sys_close(node.cap);
+            0
+        }
+        None => -1,
+    }
+}
+
+/// `lstat` — no symlink-nofollow distinction yet (the fs has no symlinks in the
+/// common path), so identical to `stat`.
+#[no_mangle]
+pub unsafe extern "C" fn lstat(path: *const u8, st: *mut u8) -> i32 {
+    stat(path, st)
+}
+
+// --- directory streams (opendir/readdir/closedir) over the fs server ----------
+// rt::fs already exposes readdir(dir_cap, cursor); this wraps it as POSIX dirent.
+#[repr(C)]
+struct CDirent {
+    d_ino: u64,
+    d_off: i64,
+    d_reclen: u16,
+    d_type: u8,
+    d_name: [u8; 256],
+}
+
+/// Opaque DIR: holds the directory capability, the readdir cursor, and a per-stream
+/// entry buffer (so concurrent streams during a recursive walk don't clobber).
+struct OxDir {
+    cap: Handle,
+    cursor: u64,
+    de: CDirent,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn opendir(path: *const u8) -> *mut OxDir {
+    let n = cstr_len(path);
+    if n == 0 {
+        return core::ptr::null_mut();
+    }
+    let p = core::slice::from_raw_parts(path, n);
+    match rt::fs::open(BOOT_EP, p) {
+        Some(node) if node.kind == oxbow_abi::FS_DIR => {
+            let d = malloc(core::mem::size_of::<OxDir>()) as *mut OxDir;
+            if d.is_null() {
+                let _ = rt::sys_close(node.cap);
+                return core::ptr::null_mut();
+            }
+            (*d).cap = node.cap;
+            (*d).cursor = 0;
+            d
+        }
+        Some(node) => {
+            let _ = rt::sys_close(node.cap);
+            core::ptr::null_mut()
+        }
+        None => core::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn readdir(d: *mut OxDir) -> *mut CDirent {
+    if d.is_null() {
+        return core::ptr::null_mut();
+    }
+    match rt::fs::readdir((*d).cap, (*d).cursor) {
+        Some((name, kind)) => {
+            (*d).cursor += 1;
+            let de = &mut (*d).de;
+            *de = core::mem::zeroed();
+            de.d_type = if kind == oxbow_abi::FS_DIR { 4 } else { 8 }; // DT_DIR / DT_REG
+            let m = core::cmp::min(name.len(), 255);
+            core::ptr::copy_nonoverlapping(name.as_ptr(), de.d_name.as_mut_ptr(), m);
+            de.d_name[m] = 0;
+            de as *mut CDirent
+        }
+        None => core::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn closedir(d: *mut OxDir) -> i32 {
+    if d.is_null() {
+        return -1;
+    }
+    let _ = rt::sys_close((*d).cap);
+    free(d as *mut u8);
+    0
+}
+
+/// `fstat(fd)` — the fd table records the size at open; open only admits regular
+/// files, so the kind is S_IFREG.
+#[no_mangle]
+pub unsafe extern "C" fn fstat(fd: i32, st: *mut u8) -> i32 {
+    if fd < 0 || fd as usize >= MAX_FD || st.is_null() {
+        return -1;
+    }
+    let slot = &(*core::ptr::addr_of!(FDS))[fd as usize];
+    if !slot.used {
+        return -1;
+    }
+    fill_stat(st, FS_FILE, slot.size, 0, 0);
+    0
 }
 #[no_mangle]
 pub extern "C" fn pipe(_fds: *mut i32) -> i32 {

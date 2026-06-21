@@ -46,6 +46,7 @@ members = [
     "servers/wc",
     "servers/head",
     "servers/tail",
+    "servers/find",
     "servers/tcc",
     "servers/lua",
     "servers/micropython",
