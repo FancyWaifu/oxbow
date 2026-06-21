@@ -874,7 +874,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha224sum"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+]
+
+[[package]]
 name = "sha256sum"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+]
+
+[[package]]
+name = "sha384sum"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+]
+
+[[package]]
+name = "sha512-224sum"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+]
+
+[[package]]
+name = "sha512-256sum"
 version = "0.0.0"
 dependencies = [
  "cc",
