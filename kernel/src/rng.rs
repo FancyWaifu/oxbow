@@ -5,8 +5,10 @@
 //!
 //! Fast key erasure (Bernstein): each refill runs one ChaCha20 block; the first
 //! 32 bytes of keystream OVERWRITE the key (so past output can't be recovered
-//! from a later state capture — forward secrecy), the remaining 32 bytes are the
-//! random output.
+//! from a later state capture — BACKWARD secrecy), the remaining 32 bytes are the
+//! random output. On top of that the state is RESEEDED from fresh hardware entropy
+//! after a bounded amount of output (1 MiB) or wall time (~5 s) — this adds FORWARD
+//! secrecy, so a one-time state capture can't predict output indefinitely.
 use crate::sync::DiagMutex;
 
 const CHACHA_CONST: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
@@ -111,27 +113,52 @@ fn hw_seed() -> [u32; 8] {
     out
 }
 
+// Reseed thresholds. Fast key erasure already gives BACKWARD secrecy (a captured
+// state can't recover past output); reseeding from fresh hardware entropy adds
+// FORWARD secrecy (recovery after a state capture). Fold new entropy in after this
+// many output bytes, OR after this much wall time — whichever comes first.
+const RESEED_BYTES: u64 = 1 << 20; // 1 MiB of output
+const RESEED_TICKS: u64 = 500; // ~5 s at the 100 Hz PIT (1 tick = 10 ms)
+
 struct Csprng {
     key: [u32; 8],
     counter: u64,
     seeded: bool,
+    bytes_since_reseed: u64,
+    last_reseed_tick: u64,
 }
 
 impl Csprng {
     const fn new() -> Self {
-        Csprng { key: [0; 8], counter: 0, seeded: false }
+        Csprng {
+            key: [0; 8],
+            counter: 0,
+            seeded: false,
+            bytes_since_reseed: 0,
+            last_reseed_tick: 0,
+        }
     }
     fn reseed(&mut self) {
+        // XOR fresh hardware entropy into the key — keeps the existing state's entropy
+        // (a weak hw draw can't WEAKEN us) while folding in bits an attacker who captured
+        // a past state cannot predict (a strong draw RECOVERS us).
         let s = hw_seed();
         for i in 0..8 {
             self.key[i] ^= s[i];
         }
         self.seeded = true;
+        self.bytes_since_reseed = 0;
+        self.last_reseed_tick = crate::arch::ticks();
     }
     fn fill(&mut self, buf: &mut [u8]) {
-        if !self.seeded {
+        // Reseed on first use, after enough output, or after enough wall time.
+        let due = !self.seeded
+            || self.bytes_since_reseed >= RESEED_BYTES
+            || crate::arch::ticks().wrapping_sub(self.last_reseed_tick) >= RESEED_TICKS;
+        if due {
             self.reseed();
         }
+        self.bytes_since_reseed = self.bytes_since_reseed.saturating_add(buf.len() as u64);
         let mut off = 0;
         while off < buf.len() {
             let mut blk = [0u8; 64];
@@ -151,7 +178,8 @@ impl Csprng {
 
 static RNG: DiagMutex<Csprng> = DiagMutex::new("RNG", Csprng::new());
 
-/// Seed the CSPRNG from hardware entropy. Call once early at boot.
+/// Seed the CSPRNG from hardware entropy. Call once early at boot; thereafter `fill`
+/// reseeds itself on the RESEED_BYTES / RESEED_TICKS thresholds.
 pub fn init() {
     let mut rng = RNG.lock();
     rng.reseed();
