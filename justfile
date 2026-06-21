@@ -53,11 +53,13 @@ build-server:
     # FPU + does per-thread FXSAVE), and the non-SIMD curve25519 backend.
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2 --cfg curve25519_dalek_backend="serial"' cargo build -p drift
     RUSTFLAGS="-C relocation-model=static" cargo build -p cc-hello
-    RUSTFLAGS="-C relocation-model=static" cargo build -p wc
-    RUSTFLAGS="-C relocation-model=static" cargo build -p head
-    RUSTFLAGS="-C relocation-model=static" cargo build -p tail
-    RUSTFLAGS="-C relocation-model=static" cargo build -p find
-    RUSTFLAGS="-C relocation-model=static" cargo build -p grep
+    # The float-ABI flags (-soft-float,+sse,+sse2) matter for any tool that passes
+    # a double across the C->Rust libc boundary (seq's printf("%f"), printf, od);
+    # the kernel enabled SSE at boot, and clang-compiled C passes doubles in XMM, so
+    # oxbow-libc must use the same hardware-SSE float ABI. Harmless for the rest.
+    for t in wc head tail find grep true false yes seq basename dirname tee rev cut cmp paste fold comm uniq tr strings od printf split sleep; do \
+        RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p $t; \
+    done
     RUSTFLAGS="-C relocation-model=static" cargo build -p ps
     RUSTFLAGS="-C relocation-model=static" cargo build -p kill
     RUSTFLAGS="-C relocation-model=static" cargo build -p spin
@@ -177,7 +179,7 @@ _iso:
     # bare command names here (PATH), reachable by every logged-in user. Stripped
     # (llvm-strip; Apple strip can't touch ELF) so the 56-byte FS_READ loop is quick.
     STRIP=$(find $(rustc --print sysroot) -name llvm-strip | head -1); \
-    for t in hello ls cat mkdir touch rm mv cp thrtest wc head tail find grep ps kill spin; do \
+    for t in hello ls cat mkdir touch rm mv cp thrtest wc head tail find grep true false yes seq basename dirname tee rev cut cmp paste fold comm uniq tr strings od printf split sleep ps kill spin; do \
       cp target/x86_64-unknown-none/debug/$t build/initrd/bin/$t; \
       "$STRIP" --strip-all build/initrd/bin/$t; \
     done

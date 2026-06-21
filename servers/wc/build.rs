@@ -26,7 +26,8 @@ fn main() {
     let res_inc = format!("{}/include", res.trim());
 
     let tool = std::env::var("CARGO_PKG_NAME").unwrap();
-    cc::Build::new()
+    let mut build = cc::Build::new();
+    build
         .compiler(&compiler)
         .archiver(&llvm_ar)
         .flag("-nostdinc")
@@ -35,17 +36,20 @@ fn main() {
         .include(&sb)
         .include(format!("{dir}/../../libc/include"))
         .file(format!("{sb}/{tool}.c"))
-        .file(format!("{sb}/utf.c"))
         .file(format!("{sb}/getline.c"))
-        .file(format!("{sb}/libutil/eprintf.c"))
-        .file(format!("{sb}/libutil/strtonum.c"))
-        .file(format!("{sb}/libutil/fshut.c"))
-        .file(format!("{sb}/libutil/concat.c"))
-        .file(format!("{sb}/libutil/writeall.c"))
-        .file(format!("{sb}/libutil/ealloc.c"))
-        .file(format!("{sb}/libutil/reallocarray.c"))
         .file(format!("{sb}/oxcompat.c"))
-        .file(format!("{sb}/re.c"))
+        .file(format!("{sb}/re.c"));
+    // Vendor the real sbase libutf (UTF-8) + libutil wholesale — glob so new
+    // support files are picked up without touching this template.
+    for sub in ["libutf", "libutil"] {
+        for ent in std::fs::read_dir(format!("{sb}/{sub}")).unwrap() {
+            let p = ent.unwrap().path();
+            if p.extension().map(|e| e == "c").unwrap_or(false) {
+                build.file(p);
+            }
+        }
+    }
+    build
         .flag("-ffreestanding")
         .flag("-fno-stack-protector")
         .flag("-fno-builtin")

@@ -29,6 +29,7 @@ struct sigaction {
 int sigaction(int, const struct sigaction *, struct sigaction *);
 #define SIG_DFL ((sighandler_t)0)
 #define SIG_IGN ((sighandler_t)1)
+#define SIG_ERR ((sighandler_t)-1)
 #define SIG_BLOCK   0
 #define SIG_UNBLOCK 1
 #define SIG_SETMASK 2

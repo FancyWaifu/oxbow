@@ -16,6 +16,19 @@
 
 #define UTF8_POINT(c) (((c) & 0xc0) != 0x80)
 
+/* clang's freestanding <limits.h> omits SSIZE_MAX; parseoffset.c needs it. */
+#ifndef SSIZE_MAX
+#define SSIZE_MAX LONG_MAX
+#endif
+
+/* clang freestanding <limits.h> omits these POSIX path limits; split/od need them. */
+#ifndef NAME_MAX
+#define NAME_MAX 255
+#endif
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
 /* oxbow-libc's <sys/stat.h> lacks the FIFO bits; tail uses S_ISFIFO. */
 #ifndef S_IFIFO
 #define S_IFIFO 0010000
@@ -29,6 +42,7 @@
 #undef MAX
 #define MAX(x, y)  ((x) > (y) ? (x) : (y))
 #define LEN(x) (sizeof(x) / sizeof *(x))
+#define LIMIT(x, a, b)  (x) = (x) < (a) ? (a) : (x) > (b) ? (b) : (x)
 
 extern char *argv0;
 
@@ -61,5 +75,9 @@ char *enstrndup(int, const char *, size_t);
 void *reallocarray(void *, size_t, size_t);
 void *ereallocarray(void *, size_t, size_t);
 void *enreallocarray(int, void *, size_t, size_t);
+
+double estrtod(const char *);
+off_t parseoffset(const char *);
+size_t unescape(char *);
 
 #endif

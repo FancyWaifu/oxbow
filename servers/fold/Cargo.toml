@@ -1,0 +1,15 @@
+[package]
+name = "fold"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fold"
+path = "src/main.rs"
+
+[dependencies]
+oxbow-libc = { path = "../../libc" }
+
+[build-dependencies]
+cc = "1"
