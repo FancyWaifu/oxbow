@@ -64,4 +64,14 @@ extern long  __oxbow_read(int fd, void *buf, unsigned long len);
 extern void *__oxbow_mmap_anon(unsigned long len);
 extern void  __oxbow_set_fsbase(unsigned long addr);
 
+/* fsd-backed file ops (Phase 2). open resolves the path against the process's cwd
+ * dir cap (the namespace); pread/pwrite are offset-based over the file capability.
+ * open returns the file cap (>=0) or a negative status (-1 NotFound, -2 Exists). */
+extern long __oxbow_fs_open(const char *path, unsigned long len, unsigned int flags,
+                            unsigned long *size_out, int *kind_out,
+                            unsigned int *mtime_out, unsigned int *atime_out);
+extern long __oxbow_fs_pread(long file, void *buf, unsigned long len, unsigned long off);
+extern long __oxbow_fs_pwrite(long file, const void *buf, unsigned long len, unsigned long off);
+extern void __oxbow_fs_close(long file);
+
 #endif

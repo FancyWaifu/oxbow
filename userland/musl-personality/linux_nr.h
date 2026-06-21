@@ -10,6 +10,7 @@
 #define NR_close             3
 #define NR_stat              4
 #define NR_fstat             5
+#define NR_lstat             6
 #define NR_lseek             8
 #define NR_mmap              9
 #define NR_mprotect          10
@@ -45,6 +46,7 @@
 #define NR_openat            257
 #define NR_newfstatat        262
 #define NR_getrandom         318
+#define NR_statx             332
 
 /* arch_prctl codes */
 #define ARCH_SET_FS 0x1002
@@ -59,5 +61,18 @@
 #define E_BADF   9
 #define E_INVAL  22
 #define E_FAULT  14
+#define E_NOENT  2
+#define E_EXIST  17
+#define E_MFILE  24
+#define E_NOTTY  25
+
+/* openat dirfd / flags */
+#define AT_FDCWD       (-100)
+#define AT_EMPTY_PATH  0x1000
+#define LO_WRONLY  01
+#define LO_RDWR    02
+#define LO_CREAT   0100
+#define LO_EXCL    0200
+#define LO_TRUNC   01000
 
 #endif

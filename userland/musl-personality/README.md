@@ -23,7 +23,28 @@ app → musl (stock) → __syscallN → __oxbow_syscall → oxbow rt/kernel
 - `oxsys.h` — oxbow raw-syscall inline asm + oxbow syscall numbers + rt shim decls.
 - `build-musl.sh` — builds vendored musl with the override + compiles the dispatcher.
 
-## Status — Phase 1 reached: STOCK MUSL RUNS ON OXBOW ✅
+## Status — Phase 2 reached: HEAP + STDIO + FILE I/O ✅
+`muslhello` now exercises the full picture on the hardware-path QEMU:
+```
+Hello from musl libc, running on oxbow!
+  sum(1..10) = 55 via stock musl printf
+  malloc + snprintf at 0x40002040
+  stat(/hello.c): 510 bytes
+  first line: /* A C program to compile + run ON oxbow ...
+  readback: written by musl libc on oxbow
+```
+Working: `malloc`/`free` (mallocng over `mmap`), buffered stdio
+(`fopen`/`fgets`/`fread`/`fprintf`), and file I/O over fsd — `open`/`openat`/
+`read`/`write`/`lseek`/`close` plus `stat`/`fstat`/`lstat`/`fstatat` (filling the
+x86_64 `struct kstat`; musl skips `statx` on x86_64). Paths resolve against the
+process's cwd dir cap via `__oxbow_fs_*`, so there is still zero ambient authority.
+
+Two bring-up bugs found + fixed: (1) musl's stat uses the **kstat** path on x86_64,
+not statx; (2) mallocng's meta-area setup mmaps `PROT_NONE` then `mprotect`s to RW
+and bails if mprotect fails — our anon mappings are already RW, so `mprotect`→0 and
+`brk`→a fixed (never-growing) address let mallocng fall back to mmap cleanly.
+
+## Status — Phase 1: STOCK MUSL RUNS ON OXBOW ✅
 `servers/muslhello` is a `printf` program compiled against musl headers, linked
 with the freshly-built musl `libc.a` + the crt bridge + oxbow-rt[hosted]. On the
 hardware-path QEMU it prints and exits cleanly:
