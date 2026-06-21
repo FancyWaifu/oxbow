@@ -39,13 +39,29 @@ inheriting cwd+stdout, runs to completion, exits with its status — the launche
 "exec as the last thing" case), and `waitpid` (`__oxbow_wait` on the child's
 exit-notif). Reuses the existing `std::process::Command` shims; no kernel/rt change.
 
-**True `fork()` is deferred to Phase 3b — it needs a kernel primitive.** A spawn
-kernel has no fork, and userland CAN'T emulate it: `fork()` must return (popping its
-frame) so the child code runs, which leaves nothing for the child's `execve` to
-`longjmp` back to (verified: it faults at rip=0). The fix is a kernel thread-clone
-(new thread resuming at the caller's RIP with `rax=0` on a copied stack, shared AS);
-the syscall entry already has the user RIP/RSP. `fork`/`clone` return `-ENOSYS` for
-now so fork-using code takes its failure path instead of crashing.
+**True `fork()` — Phase 3b ATTEMPTED, needs a separate-AS COW fork (deferred).**
+`fork`/`clone` return `-ENOSYS` for now so fork-using code takes its failure path.
+
+A full vfork-style kernel primitive was built and tested (`SYS_VFORK_SPAWN`/
+`SYS_VFORK_RESUME`): userland `setjmp`/`longjmp` captures the context (so the kernel
+needs no register capture), the kernel spawns a child thread sharing the parent's AS
+and suspends the parent, the child `longjmp`s onto the parent's idle stack, runs up
+to `execve`, spawns the program, and resumes the parent with the child pid. It got
+*almost* all the way — verified on QEMU: child spawns, `seq` runs, parent is woken
+to Ready — but it **fundamentally can't work with a shared stack**. musl's `_Fork`
+does substantial work (atfork handlers, lock resets) and `main`+`execve` run a deep
+call chain ON THE SHARED STACK, clobbering the parent's *suspended call chain*
+(`NR_fork→__oxbow_syscall→__syscall→_Fork→fork→main`). A scratch-stack switch
+protects the deepest frame but not those. The classic vfork contract ("child does
+*only* `exec`") is violated by musl itself.
+
+**The real fix is a separate address space.** `fork` must copy the parent's AS (eager
+copy or COW) at the *same* virtual addresses, then run a child thread in that copy
+resuming at the parent's RIP with `rax=0`. The `setjmp`/`longjmp` trick then works
+unchanged (the copied stack lives at the same VA), and the child never touches the
+parent's memory. That's a major kernel feature (per-fork AS clone + COW page faults)
+— a focused future effort. The bring-up learnings (stack alignment for raw thread
+entries, the lost-wakeup-safe block/wake, the scratch-stack switch) carry over.
 
 ## Status — Phase 2: HEAP + STDIO + FILE I/O ✅
 `muslhello` now exercises the full picture on the hardware-path QEMU:

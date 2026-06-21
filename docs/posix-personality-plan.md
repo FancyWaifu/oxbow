@@ -119,19 +119,26 @@ against the dirfd's cap. This is the Fuchsia model.
 seeded from spawn. `open`/`stat`/`access`/`*at` go through it.
 
 ### 3.4 fork/exec
-The dominant real use is `fork()`-then-`exec*()`. We do **not** need COW fork for
-that.
+**DONE (3a):** `execve` (run-to-completion launcher) + `waitpid` (block on the
+child's exit-notif) — a musl program runs another program. Reuses the existing
+`__oxbow_spawn`/`__oxbow_wait` shims; no kernel change.
 
-**Action:**
-- `posix_spawn` path: implement `fork`+`execve` as a deferred spawn — `fork`
-  returns a "pending child" token, recording the file-actions the child wants
-  (dup2/close on fds); `execve` materializes it via `SYS_SPAWN_BYTES` with the
-  fd-table caps + namespace in the spawn message. Covers shells, configure, make.
-- `vfork` → same path.
-- True COW `fork` (child keeps running without exec): deferred. Needs AS
-  snapshot; rare enough to punt.
-- `waitpid` → block on the child's exit-notif (`SYS_NOTIF_*`), already how the
-  shell waits.
+**Phase 3b — true `fork()` — REQUIRES A SEPARATE-AS COW FORK (deferred).**
+A shared-stack vfork primitive was built and tested (`SYS_VFORK_SPAWN`/`_RESUME` +
+userland `setjmp`/`longjmp`) and got most of the way — but it can't work: musl's
+`_Fork` (atfork handlers, lock resets) and `main`+`execve` run a deep call chain on
+the **shared** stack, clobbering the parent's suspended call chain. The vfork
+contract ("child does only exec") is violated by musl itself; a scratch-stack switch
+isn't enough.
+
+The correct design: `fork` clones the parent's **address space** (eager copy or COW)
+at the same virtual addresses, then runs a child thread in that copy resuming at the
+parent's RIP with `rax=0`. With a separate AS the `setjmp`/`longjmp` trick works
+unchanged (copied stack at the same VA) and the child never touches the parent's
+memory. Needs: a kernel `clone-AS` (page-table copy + COW page-fault handler) — a
+focused future effort. `fork`/`clone` return `-ENOSYS` until then.
+
+- `waitpid` → block on the child's exit-notif (`SYS_NOTIF_*`). DONE.
 
 ### 3.5 Signals (subset)
 **Action (phase 2):** deliver `SIGINT`/`SIGTERM`/`SIGCHLD`/`SIGPIPE`/`SIGSEGV`.
