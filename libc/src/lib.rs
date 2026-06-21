@@ -2171,6 +2171,46 @@ unsafe fn print_int(emit: &mut dyn FnMut(&[u8]), v: i64) -> i32 {
     }
 }
 
+/// Emit `body` in a field of `width`, padding with spaces (or '0' when `zero` and
+/// right-justified). Zero-padding goes after a leading sign so `%05d`/-3 → "-0003".
+/// Returns total bytes emitted. Used to honor printf width/flags (e.g. `%02x`).
+unsafe fn emit_field(
+    emit: &mut dyn FnMut(&[u8]),
+    body: &[u8],
+    width: i32,
+    left: bool,
+    zero: bool,
+) -> i32 {
+    let bl = body.len() as i32;
+    if width <= bl {
+        emit(body);
+        return bl;
+    }
+    let pad = width - bl;
+    if left {
+        emit(body);
+        for _ in 0..pad {
+            emit(b" ");
+        }
+    } else if zero {
+        let mut k = 0;
+        if !body.is_empty() && (body[0] == b'-' || body[0] == b'+') {
+            emit(&body[..1]);
+            k = 1;
+        }
+        for _ in 0..pad {
+            emit(b"0");
+        }
+        emit(&body[k..]);
+    } else {
+        for _ in 0..pad {
+            emit(b" ");
+        }
+        emit(body);
+    }
+    width
+}
+
 /// Format `x` in fixed notation with exactly `prec` fractional digits. Returns
 /// the byte count. Integer part uses u64 (fine for an interpreter's range).
 unsafe fn fmt_fixed(emit: &mut dyn FnMut(&[u8]), x: f64, prec: usize) -> i32 {
@@ -2351,18 +2391,32 @@ unsafe fn vfmt(emit: &mut dyn FnMut(&[u8]), fmt: *const u8, ap: &mut VaList) -> 
         }
         if c == b'%' {
             i += 1;
-            // flags + width + precision (honored only enough to not misread args;
-            // '*' consumes an int arg). Track the length modifier so %ld/%lx read
-            // a 64-bit arg instead of 32 — tcc prints sizes/addresses this way.
+            // flags + width + precision. Width/zero/left-justify are now applied
+            // (e.g. `%02x` zero-pads — needed for hex digests). '*' consumes an int
+            // arg. Track the length modifier so %ld/%lx read a 64-bit arg.
+            let mut left = false;
+            let mut zero = false;
             while matches!(*fmt.add(i), b'-' | b'+' | b' ' | b'#' | b'0') {
+                match *fmt.add(i) {
+                    b'-' => left = true,
+                    b'0' => zero = true,
+                    _ => {}
+                }
                 i += 1;
             }
-            while matches!(*fmt.add(i), b'0'..=b'9') {
-                i += 1;
-            }
+            let mut width: i32 = 0;
             if *fmt.add(i) == b'*' {
-                let _ = ap.next_arg::<i32>();
+                width = ap.next_arg::<i32>();
+                if width < 0 {
+                    left = true;
+                    width = -width;
+                }
                 i += 1;
+            } else {
+                while matches!(*fmt.add(i), b'0'..=b'9') {
+                    width = width * 10 + (*fmt.add(i) - b'0') as i32;
+                    i += 1;
+                }
             }
             let mut prec: i32 = -1; // -1 = unspecified
             if *fmt.add(i) == b'.' {
@@ -2387,45 +2441,62 @@ unsafe fn vfmt(emit: &mut dyn FnMut(&[u8]), fmt: *const u8, ap: &mut VaList) -> 
                 i += 1;
             }
             let spec = *fmt.add(i);
+            // Render the conversion body into a scratch buffer, then emit it padded
+            // to `width`. Uppercase %X folds the hex digits after rendering.
+            let mut body = TmpBuf::new();
             match spec {
                 b'd' | b'i' => {
                     let v = if lng { ap.next_arg::<i64>() } else { ap.next_arg::<i32>() as i64 };
-                    w += print_int(emit, v);
+                    print_int(&mut |s| body.push(s), v);
+                    w += emit_field(emit, &body.buf[..body.len], width, left, zero);
                 }
                 b'u' => {
                     let v = if lng { ap.next_arg::<u64>() } else { ap.next_arg::<u32>() as u64 };
-                    w += print_uint(emit, v, 10);
+                    print_uint(&mut |s| body.push(s), v, 10);
+                    w += emit_field(emit, &body.buf[..body.len], width, left, zero);
                 }
                 b'o' => {
                     let v = if lng { ap.next_arg::<u64>() } else { ap.next_arg::<u32>() as u64 };
-                    w += print_uint(emit, v, 8);
+                    print_uint(&mut |s| body.push(s), v, 8);
+                    w += emit_field(emit, &body.buf[..body.len], width, left, zero);
                 }
                 b'x' | b'X' => {
                     let v = if lng { ap.next_arg::<u64>() } else { ap.next_arg::<u32>() as u64 };
-                    w += print_uint(emit, v, 16);
+                    print_uint(&mut |s| body.push(s), v, 16);
+                    if spec == b'X' {
+                        for k in 0..body.len {
+                            body.buf[k] = body.buf[k].to_ascii_uppercase();
+                        }
+                    }
+                    w += emit_field(emit, &body.buf[..body.len], width, left, zero);
                 }
                 b'p' => {
-                    emit(b"0x");
-                    w += 2 + print_uint(emit, ap.next_arg::<usize>() as u64, 16);
+                    body.push(b"0x");
+                    print_uint(&mut |s| body.push(s), ap.next_arg::<usize>() as u64, 16);
+                    w += emit_field(emit, &body.buf[..body.len], width, left, zero);
                 }
                 b'c' => {
-                    emit(&[ap.next_arg::<i32>() as u8]);
-                    w += 1;
+                    body.push(&[ap.next_arg::<i32>() as u8]);
+                    w += emit_field(emit, &body.buf[..body.len], width, left, false);
                 }
                 b's' => {
                     let p = ap.next_arg::<*const u8>();
-                    let n = cstr_len(p);
                     if p.is_null() {
-                        emit(b"(null)");
-                        w += 6;
+                        w += emit_field(emit, b"(null)", width, left, false);
                     } else {
-                        emit(core::slice::from_raw_parts(p, n));
-                        w += n as i32;
+                        // honor precision as a max length; emit directly (may exceed
+                        // the 64-byte scratch buffer), padding only when shorter.
+                        let mut n = cstr_len(p);
+                        if prec >= 0 && (prec as usize) < n {
+                            n = prec as usize;
+                        }
+                        w += emit_field(emit, core::slice::from_raw_parts(p, n), width, left, false);
                     }
                 }
                 b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => {
                     let v = ap.next_arg::<f64>();
-                    w += fmt_float(emit, v, prec, spec);
+                    fmt_float(&mut |s| body.push(s), v, prec, spec);
+                    w += emit_field(emit, &body.buf[..body.len], width, left, zero);
                 }
                 b'%' => {
                     emit(b"%");

@@ -154,6 +154,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cksum"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+]
+
+[[package]]
 name = "cmp"
 version = "0.0.0"
 dependencies = [
@@ -509,6 +517,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
+name = "md5sum"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+]
+
+[[package]]
 name = "mkdir"
 version = "0.0.0"
 dependencies = [
@@ -531,6 +547,14 @@ dependencies = [
  "oxbow-abi",
  "oxbow-rt",
  "smoltcp",
+]
+
+[[package]]
+name = "nl"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
 ]
 
 [[package]]
@@ -842,6 +866,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1sum"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+]
+
+[[package]]
+name = "sha256sum"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+]
+
+[[package]]
+name = "sha512sum"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
+]
+
+[[package]]
 name = "shell"
 version = "0.0.0"
 dependencies = [
@@ -950,6 +998,14 @@ dependencies = [
  "cc",
  "oxbow-libc",
  "oxbow-rt",
+]
+
+[[package]]
+name = "tac"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-libc",
 ]
 
 [[package]]

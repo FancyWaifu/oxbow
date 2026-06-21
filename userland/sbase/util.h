@@ -11,6 +11,7 @@
 #include <limits.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <regex.h>
 
 #include "arg.h"
 
@@ -79,5 +80,8 @@ void *enreallocarray(int, void *, size_t, size_t);
 double estrtod(const char *);
 off_t parseoffset(const char *);
 size_t unescape(char *);
+
+int enregcomp(int, regex_t *, const char *, int);
+int eregcomp(regex_t *, const char *, int);
 
 #endif
