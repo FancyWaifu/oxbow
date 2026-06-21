@@ -482,6 +482,39 @@ pub unsafe extern "C" fn __oxbow_walltime(secs: *mut u64, nanos: *mut u32) {
     }
 }
 
+// POSIX personality (musl) shims: set the TLS base (arch_prctl ARCH_SET_FS) and
+// anonymous mmap for musl's allocator.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_set_fsbase(addr: u64) {
+    let _ = unsafe { syscall1(oxbow_abi::SYS_SET_FSBASE, addr) };
+}
+
+/// Anonymous mmap for the POSIX personality (musl's allocator). Bumps a dedicated
+/// vaddr window [0x4000_0000, 0x6000_0000) — separate from rt's own heap — and
+/// backs it RW with SYS_MAP. No unmap yet (Phase 1); returns (void*)-1 (MAP_FAILED)
+/// on exhaustion or map failure.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_mmap_anon(len: usize) -> *mut u8 {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    const BASE: usize = 0x4000_0000;
+    const LIMIT: usize = 0x6000_0000;
+    static CURSOR: AtomicUsize = AtomicUsize::new(BASE);
+    let need = (len + 0xfff) & !0xfff;
+    if need == 0 {
+        return usize::MAX as *mut u8;
+    }
+    let start = CURSOR.fetch_add(need, Ordering::Relaxed);
+    if start + need > LIMIT {
+        return usize::MAX as *mut u8;
+    }
+    if sys_map(BOOT_MEM, start as u64, need as u64, PROT_READ | PROT_WRITE).is_err() {
+        return usize::MAX as *mut u8;
+    }
+    start as *mut u8
+}
+
 // §96 hosted shims for std's pal thread + futex backend.
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]

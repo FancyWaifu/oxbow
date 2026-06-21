@@ -783,6 +783,15 @@ pub fn current_tid() -> usize {
     current()
 }
 
+/// Set the calling thread's FS base (x86_64 TLS pointer) and apply it to the CPU
+/// immediately. Backs `SYS_SET_FSBASE` / musl's `arch_prctl(ARCH_SET_FS)`. The new
+/// base is stored in the TCB so it survives context switches (restored at line ~431).
+pub fn set_fsbase_current(base: u64) {
+    let cur = current();
+    unsafe { (*addr_of_mut!(TCBS[cur])).fs_base = base };
+    crate::arch::set_fs_base(base);
+}
+
 /// §96 thread exit with an optional join signal. If `done_addr != 0`, store
 /// `*done_addr = 1` and futex-wake it FIRST — done from kernel mode, when the
 /// thread is already off its user stack, so a joiner woken by this can free that
