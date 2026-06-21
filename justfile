@@ -178,6 +178,9 @@ _iso:
     # Rust std runs on oxbow. Copied only if prebuilt (needs the patched-std fork —
     # see std-port/). Already stripped at build time.
     [ -f std-port/oxhello-demo.elf ] && cp std-port/oxhello-demo.elf build/initrd/bin/oxhello || true
+    # UDP MTU echo test (netmap Stage 2): a std program that round-trips 400/800/1400-byte
+    # datagrams through the per-socket zero-copy frame. Copied only if prebuilt.
+    [ -f std-port/apps/udpmtu/target/x86_64-unknown-oxbow/release/udpmtu ] && { cp std-port/apps/udpmtu/target/x86_64-unknown-oxbow/release/udpmtu build/initrd/bin/udpmtu; STRIP=$(find $(rustc --print sysroot) -name llvm-strip | head -1); "$STRIP" --strip-all build/initrd/bin/udpmtu; } || true
     # Self-hosting (§35): liboxbow_libc.a staged at /lib/c.a — the C library
     # archive tcc statically links to produce a standalone binary on oxbow.
     # `cc src.c -o out` expands to `tcc -static src.c -o out /lib/c.a`. Built with

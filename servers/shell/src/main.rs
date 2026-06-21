@@ -1090,38 +1090,33 @@ fn dns_cmd(name: &[u8]) {
         tw(b"dns: bad name\n");
         return;
     };
-    // Attach the shared UDP frame ONCE per process: there is no unmap syscall, so
-    // a second sys_frame_map at UDP_XFER would fail. Cache the buffer pointer.
-    static mut DNS_BUF: *mut u8 = core::ptr::null_mut();
-    let buf = unsafe {
-        if DNS_BUF.is_null() {
-            DNS_BUF = rt::udp::attach(BOOT_NET_EP).unwrap_or(core::ptr::null_mut());
-        }
-        DNS_BUF
-    };
-    if buf.is_null() {
-        tw(b"dns: attach failed (no net server?)\n");
-        return;
-    }
+    // Per-socket transfer frame (netmap Stage 2): bind first, then attach THIS
+    // socket's frame (the server hands each socket its own page). Query + response
+    // ride the frame — no inline size cap, full MTU.
     let Some((sock, _port)) = rt::udp::bind(BOOT_NET_EP, 0) else {
         tw(b"dns: bind failed (no net server?)\n");
         return;
     };
+    let Some(buf) = rt::udp::attach_sock(sock) else {
+        tw(b"dns: attach failed (no net server?)\n");
+        rt::udp::close(sock);
+        return;
+    };
     let q = rt::dns::query(0x1234, name_str, rt::dns::TYPE_A);
     let server = rt::udp::dns_server(BOOT_NET_EP); // DHCP-leased resolver, not hardcoded
-    // Query + response ride the shared frame (large path — no 40-byte inline cap).
     unsafe { core::ptr::copy_nonoverlapping(q.as_ptr(), buf, q.len()) };
     if !rt::udp::sendv(sock, server, 53, q.len()) {
         tw(b"dns: send failed\n");
         rt::udp::close(sock);
         return;
     }
-    // recvv is non-blocking; poll with a deadline so a lost reply doesn't hang.
+    // recvv_src is non-blocking; poll with a deadline so a lost reply doesn't hang.
     let mut n = 0;
     let deadline = rt::sys_uptime_ms() + 3000;
     while rt::sys_uptime_ms() < deadline {
-        n = rt::udp::recvv(sock);
-        if n > 0 {
+        let (m, _, _) = rt::udp::recvv_src(sock);
+        if m > 0 {
+            n = m;
             break;
         }
     }

@@ -862,10 +862,11 @@ extern "C" {
     fn oxbow_cares_resolve(host: *const u8, out_ip: *mut u8) -> i32;
 }
 
-/// Attach (once) to the net server's shared UDP frame; null on failure.
+/// Attach socket `cap`'s per-socket UDP transfer frame; null on failure. Each
+/// socket gets its own page (netmap Stage 2), so call this once per opened socket.
 #[no_mangle]
-pub extern "C" fn ox_udp_attach() -> *mut u8 {
-    rt::udp::attach(BOOT_NET_EP).unwrap_or(core::ptr::null_mut())
+pub extern "C" fn ox_udp_attach(cap: u64) -> *mut u8 {
+    rt::udp::attach_sock(cap as u32).unwrap_or(core::ptr::null_mut())
 }
 
 /// Bind a fresh UDP socket; returns its capability handle, or -1.
@@ -887,10 +888,11 @@ pub extern "C" fn ox_udp_sendv(cap: u64, ip: u32, port: u16, len: usize) -> i32 
     }
 }
 
-/// Non-blocking receive into the shared frame; returns datagram length (0=none).
+/// Non-blocking receive into the socket's frame; returns datagram length (0=none).
 #[no_mangle]
 pub extern "C" fn ox_udp_recvv(cap: u64) -> i64 {
-    rt::udp::recvv(cap as u32) as i64
+    let (n, _, _) = rt::udp::recvv_src(cap as u32);
+    n as i64
 }
 
 /// Close a UDP socket capability (frees the net server's socket slot too).

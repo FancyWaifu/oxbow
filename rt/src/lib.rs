@@ -1044,6 +1044,19 @@ pub unsafe extern "C" fn __oxbow_udp_send_to(
     buf: *const u8,
     len: usize,
 ) -> isize {
+    if len > 1472 {
+        return -1; // one datagram, one MTU; we do not fragment
+    }
+    if len > 480 {
+        // Large datagram: zero-copy via this socket's transfer frame (full MTU).
+        if let Some(frame) = udp::attach_sock(sock as Handle) {
+            unsafe { core::ptr::copy_nonoverlapping(buf, frame, len) };
+            if udp::sendv(sock as Handle, ip_be.to_be_bytes(), port, len) {
+                return len as isize;
+            }
+        }
+        return -1;
+    }
     let payload = unsafe { core::slice::from_raw_parts(buf, len) };
     if udp::sendto(sock as Handle, ip_be.to_be_bytes(), port, payload) {
         len as isize
@@ -1060,6 +1073,22 @@ pub unsafe extern "C" fn __oxbow_udp_recv_from(
     src_ip: *mut u32,
     src_port: *mut u16,
 ) -> isize {
+    // Prefer this socket's transfer frame: the whole datagram (up to the full MTU)
+    // lands in the frame, so std's recv_from never truncates at the old 480-byte inline
+    // cap. Fall back to the inline path only if attach fails.
+    if let Some(frame) = udp::attach_sock(sock as Handle) {
+        let (n, sip, sport) = udp::recvv_src(sock as Handle);
+        unsafe {
+            src_ip.write(u32::from_be_bytes(sip));
+            src_port.write(sport);
+        }
+        if n == 0 {
+            return -1; // nothing buffered now; std polls
+        }
+        let copy = n.min(len);
+        unsafe { core::ptr::copy_nonoverlapping(frame as *const u8, buf, copy) };
+        return copy as isize;
+    }
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
     let (n, sip, sport) = udp::recvfrom_src(sock as Handle, out);
     unsafe {
@@ -1078,53 +1107,42 @@ pub extern "C" fn __oxbow_udp_close(sock: i64) {
 // resolver over UDP, reusing the rt dns query/parse helpers. Writes a big-endian IPv4
 // to `out_ip` and returns 0 on success; -1 on failure/timeout. (Inline UDP path — fine
 // for the common single-A response; very large responses can truncate at 56 bytes.)
-#[cfg(feature = "hosted")]
-#[unsafe(no_mangle)]
-/// The shared UDP transfer frame, mapped once (per process) and reused — a single
-/// global, so DNS is serialized with `DNS_LOCK`.
-#[cfg(feature = "hosted")]
-static DNS_FRAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DNS is serialized with `DNS_LOCK` (binds a fresh per-socket transfer frame each
+/// time); one resolver query in flight at a time keeps the socket-slot table calm.
 #[cfg(feature = "hosted")]
 static DNS_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
-/// Send a DNS query of `qtype` for `name` over the shared transfer frame and copy the
-/// response into `out`, returning its length (0 = fail/timeout). Serialized + attaches
-/// the frame once (the frame is a single per-process global).
+/// Send a DNS query of `qtype` for `name` over a per-socket transfer frame and copy the
+/// response into `out`, returning its length (0 = fail/timeout). Serialized via
+/// `DNS_LOCK`; binds a fresh socket + attaches its own frame each call.
 #[cfg(feature = "hosted")]
 unsafe fn dns_transport(name: &str, qtype: u16, out: &mut [u8]) -> usize {
     use core::sync::atomic::Ordering;
     while DNS_LOCK.swap(true, Ordering::Acquire) {
         core::hint::spin_loop();
     }
-    // Attach the shared frame once (mapped at UDP_XFER), reuse the pointer thereafter.
-    let frame = {
-        let cached = DNS_FRAME.load(Ordering::Relaxed);
-        if cached != 0 {
-            cached as *mut u8
-        } else if let Some(f) = udp::attach(oxbow_abi::BOOT_NET_EP) {
-            DNS_FRAME.store(f as u64, Ordering::Relaxed);
-            f
-        } else {
-            DNS_LOCK.store(false, Ordering::Release);
-            return 0;
-        }
-    };
     let server = udp::dns_server(oxbow_abi::BOOT_NET_EP);
+    // Bind first, then attach THIS socket's transfer frame (per-socket — netmap Stage 2).
     let Some((sock, _)) = udp::bind(oxbow_abi::BOOT_NET_EP, 0) else {
+        DNS_LOCK.store(false, Ordering::Release);
+        return 0;
+    };
+    let Some(frame) = udp::attach_sock(sock) else {
+        udp::close(sock);
         DNS_LOCK.store(false, Ordering::Release);
         return 0;
     };
     let mut got = 0;
     let query = dns::query(0x1234, name, qtype);
     let qn = query.len().min(1472);
-    // Stage the query in the shared frame; the reply (up to ~1472 B) lands back in it.
+    // Stage the query in the frame; the reply (up to ~1472 B) lands back in it.
     unsafe { core::ptr::copy_nonoverlapping(query.as_ptr(), frame, qn) };
     if udp::sendv(sock, server, 53, qn) {
         let start = sys_uptime_ms();
         loop {
-            let n = udp::recvv(sock);
+            let (n, _, _) = udp::recvv_src(sock);
             if n > 0 {
                 let m = n.min(out.len());
                 unsafe { core::ptr::copy_nonoverlapping(frame as *const u8, out.as_mut_ptr(), m) };
@@ -1827,29 +1845,107 @@ fn panic(_info: &PanicInfo) -> ! {
 /// ride that cap (badge = socket id) so the server stays near-stateless.
 pub mod udp {
     use crate::{sys_call, sys_frame_map, Handle};
+    use core::hint::spin_loop;
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use oxbow_abi::{
         MsgBuf, PROT_READ, PROT_WRITE, TAG_NET_DNS, TAG_UDP_ATTACH, TAG_UDP_BIND, TAG_UDP_CLOSE,
         TAG_UDP_RECVFROM, TAG_UDP_RECVV, TAG_UDP_SENDTO, TAG_UDP_SENDV,
     };
 
-    /// Client-side vaddr of the shared UDP transfer frame (large datagram path).
+    /// Client-side base vaddr of the per-socket UDP transfer frames (netmap Stage 2).
+    /// Socket `sid`'s frame maps at `UDP_XFER + sid*4096`; the server returns `sid` on
+    /// attach so the vaddr is stable across re-attach of a reused socket slot (the same
+    /// physical page), which means we never remap (there is no frame_unmap).
     pub const UDP_XFER: u64 = 0x3E00_0000;
 
-    /// Attach to the net server's shared UDP transfer frame (TAG_UDP_ATTACH on
-    /// `ctl`). The server owns the frame and returns a cap to it; we map that same
-    /// physical page at `UDP_XFER`. Returns the buffer pointer on success;
-    /// thereafter `sendv` sends FROM it and `recvv` receives INTO it, so a whole
-    /// (<=1472-byte) UDP datagram moves in one IPC. Call once per process.
-    pub fn attach(ctl: Handle) -> Option<*mut u8> {
-        let mut m = MsgBuf::new(TAG_UDP_ATTACH);
-        if sys_call(ctl, &mut m).is_err() || m.data[0] != 0 || m.handle_count == 0 {
-            return None;
+    const UDP_FRAME_SLOTS: usize = 16;
+    /// Lock guarding the attach slow-path (the cache mutation + the one IPC).
+    static FRAME_LOCK: AtomicBool = AtomicBool::new(false);
+    /// Cache: socket cap -> client frame ptr, so send/recv don't re-attach per packet
+    /// (0 = empty slot).
+    static FRAME_SOCK: [AtomicU32; UDP_FRAME_SLOTS] =
+        [const { AtomicU32::new(0) }; UDP_FRAME_SLOTS];
+    static FRAME_PTR: [AtomicU64; UDP_FRAME_SLOTS] =
+        [const { AtomicU64::new(0) }; UDP_FRAME_SLOTS];
+    /// Per-sid one-time mapping record (0 = not yet mapped). A reused sid reuses the
+    /// same page, so we map exactly once per sid over the process lifetime.
+    static SID_MAPPED: [AtomicU64; UDP_FRAME_SLOTS + 1] =
+        [const { AtomicU64::new(0) }; UDP_FRAME_SLOTS + 1];
+
+    /// Attach socket `sock`'s shared transfer frame and return its client pointer,
+    /// caching it so subsequent send/recv are a single IPC with zero payload copy
+    /// across the boundary. Attaching via the SOCKET cap (badge = socket id) means the
+    /// net server hands each socket its own page — correct per-process isolation.
+    /// Returns `None` if the server can't allocate/return a frame (caller falls back
+    /// to the inline path).
+    pub fn attach_sock(sock: Handle) -> Option<*mut u8> {
+        // Fast path: already cached.
+        for i in 0..UDP_FRAME_SLOTS {
+            if FRAME_SOCK[i].load(Ordering::Acquire) == sock {
+                let p = FRAME_PTR[i].load(Ordering::Acquire);
+                if p != 0 {
+                    return Some(p as *mut u8);
+                }
+            }
         }
-        let frame = m.handles[0];
-        if sys_frame_map(frame, UDP_XFER, PROT_READ | PROT_WRITE).is_err() {
-            return None;
+        while FRAME_LOCK.swap(true, Ordering::Acquire) {
+            spin_loop();
         }
-        Some(UDP_XFER as *mut u8)
+        let mut result = None;
+        'done: {
+            // Re-check under the lock (another thread may have attached meanwhile).
+            for i in 0..UDP_FRAME_SLOTS {
+                if FRAME_SOCK[i].load(Ordering::Relaxed) == sock {
+                    let p = FRAME_PTR[i].load(Ordering::Relaxed);
+                    if p != 0 {
+                        result = Some(p as *mut u8);
+                        break 'done;
+                    }
+                }
+            }
+            let mut m = MsgBuf::new(TAG_UDP_ATTACH);
+            if sys_call(sock, &mut m).is_err() || m.data[0] != 0 || m.handle_count == 0 {
+                break 'done;
+            }
+            let frame = m.handles[0];
+            let sid = m.data[1] as usize;
+            if sid == 0 || sid > UDP_FRAME_SLOTS {
+                break 'done;
+            }
+            let vaddr = UDP_XFER + (sid as u64) * 4096;
+            if SID_MAPPED[sid].load(Ordering::Relaxed) == 0 {
+                if sys_frame_map(frame, vaddr, PROT_READ | PROT_WRITE).is_err() {
+                    break 'done;
+                }
+                SID_MAPPED[sid].store(vaddr, Ordering::Relaxed);
+            }
+            // Cache sock -> vaddr for the per-packet fast path.
+            for i in 0..UDP_FRAME_SLOTS {
+                if FRAME_SOCK[i].load(Ordering::Relaxed) == 0 {
+                    FRAME_PTR[i].store(vaddr, Ordering::Relaxed);
+                    FRAME_SOCK[i].store(sock, Ordering::Release);
+                    break;
+                }
+            }
+            result = Some(vaddr as *mut u8);
+        }
+        FRAME_LOCK.store(false, Ordering::Release);
+        result
+    }
+
+    /// Drop a socket's cache entry on close so a future bind that reuses the cap value
+    /// re-attaches cleanly (the underlying per-sid mapping is intentionally kept).
+    fn frame_drop(sock: Handle) {
+        while FRAME_LOCK.swap(true, Ordering::Acquire) {
+            spin_loop();
+        }
+        for i in 0..UDP_FRAME_SLOTS {
+            if FRAME_SOCK[i].load(Ordering::Relaxed) == sock {
+                FRAME_SOCK[i].store(0, Ordering::Relaxed);
+                FRAME_PTR[i].store(0, Ordering::Relaxed);
+            }
+        }
+        FRAME_LOCK.store(false, Ordering::Release);
     }
 
     /// Send the first `len` bytes of the shared frame to `ip:dport` on `sock`.
@@ -1863,14 +1959,19 @@ pub mod udp {
         sys_call(sock, &mut m).is_ok() && m.data[0] == 0
     }
 
-    /// Non-blocking: receive the next datagram for `sock` INTO the shared frame.
-    /// Returns its length (0 = nothing buffered now). Requires a prior `attach`.
-    pub fn recvv(sock: Handle) -> usize {
+    /// Non-blocking: receive the next datagram for `sock` INTO its shared frame.
+    /// Returns `(len, src_ip, src_port)` (len 0 = nothing buffered now). The whole
+    /// datagram (up to the full MTU) lands in the frame — no inline-size truncation.
+    /// Requires a prior `attach_sock`.
+    pub fn recvv_src(sock: Handle) -> (usize, [u8; 4], u16) {
         let mut m = MsgBuf::new(TAG_UDP_RECVV);
         if sys_call(sock, &mut m).is_err() {
-            return 0;
+            return (0, [0; 4], 0);
         }
-        (m.data[0] as usize).min(1472)
+        let n = (m.data[0] as usize).min(1472);
+        let sip = (m.data[1] as u32).to_be_bytes();
+        let sport = m.data[2] as u16;
+        (n, sip, sport)
     }
 
     /// Close a UDP socket: free the net server's socket slot AND the client cap.
@@ -1881,6 +1982,7 @@ pub mod udp {
     pub fn close(sock: Handle) {
         let m = MsgBuf::new(TAG_UDP_CLOSE);
         let _ = crate::sys_send(sock, &m);
+        frame_drop(sock);
         let _ = crate::sys_close(sock);
     }
 

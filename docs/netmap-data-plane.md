@@ -43,8 +43,10 @@ For oxbow the boundary to attack is the same shape but it's **server↔server**
 - The e1000 driver already has **its own DMA RX/TX rings** internally (descriptor
   rings the NIC DMAs into/out of) — the hardware half of the pattern is built.
 - Known-missing primitives (noted during the std port): `frame_unmap`, frame *remap*
-  (map panics on remap), and **recv exposing the sender PID/badge** — these block a
-  clean multi-client shared-ring and are the first things to build.
+  (map panics on remap), and **recv exposing the sender PID/badge**. Stage 2 (UDP)
+  turned out NOT to need them — per-socket frames key off the already-per-socket badged
+  socket cap, and the cap-copy + fixed per-sid binding mean each frame is mapped exactly
+  once and kept (no unmap/remap). A multi-slot ring (Stage 3) may still want them.
 
 So oxbow has the *ingredients* (shared frames, NIC DMA rings, a notif/doorbell
 primitive) — what's missing is the **ring protocol** that ties them into a batched,
@@ -57,15 +59,47 @@ Raise the per-IPC caps to the full message (TCP 504, UDP 480), make socket close
 one-way send. *Effect:* ~9× fewer round trips for small/medium packets; still one
 crossing per packet, still two copies. Committed.
 
-### Stage 2 — one shared frame per socket, MTU-sized, zero-copy payload (NEXT)
+### Stage 2 — one shared frame per socket, MTU-sized, zero-copy payload (UDP: DONE)
 Generalize the DNS `sendv`/`recvv` shared-frame path to every wire UDP/TCP socket: on
 bind/connect, map a per-socket shared frame (a `NET_SHARED`-style region) into both the
 app and the net server. `send`/`recv` write/read the payload *in the frame*; the IPC
 carries only `(length, offset)` — **no payload copy across the boundary**, and full
 MTU (up to ~1500 B) per packet. *Still one crossing per packet*, but the copy is gone
-and the size limit is gone (fixes the residual >480 B truncation). **Prereqs:** build
-`frame_unmap` + safe frame remap + sender-badge-on-recv (the missing primitives).
-*Effort: medium. This is the highest-ROI next step — it's the DNS path, generalized.*
+and the size limit is gone (fixes the residual >480 B truncation).
+
+**UDP — built + validated (2026-06-20).** Done without any of the "missing
+primitives": the key realization is the **socket cap is already per-socket badged**
+(badge = socket id), and **handle transfer is a copy** (§3.4, sender retains). So the
+net server allocates **one frame per socket id** lazily on first attach, maps it at
+`frame_vaddr(sid) = NET_SHARED + sid*4096`, and **keeps it for its lifetime** — no
+`frame_unmap` needed, because a reused socket slot re-shares the same physical page
+with its new owner (16 sockets × 4 KiB = 64 KiB, fixed). The client (`rt::udp`) attaches
+via the *socket* cap (not the control cap), so the server returns each socket its own
+page — **correct per-process isolation**: two processes never map the same frame. The
+attach reply returns `sid`, so the client picks a stable per-sid client vaddr
+(`UDP_XFER + sid*4096`) and maps it exactly once (no remap). The cap-copy + per-sid
+binding sidesteps `frame_unmap`/remap/sender-badge entirely.
+
+- **Server** (`servers/net`): `socket_frames[sid]` table; `TAG_UDP_ATTACH` dispatched on
+  the socket badge → alloc/map/return `(frame cap, sid)`; `TAG_UDP_SENDV`/`RECVV` read/
+  write `frame_vaddr(sid)`; `RECVV` also returns the sender IPv4/port for `recv_from`.
+- **rt** (`rt::udp`): `attach_sock(sock)` caches sock→ptr (so send/recv don't re-attach
+  per packet) + a per-sid one-time mapping; `recvv_src` returns `(len, ip, port)`;
+  `close` drops the cache entry. The hosted shims `__oxbow_udp_send_to`/`recv_from` use
+  the frame for >480 B (send) and always for recv (no truncation); inline ≤480 stays.
+- **Migrated to per-socket:** the DNS path (`dns_transport`), the shell `dns` builtin,
+  and the c-ares glue (`cares_glue.c`, per-`g_fds[fd].frame`). The old single-frame
+  control-cap `attach` is gone.
+- **Validated:** `dns example.com/google.com` resolve on the wire (shell + rt + net);
+  a std `UdpSocket` echo (`std-port/apps/udpmtu`) round-trips 400/800/1400-byte
+  datagrams byte-for-byte off a host echo at 10.0.2.2 — the 800/1400 cases are the
+  >480 frame path that previously truncated/rejected.
+
+**TCP — pending.** TCP is a byte stream, so the frame win is zero-copy + batching the
+segment I/O, not a packet ring. Add `TAG_TCP_SENDV/RECVV` + frame send/recv in `tcp.rs`
+and wire `TcpStream`. Lower urgency than UDP: TCP's inline 504-B chunking is already
+*correct* (no truncation), so this is a throughput optimization, not a fix.
+*Effort: medium.*
 
 ### Stage 3 — a multi-slot ring + batched doorbell (the real netmap)
 Replace the single frame with a **ring of N fixed-size slots** + a TX and RX

@@ -20,7 +20,7 @@
 #include <sys/uio.h>
 
 /* ---- extern "C" UDP helpers (oxudp.rs) ---------------------------------- */
-extern unsigned char *ox_udp_attach(void);
+extern unsigned char *ox_udp_attach(unsigned long cap);
 extern long           ox_udp_open(void);
 extern int  ox_udp_sendv(unsigned long cap, unsigned int ip, unsigned short port,
                          unsigned long len);
@@ -92,10 +92,10 @@ void ares_event_configchg_destroy(void *cc) { (void)cc; }
 
 /* ---- fd table: c-ares socket fd -> oxbow UDP cap + connected peer -------- */
 #define OX_MAXFD 8
-static unsigned char *g_shared; /* shared UDP transfer frame */
 static struct {
   int            used;
   unsigned long  cap;
+  unsigned char *frame; /* THIS socket's transfer frame (per-socket — Stage 2) */
   unsigned int   ip;   /* packed a<<24|b<<16|c<<8|d */
   unsigned short port;
 } g_fds[OX_MAXFD];
@@ -114,10 +114,16 @@ static ares_socket_t ox_asocket(int domain, int type, int protocol, void *ud)
       if (cap < 0) {
         return ARES_SOCKET_BAD;
       }
-      g_fds[i].used = 1;
-      g_fds[i].cap  = (unsigned long)cap;
-      g_fds[i].ip   = 0;
-      g_fds[i].port = 0;
+      unsigned char *frame = ox_udp_attach((unsigned long)cap);
+      if (frame == NULL) {
+        ox_udp_close((unsigned long)cap);
+        return ARES_SOCKET_BAD;
+      }
+      g_fds[i].used  = 1;
+      g_fds[i].cap   = (unsigned long)cap;
+      g_fds[i].frame = frame;
+      g_fds[i].ip    = 0;
+      g_fds[i].port  = 0;
       return i;
     }
   }
@@ -166,7 +172,7 @@ static ares_ssize_t ox_asendv(ares_socket_t fd, const struct iovec *iov,
     if (total + iov[i].iov_len > 1472) {
       break;
     }
-    memcpy(g_shared + total, iov[i].iov_base, iov[i].iov_len);
+    memcpy(g_fds[fd].frame + total, iov[i].iov_base, iov[i].iov_len);
     total += iov[i].iov_len;
   }
   if (ox_udp_sendv(g_fds[fd].cap, g_fds[fd].ip, g_fds[fd].port, total) != 0) {
@@ -194,7 +200,7 @@ static ares_ssize_t ox_arecvfrom(ares_socket_t fd, void *buf, size_t buflen,
   if ((size_t)n > buflen) {
     n = (long)buflen;
   }
-  memcpy(buf, g_shared, (size_t)n);
+  memcpy(buf, g_fds[fd].frame, (size_t)n);
   if (from != NULL && fromlen != NULL &&
       *fromlen >= (ares_socklen_t)sizeof(struct sockaddr_in)) {
     struct sockaddr_in *si = (struct sockaddr_in *)from;
@@ -252,13 +258,8 @@ static void ox_addrinfo_cb(void *arg, int status, int timeouts,
  * on success, 0 on failure. Drives c-ares to completion against a 5s deadline. */
 int oxbow_cares_resolve(const char *host, unsigned char out_ip[4])
 {
-  if (g_shared == NULL) {
-    g_shared = ox_udp_attach();
-    if (g_shared == NULL) {
-      return 0;
-    }
-  }
-
+  /* Frames are now attached per-socket in ox_asocket(), so there is no global
+   * frame to set up here. */
   ares_channel_t      *ch = NULL;
   struct ares_options  opt;
   memset(&opt, 0, sizeof(opt));

@@ -1,0 +1,18 @@
+[package]
+name = "udpmtu"
+version = "0.1.0"
+edition = "2021"
+description = "UDP MTU echo test — exercises the per-socket zero-copy frame (netmap Stage 2)"
+
+[workspace]
+
+[[bin]]
+name = "udpmtu"
+path = "src/main.rs"
+
+[dependencies]
+oxbow-rt = { path = "/Users/5speeddeasil/oxbow/rt", features = ["hosted"] }
+
+[profile.release]
+opt-level = "z"
+panic = "unwind"
