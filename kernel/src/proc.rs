@@ -65,6 +65,8 @@ pub struct Process {
     /// protection can never change again. Fixed pool; `imm_count` are live.
     imm: [(u64, u64); MAX_IMM],
     imm_count: usize,
+    /// Process name (NUL-padded), set at spawn — reported by SYS_PROC_LIST (ps).
+    name: [u8; 16],
 }
 
 /// Max immutable ranges per process (a runtime locks text + maybe rodata/got).
@@ -87,6 +89,7 @@ impl Process {
             pledge: u64::MAX, // unpledged: every syscall class permitted
             imm: [(0, 0); MAX_IMM],
             imm_count: 0,
+            name: [0; 16],
         }
     }
 
@@ -218,6 +221,39 @@ pub fn find_by_exit_notif(notif_idx: u8) -> Option<usize> {
     let procs = PROCESSES.lock();
     (0..MAX_PROCS)
         .find(|&i| matches!(procs[i].state, PState::Alive) && procs[i].exit_notif == Some(notif_idx))
+}
+
+/// Snapshot live/dead processes into `out` (for SYS_PROC_LIST / ps). Returns the
+/// number filled. Each row is (pid, state: 1=alive 2=dead, 16-byte NUL-padded name).
+pub fn snapshot(out: &mut [(u8, u8, [u8; 16])]) -> usize {
+    let procs = PROCESSES.lock();
+    let mut n = 0;
+    for i in 0..MAX_PROCS {
+        if n >= out.len() {
+            break;
+        }
+        let st = match procs[i].state {
+            PState::Alive => 1u8,
+            PState::Dead => 2u8,
+            PState::Free => continue,
+        };
+        out[n] = (i as u8, st, procs[i].name);
+        n += 1;
+    }
+    n
+}
+
+/// Kill process `pid` by id (SYS_KILL / the ambient `kill` tool, pledge-gated at the
+/// syscall layer). Returns false if `pid` is out of range or not alive.
+pub fn kill_pid(pid: usize, code: i32) -> bool {
+    if pid >= MAX_PROCS {
+        return false;
+    }
+    if !matches!(PROCESSES.lock()[pid].state, PState::Alive) {
+        return false;
+    }
+    kill(pid, code);
+    true
 }
 
 /// Mark a process dead and drop its handles (on a ring-3 fault or `sys_exit`).
@@ -449,6 +485,9 @@ pub fn create(
         procs[id] = Process::new(); // clear all stale state (handles, lifecycle)
         procs[id].state = PState::Alive;
         procs[id].pml4_phys = pml4_phys;
+        let nb = name.as_bytes();
+        let n = core::cmp::min(nb.len(), 15);
+        procs[id].name[..n].copy_from_slice(&nb[..n]);
         (id, dead_pml4)
     };
 

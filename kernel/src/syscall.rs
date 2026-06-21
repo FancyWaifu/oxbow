@@ -17,9 +17,10 @@ use oxbow_abi::{
     SYS_PROTECT, SYS_RECV, SYS_RECV_NOTIF, SYS_REPLY,
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_MEMINFO, SYS_UPTIME_MS,
     SYS_WALLTIME, SYS_THREAD_SPAWN, SYS_THREAD_EXIT, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE,
-    SYS_THREAD_ID, SYS_YIELD, SYS_PROC_KILL,
+    SYS_THREAD_ID, SYS_YIELD, SYS_PROC_KILL, SYS_PROC_LIST, SYS_KILL, ProcInfo,
     SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_PIPE_EOF, CHAN_NONBLOCK, PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT,
     R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM, PLEDGE_SPAWN, PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
+    PLEDGE_PROC,
 };
 
 use crate::object::{HandleEntry, ObjType, ObjectRef};
@@ -162,6 +163,8 @@ pub extern "C" fn syscall_dispatch(
             SyscallRet { rax: 0, rdx: 0 }
         }
         SYS_PROC_KILL => sys_proc_kill(a1, a2),
+        SYS_PROC_LIST => sys_proc_list(a1, a2),
+        SYS_KILL => sys_kill(a1, a2),
         SYS_MEMINFO => {
             let (used, total) = crate::mm::pmm::stats();
             let used_kib = (used / 1024) & 0xffff_ffff;
@@ -475,6 +478,8 @@ fn spawn_common(
         arg_len: usize,
         ident_ptr: u64,
         ident_len: usize,
+        name_ptr: u64,
+        name_len: usize,
     }
     let prep = (|| -> SysResult<Prep> {
         let me = proc::with_current(|p| p.lookup(mem_h as Handle, ObjType::Memory, R_MAP))?;
@@ -521,6 +526,13 @@ fn spawn_common(
         if ident_len > 0 {
             usermem::check_user(ident_ptr, ident_len, false)?;
         }
+        // Process name for ps (data[5] = ptr, data[6] = len). Separate from argv so the
+        // shell can pass the command name without disturbing the args convention.
+        let name_ptr = msg.data[5];
+        let name_len = (msg.data[6] as usize).min(64);
+        if name_len > 0 {
+            usermem::check_user(name_ptr, name_len, false)?;
+        }
         // Collect the granted handle entries; each non-null needs R_GRANT (§3.4).
         let mut grants: [Option<HandleEntry>; MSG_HANDLES] = [None; MSG_HANDLES];
         proc::with_current(|p| -> SysResult {
@@ -558,6 +570,8 @@ fn spawn_common(
             arg_len,
             ident_ptr,
             ident_len,
+            name_ptr,
+            name_len,
         })
     })();
     let prep = match prep {
@@ -568,7 +582,17 @@ fn spawn_common(
     // ---- Side effects. Create the child (claims a slot, loads the image), then
     // mint its budget, install its handles, debit the parent, and start it. ----
     let pml4 = mm::vm::new_user_pml4();
-    let (cid, entry, rsp, fs_base) = match proc::create(img, pml4, label) {
+    // Process name for ps: the basename of the name the spawner passed (data[5]/[6]),
+    // falling back to the static `label` (boot images, or no name passed). name_ptr is
+    // the spawner's memory, still mapped + constant here (non-preemptible, same CR3).
+    let name = if prep.name_len > 0 {
+        let nb = unsafe { core::slice::from_raw_parts(prep.name_ptr as *const u8, prep.name_len) };
+        let base = nb.iter().rposition(|&b| b == b'/').map_or(nb, |i| &nb[i + 1..]);
+        core::str::from_utf8(base).ok().filter(|s| !s.is_empty()).unwrap_or(label)
+    } else {
+        label
+    };
+    let (cid, entry, rsp, fs_base) = match proc::create(img, pml4, name) {
         Ok(t) => t,
         Err(e) => return SyscallRet::err(e), // pool full — nothing debited yet
     };
@@ -713,6 +737,39 @@ fn sys_proc_kill(notif_h: u64, code: u64) -> SyscallRet {
             SyscallRet::ok()
         }
         None => SyscallRet::err(SysError::Gone),
+    }
+}
+
+/// `sys_proc_list(buf, max) -> count` — snapshot all live/dead processes into the
+/// user's ProcInfo array. Ambient (a global view), so gated by PLEDGE_PROC.
+fn sys_proc_list(buf: u64, max: u64) -> SyscallRet {
+    let max = max as usize;
+    if max == 0 {
+        return SyscallRet { rax: 0, rdx: 0 };
+    }
+    let bytes = max.saturating_mul(size_of::<ProcInfo>());
+    if usermem::check_user(buf, bytes, true).is_err() {
+        return SyscallRet::err(SysError::Fault);
+    }
+    let mut snap = [(0u8, 0u8, [0u8; 16]); proc::MAX_PROCS];
+    let n = proc::snapshot(&mut snap).min(max);
+    let p = buf as *mut ProcInfo;
+    for i in 0..n {
+        let (pid, st, name) = snap[i];
+        let info = ProcInfo { pid: pid as u32, state: st as u32, name };
+        unsafe { p.add(i).write_unaligned(info) };
+    }
+    SyscallRet { rax: 0, rdx: n as u64 }
+}
+
+/// `sys_kill(pid, code)` — kill process `pid` by id (the ambient `kill` tool). Gated
+/// by PLEDGE_PROC. The capability-pure path (kill your own child) is SYS_PROC_KILL.
+fn sys_kill(pid: u64, code: u64) -> SyscallRet {
+    if proc::kill_pid(pid as usize, code as i32) {
+        crate::thread::mark_proc_dying(pid as usize);
+        SyscallRet::ok()
+    } else {
+        SyscallRet::err(SysError::Gone)
     }
 }
 
@@ -1339,6 +1396,7 @@ fn pledge_class(nr: u64) -> u64 {
         | SYS_DMA_ALLOC_CONTIG | SYS_SHM_CREATE | SYS_SHM_MAP | SYS_SHM_PHYS => PLEDGE_MEM,
         SYS_CAP_TYPE | SYS_CAP_DUP => PLEDGE_IPC,
         SYS_SPAWN | SYS_SPAWN_BYTES | SYS_PROC_KILL => PLEDGE_SPAWN,
+        SYS_PROC_LIST | SYS_KILL => PLEDGE_PROC,
         SYS_ATTENUATE => PLEDGE_CAP,
         SYS_IO_IN | SYS_IO_OUT | SYS_PCI_READ | SYS_PCI_WRITE | SYS_PCI_BAR_MAP | SYS_IRQ_BIND
         | SYS_IRQ_ACK | SYS_FB_INFO | SYS_FB_MAP => PLEDGE_IO,

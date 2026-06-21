@@ -150,6 +150,7 @@ pub const PLEDGE_SPAWN: u64 = 1 << 3; // spawn, spawn_bytes
 pub const PLEDGE_CAP: u64 = 1 << 4; // attenuate
 pub const PLEDGE_IO: u64 = 1 << 5; // io_in/out, pci_*, irq_*
 pub const PLEDGE_NOTIF: u64 = 1 << 6; // notif_create/signal/wait
+pub const PLEDGE_PROC: u64 = 1 << 7; // proc_list / kill (enumerate + kill other procs)
 
 /// immutable (§38) — OpenBSD mimmutable(2): permanently lock the protection of a
 /// mapped range. After this, sys_map or sys_protect touching any page in the
@@ -209,6 +210,24 @@ pub const SYS_RECV_NOTIF: u64 = 60; // (ep, notif, &MsgBuf) -> see above. needs 
 /// Set in `rdx` when SYS_RECV_NOTIF returned because the notification fired (not a
 /// message). Reply caps are small handle indices, so the top bit is always free.
 pub const RECV_NOTIF_FIRED: u64 = 1 << 63;
+// Process introspection + control (ps/kill). These are ambient (a global view/kill,
+// not a per-cap right), so they are gated by PLEDGE_PROC: an unconfined process (the
+// shell, root tools) may use them; anything that pledged PROC away cannot see or kill
+// other processes. The capability-pure path (kill your own child via its exit-notif
+// cap) is SYS_PROC_KILL, which stays.
+pub const SYS_PROC_LIST: u64 = 61; // (buf: *mut ProcInfo, max) -> count. needs PLEDGE_PROC
+pub const SYS_KILL: u64 = 62; // (pid, code) -> 0 ok / err. needs PLEDGE_PROC
+pub const PROC_NAME_LEN: usize = 16;
+pub const PROC_STATE_ALIVE: u32 = 1;
+pub const PROC_STATE_DEAD: u32 = 2; // exited, slot not yet reused (zombie)
+/// One row of SYS_PROC_LIST. `name` is NUL-padded.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProcInfo {
+    pub pid: u32,
+    pub state: u32,
+    pub name: [u8; PROC_NAME_LEN],
+}
 // SYS_THREAD_EXIT(a1): if a1 != 0, the kernel stores *a1 = 1 and futex-wakes a1
 // AFTER the thread is off its user stack — so a joiner can free that stack safely.
 /// Capability kinds reported by SYS_CAP_TYPE (so recvmsg can reconstruct the

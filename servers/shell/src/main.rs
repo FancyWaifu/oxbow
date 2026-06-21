@@ -821,27 +821,43 @@ fn find_program(verb: &[u8], path: &Path) -> Option<usize> {
 /// Run the program currently in `ELF_BUF[..len]` to completion (exec-from-fs, ABI
 /// §33): cwd dir cap at slot 1, stdout at slot 2, the net cap at slot 20, argv =
 /// `args`, and our identity. The exit status flows into `$?`.
-fn run_program(len: usize, cwd: Handle, args: &[u8], sp: &Spawner) {
+fn run_program(len: usize, cwd: Handle, cmd: &[u8], args: &[u8], bg: bool, sp: &Spawner) {
     let mut sm = MsgBuf::new(0);
     // §96/§104: 64 MiB default budget — std programs spawn threads (each a 256 KiB
     // stack); a thread-heavy program (e.g. a libtest runner spawning dozens of
     // threads) OOM'd at 16 MiB. The shell funds it from its own 96 MiB and the budget
     // is refunded when the child exits.
-    sm.data[0] = 64 * 1024 * 1024;
+    // Background jobs get a small budget so one can't hog the shell's pool — else you
+    // couldn't even spawn `kill` to reap it (the shell funds each job from its 96 MiB).
+    sm.data[0] = if bg { 8 * 1024 * 1024 } else { 64 * 1024 * 1024 };
     sm.data[1] = args.as_ptr() as u64;
     sm.data[2] = args.len() as u64;
     sm.data_len = 3;
     rt::msg_set_identity(&mut sm, cur_ident()); // §44: program inherits our identity
+    sm.data[5] = cmd.as_ptr() as u64; // process name for ps (data[5]/[6])
+    sm.data[6] = cmd.len() as u64;
+    if sm.data_len < 7 {
+        sm.data_len = 7;
+    }
     sm.handle_count = 4;
     sm.handles[0] = cwd;
     sm.handles[1] = sp.stdout;
     sm.handles[2] = HANDLE_NULL; // slot 4 (stdin) unused outside a pipeline
     sm.handles[3] = BOOT_NET_EP; // slot 20 = network access
     let elf = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(ELF_BUF) as *const u8, len) };
-    match rt::sys_spawn_bytes(elf, BOOT_MEM, &sm, sp.exit) {
-        Ok(_) => {
-            wait_exits(sp, 1);
-            set_status(rt::sys_notif_status(sp.exit));
+    // A background job runs untracked (exit notif = NULL) so its later exit/kill can't
+    // be mistaken for a foreground command's exit; it's reaped by the kernel on exit.
+    let exit = if bg { HANDLE_NULL } else { sp.exit };
+    match rt::sys_spawn_bytes(elf, BOOT_MEM, &sm, exit) {
+        Ok(pid) => {
+            if bg {
+                tw(b"[bg] pid ");
+                tw_dec_u32(pid as u32);
+                tw(b"\n");
+            } else {
+                wait_exits(sp, 1);
+                set_status(rt::sys_notif_status(sp.exit));
+            }
         }
         Err(_) => {
             tw(b"exec: not a valid program (spawn rejected)\n");
@@ -852,13 +868,32 @@ fn run_program(len: usize, cwd: Handle, args: &[u8], sp: &Spawner) {
 
 /// §94: resolve a non-builtin command to a program file and run it. Returns
 /// `false` only if nothing matched (so the caller prints "command not found").
-fn path_exec(cmd: &[u8], rest: &[u8], cwd: Handle, path: &Path, sp: &Spawner) -> bool {
+fn path_exec(cmd: &[u8], rest: &[u8], cwd: Handle, path: &Path, bg: bool, sp: &Spawner) -> bool {
     match find_program(cmd, path) {
         Some(len) => {
-            run_program(len, cwd, rest, sp);
+            run_program(len, cwd, cmd, rest, bg, sp);
             true
         }
         None => false,
+    }
+}
+
+/// Strip a trailing standalone `&` (background) from a command's argument tail,
+/// returning the args without it and whether to background. `&&` (handled by the
+/// line splitter) is left alone.
+fn split_bg(rest: &[u8]) -> (&[u8], bool) {
+    let mut e = rest.len();
+    while e > 0 && (rest[e - 1] == b' ' || rest[e - 1] == b'\t') {
+        e -= 1;
+    }
+    if e > 0 && rest[e - 1] == b'&' && (e < 2 || rest[e - 2] != b'&') {
+        let mut k = e - 1;
+        while k > 0 && (rest[k - 1] == b' ' || rest[k - 1] == b'\t') {
+            k -= 1;
+        }
+        (&rest[..k], true)
+    } else {
+        (rest, false)
     }
 }
 
@@ -870,7 +905,7 @@ fn exec_cmd(cwd: Handle, path: &Path, arg_line: &[u8], sp: &Spawner) {
         tw(b"exec: usage: exec <path> [args]\n");
         return;
     }
-    if !path_exec(pathname, rest, cwd, path, sp) {
+    if !path_exec(pathname, rest, cwd, path, false, sp) {
         tw(b"exec: ");
         tw(pathname);
         tw(b": not found\n");
@@ -1874,7 +1909,9 @@ fn run_command(line0: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         _ => {
             // §94: not a builtin — resolve it as a program on the filesystem
             // (/bin for system tools, ~/bin or an explicit path for user programs).
-            if !path_exec(cmd, rest, *cwd, path, sp) {
+            // A trailing `&` backgrounds the job.
+            let (rest, bg) = split_bg(rest);
+            if !path_exec(cmd, rest, *cwd, path, bg, sp) {
                 tw(b"oxbow: ");
                 tw(cmd);
                 tw(b": command not found\n");

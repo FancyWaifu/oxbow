@@ -399,6 +399,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kill"
+version = "0.0.0"
+dependencies = [
+ "oxbow-abi",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -485,7 +493,7 @@ version = "0.0.0"
 dependencies = [
  "limine",
  "oxbow-abi",
- "spin",
+ "spin 0.9.8",
  "uart_16550",
  "x86_64",
 ]
@@ -655,6 +663,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ps"
+version = "0.0.0"
+dependencies = [
+ "oxbow-abi",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -750,6 +766,13 @@ dependencies = [
  "defmt 0.3.100",
  "heapless",
  "managed",
+]
+
+[[package]]
+name = "spin"
+version = "0.0.0"
+dependencies = [
+ "oxbow-rt",
 ]
 
 [[package]]

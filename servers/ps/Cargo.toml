@@ -1,0 +1,13 @@
+[package]
+name = "ps"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ps"
+path = "src/main.rs"
+
+[dependencies]
+oxbow-rt = { path = "../../rt" }
+oxbow-abi = { path = "../../abi" }

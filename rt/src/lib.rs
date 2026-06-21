@@ -1405,6 +1405,29 @@ pub fn sys_call(ep: Handle, msg: *mut MsgBuf) -> SysResult {
     SysError::from_raw(rax)
 }
 
+/// Snapshot processes into `buf` (ps). Returns the count filled. Needs PLEDGE_PROC.
+pub fn sys_proc_list(buf: &mut [oxbow_abi::ProcInfo]) -> usize {
+    let (rax, rdx) = unsafe {
+        syscall2(oxbow_abi::SYS_PROC_LIST, buf.as_mut_ptr() as u64, buf.len() as u64)
+    };
+    if rax != 0 {
+        0
+    } else {
+        rdx as usize
+    }
+}
+
+/// Kill process `pid` by id (kill). Needs PLEDGE_PROC.
+pub fn sys_kill(pid: u32, code: i32) -> SysResult {
+    let (rax, _) = unsafe { syscall2(oxbow_abi::SYS_KILL, pid as u64, code as u64) };
+    SysError::from_raw(rax)
+}
+
+/// Voluntarily reschedule (no_std). The hosted shim is `__oxbow_yield`.
+pub fn sys_yield() {
+    unsafe { syscall1(oxbow_abi::SYS_YIELD, 0) };
+}
+
 pub fn sys_reply(reply: Handle, msg: *const MsgBuf) -> SysResult {
     let (rax, _) = unsafe { syscall2(SYS_REPLY, reply as u64, msg as u64) };
     SysError::from_raw(rax)
