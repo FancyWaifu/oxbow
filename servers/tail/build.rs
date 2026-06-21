@@ -45,6 +45,7 @@ fn main() {
         .file(format!("{sb}/libutil/ealloc.c"))
         .file(format!("{sb}/libutil/reallocarray.c"))
         .file(format!("{sb}/oxcompat.c"))
+        .file(format!("{sb}/re.c"))
         .flag("-ffreestanding")
         .flag("-fno-stack-protector")
         .flag("-fno-builtin")

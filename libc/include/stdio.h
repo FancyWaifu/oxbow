@@ -9,6 +9,9 @@ extern FILE *stdin, *stdout, *stderr;
 #define SEEK_CUR 1
 #define SEEK_END 2
 #define BUFSIZ 1024
+/* POSIX getline/getdelim (oxbow-libc provides them). ssize_t == long on LP64. */
+long getline(char **, size_t *, FILE *);
+long getdelim(char **, size_t *, int, FILE *);
 FILE *fopen(const char *, const char *);
 FILE *fdopen(int, const char *);
 int fclose(FILE *);

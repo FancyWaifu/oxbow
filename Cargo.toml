@@ -47,6 +47,7 @@ members = [
     "servers/head",
     "servers/tail",
     "servers/find",
+    "servers/grep",
     "servers/ps",
     "servers/kill",
     "servers/spin",

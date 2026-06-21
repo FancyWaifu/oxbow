@@ -57,6 +57,7 @@ build-server:
     RUSTFLAGS="-C relocation-model=static" cargo build -p head
     RUSTFLAGS="-C relocation-model=static" cargo build -p tail
     RUSTFLAGS="-C relocation-model=static" cargo build -p find
+    RUSTFLAGS="-C relocation-model=static" cargo build -p grep
     RUSTFLAGS="-C relocation-model=static" cargo build -p ps
     RUSTFLAGS="-C relocation-model=static" cargo build -p kill
     RUSTFLAGS="-C relocation-model=static" cargo build -p spin
@@ -176,7 +177,7 @@ _iso:
     # bare command names here (PATH), reachable by every logged-in user. Stripped
     # (llvm-strip; Apple strip can't touch ELF) so the 56-byte FS_READ loop is quick.
     STRIP=$(find $(rustc --print sysroot) -name llvm-strip | head -1); \
-    for t in hello ls cat mkdir touch rm mv cp thrtest wc head tail find ps kill spin; do \
+    for t in hello ls cat mkdir touch rm mv cp thrtest wc head tail find grep ps kill spin; do \
       cp target/x86_64-unknown-none/debug/$t build/initrd/bin/$t; \
       "$STRIP" --strip-all build/initrd/bin/$t; \
     done
