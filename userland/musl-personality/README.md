@@ -23,7 +23,26 @@ app → musl (stock) → __syscallN → __oxbow_syscall → oxbow rt/kernel
 - `oxsys.h` — oxbow raw-syscall inline asm + oxbow syscall numbers + rt shim decls.
 - `build-musl.sh` — builds vendored musl with the override + compiles the dispatcher.
 
-## Status — Phase 0 complete (scaffolding + kernel primitive)
+## Status — Phase 1 reached: STOCK MUSL RUNS ON OXBOW ✅
+`servers/muslhello` is a `printf` program compiled against musl headers, linked
+with the freshly-built musl `libc.a` + the crt bridge + oxbow-rt[hosted]. On the
+hardware-path QEMU it prints and exits cleanly:
+```
+root@oxbow:/$ muslhello
+Hello from musl libc, running on oxbow!
+  sum(1..10) = 55 via stock musl printf
+```
+Full chain verified: oxbow `_start` → `oxbow_main` (crt_glue: synthesizes the
+Linux initial stack + auxv incl. AT_RANDOM) → musl `__libc_start_main` → musl TLS
+init (`arch_prctl(ARCH_SET_FS)` → `SYS_SET_FSBASE`) → musl stdio `printf` →
+`writev` → `__oxbow_syscall` → oxbow tty. musl `libc.a` has 254 objects routed
+through `__oxbow_syscall`.
+
+Build: `userland/musl-personality/build-musl.sh` builds musl with the override;
+`cargo build -p muslhello` links a program. muslhello is in the `_iso` /bin loop
+(kept OUT of the default `build-server`, since it needs the out-of-repo musl).
+
+## Status — Phase 0 (scaffolding + kernel primitive)
 **Done and building:**
 - `SYS_SET_FSBASE` (abi/kernel) — sets the calling thread's FS base at runtime;
   backs musl's `arch_prctl(ARCH_SET_FS)` for TLS. Kernel builds.

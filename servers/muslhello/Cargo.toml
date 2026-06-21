@@ -1,0 +1,15 @@
+[package]
+name = "muslhello"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "muslhello"
+path = "src/main.rs"
+
+[dependencies]
+oxbow-rt = { path = "../../rt", features = ["hosted"] }
+
+[build-dependencies]
+cc = "1"

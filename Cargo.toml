@@ -80,6 +80,7 @@ members = [
     "servers/sha384sum",
     "servers/sha512-224sum",
     "servers/sha512-256sum",
+    "servers/muslhello",
     "servers/ps",
     "servers/kill",
     "servers/spin",

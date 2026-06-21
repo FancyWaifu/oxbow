@@ -533,6 +533,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "muslhello"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "mv"
 version = "0.0.0"
 dependencies = [
