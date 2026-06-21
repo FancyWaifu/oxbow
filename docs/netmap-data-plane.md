@@ -173,12 +173,24 @@ the notif count just stays latched for the next call).
   a notif, sends a TX batch, blocks in `sys_notif_wait` (no poll-kick), and the pump
   delivers all 7 echoes + signals it — one wakeup, all 7 popped byte-exact.
 
+**Pump feeds smoltcp — built + validated (2026-06-20).** The async pump owns the NIC, so
+TCP frames it drained would have been lost (concurrent TCP degrades). Fixed with a bounded
+**software RX queue inside the `Nic`** (`tcp_rx_q`): the pump routes IPv4-TCP frames into it
+(ring-UDP still goes to the ring + notif; ARP/ICMP stay inline via `handle_background`), and
+smoltcp's `PhyDevice::receive` drains that queue before the NIC ring. Crucially the queue is
+**empty and untouched outside async mode** (only the pump fills it, and the pump only runs
+when `async_count > 0`), so the non-async TCP path is byte-for-byte the unchanged
+direct-from-NIC read — no regression. Validated: a 1000-byte TCP echo completes **while a
+ring socket is in async mode**, with the echo deliberately delayed so it lands during a pump
+tick — proving it flowed NIC → pump → `tcp_rx_q` → smoltcp. (Non-ring UDP, e.g. a DNS reply
+arriving mid-async, is still dropped by the pump — a second per-protocol queue would cover
+it, but TCP was the goal; rare in practice.)
+
 *Remaining for a fuller Stage 3:* MTU-sized slots need a multi-page ring (`MSG_HANDLES=4`
 lets one attach carry up to 4 frame caps) — small slots were the deliberate first cut
-(high-pps is the point). The pump dropping non-ring frames (TCP) while async means
-concurrent TCP degrades during async-RX mode — feeding smoltcp from the pump (a software
-rx queue) is the next refinement. Slot typestate (`Slot<Owned>`/`Slot<Posted>`) is a
-nicety the rendezvous alternation already makes safe.
+(high-pps is the point). A `udp_rx_q` sibling would keep non-ring UDP (DNS) alive mid-async.
+Slot typestate (`Slot<Owned>`/`Slot<Posted>`) is a nicety the rendezvous alternation already
+makes safe.
 
 ### Stage 4 — NIC DMA directly into the shared ring (true zero-copy end-to-end)
 Today the net server copies between its e1000 DMA rings and the client frame. Stage 4

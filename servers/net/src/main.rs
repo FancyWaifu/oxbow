@@ -12,6 +12,8 @@
 
 extern crate alloc;
 
+use alloc::collections::VecDeque;
+
 mod arp;
 mod dhcp;
 mod eth;
@@ -128,6 +130,12 @@ fn pump_ring_rx(
             continue;
         }
         let Some(ip) = ipv4::parse(&buf[off..n]) else { continue };
+        if ip.proto == ipv4::PROTO_TCP {
+            // Hand TCP to smoltcp via the software queue so concurrent TCP keeps
+            // working while the pump owns the NIC.
+            nic.push_rx_tcp(&buf[..n]);
+            continue;
+        }
         if ip.proto != ipv4::PROTO_UDP {
             continue;
         }
@@ -397,6 +405,10 @@ struct Nic {
     tx_buf_v: [u64; TX_DESCS],
     tx_buf_p: [u64; TX_DESCS],
     tx_cur: usize,
+    /// Software RX queue for frames the async pump drained from the NIC but that belong
+    /// to smoltcp (TCP). `PhyDevice::receive` drains this before the NIC, so TCP isn't
+    /// lost when the pump owns the NIC. Empty (and untouched) outside async-RX mode.
+    tcp_rx_q: VecDeque<([u8; BUF], usize)>,
 }
 
 impl Nic {
@@ -426,6 +438,28 @@ impl Nic {
             setreg(TDT, ((i + 1) % TX_DESCS) as u32);
         }
         self.tx_cur = (i + 1) % TX_DESCS;
+    }
+
+    /// Queue a frame for smoltcp (the async pump drained it from the NIC). Bounded —
+    /// drops the oldest if full (a software RX-ring overflow; TCP retransmits).
+    fn push_rx_tcp(&mut self, frame: &[u8]) {
+        const TCP_RXQ_CAP: usize = 64;
+        if self.tcp_rx_q.len() >= TCP_RXQ_CAP {
+            self.tcp_rx_q.pop_front();
+        }
+        let mut b = [0u8; BUF];
+        let n = frame.len().min(BUF);
+        b[..n].copy_from_slice(&frame[..n]);
+        self.tcp_rx_q.push_back((b, n));
+    }
+
+    /// Pop the next queued smoltcp frame into `out` (used by `PhyDevice::receive`
+    /// before touching the NIC), or None if the queue is empty.
+    fn pop_rx_tcp(&mut self, out: &mut [u8]) -> Option<usize> {
+        let (b, n) = self.tcp_rx_q.pop_front()?;
+        let m = n.min(out.len());
+        out[..m].copy_from_slice(&b[..m]);
+        Some(m)
     }
 
     /// Return the next received frame (copied into `out`), blocking on the NIC
@@ -679,6 +713,7 @@ pub extern "C" fn oxbow_main() -> ! {
         tx_buf_v,
         tx_buf_p,
         tx_cur: 0,
+        tcp_rx_q: VecDeque::new(),
     };
     let mut cache = arp::Cache::new();
 

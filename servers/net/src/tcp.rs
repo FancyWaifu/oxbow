@@ -59,8 +59,11 @@ impl Device for PhyDevice {
     fn receive(&mut self, _t: Instant) -> Option<(PhyRx, PhyTx)> {
         let nic = unsafe { &mut *self.nic };
         let mut buf = [0u8; FRAME_CAP];
-        // No allocation on the empty-ring path (the common case while polling).
-        nic.recv_nonblocking(&mut buf).map(|n| (PhyRx { buf, len: n }, PhyTx { nic: self.nic }))
+        // Drain the async pump's software RX queue first (TCP frames it pulled off the
+        // NIC for us), then the NIC ring. The queue is empty outside async-RX mode, so
+        // there this stays the unchanged direct-from-NIC path.
+        let got = nic.pop_rx_tcp(&mut buf).or_else(|| nic.recv_nonblocking(&mut buf));
+        got.map(|n| (PhyRx { buf, len: n }, PhyTx { nic: self.nic }))
     }
 
     fn transmit(&mut self, _t: Instant) -> Option<PhyTx> {

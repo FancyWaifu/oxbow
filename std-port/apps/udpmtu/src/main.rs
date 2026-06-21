@@ -160,6 +160,25 @@ fn ring_async() -> Result<(), String> {
         udp::close(sock);
         return Err("async: set_rxnotif failed".into());
     }
+    // Concurrent TCP while the server is in async/reactor mode: connect + write, then
+    // SLEEP so the echo arrives during a pump window (the server owns the NIC then).
+    // The pump must hand the TCP response to smoltcp via its software RX queue, or this
+    // read_exact hangs (the whole point of the fix). 1000 B = one segment.
+    {
+        let tdst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 2), TCP_ECHO_PORT));
+        let mut s = TcpStream::connect(tdst).map_err(|e| format!("async-tcp connect {e}"))?;
+        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+        let tx = pattern(1000);
+        s.write_all(&tx).map_err(|e| format!("async-tcp write {e}"))?;
+        std::thread::sleep(Duration::from_millis(80)); // echo lands during a pump tick
+        let mut rx = vec![0u8; 1000];
+        s.read_exact(&mut rx).map_err(|e| format!("async-tcp read {e}"))?;
+        if rx != tx {
+            udp::close(sock);
+            return Err("async-tcp: echo mismatch".into());
+        }
+        println!("UDPMTU: async+tcp ok (1000 B TCP echo through the pump while async)");
+    }
     for i in 0..N {
         let mut p = pattern(PLEN);
         p[0] = i as u8;

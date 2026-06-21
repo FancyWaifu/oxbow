@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 
 pub const PROTO_ICMP: u8 = 1;
 pub const PROTO_UDP: u8 = 17;
+pub const PROTO_TCP: u8 = 6;
 
 /// The 16-bit one's-complement internet checksum over `data`.
 pub fn checksum(data: &[u8]) -> u16 {
