@@ -421,6 +421,36 @@ static void deliver_pending(void)
 	}
 }
 
+/* ---- async signal dispatch (Phase 9 step 2) ----
+ * The kernel injects a frame that enters __oxbow_sig_dispatch with rdi=signum and
+ * rsp pointing at a saved context (the interrupted [rip,rflags,rsp,rax]); we run the
+ * handler, then SYS_SIGRETURN to restore. Called for SIGINT from a running program
+ * (Ctrl-C while not at a read boundary). */
+void __oxbow_run_signal(int sig)
+{
+	run_sig(sig); /* the installed handler, or the default action (terminate) */
+}
+
+/* The trampoline the kernel redirects to. rsp = the sigcontext pointer on entry
+ * (16-aligned); rbx (callee-saved) preserves it across the C handler call, then it's
+ * handed to SYS_SIGRETURN, which never returns here. */
+__asm__(".text\n"
+	".globl __oxbow_sig_dispatch\n"
+	"__oxbow_sig_dispatch:\n"
+	"	movq %rsp, %rbx\n"
+	"	call __oxbow_run_signal\n"
+	"	movq %rbx, %rdi\n"
+	"	movl $68, %eax\n" /* OX_SYS_SIGRETURN */
+	"	syscall\n"
+	"	ud2\n");
+
+/* Register our async-signal dispatcher with the kernel (call once at startup). */
+void __oxbow_register_sigdispatch(void)
+{
+	extern void __oxbow_sig_dispatch(void);
+	ox_syscall1(OX_SYS_SIGDISPATCH, (long)&__oxbow_sig_dispatch);
+}
+
 long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6)
 {
 	(void)a6;

@@ -99,6 +99,12 @@ struct Tcb {
     /// §101 native ELF TLS: this thread's %fs base (thread pointer), loaded into
     /// IA32_FS_BASE on switch-in. 0 = no TLS (kernel threads / TLS-less images).
     fs_base: u64,
+    /// §Phase 9 step 2 async signals: a pending signal number to inject at this
+    /// thread's next syscall return (0 = none), and a saved sigreturn context
+    /// `[rip, rflags, rsp, rax]` to restore (`sigret_valid` gates it).
+    pending_sig: u32,
+    sigret_valid: u32,
+    sigret: [u64; 4],
 }
 
 static mut TCBS: [Tcb; MAX_THREADS] = [Tcb {
@@ -109,6 +115,9 @@ static mut TCBS: [Tcb; MAX_THREADS] = [Tcb {
     wake_at: 0,
     futex_addr: 0,
     fs_base: 0,
+    pending_sig: 0,
+    sigret_valid: 0,
+    sigret: [0; 4],
 }; MAX_THREADS];
 
 // §70 SMP lost-wakeup fix: the thread STATE lives in its own atomic array, NOT in
@@ -157,6 +166,57 @@ fn fs_base_of(s: usize) -> u64 {
 /// TLS block was copied with the address space at the same virtual address.
 pub fn current_fs_base() -> u64 {
     fs_base_of(current())
+}
+
+// --- §Phase 9 step 2: async signal injection state -------------------------------
+/// Set a pending signal on a thread (delivered at its next syscall return).
+pub fn set_pending_sig(tid: usize, sig: u32) {
+    if tid < MAX_THREADS {
+        unsafe { (*addr_of_mut!(TCBS[tid])).pending_sig = sig };
+    }
+}
+/// Take (read + clear) the current thread's pending signal (0 = none).
+pub fn take_pending_sig_current() -> u32 {
+    let s = current();
+    unsafe {
+        let v = (*addr_of!(TCBS[s])).pending_sig;
+        (*addr_of_mut!(TCBS[s])).pending_sig = 0;
+        v
+    }
+}
+/// Store a sigreturn context on the current thread (restored at this syscall return).
+pub fn set_sigret_current(ctx: [u64; 4]) {
+    let s = current();
+    unsafe {
+        (*addr_of_mut!(TCBS[s])).sigret = ctx;
+        (*addr_of_mut!(TCBS[s])).sigret_valid = 1;
+    }
+}
+/// Take (read + clear) the current thread's sigreturn context, if any.
+pub fn take_sigret_current() -> Option<[u64; 4]> {
+    let s = current();
+    unsafe {
+        if (*addr_of!(TCBS[s])).sigret_valid == 0 {
+            return None;
+        }
+        (*addr_of_mut!(TCBS[s])).sigret_valid = 0;
+        Some((*addr_of!(TCBS[s])).sigret)
+    }
+}
+/// Is there any signal work pending for the current thread? (Fast hot-path check.)
+pub fn current_has_sig_work() -> bool {
+    let s = current();
+    unsafe { (*addr_of!(TCBS[s])).pending_sig != 0 || (*addr_of!(TCBS[s])).sigret_valid != 0 }
+}
+/// The lowest-tid live thread owned by `proc` (its main thread) — the async-signal
+/// target. Returns 0 (no valid user thread) if none.
+pub fn main_thread_of(proc: usize) -> usize {
+    for s in 0..MAX_THREADS {
+        if proc_of(s) == proc && STATE[s].load(Ordering::Relaxed) != State::Free as u8 {
+            return s;
+        }
+    }
+    0
 }
 fn proc_of(s: usize) -> usize {
     unsafe { (*addr_of!(TCBS[s])).proc }
@@ -243,6 +303,9 @@ fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64, fs_base: u64) 
                     wake_at: 0,
                     futex_addr: 0,
                     fs_base,
+                    pending_sig: 0,
+                    sigret_valid: 0,
+                    sigret: [0; 4],
                 };
                 // Fresh (or reused) slot: reset its FPU state to the clean template.
                 core::ptr::copy_nonoverlapping(
@@ -287,6 +350,9 @@ pub fn register_running_idle(kstack_top: u64) -> usize {
                     wake_at: 0,
                     futex_addr: 0,
                     fs_base: 0,
+                    pending_sig: 0,
+                    sigret_valid: 0,
+                    sigret: [0; 4],
                 };
             }
             set_state(slot, State::Running); // the AP is already running on this stack

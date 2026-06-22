@@ -37,10 +37,16 @@ static unsigned char rnd[16];
 #define AT_PAGESZ  6
 #define AT_RANDOM 25
 
+extern void __oxbow_register_sigdispatch(void);
+
 __attribute__((noreturn)) void oxbow_main(void)
 {
 	/* 16 real random bytes for musl's stack-guard / malloc seed. */
 	ox_syscall2(OX_SYS_GETENTROPY, (long)rnd, (long)sizeof rnd);
+
+	/* Phase 9 step 2: register the async-signal dispatcher so a Ctrl-C delivered to
+	 * us while running (not at a read) runs our SIGINT handler instead of a kill. */
+	__oxbow_register_sigdispatch();
 
 	/* Copy the SPAWN_ARGV string into our own buffer, then split it in place. */
 	const char *src = (const char *)SPAWN_ARGV;

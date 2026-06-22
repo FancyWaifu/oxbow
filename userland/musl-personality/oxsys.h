@@ -23,6 +23,8 @@
 #define OX_SYS_YIELD         58
 #define OX_SYS_SET_FSBASE    63
 #define OX_SYS_FORK          64
+#define OX_SYS_SIGDISPATCH   67
+#define OX_SYS_SIGRETURN     68
 
 /* CRITICAL: oxbow syscalls return TWO values (rax + RDX), unlike Linux (rax only).
  * So RDX is ALWAYS clobbered by the syscall — it must be an asm output, never left

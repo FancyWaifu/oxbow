@@ -83,6 +83,16 @@ extern "C" fn syscall_entry() {
         "push rax",                          // nr -> 7th C arg (on the stack)
         "call {dispatch}",
         "add rsp, 16",                       // drop nr + pad; rax/rdx now live
+        // §Phase 9 step 2: signal hook. Preserve the two return values, pass a pointer
+        // to the saved frame [rdx,rax,r9,r8,r10,rsi,rdi,rip,rflags,user_rsp], let the
+        // kernel inject a signal frame / restore a sigreturn, then resume. A no-op
+        // (and untouched frame) in the common case.
+        "push rax",
+        "push rdx",
+        "mov rdi, rsp",
+        "call {siginject}",
+        "pop rdx",
+        "pop rax",
         "pop r9",
         "pop r8",
         "pop r10",
@@ -93,6 +103,7 @@ extern "C" fn syscall_entry() {
         "pop rsp",                           // restore user rsp
         "sysretq",
         dispatch = sym crate::syscall::syscall_dispatch,
+        siginject = sym crate::syscall::syscall_siginject,
     );
 }
 

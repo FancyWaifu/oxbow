@@ -67,6 +67,10 @@ pub struct Process {
     imm_count: usize,
     /// Process name (NUL-padded), set at spawn — reported by SYS_PROC_LIST (ps).
     name: [u8; 16],
+    /// §Phase 9 step 2: the userland async-signal dispatcher address this process
+    /// registered (SYS_SIGDISPATCH), or 0. When set, an async signal injects a frame
+    /// redirecting here instead of terminating the process.
+    pub sig_dispatch: u64,
 }
 
 /// Max immutable ranges per process (a runtime locks text + maybe rodata/got).
@@ -90,6 +94,7 @@ impl Process {
             imm: [(0, 0); MAX_IMM],
             imm_count: 0,
             name: [0; 16],
+            sig_dispatch: 0,
         }
     }
 
@@ -254,6 +259,20 @@ pub fn kill_pid(pid: usize, code: i32) -> bool {
     }
     kill(pid, code);
     true
+}
+
+/// The async-signal dispatcher a live process registered (0 = none / not alive).
+/// §Phase 9 step 2: used to decide inject-vs-terminate on async Ctrl-C.
+pub fn sig_dispatch_of(pid: usize) -> u64 {
+    if pid >= MAX_PROCS {
+        return 0;
+    }
+    let procs = PROCESSES.lock();
+    if matches!(procs[pid].state, PState::Alive) {
+        procs[pid].sig_dispatch
+    } else {
+        0
+    }
 }
 
 /// Mark a process dead and drop its handles (on a ring-3 fault or `sys_exit`).

@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <poll.h>
+#include <sched.h>
 
 static volatile sig_atomic_t got_sig = 0;
 static void on_usr1(int s) { got_sig = s; }
@@ -47,11 +48,37 @@ tty_test(void)
 	return 0;
 }
 
+static volatile sig_atomic_t async_int = 0;
+static void on_async_int(int s) { async_int = s; }
+
+/* Phase 9 step 2: a CPU-bound loop with a SIGINT handler. Run as `muslhello loop`,
+ * then Ctrl-C — the kernel injects the handler asynchronously (the program is NOT at
+ * a read boundary), it sets the flag, and the loop exits. Proves async delivery. */
+static int
+loop_test(void)
+{
+	setvbuf(stdout, NULL, _IONBF, 0);
+	signal(SIGINT, on_async_int);
+	printf("musltty: looping (CPU-bound) — press Ctrl-C\n");
+	long spins = 0;
+	while (!async_int) {
+		for (volatile long i = 0; i < 200000; i++) { /* CPU work */
+		}
+		sched_yield(); /* a syscall return — the async injection point */
+		spins++;
+	}
+	printf("  caught async SIGINT (sig=%d) after %ld spins — handler ran!\n",
+	       (int)async_int, spins);
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)
 		return tty_test();
+	if (argc > 1 && strcmp(argv[1], "loop") == 0)
+		return loop_test();
 	setvbuf(stdout, NULL, _IONBF, 0); /* unbuffered, so output order is deterministic */
 	printf("Hello from musl libc, running on oxbow!\n");
 

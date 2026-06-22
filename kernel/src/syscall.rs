@@ -18,7 +18,7 @@ use oxbow_abi::{
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_MEMINFO, SYS_UPTIME_MS,
     SYS_WALLTIME, SYS_THREAD_SPAWN, SYS_THREAD_EXIT, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE,
     SYS_THREAD_ID, SYS_YIELD, SYS_PROC_KILL, SYS_PROC_LIST, SYS_KILL, SYS_SET_FSBASE, SYS_FORK,
-    SYS_SET_FOREGROUND, SYS_TTY_INTR,
+    SYS_SET_FOREGROUND, SYS_TTY_INTR, SYS_SIGDISPATCH, SYS_SIGRETURN,
     ProcInfo,
     SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_PIPE_EOF, CHAN_NONBLOCK, PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT,
     R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM, PLEDGE_SPAWN, PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
@@ -71,6 +71,58 @@ impl SyscallRet {
 
 /// Syscall dispatcher. `nr` arrives as the 7th (stack) argument so a1..a6 stay
 /// in their SysV registers untouched by the entry stub. See ABI §4.3.
+/// §Phase 9 step 2: runs on every syscall return with a pointer to the saved user
+/// frame `[rdx, rax, r9, r8, r10, rsi, rdi, rip, rflags, user_rsp]` (u64 each). It
+/// injects a signal frame (redirect to the userland dispatcher) or restores a
+/// sigreturn. MUST be a fast no-op when no signal work is pending — it's on every
+/// syscall's hot path.
+pub extern "C" fn syscall_siginject(frame: *mut u64) {
+    // Fast path: the overwhelming common case — no signal work for this thread.
+    if !crate::thread::current_has_sig_work() {
+        return;
+    }
+    // 1. A pending sigreturn restores the interrupted context (priority over a new
+    //    signal, so handlers can't stack indefinitely).
+    if let Some(ctx) = crate::thread::take_sigret_current() {
+        unsafe {
+            *frame.add(7) = ctx[0]; // rip
+            *frame.add(8) = ctx[1]; // rflags
+            *frame.add(9) = ctx[2]; // user_rsp
+            *frame.add(1) = ctx[3]; // rax (the original syscall's return value)
+        }
+        return;
+    }
+    // 2. A pending async signal: inject a frame that runs the userland dispatcher.
+    let sig = crate::thread::take_pending_sig_current();
+    if sig == 0 {
+        return;
+    }
+    let disp = proc::with_current(|p| p.sig_dispatch);
+    if disp == 0 {
+        return; // no dispatcher registered — leave the frame untouched (normal return)
+    }
+    let (rip, rflags, usp, rax_val) =
+        unsafe { (*frame.add(7), *frame.add(8), *frame.add(9), *frame.add(1)) };
+    // Build the sigcontext on the user stack just below its current top, 16-aligned:
+    // [rip, rflags, rsp, rax]. The dispatcher passes this pointer to SYS_SIGRETURN.
+    let ctx = (usp.wrapping_sub(32)) & !15u64;
+    if usermem::check_user(ctx, 32, true).is_err() {
+        return; // bad user stack — skip injection rather than fault the kernel
+    }
+    unsafe {
+        let c = ctx as *mut u64;
+        c.write(rip);
+        c.add(1).write(rflags);
+        c.add(2).write(usp);
+        c.add(3).write(rax_val);
+        // Redirect this return into the dispatcher: rip -> dispatcher, rdi -> signum,
+        // user_rsp -> the sigcontext. rflags is left as the interrupted code's.
+        *frame.add(7) = disp;
+        *frame.add(6) = sig as u64;
+        *frame.add(9) = ctx;
+    }
+}
+
 pub extern "C" fn syscall_dispatch(
     a1: u64,
     a2: u64,
@@ -169,6 +221,11 @@ pub extern "C" fn syscall_dispatch(
         SYS_KILL => sys_kill(a1, a2),
         SYS_SET_FOREGROUND => sys_set_foreground(a1),
         SYS_TTY_INTR => sys_tty_intr(),
+        SYS_SIGDISPATCH => {
+            proc::with_current_mut(|p| p.sig_dispatch = a1);
+            SyscallRet::ok()
+        }
+        SYS_SIGRETURN => sys_sigreturn(a1),
         SYS_SET_FSBASE => {
             crate::thread::set_fsbase_current(a1);
             SyscallRet { rax: 0, rdx: 0 }
@@ -819,10 +876,34 @@ fn sys_set_foreground(pid: u64) -> SyscallRet {
 /// default SIGINT action). Reuses the kill path; a no-op if no foreground is set.
 fn sys_tty_intr() -> SyscallRet {
     let pid = FOREGROUND_PID.load(core::sync::atomic::Ordering::Relaxed);
-    if pid != 0 && proc::kill_pid(pid, 130) {
+    if pid == 0 {
+        return SyscallRet::ok();
+    }
+    // If the foreground process registered an async-signal dispatcher, deliver SIGINT
+    // to run its handler (injected at its next syscall return). Otherwise terminate it
+    // (the default SIGINT action) — step 1.
+    if proc::sig_dispatch_of(pid) != 0 {
+        let tid = crate::thread::main_thread_of(pid);
+        if tid != 0 {
+            crate::thread::set_pending_sig(tid, 2); // SIGINT
+        }
+    } else if proc::kill_pid(pid, 130) {
         crate::thread::mark_proc_dying(pid);
         FOREGROUND_PID.store(0, core::sync::atomic::Ordering::Relaxed);
     }
+    SyscallRet::ok()
+}
+
+/// `sys_sigreturn(ctx_ptr)` — the tail of a userland signal handler. Reads the saved
+/// context `[rip, rflags, rsp, rax]` from the user stack and stashes it; the siginject
+/// hook restores it onto THIS syscall's return frame, resuming the interrupted code.
+fn sys_sigreturn(ctx_ptr: u64) -> SyscallRet {
+    if usermem::check_user(ctx_ptr, 32, false).is_err() {
+        return SyscallRet::err(SysError::Fault);
+    }
+    let p = ctx_ptr as *const u64;
+    let ctx = unsafe { [p.read(), p.add(1).read(), p.add(2).read(), p.add(3).read()] };
+    crate::thread::set_sigret_current(ctx);
     SyscallRet::ok()
 }
 

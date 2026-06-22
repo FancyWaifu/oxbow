@@ -233,6 +233,13 @@ pub const SYS_SET_FOREGROUND: u64 = 65;
 /// SIGINT action) when no reader is blocked — i.e. a program is running, not at a
 /// read boundary (which the synchronous path already handles). Phase 9.
 pub const SYS_TTY_INTR: u64 = 66;
+/// (addr) -> 0. Register this process's userland async-signal dispatcher. When set,
+/// an async signal injects a frame redirecting to `addr` (the handler runs) instead
+/// of terminating the process. Phase 9 step 2.
+pub const SYS_SIGDISPATCH: u64 = 67;
+/// (ctx_ptr) -> never returns normally. Restore the interrupted context saved at
+/// `ctx_ptr` ([rip, rflags, rsp, rax]) — the tail of a signal handler. Phase 9 step 2.
+pub const SYS_SIGRETURN: u64 = 68;
 pub const PROC_NAME_LEN: usize = 16;
 pub const PROC_STATE_ALIVE: u32 = 1;
 pub const PROC_STATE_DEAD: u32 = 2; // exited, slot not yet reused (zombie)
