@@ -16,7 +16,7 @@ use oxbow_abi::{
     BOOT_IMG_HELLO, BOOT_IMG_PONG,
     BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_LUA, BOOT_IMG_UPY, BOOT_IMG_QJS, BOOT_IMG_CURL, BOOT_IMG_CARES, BOOT_IMG_FFI, BOOT_IMG_WL, BOOT_IMG_XKB, BOOT_IMG_VTERM, BOOT_IMG_FT, BOOT_IMG_JAIL, BOOT_IMG_FSTEST, BOOT_MEM, BOOT_SESSION_CHAN, BOOT_TICK, BOOT_TTY,
     HANDLE_NULL, IdentRec, R_GRANT, R_IN, R_OUT, R_RECV,
-    R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_FLUSH, TAG_TTY_READ, TAG_TTY_WRITE,
+    R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_NAMESPACE, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_FLUSH, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 use blake2::{Blake2b, Digest};
@@ -2082,14 +2082,14 @@ fn set_cwd_home(i: usize, cwd: &mut Handle, path: &mut Path) {
     }
     *path = Path::root();
     if a.home != b"/" {
-        // Mint the home dir cap from the root authority (login machinery), then
-        // adopt it as the session root — the only fs cap this session will use.
-        let mut m = MsgBuf::new(TAG_FS_OPEN);
+        // §namespace: mint a per-user NAMESPACE cap (the user's home + the shared,
+        // read-only /bin) and adopt it as the session root. Because the shell already
+        // passes the session root as slot 1 to every program it spawns, each program
+        // INHERITS this namespace automatically — so /bin tools work with no
+        // per-program wiring, while the rest of the fs stays confined to home.
+        let mut m = MsgBuf::new(TAG_FS_NAMESPACE);
         pack_name(&mut m, a.home);
-        if rt::sys_call(BOOT_FS_ROOT, &mut m).is_ok()
-            && m.data[0] == 0
-            && m.data[1] == oxbow_abi::FS_DIR
-        {
+        if rt::sys_call(BOOT_FS_ROOT, &mut m).is_ok() && m.data[0] == 0 {
             unsafe {
                 SESSION_ROOT = m.handles[0];
             }

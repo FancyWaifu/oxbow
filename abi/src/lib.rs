@@ -512,6 +512,11 @@ pub const FS_SYMLINK: u64 = 3;
 /// client needs no separate stat. Reply `data[0]` = status (0 ok / 1 NotFound / 2
 /// AlreadyExists), `data[1]` = kind, `data[2]` = size, `data[3]`/`data[4]` = mtime/atime.
 pub const TAG_FS_OPEN: u64 = u32::from_le_bytes(*b"FSOP") as u64;
+/// Mint a per-user NAMESPACE cap rooted at the given home path (the message name).
+/// The cap routes `bin/...` to the shared read-only `/bin` and everything else under
+/// home — a confined user's session root, inherited by every program they spawn so
+/// the shared tools "just work" with no per-program wiring. Reply: a dir cap.
+pub const TAG_FS_NAMESPACE: u64 = u32::from_le_bytes(*b"FSNS") as u64;
 /// Open flags (in `TAG_FS_OPEN` `data[63]`): create-if-missing, exclusive-create
 /// (fail if exists), truncate-existing-to-zero.
 pub const FS_O_CREATE: u64 = 1;

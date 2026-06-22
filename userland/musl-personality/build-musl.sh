@@ -25,6 +25,10 @@ TARGET=x86_64-unknown-none
 #      first setlocale faulted). Ours issues oxbow's SYS_SET_FSBASE directly.
 cp "$PERS/syscall_arch.h" "$MUSL/arch/x86_64/syscall_arch.h"
 cp "$PERS/__set_thread_area.s" "$MUSL/src/thread/x86_64/__set_thread_area.s"
+# vfork.s: upstream's raw vfork syscall (nr 58) bypasses the override and collides with
+# oxbow's SYS_YIELD, clobbering the saved return address -> a jump to rip=0. Route
+# vfork() to the real fork() (dash's vforkexec only execs/_exits in the child).
+cp "$PERS/vfork.s" "$MUSL/src/process/x86_64/vfork.s"
 
 # 2. Configure + build static musl with clang cross-targeting bare x86_64.
 cd "$MUSL"

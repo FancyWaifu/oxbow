@@ -25,7 +25,7 @@ use oxbow_abi::{
     FS_DIR, FS_FILE, FS_INITRD, FS_O_CREATE, FS_O_EXCL, FS_O_TRUNC, FS_ROOT, FS_SYMLINK,
     MSG_DATA_WORDS, PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_BLK_ATTACH,
     TAG_BLK_FLUSH, TAG_BLK_READ, TAG_BLK_READN, TAG_BLK_WRITE, TAG_BLK_WRITEN, TAG_FS_CREATE,
-    TAG_FS_LINK, TAG_FS_MKDIR, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_FS_READLINK,
+    TAG_FS_LINK, TAG_FS_MKDIR, TAG_FS_NAMESPACE, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_FS_READLINK,
     TAG_FS_RELEASE, TAG_FS_RENAME, TAG_FS_SETTIMES, TAG_FS_SYMLINK, TAG_FS_SYNC, TAG_FS_TRUNCATE,
     TAG_FS_UNLINK, TAG_FS_WRITE,
 };
@@ -425,9 +425,19 @@ static mut USED: [bool; MAXID] = [false; MAXID];
 // TAG_FS_RELEASE (client File/ReadDir close). The slot is reclaimed when this hits 0, so
 // only CONCURRENTLY-open paths occupy the table (sequential opens reuse slots).
 static mut REFS: [u16; MAXID] = [0; MAXID];
+// A NAMESPACE node (TAG_FS_NAMESPACE): resolves `bin/...` against the shared read-only
+// /bin (under the ext2 root) and everything else under its home path (PATHS[id]). The
+// per-user session root; inherited by spawned programs so /bin tools work everywhere.
+static mut NS: [bool; MAXID] = [false; MAXID];
 
 fn rel(id: usize) -> &'static [u8] {
     unsafe { &PATHS[id][..PLENS[id] as usize] }
+}
+
+/// Does a namespace node route `name` to the shared /bin (vs the user's home)?
+fn ns_to_bin(id: usize, name: &[u8]) -> bool {
+    let is_ns = unsafe { NS[id] };
+    is_ns && name.split(|&b| b == b'/').find(|c| !c.is_empty()) == Some(&b"bin"[..])
 }
 
 /// Absolute lwext4 path ("/mp/" + relpath) into `out`, NUL-terminated. An empty
@@ -455,7 +465,18 @@ fn full_path(id: usize, out: &mut [u8; 256]) -> Option<usize> {
 /// the child rel length, or None if it overflows. Caller built `out` via
 /// full_from_rel(&relbuf[..len]).
 fn join_child(id: usize, name: &[u8], relbuf: &mut [u8; PLEN]) -> Option<usize> {
-    let p = rel(id);
+    // A namespace node routes `bin/...` to the real /bin (base = root, "") and
+    // everything else under its home (base = the node's path). name_ok already blocks
+    // ".."/"." so neither subtree can be escaped.
+    let p: &[u8] = if unsafe { NS[id] } {
+        if ns_to_bin(id, name) {
+            &[]
+        } else {
+            rel(id)
+        }
+    } else {
+        rel(id)
+    };
     let mut len = 0usize;
     if !p.is_empty() {
         relbuf[..p.len()].copy_from_slice(p);
@@ -752,6 +773,11 @@ pub extern "C" fn oxbow_main() -> ! {
                     if !(valid && name_ok(name)) {
                         break 'open;
                     }
+                    // §namespace: the shared /bin is READ-ONLY — deny create/truncate.
+                    if ns_to_bin(id, name) && flags & (FS_O_CREATE | FS_O_TRUNC) != 0 {
+                        status = 3; // write to a read-only location
+                        break 'open;
+                    }
                     let Some(clen) = join_child(id, name, &mut relbuf) else { break 'open };
                     if full_from_rel(&relbuf[..clen], &mut full).is_none() {
                         break 'open;
@@ -826,6 +852,40 @@ pub extern "C" fn oxbow_main() -> ! {
                     done = true;
                 }
                 if !done {
+                    reply_status(reply, status);
+                }
+            }
+            TAG_FS_NAMESPACE => {
+                // Mint a namespace cap rooted at the given home path (e.g. "home/bryson"):
+                // routes bin/... -> shared /bin, else under home. Inherited as a confined
+                // user's session root. (The badge isn't used — composed from the root.)
+                let name = msg_name(&m);
+                let home = name.strip_prefix(b"/").unwrap_or(name); // "" = the ext2 root
+                let mut r = MsgBuf::new(0);
+                let mut status = 1u64;
+                'ns: {
+                    if home.len() >= PLEN || !name_ok(if home.is_empty() { b"x" } else { home }) {
+                        break 'ns;
+                    }
+                    let cid = intern(home);
+                    if cid == 0 {
+                        break 'ns;
+                    }
+                    unsafe { NS[cid] = true };
+                    let Ok(cap) = rt::sys_mint(BOOT_EP, cid as u64, R_SEND | R_GRANT) else {
+                        break 'ns;
+                    };
+                    unsafe { REFS[cid] += 1 };
+                    r.data[0] = 0;
+                    r.data[1] = FS_DIR;
+                    r.data_len = 2;
+                    r.handle_count = 1;
+                    r.handles[0] = cap;
+                    let _ = rt::sys_reply(reply, &r);
+                    let _ = rt::sys_close(cap);
+                    status = 0;
+                }
+                if status != 0 {
                     reply_status(reply, status);
                 }
             }
