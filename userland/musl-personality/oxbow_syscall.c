@@ -59,6 +59,7 @@ static long do_clock_gettime(long id, struct ox_timespec *ts)
 #define K_FILE   0
 #define K_PIPE_R 1
 #define K_PIPE_W 2
+#define K_DIR    3  /* an open directory; .off is the readdir cursor */
 struct oxfd {
 	int used;
 	int kind;
@@ -101,10 +102,16 @@ static void fd_release(int fd)
 {
 	if (fd < 0 || fd >= MAXFD || !fds[fd].used)
 		return;
-	if (fds[fd].kind == K_PIPE_R || fds[fd].kind == K_PIPE_W)
+	if (fds[fd].kind == K_PIPE_W) {
+		/* Closing a write end signals EOF to readers (oxbow pipes don't refcount
+		 * writers, so the holder must do this — mirrors the shell's pipeline). */
+		__oxbow_pipe_eof((unsigned int)fds[fd].handle);
 		__oxbow_pipe_close((unsigned int)fds[fd].handle);
-	else if (fds[fd].kind == K_FILE)
+	} else if (fds[fd].kind == K_PIPE_R) {
+		__oxbow_pipe_close((unsigned int)fds[fd].handle);
+	} else if (fds[fd].kind == K_FILE || fds[fd].kind == K_DIR) {
 		__oxbow_fs_close(fds[fd].handle);
+	}
 	fds[fd].used = 0;
 }
 
@@ -126,7 +133,7 @@ static long do_open(const char *path, long flags)
 	long h = __oxbow_fs_open(path, slen(path), ox, &size, &kind, &mt, &at);
 	if (h < 0)
 		return (h == -1) ? -E_NOENT : (h == -2) ? -E_EXIST : -E_INVAL;
-	int fd = fd_alloc(h, size);
+	int fd = fd_alloc_kind(h, size, (kind == 1) ? K_DIR : K_FILE);
 	if (fd < 0) {
 		__oxbow_fs_close(h);
 		return -E_MFILE;
@@ -339,9 +346,14 @@ static long do_exec_spawn(const char *path, char *const argv[])
 	unsigned int stdout_cap = 2;
 	if (fds[1].used && fds[1].kind == K_PIPE_W)
 		stdout_cap = (unsigned int)fds[1].handle;
+	/* Honor a dup2'd stdin too: popen("w") / a pipeline does dup2(pipe_r, 0) +
+	 * exec, so the child reads its stdin from the pipe. 0 = inherit ours. */
+	unsigned int stdin_cap = 0;
+	if (fds[0].used && fds[0].kind == K_PIPE_R)
+		stdin_cap = (unsigned int)fds[0].handle;
 
 	unsigned int pid = 0;
-	long notif = __oxbow_spawn(elf, got, blob, (unsigned long)bl, stdout_cap, &pid);
+	long notif = __oxbow_spawn(elf, got, blob, (unsigned long)bl, stdout_cap, stdin_cap, &pid);
 	free(elf);
 	if (notif < 0)
 		return -E_NOENT;
@@ -517,6 +529,48 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 			fds[fd].off = fds[fd].size;
 		return 0;
 	}
+	case NR_getdents64: {
+		/* Fill `buf` with linux_dirent64 records by walking the dir via fsd's readdir
+		 * (fds[fd].off is the cursor). Backs opendir()/readdir() — needed by shells,
+		 * find, ls, ./configure. Returns bytes written, 0 at end of directory. */
+		long fd = a1;
+		unsigned char *buf = (unsigned char *)a2;
+		unsigned long cap = (unsigned long)a3;
+		if (fd < 0 || fd >= MAXFD || !fds[fd].used || fds[fd].kind != K_DIR)
+			return -E_BADF;
+		if (!buf)
+			return -E_FAULT;
+		unsigned long off = 0;
+		char nm[256];
+		unsigned int dkind = 0;
+		for (;;) {
+			long nl = __oxbow_fs_readdir(fds[fd].handle, fds[fd].off,
+						     (unsigned char *)nm, sizeof nm - 1, &dkind);
+			if (nl < 0)
+				break; /* end of directory */
+			if (nl > 255)
+				nl = 255;
+			/* linux_dirent64: d_ino(8) d_off(8) d_reclen(2) d_type(1) d_name[],
+			 * the whole record padded to an 8-byte multiple. */
+			unsigned long reclen = (19 + (unsigned long)nl + 1 + 7) & ~7UL;
+			if (off + reclen > cap) {
+				if (off == 0)
+					return -E_INVAL; /* buffer too small for one entry */
+				break;               /* full; this entry comes next call (cursor unmoved) */
+			}
+			unsigned char *e = buf + off;
+			*(uint64_t *)(e + 0) = (uint64_t)(fds[fd].off + 1); /* d_ino (nonzero) */
+			*(int64_t *)(e + 8) = (int64_t)(fds[fd].off + 1);   /* d_off */
+			*(uint16_t *)(e + 16) = (uint16_t)reclen;
+			e[18] = (dkind == 1) ? 4 : 8; /* d_type: DT_DIR / DT_REG */
+			for (long i = 0; i < nl; i++)
+				e[19 + i] = (unsigned char)nm[i];
+			e[19 + nl] = 0;
+			off += reclen;
+			fds[fd].off++; /* advance the readdir cursor */
+		}
+		return (long)off;
+	}
 	case NR_lseek: {
 		long fd = a1, off = a2;
 		int whence = (int)a3;
@@ -541,9 +595,13 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		if (!kst)
 			return -E_FAULT;
 		unsigned long sz = 0;
-		if (fd >= 3 && fd < MAXFD && fds[fd].used)
+		int kd = 2; /* default: regular file */
+		if (fd >= 3 && fd < MAXFD && fds[fd].used) {
 			sz = fds[fd].size;
-		fill_kstat(kst, sz, 2, 0);
+			if (fds[fd].kind == K_DIR)
+				kd = 1; /* directory — opendir()/fstat() must see S_IFDIR */
+		}
+		fill_kstat(kst, sz, kd, 0);
 		return 0;
 	}
 	case NR_newfstatat: { /* a1=dirfd, a2=path, a3=kstat, a4=flag */
@@ -739,6 +797,48 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 	case NR_exit_group:
 		ox_syscall1(OX_SYS_EXIT, a1);
 		__builtin_unreachable();
+
+	/* ---- I/O multiplexing (pragmatic: report the requested fds ready, so a
+	 * poll/select-then-read works — reads block for real data) ---- */
+	case NR_poll:
+	case NR_ppoll: {
+		struct pfd {
+			int fd;
+			short events;
+			short revents;
+		} *pf = (struct pfd *)a1;
+		unsigned long nfds = (unsigned long)a2;
+		int ready = 0;
+		for (unsigned long i = 0; i < nfds && pf; i++) {
+			short re = (pf[i].fd >= 0) ? (short)(pf[i].events & 0x7) : 0; /* IN|PRI|OUT */
+			pf[i].revents = re;
+			if (re)
+				ready++;
+		}
+		return ready;
+	}
+	case NR_select:
+	case NR_pselect6: {
+		/* nfds=a1; readfds=a2, writefds=a3 (fd_set bitmaps). Leave the sets as-is
+		 * (all requested fds reported ready) + clear exceptfds; return the count. */
+		int nfds = (int)a1;
+		unsigned long *rd = (unsigned long *)a2;
+		unsigned long *wr = (unsigned long *)a3;
+		unsigned long *ex = (unsigned long *)a4;
+		int ready = 0;
+		for (int fd = 0; fd < nfds && fd < 1024; fd++) {
+			unsigned long bit = 1UL << (fd & 63);
+			int w = fd >> 6;
+			if (rd && (rd[w] & bit))
+				ready++;
+			if (wr && (wr[w] & bit))
+				ready++;
+		}
+		if (ex)
+			for (int w = 0; w < (nfds + 63) / 64 && w < 16; w++)
+				ex[w] = 0;
+		return ready;
+	}
 
 	/* ---- pipes + fd duplication (Phase 6) ---- */
 	case NR_pipe:

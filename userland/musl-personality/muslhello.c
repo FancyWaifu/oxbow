@@ -11,6 +11,8 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <poll.h>
 
 static volatile sig_atomic_t got_sig = 0;
 static void on_usr1(int s) { got_sig = s; }
@@ -144,6 +146,60 @@ main(int argc, char **argv)
 		db[dn > 0 ? dn : 0] = 0;
 		close(7);
 		printf("  dup2(pipe,7) read: \"%s\" (expect dup2ok)\n", db);
+	}
+
+	/* Phase 8: getdents via opendir/readdir — list "/". */
+	printf("  --- opendir/readdir(/) ---\n");
+	DIR *dir = opendir("/");
+	if (dir) {
+		struct dirent *e;
+		int n = 0;
+		printf("  /:");
+		while ((e = readdir(dir)) != NULL && n < 24) {
+			printf(" %s", e->d_name);
+			n++;
+		}
+		printf("\n");
+		closedir(dir);
+	} else {
+		printf("  opendir(/) failed\n");
+	}
+
+	/* Phase 8: poll a pipe that has data — expect ready + POLLIN. */
+	printf("  --- poll ---\n");
+	int qp[2];
+	if (pipe(qp) == 0) {
+		write(qp[1], "x", 1);
+		struct pollfd pfd = { .fd = qp[0], .events = POLLIN, .revents = 0 };
+		int pr = poll(&pfd, 1, 0);
+		printf("  poll -> %d revents&POLLIN=%d (expect 1 1)\n", pr, !!(pfd.revents & POLLIN));
+		close(qp[0]);
+		close(qp[1]);
+	}
+
+	/* Phase 8: execve stdin-redirect — pipe + fork + dup2(pipe,0) + exec /bin/cat,
+	 * then write to the pipe; cat reads its stdin (the pipe) and echoes to our
+	 * stdout. The popen("w") / pipeline-to-subprocess path. The child closes only its
+	 * READ end after dup2 — closing the write end would signal EOF (oxbow has no
+	 * writer refcount), racing the parent. The parent is the sole writer and EOFs on
+	 * close; cat doesn't inherit the write end (only stdin is passed). */
+	printf("  --- exec with redirected stdin (cat) ---\n");
+	int cp[2];
+	if (pipe(cp) == 0) {
+		pid_t cc = fork();
+		if (cc == 0) {
+			dup2(cp[0], 0);
+			close(cp[0]);
+			char *av[] = { "cat", NULL };
+			char *ev[] = { NULL };
+			execve("/bin/cat", av, ev);
+			_exit(127);
+		}
+		close(cp[0]);
+		write(cp[1], "  cat<stdin: piped-stdin-ok\n", 28);
+		close(cp[1]); /* signals EOF so cat finishes */
+		int ws;
+		waitpid(cc, &ws, 0);
 	}
 
 	return 0;

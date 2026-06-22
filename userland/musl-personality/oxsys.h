@@ -104,6 +104,8 @@ extern long __oxbow_fs_pread(long file, void *buf, unsigned long len, unsigned l
 extern long __oxbow_fs_pwrite(long file, const void *buf, unsigned long len, unsigned long off);
 extern void __oxbow_fs_close(long file);
 extern int  __oxbow_fs_truncate(long file, unsigned long size);
+extern long __oxbow_fs_readdir(long dir, unsigned long cursor, unsigned char *name_out,
+                               unsigned long name_cap, unsigned int *kind_out);
 
 /* process spawn/wait (Phase 3), reusing the std::process::Command shims. spawn
  * loads `elf` via SYS_SPAWN_BYTES inheriting cwd+stdout, returns the exit-notif
@@ -111,7 +113,7 @@ extern int  __oxbow_fs_truncate(long file, unsigned long size);
  * exit status. */
 extern long __oxbow_spawn(const void *elf, unsigned long elf_len, const void *argv,
                           unsigned long argv_len, unsigned int stdout_cap,
-                          unsigned int *pid_out);
+                          unsigned int stdin_cap, unsigned int *pid_out);
 extern int  __oxbow_wait(long notif);
 
 /* pipes (Phase 6): __oxbow_pipe creates a pair, writing the read/write endpoint

@@ -1002,6 +1002,7 @@ pub unsafe extern "C" fn __oxbow_spawn(
     argv: *const u8,
     argv_len: usize,
     stdout_cap: u32,
+    stdin_cap: u32,
     pid_out: *mut u32,
 ) -> i64 {
     let notif = match sys_notif_create() {
@@ -1016,7 +1017,8 @@ pub unsafe extern "C" fn __oxbow_spawn(
     sm.handle_count = 4;
     sm.handles[0] = cwd_handle(); // cwd dir cap (slot 1, or the parent's re-rooted cwd)
     sm.handles[1] = stdout_cap as Handle; // stdout: 2 (inherit) or a pipe write-end
-    sm.handles[2] = 4; // stdin (SPAWN_STDIN)
+    // stdin: 4 (inherit the parent's) or a dup2'd pipe read-end (popen "w" / pipelines)
+    sm.handles[2] = if stdin_cap != 0 { stdin_cap as Handle } else { 4 };
     sm.handles[3] = oxbow_abi::BOOT_NET_EP; // net
     let elf_slice = unsafe { core::slice::from_raw_parts(elf, elf_len) };
     match sys_spawn_bytes(elf_slice, BOOT_MEM, &sm, notif) {
@@ -1337,7 +1339,9 @@ pub unsafe extern "C" fn __oxbow_pipe(rend_out: *mut u32, wend_out: *mut u32) ->
         Err(_) => return -1,
     };
     let wend = sys_attenuate(pipe, oxbow_abi::R_OUT | oxbow_abi::R_GRANT).unwrap_or(0);
-    let rend = sys_attenuate(pipe, oxbow_abi::R_IN).unwrap_or(0);
+    // R_GRANT on the read end too, so it can be handed to a spawned child as stdin
+    // (the popen("w") / pipeline-to-subprocess path; the write end already had it).
+    let rend = sys_attenuate(pipe, oxbow_abi::R_IN | oxbow_abi::R_GRANT).unwrap_or(0);
     let _ = sys_close(pipe);
     if wend == 0 || rend == 0 {
         let _ = sys_close(wend);

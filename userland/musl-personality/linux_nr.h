@@ -11,7 +11,11 @@
 #define NR_stat              4
 #define NR_fstat             5
 #define NR_lstat             6
+#define NR_poll              7
 #define NR_lseek             8
+#define NR_select            23
+#define NR_ppoll             271
+#define NR_pselect6          270
 #define NR_mmap              9
 #define NR_mprotect          10
 #define NR_munmap            11
@@ -31,6 +35,7 @@
 #define NR_dup3              292
 #define NR_nanosleep         35
 #define NR_ftruncate         77
+#define NR_getdents64        217
 #define NR_getpid            39
 #define NR_clone             56
 #define NR_fork              57
