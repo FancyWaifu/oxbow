@@ -1135,6 +1135,11 @@ fn tw_dec(n: u8) {
 /// just a UDP datagram on a bound port. This crosses the shell↔net process
 /// boundary entirely through capabilities.
 fn dns_cmd(name: &[u8]) {
+    if !unsafe { NET_ALLOWED } {
+        tw(b"dns: permission denied (no network access)\n");
+        set_status(1);
+        return;
+    }
     if name.is_empty() {
         tw(b"dns: usage: dns <hostname>\n");
         return;
@@ -1231,6 +1236,11 @@ fn parse_ip(s: &[u8]) -> Option<[u8; 4]> {
 /// capability API (smoltcp does the TCP), send a minimal HTTP/1.0 GET, and print
 /// the response. We hold only BOOT_NET_EP; `tcp::connect` mints us a socket cap.
 fn http_cmd(args: &[u8]) {
+    if !unsafe { NET_ALLOWED } {
+        tw(b"http: permission denied (no network access)\n");
+        set_status(1);
+        return;
+    }
     let (host, rest) = split_cmd(args);
     let Some(ip) = parse_ip(host) else {
         tw(b"http: usage: http <a.b.c.d> [port]\n");
@@ -2141,16 +2151,20 @@ fn remove_rule(skind: u8, sname: &[u8], rkind: u8, rname: &[u8]) -> bool {
     false
 }
 
-/// Send a TAG_FS_NS_MOUNT to a namespace cap: makes the path PREFIX `name` resolve
-/// against the fs root (shared), at rights `right`. Returns true on success.
-fn mount_into(ns_cap: Handle, name: &[u8], right: u8) -> bool {
+/// Mount the path PREFIX `name` into namespace node `ns_node` at rights `right`. This
+/// is a PRIVILEGED op (it composes a user's reachable filesystem), so it's sent to the
+/// root-authority cap BOOT_FS_ROOT — NOT to the namespace cap the user holds, which fsd
+/// now refuses to mount through. The target namespace is named by node id (returned by
+/// the TAG_FS_NAMESPACE that created it). Returns true on success.
+fn mount_into(ns_node: u64, name: &[u8], right: u8) -> bool {
     let mut m = MsgBuf::new(TAG_FS_NS_MOUNT);
-    pack_name(&mut m, name);
+    pack_name(&mut m, name); // occupies data words 0..7
+    m.data[62] = ns_node; // target namespace node id (clear of name + rights word)
     m.data[63] = right as u64;
-    // Rights ride in data[63]; the kernel copies only `data_len` words, so send the
-    // whole message (like TAG_FS_OPEN's flags) — else the field is dropped.
+    // Fields ride in high data words; the kernel copies only `data_len` words, so send
+    // the whole message — else they're dropped.
     m.data_len = 64;
-    rt::sys_call(ns_cap, &mut m).is_ok() && m.data[0] == 0
+    rt::sys_call(BOOT_FS_ROOT, &mut m).is_ok() && m.data[0] == 0
 }
 
 /// Release a namespace cap: tell fsd to drop the node (so its fresh node + mounts are
@@ -2479,7 +2493,8 @@ fn confine_cmd(rest: &[u8], path: &Path, sp: &Spawner) {
         return;
     }
     let ns = m.handles[0];
-    mount_into(ns, b"bin", FS_RIGHT_RO as u8);
+    let node = m.data[2]; // namespace node id, for privileged mounts via BOOT_FS_ROOT
+    mount_into(node, b"bin", FS_RIGHT_RO as u8);
     for spec in specs.split(|&b| b == b' ').filter(|s| !s.is_empty()) {
         let (dname, rspec) = match spec.iter().position(|&b| b == b':') {
             Some(p) => (&spec[..p], &spec[p + 1..]),
@@ -2504,7 +2519,7 @@ fn confine_cmd(rest: &[u8], path: &Path, sp: &Spawner) {
                 }
             }
         };
-        mount_into(ns, dir, right);
+        mount_into(node, dir, right);
     }
     match find_program(cmd0, path) {
         Some(len) => run_program(len, ns, cmd0, args, false, net_cap(), sp),
@@ -2556,9 +2571,9 @@ fn rules_cmd() {
 /// Compose account `i`'s namespace `ns_cap`: read-only /bin for everyone, plus every
 /// path rule whose subject (user / group / assigned role) matches. Also sets
 /// NET_ALLOWED for this session from the matching RES_NET rules.
-fn apply_namespace_mounts(ns_cap: Handle, i: usize) {
+fn apply_namespace_mounts(ns_node: u64, i: usize) {
     let a = &ACCTS[i];
-    mount_into(ns_cap, b"bin", FS_RIGHT_RO as u8); // shared system tools, read-only
+    mount_into(ns_node, b"bin", FS_RIGHT_RO as u8); // shared system tools, read-only
     let mut net = a.uid == 0; // root always has the network
     unsafe {
         for r in RULES.iter() {
@@ -2567,7 +2582,7 @@ fn apply_namespace_mounts(ns_cap: Handle, i: usize) {
             }
             match r.rkind {
                 RES_PATH => {
-                    mount_into(ns_cap, r.rname(), r.right);
+                    mount_into(ns_node, r.rname(), r.right);
                 }
                 RES_NET => net = true,
                 _ => {}
@@ -2595,11 +2610,12 @@ fn program_profile_ns(progname: &[u8], i: usize) -> Option<Handle> {
         return None;
     }
     let ns = m.handles[0];
-    mount_into(ns, b"bin", FS_RIGHT_RO as u8);
+    let node = m.data[2]; // namespace node id, for privileged mounts via BOOT_FS_ROOT
+    mount_into(node, b"bin", FS_RIGHT_RO as u8);
     unsafe {
         for r in RULES.iter() {
             if r.used && r.skind == SUBJ_PROGRAM && r.sname() == progname && r.rkind == RES_PATH {
-                mount_into(ns, r.rname(), r.right);
+                mount_into(node, r.rname(), r.right);
             }
         }
     }
@@ -2853,7 +2869,16 @@ fn set_cwd_home(i: usize, cwd: &mut Handle, path: &mut Path) {
             unsafe {
                 SESSION_ROOT = m.handles[0];
             }
-            apply_namespace_mounts(session_root(), i);
+            apply_namespace_mounts(m.data[2], i); // data[2] = the namespace node id
+        } else {
+            // FAIL CLOSED: if we can't build the confined namespace (e.g. node-pool
+            // exhaustion), never fall back to the broad root cap — that would hand a
+            // confined user the whole filesystem. Give them a dead session root instead.
+            unsafe {
+                SESSION_ROOT = HANDLE_NULL;
+                NET_ALLOWED = false;
+            }
+            tw(b"login: could not establish a confined session; access denied\n");
         }
     }
     *cwd = session_root();

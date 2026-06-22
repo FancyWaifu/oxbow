@@ -1004,6 +1004,13 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut r = MsgBuf::new(0);
                 let mut status = 1u64;
                 'ns: {
+                    // PRIVILEGED: creating a namespace (esp. one rooted at the disk root with
+                    // full rights) is a root-authority operation. Only the holder of the
+                    // FS_ROOT cap (the login shell's BOOT_FS_ROOT) may do it — a confined
+                    // user's home/file caps carry a different badge and are rejected here.
+                    if id != FS_ROOT as usize {
+                        break 'ns;
+                    }
                     if home.len() >= PLEN || !name_ok(if home.is_empty() { b"x" } else { home }) {
                         break 'ns;
                     }
@@ -1024,7 +1031,8 @@ pub extern "C" fn oxbow_main() -> ! {
                     unsafe { REFS[cid] += 1 };
                     r.data[0] = 0;
                     r.data[1] = FS_DIR;
-                    r.data_len = 2;
+                    r.data[2] = cid as u64; // the namespace node id — used to target NS_MOUNT
+                    r.data_len = 3;
                     r.handle_count = 1;
                     r.handles[0] = cap;
                     let _ = rt::sys_reply(reply, &r);
@@ -1036,18 +1044,25 @@ pub extern "C" fn oxbow_main() -> ! {
                 }
             }
             TAG_FS_NS_MOUNT => {
-                // Mount a path PREFIX into a namespace: the message is sent TO the
-                // namespace cap (badge = its node id), so `id` IS the namespace. The
-                // prefix `name` (one or more components, or a single file) then resolves
-                // against the fs root (shared) instead of home, at the rights in data[63]
-                // (an FS_RIGHT_* value). This is how root's access rules reach a user: the
-                // shell composes them into the namespace at login (or per-spawn confine).
+                // PRIVILEGED: mounting a path prefix into a namespace (at attacker-chosen
+                // rights) is the "root decides who reaches what" primitive — it MUST be a
+                // root-authority op, else a confined user could mount the whole disk RW
+                // into their own session namespace. So this is sent to the FS_ROOT cap
+                // (the shell's BOOT_FS_ROOT); the target namespace node is named in
+                // data[0] (returned by TAG_FS_NAMESPACE). The prefix `name` resolves
+                // against the fs root (shared) instead of home, at the rights in data[63].
                 let name = msg_name(&m);
                 let right = (m.data[63] & 0x7) as u8;
+                // Target node id lives in data[62] — clear of the name (words 0..7) and the
+                // rights (word 63), both of which the kernel transmits (data_len=64).
+                let target = m.data[62] as usize;
                 let mut status = 1u64;
                 'mnt: {
-                    // Must target a real namespace node; name a clean prefix that fits.
-                    if !(valid && unsafe { NS[id] } && name_ok(name)) {
+                    // Caller must hold FS_ROOT; target must be a real namespace node.
+                    if id != FS_ROOT as usize {
+                        break 'mnt;
+                    }
+                    if !(target > 0 && target < MAXID && unsafe { USED[target] && NS[target] } && name_ok(name)) {
                         break 'mnt;
                     }
                     // Normalise the prefix: drop empty components, join with single '/'.
@@ -1076,7 +1091,7 @@ pub extern "C" fn oxbow_main() -> ! {
                     for i in 0..MAX_NSMNT {
                         unsafe {
                             if NM_USED[i]
-                                && NM_NS[i] as usize == id
+                                && NM_NS[i] as usize == target
                                 && &NM_NAME[i][..NM_NLEN[i] as usize] == prefix
                             {
                                 slot = Some(i);
@@ -1097,7 +1112,7 @@ pub extern "C" fn oxbow_main() -> ! {
                             let Some(j) = free else { break 'mnt };
                             unsafe {
                                 NM_USED[j] = true;
-                                NM_NS[j] = id as u16;
+                                NM_NS[j] = target as u16;
                                 NM_NLEN[j] = plen as u8;
                                 NM_NAME[j][..plen].copy_from_slice(prefix);
                             }
@@ -1442,8 +1457,14 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut rb1 = [0u8; PLEN];
                 let mut rb2 = [0u8; PLEN];
                 let mut status = 1u64;
+                // A hard link makes a second name for the SAME inode. Rights here are
+                // path-based, so linking a file out of a read-only mount into a writable
+                // dir would let it be written through the new name. Require write-class
+                // rights on BOTH endpoints, so you can't re-label a read-only inode into a
+                // domain that can mutate it.
                 if valid && name_ok(src) && name_ok(dst)
                     && allows_link(eff_right(id, cap_right, dst))
+                    && allows_link(eff_right(id, cap_right, src))
                 {
                     let s = join_child(id, src, &mut rb1);
                     let d = join_child(id, dst, &mut rb2);
