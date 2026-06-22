@@ -606,7 +606,9 @@ fn read_line(buf: &mut [u8; 256]) -> usize {
             );
         }
         total += take;
-        if more == 0 {
+        // more==1 means another chunk follows. 0 = line end; 2 = EOF (Ctrl-D);
+        // 3 = interrupt (Ctrl-C) — for the shell all three end the (empty) line.
+        if more != 1 {
             break;
         }
     }

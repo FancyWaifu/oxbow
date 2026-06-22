@@ -21,7 +21,7 @@ use oxbow_abi::{
     SPAWN_STDIN, SPAWN_STDOUT, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC,
     SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND, SYS_MAP, SYS_NOTIF_CREATE,
     SYS_NOTIF_SIGNAL, SYS_NOTIF_STATUS, SYS_NOTIF_WAIT, SYS_RECV, SYS_REPLY, SYS_SEND, SYS_EP_CREATE, SYS_MINT,
-    SYS_SPAWN, SYS_SPAWN_BYTES, TAG_TTY_WRITE,
+    SYS_SPAWN, SYS_SPAWN_BYTES, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 
 // --- Heap (so `alloc` works) ----------------------------------------------
@@ -448,10 +448,64 @@ pub unsafe extern "C" fn __oxbow_write(_fd: i32, buf: *const u8, len: usize) -> 
     stdout_write(slice);
     len as isize
 }
+/// Sentinel returned by `__oxbow_read` when a tty read was interrupted by Ctrl-C —
+/// the musl personality turns this into a SIGINT delivery + EINTR. (= -EINTR; a
+/// normal read never returns a small negative, so the dispatcher tests for it.)
+pub const OXBOW_READ_EINTR: isize = -4;
+
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __oxbow_read(_fd: i32, _buf: *mut u8, _len: usize) -> isize {
-    0 // no console read path yet
+pub unsafe extern "C" fn __oxbow_read(_fd: i32, buf: *mut u8, len: usize) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    // 1. Pipeline stdin: if SPAWN_STDIN is a real pipe, read from it. A genuine pipe
+    //    returns rax=ok with rdx=count (0 = EOF, write side closed); a NULL/non-pipe
+    //    handle (the interactive case — no pipeline) returns rax=error, which is how
+    //    we distinguish "pipe EOF" from "not a pipe" (the rt wrapper collapses both).
+    let (rax, rdx) = unsafe {
+        syscall3(oxbow_abi::SYS_PIPE_READ, SPAWN_STDIN as u64, buf as u64, len as u64)
+    };
+    if SysError::from_raw(rax).is_ok() {
+        return rdx as isize;
+    }
+    // 2. Interactive: read one line from the tty. The SPAWN_STDOUT endpoint also
+    //    serves TAG_TTY_READ (it's the BOOT_TTY cap the shell granted). Canonical
+    //    mode: returns the line INCLUDING its trailing '\n'. The tty signals EOF
+    //    (Ctrl-D) as more==2 and interrupt (Ctrl-C) as more==3.
+    let mut total = 0usize;
+    loop {
+        let mut m = MsgBuf::new(TAG_TTY_READ);
+        if sys_call(SPAWN_STDOUT, &mut m).is_err() {
+            return total as isize;
+        }
+        match m.data[1] {
+            2 => return total as isize,    // EOF: 0 if nothing buffered yet
+            3 => return OXBOW_READ_EINTR,  // Ctrl-C
+            _ => {}
+        }
+        let n = (m.data[0] as usize).min(48);
+        let take = n.min(len - total);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (m.data.as_ptr() as *const u8).add(16),
+                buf.add(total),
+                take,
+            );
+        }
+        total += take;
+        if m.data[1] == 0 {
+            if total < len {
+                unsafe { *buf.add(total) = b'\n' };
+                total += 1;
+            }
+            break;
+        }
+        if total >= len {
+            break;
+        }
+    }
+    total as isize
 }
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]

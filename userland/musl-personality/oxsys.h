@@ -113,4 +113,14 @@ extern long __oxbow_spawn(const void *elf, unsigned long elf_len, const void *ar
                           unsigned int *pid_out);
 extern int  __oxbow_wait(long notif);
 
+/* pipes (Phase 6): __oxbow_pipe creates a pair, writing the read/write endpoint
+ * handles; read/write/close/dup/eof operate on an endpoint handle. Back pipe()/
+ * dup2() and a pipeline's inherited stdin. */
+extern int  __oxbow_pipe(unsigned int *rend_out, unsigned int *wend_out);
+extern long __oxbow_pipe_read(unsigned int pipe, void *buf, unsigned long len);
+extern long __oxbow_pipe_write(unsigned int pipe, const void *buf, unsigned long len);
+extern void __oxbow_pipe_close(unsigned int pipe);
+extern long __oxbow_pipe_dup(unsigned int pipe);
+extern void __oxbow_pipe_eof(unsigned int pipe);
+
 #endif

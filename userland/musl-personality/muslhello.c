@@ -15,9 +15,41 @@
 static volatile sig_atomic_t got_sig = 0;
 static void on_usr1(int s) { got_sig = s; }
 
-int
-main(void)
+static volatile sig_atomic_t got_int = 0;
+static void on_int(int s) { got_int = s; }
+
+/* Phase 6: interactive stdin + Ctrl-C, driven by `muslhello tty`. Reads a line from
+ * the keyboard, then installs a SIGINT handler and blocks on another read so a
+ * Ctrl-C can be delivered to it. */
+static int
+tty_test(void)
 {
+	setvbuf(stdout, NULL, _IONBF, 0);
+	char line[128];
+	printf("musltty: type a line + Enter:\n");
+	if (fgets(line, sizeof line, stdin))
+		printf("  you typed: %s", line); /* fgets keeps the trailing \n */
+	else
+		printf("  (EOF)\n");
+
+	signal(SIGINT, on_int);
+	printf("musltty: now press Ctrl-C:\n");
+	char l2[128];
+	char *r = fgets(l2, sizeof l2, stdin);
+	if (got_int)
+		printf("  caught SIGINT (sig=%d)\n", (int)got_int);
+	else if (r)
+		printf("  line2: %s", l2);
+	else
+		printf("  (no signal, EOF)\n");
+	return 0;
+}
+
+int
+main(int argc, char **argv)
+{
+	if (argc > 1 && strcmp(argv[1], "tty") == 0)
+		return tty_test();
 	setvbuf(stdout, NULL, _IONBF, 0); /* unbuffered, so output order is deterministic */
 	printf("Hello from musl libc, running on oxbow!\n");
 
@@ -77,6 +109,42 @@ main(void)
 	int st2 = 0;
 	pid_t w2 = waitpid(p2, &st2, 0);
 	printf("  fork#2: pid=%d waited=%d exit=%d\n", (int)p2, (int)w2, WEXITSTATUS(st2));
+
+	/* Phase 6: pipe() + fork() — child writes, parent reads (POSIX shared pipe). */
+	printf("  --- pipe + fork ---\n");
+	int pfd[2];
+	if (pipe(pfd) == 0) {
+		pid_t pc = fork();
+		if (pc == 0) {
+			close(pfd[0]);
+			write(pfd[1], "ping", 4);
+			close(pfd[1]);
+			_exit(0);
+		}
+		close(pfd[1]);
+		char pb[16];
+		int pn = read(pfd[0], pb, sizeof pb - 1);
+		pb[pn > 0 ? pn : 0] = 0;
+		close(pfd[0]);
+		int ws;
+		waitpid(pc, &ws, 0);
+		printf("  pipe got: \"%s\" (%d bytes, expect ping)\n", pb, pn);
+	}
+
+	/* Phase 6: dup2 — redirect a pipe read end onto fd 7, read via that fd. */
+	printf("  --- dup2 ---\n");
+	int d[2];
+	if (pipe(d) == 0) {
+		write(d[1], "dup2ok", 6);
+		close(d[1]);
+		dup2(d[0], 7);
+		close(d[0]);
+		char db[16];
+		int dn = read(7, db, sizeof db - 1);
+		db[dn > 0 ? dn : 0] = 0;
+		close(7);
+		printf("  dup2(pipe,7) read: \"%s\" (expect dup2ok)\n", db);
+	}
 
 	return 0;
 }

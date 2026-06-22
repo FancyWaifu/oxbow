@@ -26,6 +26,9 @@
 #define NR_madvise           28
 #define NR_dup               32
 #define NR_dup2              33
+#define NR_pipe              22
+#define NR_pipe2             293
+#define NR_dup3              292
 #define NR_nanosleep         35
 #define NR_getpid            39
 #define NR_clone             56
@@ -79,6 +82,9 @@
 
 /* a few errnos we return as negatives */
 #define E_NOSYS  38
+#define E_INTR   4
+/* __oxbow_read returns this (= -EINTR) when a tty read is interrupted by Ctrl-C. */
+#define OX_READ_EINTR (-4L)
 #define E_BADF   9
 #define E_INVAL  22
 #define E_FAULT  14

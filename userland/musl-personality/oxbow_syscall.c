@@ -53,11 +53,18 @@ static long do_clock_gettime(long id, struct ox_timespec *ts)
 
 /* ----------------------------- fd table ------------------------------------ */
 #define MAXFD 64
+/* fd kinds. FILE backs a fsd file (handle = fsd cap, uses off/size); PIPE_R/PIPE_W
+ * back an oxbow pipe endpoint (handle = pipe handle); TTY is the interactive console
+ * (fds 0/1/2 by default — not table-resident unless dup2 redirects them). */
+#define K_FILE   0
+#define K_PIPE_R 1
+#define K_PIPE_W 2
 struct oxfd {
 	int used;
-	long handle;         /* fsd file capability */
-	unsigned long off;   /* current file offset */
-	unsigned long size;  /* known size (grows on write) */
+	int kind;
+	long handle;         /* fsd file cap (FILE) or pipe handle (PIPE_*) */
+	unsigned long off;   /* current file offset (FILE only) */
+	unsigned long size;  /* known size, grows on write (FILE only) */
 };
 static struct oxfd fds[MAXFD];
 
@@ -69,11 +76,12 @@ static unsigned long slen(const char *s)
 	return n;
 }
 
-static int fd_alloc(long handle, unsigned long size)
+static int fd_alloc_kind(long handle, unsigned long size, int kind)
 {
 	for (int i = 3; i < MAXFD; i++) {
 		if (!fds[i].used) {
 			fds[i].used = 1;
+			fds[i].kind = kind;
 			fds[i].handle = handle;
 			fds[i].off = 0;
 			fds[i].size = size;
@@ -81,6 +89,23 @@ static int fd_alloc(long handle, unsigned long size)
 		}
 	}
 	return -1;
+}
+
+static int fd_alloc(long handle, unsigned long size)
+{
+	return fd_alloc_kind(handle, size, K_FILE);
+}
+
+/* Close whatever an fd backs (pipe endpoints need an explicit pipe close). */
+static void fd_release(int fd)
+{
+	if (fd < 0 || fd >= MAXFD || !fds[fd].used)
+		return;
+	if (fds[fd].kind == K_PIPE_R || fds[fd].kind == K_PIPE_W)
+		__oxbow_pipe_close((unsigned int)fds[fd].handle);
+	else if (fds[fd].kind == K_FILE)
+		__oxbow_fs_close(fds[fd].handle);
+	fds[fd].used = 0;
 }
 
 static long do_open(const char *path, long flags)
@@ -109,32 +134,100 @@ static long do_open(const char *path, long flags)
 	return fd;
 }
 
-/* read/write that dispatch on fd: 0/1/2 -> the tty path, >=3 -> fsd file. */
+static long deliver_self(int sig); /* forward: SIGINT on a Ctrl-C'd tty read */
+
+/* read/write dispatch on the fd's kind. A table-resident fd (incl. one dup2'd onto
+ * 0/1/2) uses its kind; a bare 0/1/2 is the interactive tty. */
 static long do_read(long fd, void *buf, unsigned long len)
 {
-	if (fd < 3)
-		return __oxbow_read((int)fd, buf, len);
-	if (fd >= MAXFD || !fds[fd].used)
-		return -E_BADF;
-	long n = __oxbow_fs_pread(fds[fd].handle, buf, len, fds[fd].off);
-	if (n > 0)
-		fds[fd].off += (unsigned long)n;
-	return n;
+	if (fd >= 0 && fd < MAXFD && fds[fd].used) {
+		if (fds[fd].kind == K_PIPE_R)
+			return __oxbow_pipe_read((unsigned int)fds[fd].handle, buf, len);
+		if (fds[fd].kind == K_FILE) {
+			long n = __oxbow_fs_pread(fds[fd].handle, buf, len, fds[fd].off);
+			if (n > 0)
+				fds[fd].off += (unsigned long)n;
+			return n;
+		}
+		return -E_BADF; /* read on a write-only pipe end */
+	}
+	if (fd < 3) {
+		long n = __oxbow_read((int)fd, buf, len);
+		if (n == OX_READ_EINTR) {  /* Ctrl-C while blocked for input */
+			deliver_self(2);   /* SIGINT: run handler, or default-terminate */
+			return -E_INTR;    /* a handler ran -> report EINTR to the caller */
+		}
+		return n;
+	}
+	return -E_BADF;
 }
 
 static long do_write(long fd, const void *buf, unsigned long len)
 {
+	if (fd >= 0 && fd < MAXFD && fds[fd].used) {
+		if (fds[fd].kind == K_PIPE_W)
+			return __oxbow_pipe_write((unsigned int)fds[fd].handle, buf, len);
+		if (fds[fd].kind == K_FILE) {
+			long n = __oxbow_fs_pwrite(fds[fd].handle, buf, len, fds[fd].off);
+			if (n > 0) {
+				fds[fd].off += (unsigned long)n;
+				if (fds[fd].off > fds[fd].size)
+					fds[fd].size = fds[fd].off;
+			}
+			return n;
+		}
+		return -E_BADF; /* write on a read-only pipe end */
+	}
 	if (fd == 1 || fd == 2)
 		return __oxbow_write((int)fd, buf, len);
-	if (fd < 3 || fd >= MAXFD || !fds[fd].used)
-		return -E_BADF;
-	long n = __oxbow_fs_pwrite(fds[fd].handle, buf, len, fds[fd].off);
-	if (n > 0) {
-		fds[fd].off += (unsigned long)n;
-		if (fds[fd].off > fds[fd].size)
-			fds[fd].size = fds[fd].off;
+	return -E_BADF;
+}
+
+/* pipe(): create an oxbow pipe pair, install its ends in the fd table, write the two
+ * fds to fd_out[0]=read, fd_out[1]=write. Backs pipe()/pipe2() and (with fork) the
+ * popen()/system() machinery. */
+static long do_pipe(int *fd_out)
+{
+	unsigned int re = 0, we = 0;
+	if (__oxbow_pipe(&re, &we) != 0)
+		return -E_INVAL;
+	int rfd = fd_alloc_kind((long)re, 0, K_PIPE_R);
+	int wfd = fd_alloc_kind((long)we, 0, K_PIPE_W);
+	if (rfd < 0 || wfd < 0) {
+		if (rfd >= 0)
+			fd_release(rfd);
+		else
+			__oxbow_pipe_close(re);
+		if (wfd >= 0)
+			fd_release(wfd);
+		else
+			__oxbow_pipe_close(we);
+		return -E_MFILE;
 	}
-	return n;
+	fd_out[0] = rfd;
+	fd_out[1] = wfd;
+	return 0;
+}
+
+/* dup2(old,new): make `new` refer to whatever `old` does. Pipe ends are dup'd via
+ * the pipe handle (a fresh refcount); file fds share the fsd cap (close-once caveat,
+ * acceptable for the redirect-then-exec idiom). Returns new. */
+static long do_dup2(long oldfd, long newfd)
+{
+	if (oldfd < 0 || oldfd >= MAXFD || !fds[oldfd].used)
+		return -E_BADF;
+	if (newfd < 0 || newfd >= MAXFD)
+		return -E_BADF;
+	if (oldfd == newfd)
+		return newfd;
+	fd_release((int)newfd);
+	fds[newfd] = fds[oldfd];
+	fds[newfd].used = 1;
+	if (fds[oldfd].kind == K_PIPE_R || fds[oldfd].kind == K_PIPE_W) {
+		long nh = __oxbow_pipe_dup((unsigned int)fds[oldfd].handle);
+		fds[newfd].handle = (nh >= 0) ? nh : fds[oldfd].handle;
+	}
+	return newfd;
 }
 
 /* Fill a Linux x86_64 `struct kstat` (== the kernel stat, 144 bytes). On x86_64
@@ -240,8 +333,15 @@ static long do_exec_spawn(const char *path, char *const argv[])
 	}
 	__oxbow_fs_close(h);
 
+	/* Honor a dup2'd stdout: if fd 1 was redirected onto a pipe (the popen /
+	 * `awk | cmd` idiom: pipe()+fork()+dup2(we,1)+exec), hand the exec'd child that
+	 * pipe as its stdout instead of our tty. Otherwise inherit our SPAWN_STDOUT(=2). */
+	unsigned int stdout_cap = 2;
+	if (fds[1].used && fds[1].kind == K_PIPE_W)
+		stdout_cap = (unsigned int)fds[1].handle;
+
 	unsigned int pid = 0;
-	long notif = __oxbow_spawn(elf, got, blob, (unsigned long)bl, 2 /*SPAWN_STDOUT*/, &pid);
+	long notif = __oxbow_spawn(elf, got, blob, (unsigned long)bl, stdout_cap, &pid);
 	free(elf);
 	if (notif < 0)
 		return -E_NOENT;
@@ -398,12 +498,11 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		/* a1=dirfd (only AT_FDCWD / absolute supported now), a2=path, a3=flags */
 		return do_open((const char *)a2, a3);
 	case NR_close:
-		if (a1 < 3)
-			return 0;
-		if (a1 >= MAXFD || !fds[a1].used)
+		if (a1 < 0 || a1 >= MAXFD)
 			return -E_BADF;
-		__oxbow_fs_close(fds[a1].handle);
-		fds[a1].used = 0;
+		if (!fds[a1].used)
+			return (a1 < 3) ? 0 : -E_BADF; /* bare std streams: nothing to close */
+		fd_release((int)a1); /* pipe ends + files freed by kind */
 		return 0;
 	case NR_lseek: {
 		long fd = a1, off = a2;
@@ -623,9 +722,23 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		ox_syscall1(OX_SYS_EXIT, a1);
 		__builtin_unreachable();
 
-	/* ---- not yet: fork/exec (Phase 3), the rest ---- */
-	case NR_dup:
+	/* ---- pipes + fd duplication (Phase 6) ---- */
+	case NR_pipe:
+		return do_pipe((int *)a1);
+	case NR_pipe2: /* flags (O_CLOEXEC/O_NONBLOCK) ignored — no exec-close yet */
+		return do_pipe((int *)a1);
 	case NR_dup2:
+		return do_dup2(a1, a2);
+	case NR_dup3: /* flags ignored */
+		return do_dup2(a1, a2);
+	case NR_dup: {
+		for (int i = 3; i < MAXFD; i++)
+			if (!fds[i].used)
+				return do_dup2(a1, i);
+		return -E_MFILE;
+	}
+
+	/* ---- not yet: the rest ---- */
 	case NR_fcntl:
 	case NR_access:
 	case NR_readlink:

@@ -41,6 +41,17 @@ fn w(s: &[u8]) {
 /// Reply one chunk of `line` starting at `off`: data[0] = chunk byte count,
 /// data[1] = 1 if more chunks follow (else 0), payload at byte offset 16. The
 /// shell loops READ, accumulating chunks until `more` is 0. Returns the new off.
+/// Reply to a blocked reader with a zero-length control marker in data[1]:
+/// 2 = EOF (Ctrl-D), 3 = interrupt (Ctrl-C). A normal line uses 0/1 (see send_chunk),
+/// so readers distinguish "empty line" from "EOF"/"interrupted".
+fn send_marker(reply: Handle, marker: u64) {
+    let mut m = MsgBuf::new(TAG_TTY_LINE);
+    m.data[0] = 0;
+    m.data[1] = marker;
+    m.data_len = 8;
+    let _ = rt::sys_reply(reply, &m);
+}
+
 fn send_chunk(reply: Handle, line: &[u8], off: usize) -> usize {
     let n = core::cmp::min(CHUNK, line.len() - off);
     let mut m = MsgBuf::new(TAG_TTY_LINE);
@@ -135,8 +146,29 @@ pub extern "C" fn oxbow_main() -> ! {
                     elen = 0;
                     echoed = 0;
                     if pending != HANDLE_NULL {
-                        let _ = send_chunk(pending, &[], 0);
+                        // Marker 3 = interrupt. A program reader turns this into a
+                        // SIGINT; the shell treats it as a cancelled (empty) line and
+                        // re-prompts. (Was an empty line — indistinguishable from a
+                        // blank Enter, so a program couldn't see the ^C.)
+                        send_marker(pending, 3);
                         pending = HANDLE_NULL;
+                    }
+                }
+                // Ctrl-D: EOF on an empty line; otherwise flush the partial line (no
+                // Enter needed), like a Unix tty. Only meaningful with a waiting reader.
+                0x04 => {
+                    if pending != HANDLE_NULL {
+                        if elen == 0 {
+                            send_marker(pending, 2); // EOF
+                        } else {
+                            w(b"\n");
+                            deliver[..elen].copy_from_slice(&edit[..elen]);
+                            dvlen = elen;
+                            dvoff = send_chunk(pending, &deliver[..dvlen], 0);
+                        }
+                        pending = HANDLE_NULL;
+                        elen = 0;
+                        echoed = 0;
                     }
                 }
                 b'\n' | b'\r' => {
