@@ -1,5 +1,13 @@
 # Access rules: where the namespace-policy system can go
 
+> **Status (implemented):** the whole roadmap below is now built and verified —
+> per-process confinement (`confine`), nested/single-file mounts, the rights set
+> (ro/rw/append/list/nodelete), network as a governed resource, and per-program
+> profiles + roles. See the "Suggested roadmap" section at the end for the
+> per-item status, and the `grant`/`role`/`assign`/`profile`/`confine`/`rules`
+> shell commands. This document is kept as the design rationale.
+
+
 ## What exists today (commits 7f956dc, ce5621e)
 
 Root defines **access rules** that decide which top-level directories each user
@@ -128,19 +136,29 @@ would need byte accounting). Turns qualitative access into quantitative limits.
 
 ---
 
-## Suggested roadmap (value / effort)
+## Suggested roadmap (value / effort) — all implemented
 
-1. **Per-process confinement (1a)** — reuse the existing namespace + RO_CAP
-   machinery at spawn time; add a `confine ... -- cmd` builtin. *Highest value,
-   lowest effort: the enforcement already exists.*
-2. **Nested-path & single-file mounts (2a)** — generalise `ns_mount_for` from
-   top-level component to path prefix. Unlocks curated `/bin` and finer grants.
-3. **More rights (3, append-only / exec-only / list-only)** — extend the badge
-   bit into a small rights field; one check per new right.
-4. **Network as a governed resource (2b)** — gate `BOOT_NET_EP` by rule, then a
-   per-host socket broker. *Highest "feels like a real OS" payoff.*
-5. **Per-program profiles & roles (1b/1c)** — profile table keyed by exec path /
-   role name; compose at exec/login.
+1. **Per-process confinement (1a)** — DONE. `confine <dir>[:right] ... -- <cmd>`
+   mints a fresh namespace (home + /bin + listed dirs only) and runs the command in
+   it. Non-root is limited to dirs it already holds (monotonicity); root may mount
+   anything.
+2. **Nested-path & single-file mounts (2a)** — DONE. `ns_mount_for` matches a path
+   prefix component-wise (longest wins); a grant may be `projects/oxbow` or a file.
+3. **More rights (3)** — DONE. The badge carries a rights value (FS_RIGHT_*):
+   ro / rw / append / list / nodelete, checked per operation. (exec-only/no-exec was
+   left out — exec reads bytes via the normal read path, so it isn't cleanly
+   separable at the fs-cap layer; the `confine` curated-/bin approach covers the
+   "which tools" need instead.)
+4. **Network as a governed resource (2b)** — DONE (the gate). `BOOT_NET_EP` is handed
+   to a spawned program only when the session/profile has a `net` rule (`grant <u>
+   net`); root always has it. The per-host socket broker remains a future refinement.
+5. **Per-program profiles & roles (1b/1c)** — DONE. `role <r> <dir|net> [right]` +
+   `assign <user> <role>` for reusable bundles; `profile <prog> <dir|net> [right]`
+   confines a named program at exec to home + /bin + the profile's mounts.
+
+The throughline held: the **kernel** never learned about users, rules, or rights —
+all of this lives in the userspace policy authority (the shell composing namespaces +
+fsd enforcing badge-carried rights). Each axis was additive.
 
 The throughline: keep the **kernel** capability-pure (it never learns about
 "users" or "rules"), and keep growing the **userspace policy authority** (the
