@@ -23,6 +23,31 @@ app → musl (stock) → __syscallN → __oxbow_syscall → oxbow rt/kernel
 - `oxsys.h` — oxbow raw-syscall inline asm + oxbow syscall numbers + rt shim decls.
 - `build-musl.sh` — builds vendored musl with the override + compiles the dispatcher.
 
+## Status — Phase 9 reached: async Ctrl-C (terminate + run handlers) ✅
+Ctrl-C now interrupts a *running* foreground program, not just one blocked in a read:
+```
+root@oxbow:/$ muslhello loop          # CPU-bound loop with a SIGINT handler
+musltty: looping (CPU-bound) — press Ctrl-C
+^C
+  caught async SIGINT (sig=2) after 3173 spins — handler ran!
+root@oxbow:/$
+```
+- **Step 1 (terminate):** the kernel tracks the controlling-tty FOREGROUND_PID (the
+  shell sets it around a foreground wait); the tty, on Ctrl-C with no reader blocked,
+  calls `SYS_TTY_INTR` → the kernel terminates the foreground (default SIGINT action).
+- **Step 2 (run the handler):** if the foreground process registered an async-signal
+  dispatcher (`SYS_SIGDISPATCH`, done at startup by the musl personality), the kernel
+  injects a signal frame at its next syscall return — saving the interrupted context
+  to the user stack and redirecting to a userland trampoline that runs the Phase-4
+  handler, then `SYS_SIGRETURN` restores and resumes. A no-op on the syscall hot path.
+- NOT yet: FPU/SSE save across the handler; a pure no-syscall busy loop (needs the
+  timer-IRQ return path — only syscall-return injection so far).
+
+## Status — Phase 8 reached: getdents, poll/select, exec stdin-redirect ✅
+`opendir`/`readdir` list directories (getdents64 + a K_DIR fd kind), `poll`/`select`
+report the requested fds ready, and a dup2'd stdin pipe is passed to an exec'd child
+(popen-"w" / pipeline path; needed the pipe read end to carry R_GRANT + EOF-on-close).
+
 ## Status — Phase 7 reached: a real interactive TUI editor runs (kilo) ✅
 antirez's `kilo` editor, built unmodified from upstream C, runs on oxbow via the musl
 personality — raw-mode keystroke input, a TUI rendered with ANSI escapes, and saving
