@@ -15,8 +15,9 @@ use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_CONSOLE, BOOT_FS_ROOT, BOOT_IMG_BADGE, BOOT_IMG_BETA, BOOT_NET_EP,
     BOOT_IMG_HELLO, BOOT_IMG_PONG,
     BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_LUA, BOOT_IMG_UPY, BOOT_IMG_QJS, BOOT_IMG_CURL, BOOT_IMG_CARES, BOOT_IMG_FFI, BOOT_IMG_WL, BOOT_IMG_XKB, BOOT_IMG_VTERM, BOOT_IMG_FT, BOOT_IMG_JAIL, BOOT_IMG_FSTEST, BOOT_MEM, BOOT_SESSION_CHAN, BOOT_TICK, BOOT_TTY,
+    FS_RIGHT_APPEND, FS_RIGHT_LIST, FS_RIGHT_NODELETE, FS_RIGHT_RO, FS_RIGHT_RW,
     HANDLE_NULL, IdentRec, R_GRANT, R_IN, R_OUT, R_RECV,
-    R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_NAMESPACE, TAG_FS_NS_MOUNT, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_FLUSH, TAG_TTY_READ, TAG_TTY_WRITE,
+    R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_NAMESPACE, TAG_FS_NS_MOUNT, TAG_FS_OPEN, TAG_FS_RELEASE, TAG_FS_WRITE, TAG_TTY_FLUSH, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 use blake2::{Blake2b, Digest};
@@ -666,7 +667,7 @@ fn spawn_with_budget(image: Handle, cap0: Handle, arg: &[u8], budget: u64, sp: &
     m.handles[0] = cap0; // slot 1 = BOOT_EP (a file/dir cap, or NULL)
     m.handles[1] = sp.stdout; // slot 2 = SPAWN_STDOUT
     m.handles[2] = HANDLE_NULL; // slot 4 = BOOT_TICK (unused here)
-    m.handles[3] = BOOT_NET_EP; // slot 20 = BOOT_NET_EP (network access)
+    m.handles[3] = net_cap(); // slot 20 = network access (NULL if the session lacks it)
     match rt::sys_spawn(image, BOOT_MEM, &m, sp.exit) {
         Ok(_) => {
             wait_exits(sp, 1);
@@ -823,7 +824,7 @@ fn find_program(verb: &[u8], path: &Path) -> Option<usize> {
 /// Run the program currently in `ELF_BUF[..len]` to completion (exec-from-fs, ABI
 /// §33): cwd dir cap at slot 1, stdout at slot 2, the net cap at slot 20, argv =
 /// `args`, and our identity. The exit status flows into `$?`.
-fn run_program(len: usize, cwd: Handle, cmd: &[u8], args: &[u8], bg: bool, sp: &Spawner) {
+fn run_program(len: usize, cwd: Handle, cmd: &[u8], args: &[u8], bg: bool, net: Handle, sp: &Spawner) {
     let mut sm = MsgBuf::new(0);
     // §96/§104: 64 MiB default budget — std programs spawn threads (each a 256 KiB
     // stack); a thread-heavy program (e.g. a libtest runner spawning dozens of
@@ -845,7 +846,7 @@ fn run_program(len: usize, cwd: Handle, cmd: &[u8], args: &[u8], bg: bool, sp: &
     sm.handles[0] = cwd;
     sm.handles[1] = sp.stdout;
     sm.handles[2] = HANDLE_NULL; // slot 4 (stdin) unused outside a pipeline
-    sm.handles[3] = BOOT_NET_EP; // slot 20 = network access
+    sm.handles[3] = net; // slot 20 = network access (gated by rules/profile)
     let elf = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(ELF_BUF) as *const u8, len) };
     // A background job runs untracked (exit notif = NULL) so its later exit/kill can't
     // be mistaken for a foreground command's exit; it's reaped by the kernel on exit.
@@ -877,7 +878,18 @@ fn run_program(len: usize, cwd: Handle, cmd: &[u8], args: &[u8], bg: bool, sp: &
 fn path_exec(cmd: &[u8], rest: &[u8], cwd: Handle, path: &Path, bg: bool, sp: &Spawner) -> bool {
     match find_program(cmd, path) {
         Some(len) => {
-            run_program(len, cwd, cmd, rest, bg, sp);
+            // §profile: if root defined a confinement profile for this program name,
+            // run it in a fresh namespace with ONLY home + /bin + the profile's mounts
+            // (its other session grants dropped), and net gated by the profile.
+            let prof = cur_acct_index().and_then(|i| program_profile_ns(cmd, i));
+            match prof {
+                Some(ns) => {
+                    let net = if program_has_net(cmd) { net_cap() } else { HANDLE_NULL };
+                    run_program(len, ns, cmd, rest, bg, net, sp);
+                    release_ns(ns);
+                }
+                None => run_program(len, cwd, cmd, rest, bg, net_cap(), sp),
+            }
             true
         }
         None => false,
@@ -1763,7 +1775,7 @@ fn spawn_stage(
     m.handles[0] = cwd; // slot 1 = cwd dir cap (ls/cat resolve names against it)
     m.handles[1] = stdout_h; // slot 2 = SPAWN_STDOUT (pipe write end or tty)
     m.handles[2] = stdin_h; // slot 4 = SPAWN_STDIN (pipe read end, or NULL)
-    m.handles[3] = BOOT_NET_EP; // slot 20 = BOOT_NET_EP
+    m.handles[3] = net_cap(); // slot 20 = network access (gated by rules)
     let elf = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(ELF_BUF) as *const u8, len) };
     let ok = rt::sys_spawn_bytes(elf, BOOT_MEM, &m, exit).is_ok();
     if !ok {
@@ -1868,6 +1880,10 @@ fn run_command(line0: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"passwd" => passwd_cmd(),
         b"grant" => grant_cmd(rest),
         b"revoke" => revoke_cmd(rest),
+        b"role" => role_cmd(rest),
+        b"assign" => assign_cmd(rest),
+        b"profile" => profile_cmd(rest),
+        b"confine" => confine_cmd(rest, path, sp),
         b"rules" => rules_cmd(),
         b"logout" | b"exit" => {
             // §92: end the session and return to the graphical greeter — notify it
@@ -1912,8 +1928,12 @@ fn run_command(line0: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  id / groups     print uid/gid and group membership\n");
             tw(b"  su [user]       switch user (re-authenticate; default root)\n");
             tw(b"  passwd          change your password\n");
-            tw(b"  grant <u> <dir> root: let a user/@group reach a top-level dir [ro|rw]\n");
-            tw(b"  revoke <u> <dir> root: remove a granted rule\n");
+            tw(b"  grant <u> <dir|net> [right] root: grant a user/@group a dir or net\n");
+            tw(b"      right = ro|rw|append|list|nodelete (default rw); dir may be nested\n");
+            tw(b"  revoke <u> <dir|net> root: remove a rule\n");
+            tw(b"  role <r> <dir|net> [right] / assign <user> <role>  root: roles\n");
+            tw(b"  profile <prog> <dir|net> [right] root: confine a program to those mounts\n");
+            tw(b"  confine <dir>[:right] ... -- <cmd>  run cmd seeing only home+/bin+those dirs\n");
             tw(b"  rules           show the access rules (persisted in /etc/access.rules)\n");
             tw(b"  logout          end the session and return to the login prompt\n");
             tw(b"  help            this list\n");
@@ -2000,48 +2020,107 @@ fn session_root() -> Handle {
 // everything the user runs — no per-program configuration.
 // ===========================================================================
 
+// A rule binds a SUBJECT (who) to a RESOURCE (what), at a RIGHT (how). Subjects and
+// resources each have a kind, so one table expresses users, groups, roles and
+// per-program profiles over filesystem paths, the network, and role membership.
+const SUBJ_USER: u8 = 0; // a named user account
+const SUBJ_GROUP: u8 = 1; // a named group
+const SUBJ_ROLE: u8 = 2; // a named role (a reusable mount bundle); users are assigned to it
+const SUBJ_PROGRAM: u8 = 3; // a program name (a confinement profile, applied at exec)
+const RES_PATH: u8 = 0; // a filesystem path-prefix mount (rname = prefix, right = FS_RIGHT_*)
+const RES_NET: u8 = 1; // network access (the BOOT_NET_EP socket service)
+const RES_ROLE: u8 = 2; // role membership: this (user) subject belongs to role `rname`
+
 #[derive(Clone, Copy)]
 struct Rule {
     used: bool,
-    by_uid: bool, // true: match the subject's uid; false: match a group gid
-    subj: u32,    // the uid or gid this rule grants to
-    name: [u8; 32],
-    nlen: u8,
-    ro: bool, // mount read-only (deny create/truncate under it)
+    skind: u8,
+    sname: [u8; 32],
+    snlen: u8,
+    rkind: u8,
+    rname: [u8; 64],
+    rnlen: u8,
+    right: u8, // FS_RIGHT_* (for RES_PATH)
 }
-const EMPTY_RULE: Rule = Rule { used: false, by_uid: false, subj: 0, name: [0; 32], nlen: 0, ro: false };
-const MAX_RULES: usize = 64;
+const EMPTY_RULE: Rule = Rule {
+    used: false,
+    skind: 0,
+    sname: [0; 32],
+    snlen: 0,
+    rkind: 0,
+    rname: [0; 64],
+    rnlen: 0,
+    right: 0,
+};
+const MAX_RULES: usize = 96;
 /// Root's access rules, in shell memory (the live policy store). Persisted to
-/// /etc/access.rules on every change (see save_rules) and reloaded at boot, so
-/// grants survive reboot.
+/// /etc/access.rules on every change (see save_rules) and reloaded at boot, so the
+/// policy survives reboot.
 static mut RULES: [Rule; MAX_RULES] = [EMPTY_RULE; MAX_RULES];
+/// Whether the CURRENT session's spawned programs get the network endpoint. Set at
+/// login from the RES_NET rules (root always has it). The shell itself always holds
+/// BOOT_NET_EP (for its own dns/http builtins); this gates what it hands to children.
+static mut NET_ALLOWED: bool = false;
 
-/// Add/replace a rule. `subj`/`by_uid` pick the user or group; `comp` is a single
-/// top-level dir name. Idempotent on (subject, name): updates the ro flag.
-fn add_rule(by_uid: bool, subj: u32, comp: &[u8], ro: bool) -> bool {
-    if comp.is_empty() || comp.len() > 32 {
+impl Rule {
+    fn sname(&self) -> &[u8] {
+        &self.sname[..self.snlen as usize]
+    }
+    fn rname(&self) -> &[u8] {
+        &self.rname[..self.rnlen as usize]
+    }
+}
+
+/// Map a rights word to an FS_RIGHT_* value (default rw).
+fn parse_right(w: &[u8]) -> u8 {
+    match w {
+        b"ro" => FS_RIGHT_RO as u8,
+        b"append" => FS_RIGHT_APPEND as u8,
+        b"list" => FS_RIGHT_LIST as u8,
+        b"nodelete" => FS_RIGHT_NODELETE as u8,
+        _ => FS_RIGHT_RW as u8,
+    }
+}
+fn right_name(r: u8) -> &'static [u8] {
+    match r as u64 {
+        FS_RIGHT_RO => b"ro",
+        FS_RIGHT_APPEND => b"append",
+        FS_RIGHT_LIST => b"list",
+        FS_RIGHT_NODELETE => b"nodelete",
+        _ => b"rw",
+    }
+}
+fn skind_word(k: u8) -> &'static [u8] {
+    match k {
+        SUBJ_GROUP => b"group",
+        SUBJ_ROLE => b"role",
+        SUBJ_PROGRAM => b"program",
+        _ => b"user",
+    }
+}
+
+/// Add/replace a rule. Idempotent on (skind, sname, rkind, rname): updates the right.
+fn add_rule(skind: u8, sname: &[u8], rkind: u8, rname: &[u8], right: u8) -> bool {
+    if sname.is_empty() || sname.len() > 32 || rname.len() > 64 {
         return false;
     }
     unsafe {
-        // Update an existing rule for the same subject + dir.
         for r in RULES.iter_mut() {
-            if r.used
-                && r.by_uid == by_uid
-                && r.subj == subj
-                && &r.name[..r.nlen as usize] == comp
-            {
-                r.ro = ro;
+            if r.used && r.skind == skind && r.sname() == sname && r.rkind == rkind && r.rname() == rname {
+                r.right = right;
                 return true;
             }
         }
         for r in RULES.iter_mut() {
             if !r.used {
                 r.used = true;
-                r.by_uid = by_uid;
-                r.subj = subj;
-                r.nlen = comp.len() as u8;
-                r.name[..comp.len()].copy_from_slice(comp);
-                r.ro = ro;
+                r.skind = skind;
+                r.snlen = sname.len() as u8;
+                r.sname[..sname.len()].copy_from_slice(sname);
+                r.rkind = rkind;
+                r.rnlen = rname.len() as u8;
+                r.rname[..rname.len()].copy_from_slice(rname);
+                r.right = right;
                 return true;
             }
         }
@@ -2049,15 +2128,11 @@ fn add_rule(by_uid: bool, subj: u32, comp: &[u8], ro: bool) -> bool {
     false
 }
 
-/// Remove a rule for (subject, dir). Returns true if one was found and cleared.
-fn remove_rule(by_uid: bool, subj: u32, comp: &[u8]) -> bool {
+/// Remove a rule matching (skind, sname, rkind, rname). True if one was cleared.
+fn remove_rule(skind: u8, sname: &[u8], rkind: u8, rname: &[u8]) -> bool {
     unsafe {
         for r in RULES.iter_mut() {
-            if r.used
-                && r.by_uid == by_uid
-                && r.subj == subj
-                && &r.name[..r.nlen as usize] == comp
-            {
+            if r.used && r.skind == skind && r.sname() == sname && r.rkind == rkind && r.rname() == rname {
                 *r = EMPTY_RULE;
                 return true;
             }
@@ -2066,16 +2141,26 @@ fn remove_rule(by_uid: bool, subj: u32, comp: &[u8]) -> bool {
     false
 }
 
-/// Send a TAG_FS_NS_MOUNT to the namespace cap: makes top-level `name` resolve
-/// against the fs root (shared), read-only iff `ro`. Returns true on success.
-fn mount_into(ns_cap: Handle, name: &[u8], ro: bool) -> bool {
+/// Send a TAG_FS_NS_MOUNT to a namespace cap: makes the path PREFIX `name` resolve
+/// against the fs root (shared), at rights `right`. Returns true on success.
+fn mount_into(ns_cap: Handle, name: &[u8], right: u8) -> bool {
     let mut m = MsgBuf::new(TAG_FS_NS_MOUNT);
     pack_name(&mut m, name);
-    m.data[63] = if ro { 1 } else { 0 };
-    // The ro flag lives in data[63]; the kernel copies only `data_len` words, so
-    // send the whole message (like TAG_FS_OPEN's flags) — else the flag is dropped.
+    m.data[63] = right as u64;
+    // Rights ride in data[63]; the kernel copies only `data_len` words, so send the
+    // whole message (like TAG_FS_OPEN's flags) — else the field is dropped.
     m.data_len = 64;
     rt::sys_call(ns_cap, &mut m).is_ok() && m.data[0] == 0
+}
+
+/// Release a namespace cap: tell fsd to drop the node (so its fresh node + mounts are
+/// reclaimed — namespaces aren't auto-released on close like file caps), then close it.
+fn release_ns(cap: Handle) {
+    if cap != BOOT_FS_ROOT && cap != HANDLE_NULL {
+        let mut m = MsgBuf::new(TAG_FS_RELEASE);
+        let _ = rt::sys_call(cap, &mut m);
+        let _ = rt::sys_close(cap);
+    }
 }
 
 /// Map a group name to its gid (the reverse of `gid_name`); None if unknown.
@@ -2089,13 +2174,106 @@ fn group_gid(name: &[u8]) -> Option<u32> {
     }
 }
 
-/// The first non-empty top-level component of a path (`/bin/x` -> `bin`).
-fn top_component(path: &[u8]) -> &[u8] {
-    path.split(|&b| b == b'/').find(|c| !c.is_empty()).unwrap_or(&[])
+/// Trim leading/trailing slashes from a path (so `/docs/` -> `docs`).
+fn strip_slashes(p: &[u8]) -> &[u8] {
+    let mut s = 0;
+    let mut e = p.len();
+    while s < e && p[s] == b'/' {
+        s += 1;
+    }
+    while e > s && p[e - 1] == b'/' {
+        e -= 1;
+    }
+    &p[s..e]
 }
 
-/// `grant <user|@group> <dir> [ro|rw]` — root only. Adds an access rule that
-/// mounts a top-level dir into the subject's namespace at their next login.
+/// Is `name` the name of a known account?
+fn is_user(name: &[u8]) -> bool {
+    ACCTS.iter().any(|a| a.name == name)
+}
+
+/// True if user `aname` has been assigned role `role` (a RES_ROLE membership rule).
+fn user_in_role(aname: &[u8], role: &[u8]) -> bool {
+    unsafe {
+        RULES.iter().any(|r| {
+            r.used && r.skind == SUBJ_USER && r.rkind == RES_ROLE && r.sname() == aname && r.rname() == role
+        })
+    }
+}
+
+/// Does rule `r`'s subject match account `a` (for login-time namespace composition)?
+/// PROGRAM rules never match here — they apply per-exec (see program_profile_ns).
+fn subject_matches(r: &Rule, a: &AcctDef) -> bool {
+    match r.skind {
+        SUBJ_USER => r.sname() == a.name,
+        SUBJ_GROUP => group_gid(r.sname()).map_or(false, |g| a.groups.contains(&g)),
+        SUBJ_ROLE => user_in_role(a.name, r.sname()),
+        _ => false,
+    }
+}
+
+/// Do `name`'s leading path components match `prefix`'s exactly? (So `projects/oxbow`
+/// is "under" `projects`.) Mirrors fsd's matcher so confinement checks agree.
+fn comp_prefix(name: &[u8], prefix: &[u8]) -> bool {
+    let mut n = name.split(|&b| b == b'/').filter(|c| !c.is_empty());
+    let p = prefix.split(|&b| b == b'/').filter(|c| !c.is_empty());
+    for pc in p {
+        match n.next() {
+            Some(nc) if nc == pc => continue,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The right account `i` already holds for `dir` (so a non-root user can only confine a
+/// process to dirs they can already reach — capability monotonicity). None = unreachable.
+fn caller_granted_right(i: usize, dir: &[u8]) -> Option<u8> {
+    if dir == b"bin" {
+        return Some(FS_RIGHT_RO as u8);
+    }
+    let a = &ACCTS[i];
+    let mut best: Option<u8> = None;
+    unsafe {
+        for r in RULES.iter() {
+            if r.used && r.rkind == RES_PATH && subject_matches(r, a) && comp_prefix(dir, r.rname()) {
+                best = Some(r.right);
+            }
+        }
+    }
+    best
+}
+
+/// Shared parse for the `grant`/`revoke` subject token `<user|@group>`.
+fn parse_grant_subject(subj: &[u8]) -> Option<(u8, &[u8])> {
+    if let Some(g) = subj.strip_prefix(b"@") {
+        if group_gid(g).is_some() {
+            Some((SUBJ_GROUP, g))
+        } else {
+            None
+        }
+    } else if is_user(subj) {
+        Some((SUBJ_USER, subj))
+    } else {
+        None
+    }
+}
+
+/// Add a resource rule for an already-resolved subject. `res` is `net` or a path;
+/// `mode` the optional rights word. Returns a status string for the caller to print.
+fn add_resource_rule(skind: u8, sname: &[u8], res: &[u8], mode: &[u8]) -> bool {
+    if res == b"net" {
+        add_rule(skind, sname, RES_NET, b"net", 0)
+    } else {
+        let dir = strip_slashes(res);
+        if dir.is_empty() {
+            return false;
+        }
+        add_rule(skind, sname, RES_PATH, dir, parse_right(mode))
+    }
+}
+
+/// `grant <user|@group> <dir|net> [ro|rw|append|list|nodelete]` — root only.
 fn grant_cmd(rest: &[u8]) {
     if cur_ident().uid != 0 {
         tw(b"grant: permission denied (root only)\n");
@@ -2103,62 +2281,31 @@ fn grant_cmd(rest: &[u8]) {
         return;
     }
     let (subj, r1) = split_cmd(rest);
-    let (patharg, r2) = split_cmd(r1);
+    let (res, r2) = split_cmd(r1);
     let (mode, _) = split_cmd(r2);
-    if subj.is_empty() || patharg.is_empty() {
-        tw(b"grant: usage: grant <user|@group> <dir> [ro|rw]  (default rw)\n");
+    if subj.is_empty() || res.is_empty() {
+        tw(b"grant: usage: grant <user|@group> <dir|net> [ro|rw|append|list|nodelete]\n");
         return;
     }
-    let (by_uid, sval) = if let Some(gn) = subj.strip_prefix(b"@") {
-        match group_gid(gn) {
-            Some(g) => (false, g),
-            None => {
-                tw(b"grant: unknown group\n");
-                set_status(1);
-                return;
-            }
-        }
-    } else {
-        match ACCTS.iter().find(|a| a.name == subj) {
-            Some(a) => (true, a.uid),
-            None => {
-                tw(b"grant: unknown user\n");
-                set_status(1);
-                return;
-            }
-        }
-    };
-    let comp = top_component(patharg);
-    if comp.is_empty() {
-        tw(b"grant: invalid dir\n");
+    let Some((skind, sname)) = parse_grant_subject(subj) else {
+        tw(b"grant: unknown user/group\n");
         set_status(1);
         return;
-    }
-    let ro = mode == b"ro";
-    if add_rule(by_uid, sval, comp, ro) {
-        save_rules(); // persist to /etc/access.rules so it survives reboot
+    };
+    if add_resource_rule(skind, sname, res, mode) {
+        save_rules();
         tw(b"granted ");
         tw(subj);
-        tw(b" -> /");
-        tw(comp);
-        tw(if ro { b" (read-only)" } else { b" (read-write)" });
+        tw(b" -> ");
+        tw(res);
         tw(b" - takes effect at next login\n");
     } else {
-        tw(b"grant: rule table full\n");
+        tw(b"grant: rule table full or bad arg\n");
         set_status(1);
     }
 }
 
-/// Resolve a `<user|@group>` subject to (by_uid, value). None if unknown.
-fn resolve_subject(subj: &[u8]) -> Option<(bool, u32)> {
-    if let Some(gn) = subj.strip_prefix(b"@") {
-        group_gid(gn).map(|g| (false, g))
-    } else {
-        ACCTS.iter().find(|a| a.name == subj).map(|a| (true, a.uid))
-    }
-}
-
-/// `revoke <user|@group> <dir>` — root only. Removes a previously granted rule.
+/// `revoke <user|@group> <dir|net>` — root only.
 fn revoke_cmd(rest: &[u8]) {
     if cur_ident().uid != 0 {
         tw(b"revoke: permission denied (root only)\n");
@@ -2166,31 +2313,212 @@ fn revoke_cmd(rest: &[u8]) {
         return;
     }
     let (subj, r1) = split_cmd(rest);
-    let (patharg, _) = split_cmd(r1);
-    if subj.is_empty() || patharg.is_empty() {
-        tw(b"revoke: usage: revoke <user|@group> <dir>\n");
+    let (res, _) = split_cmd(r1);
+    if subj.is_empty() || res.is_empty() {
+        tw(b"revoke: usage: revoke <user|@group> <dir|net>\n");
         return;
     }
-    let Some((by_uid, sval)) = resolve_subject(subj) else {
+    let Some((skind, sname)) = parse_grant_subject(subj) else {
         tw(b"revoke: unknown user/group\n");
         set_status(1);
         return;
     };
-    let comp = top_component(patharg);
-    if remove_rule(by_uid, sval, comp) {
+    let ok = if res == b"net" {
+        remove_rule(skind, sname, RES_NET, b"net")
+    } else {
+        remove_rule(skind, sname, RES_PATH, strip_slashes(res))
+    };
+    if ok {
         save_rules();
         tw(b"revoked ");
         tw(subj);
-        tw(b" -> /");
-        tw(comp);
-        tw(b" - takes effect at next login\n");
+        tw(b" -> ");
+        tw(res);
+        tw(b"\n");
     } else {
         tw(b"revoke: no such rule\n");
         set_status(1);
     }
 }
 
-/// `rules` — print the current access rules (root's namespace policy).
+/// `role <rolename> <dir|net> [right]` — root only. Define a mount that role members
+/// inherit. Assign members with `assign <user> <rolename>`.
+fn role_cmd(rest: &[u8]) {
+    if cur_ident().uid != 0 {
+        tw(b"role: permission denied (root only)\n");
+        set_status(1);
+        return;
+    }
+    let (role, r1) = split_cmd(rest);
+    let (res, r2) = split_cmd(r1);
+    let (mode, _) = split_cmd(r2);
+    if role.is_empty() || res.is_empty() {
+        tw(b"role: usage: role <rolename> <dir|net> [right]\n");
+        return;
+    }
+    if add_resource_rule(SUBJ_ROLE, role, res, mode) {
+        save_rules();
+        tw(b"role ");
+        tw(role);
+        tw(b" gains ");
+        tw(res);
+        tw(b"\n");
+    } else {
+        tw(b"role: rule table full or bad arg\n");
+        set_status(1);
+    }
+}
+
+/// `assign <user> <rolename>` — root only. Make a user a member of a role.
+fn assign_cmd(rest: &[u8]) {
+    if cur_ident().uid != 0 {
+        tw(b"assign: permission denied (root only)\n");
+        set_status(1);
+        return;
+    }
+    let (user, r1) = split_cmd(rest);
+    let (role, _) = split_cmd(r1);
+    if user.is_empty() || role.is_empty() {
+        tw(b"assign: usage: assign <user> <rolename>\n");
+        return;
+    }
+    if !is_user(user) {
+        tw(b"assign: unknown user\n");
+        set_status(1);
+        return;
+    }
+    if add_rule(SUBJ_USER, user, RES_ROLE, role, 0) {
+        save_rules();
+        tw(user);
+        tw(b" assigned role ");
+        tw(role);
+        tw(b" - takes effect at next login\n");
+    } else {
+        tw(b"assign: rule table full\n");
+        set_status(1);
+    }
+}
+
+/// `profile <program> <dir|net> [right]` — root only. A confinement profile: when
+/// `program` is run, it gets ONLY home + /bin(ro) + the profile's mounts (its other
+/// session grants are dropped). See program_profile_ns.
+fn profile_cmd(rest: &[u8]) {
+    if cur_ident().uid != 0 {
+        tw(b"profile: permission denied (root only)\n");
+        set_status(1);
+        return;
+    }
+    let (prog, r1) = split_cmd(rest);
+    let (res, r2) = split_cmd(r1);
+    let (mode, _) = split_cmd(r2);
+    if prog.is_empty() || res.is_empty() {
+        tw(b"profile: usage: profile <program> <dir|net> [right]\n");
+        return;
+    }
+    if add_resource_rule(SUBJ_PROGRAM, prog, res, mode) {
+        save_rules();
+        tw(b"profile for ");
+        tw(prog);
+        tw(b" gains ");
+        tw(res);
+        tw(b"\n");
+    } else {
+        tw(b"profile: rule table full or bad arg\n");
+        set_status(1);
+    }
+}
+
+/// `confine <dir>[:right] ... -- <cmd> [args]` — run a command in a fresh namespace
+/// rooted at your home with ONLY /bin(ro) + the listed dirs (per-process confinement:
+/// the child sees LESS than your session). Non-root may only confine to dirs they
+/// already hold, at no more than their granted right (capability monotonicity); root
+/// may mount anything at any right.
+fn confine_cmd(rest: &[u8], path: &Path, sp: &Spawner) {
+    // Locate the standalone `--` token splitting dir specs from the command.
+    let mut sep: Option<(usize, usize)> = None;
+    {
+        let mut i = 0;
+        while i < rest.len() {
+            while i < rest.len() && rest[i] == b' ' {
+                i += 1;
+            }
+            let start = i;
+            while i < rest.len() && rest[i] != b' ' {
+                i += 1;
+            }
+            if &rest[start..i] == b"--" {
+                sep = Some((start, i));
+                break;
+            }
+        }
+    }
+    let Some((ds, de)) = sep else {
+        tw(b"confine: usage: confine <dir>[:ro|rw|append|list|nodelete] ... -- <cmd> [args]\n");
+        return;
+    };
+    let specs = &rest[..ds];
+    let mut j = de;
+    while j < rest.len() && rest[j] == b' ' {
+        j += 1;
+    }
+    let (cmd0, args) = split_cmd(&rest[j..]);
+    if cmd0.is_empty() {
+        tw(b"confine: no command after --\n");
+        return;
+    }
+    let Some(i) = cur_acct_index() else {
+        tw(b"confine: no account\n");
+        return;
+    };
+    let a = &ACCTS[i];
+    let mut m = MsgBuf::new(TAG_FS_NAMESPACE);
+    pack_name(&mut m, a.home);
+    if rt::sys_call(BOOT_FS_ROOT, &mut m).is_err() || m.data[0] != 0 {
+        tw(b"confine: cannot create namespace\n");
+        set_status(1);
+        return;
+    }
+    let ns = m.handles[0];
+    mount_into(ns, b"bin", FS_RIGHT_RO as u8);
+    for spec in specs.split(|&b| b == b' ').filter(|s| !s.is_empty()) {
+        let (dname, rspec) = match spec.iter().position(|&b| b == b':') {
+            Some(p) => (&spec[..p], &spec[p + 1..]),
+            None => (spec, &b"rw"[..]),
+        };
+        let dir = strip_slashes(dname);
+        if dir.is_empty() {
+            continue;
+        }
+        let right = if a.uid == 0 {
+            parse_right(rspec)
+        } else {
+            match caller_granted_right(i, dir) {
+                Some(g) => g, // narrowed to what you already hold
+                None => {
+                    tw(b"confine: not permitted: ");
+                    tw(dir);
+                    tw(b"\n");
+                    let _ = rt::sys_close(ns);
+                    set_status(1);
+                    return;
+                }
+            }
+        };
+        mount_into(ns, dir, right);
+    }
+    match find_program(cmd0, path) {
+        Some(len) => run_program(len, ns, cmd0, args, false, net_cap(), sp),
+        None => {
+            tw(b"confine: ");
+            tw(cmd0);
+            tw(b": command not found\n");
+            set_status(127);
+        }
+    }
+    release_ns(ns);
+}
+
+/// `rules` — print the current access rules.
 fn rules_cmd() {
     let mut any = false;
     unsafe {
@@ -2199,55 +2527,103 @@ fn rules_cmd() {
                 continue;
             }
             any = true;
-            if r.by_uid {
-                tw(b"user ");
-                match ACCTS.iter().find(|a| a.uid == r.subj) {
-                    Some(a) => tw(a.name),
-                    None => tw_dec_u32(r.subj),
+            tw(skind_word(r.skind));
+            tw(b" ");
+            tw(r.sname());
+            match r.rkind {
+                RES_NET => tw(b" -> net\n"),
+                RES_ROLE => {
+                    tw(b" : role ");
+                    tw(r.rname());
+                    tw(b"\n");
                 }
-            } else {
-                tw(b"group ");
-                let gn = gid_name(r.subj);
-                if gn.is_empty() {
-                    tw_dec_u32(r.subj);
-                } else {
-                    tw(gn);
+                _ => {
+                    tw(b" -> /");
+                    tw(r.rname());
+                    tw(b" (");
+                    tw(right_name(r.right));
+                    tw(b")\n");
                 }
             }
-            tw(b" -> /");
-            tw(&r.name[..r.nlen as usize]);
-            tw(if r.ro { b" (ro)\n" } else { b" (rw)\n" });
         }
     }
     tw(b"default: everyone -> /bin (ro)\n");
     if !any {
-        tw(b"(no additional grants)\n");
+        tw(b"(no additional rules)\n");
     }
 }
 
-/// Compose account `i`'s namespace `ns_cap`: the default read-only /bin for
-/// everyone, plus every rule that matches the account's uid or its groups.
+/// Compose account `i`'s namespace `ns_cap`: read-only /bin for everyone, plus every
+/// path rule whose subject (user / group / assigned role) matches. Also sets
+/// NET_ALLOWED for this session from the matching RES_NET rules.
 fn apply_namespace_mounts(ns_cap: Handle, i: usize) {
     let a = &ACCTS[i];
-    mount_into(ns_cap, b"bin", true); // shared system tools, read-only — for all users
+    mount_into(ns_cap, b"bin", FS_RIGHT_RO as u8); // shared system tools, read-only
+    let mut net = a.uid == 0; // root always has the network
     unsafe {
         for r in RULES.iter() {
-            if !r.used {
+            if !r.used || !subject_matches(r, a) {
                 continue;
             }
-            let matches = if r.by_uid {
-                r.subj == a.uid
-            } else {
-                a.groups.contains(&r.subj)
-            };
-            if matches {
-                mount_into(ns_cap, &r.name[..r.nlen as usize], r.ro);
+            match r.rkind {
+                RES_PATH => {
+                    mount_into(ns_cap, r.rname(), r.right);
+                }
+                RES_NET => net = true,
+                _ => {}
+            }
+        }
+        NET_ALLOWED = net;
+    }
+}
+
+/// Build a CONFINED namespace for `progname` if a profile exists for it, rooted at
+/// account `i`'s home with ONLY /bin(ro) + the profile's mounts (the user's other
+/// session grants are intentionally dropped). Returns the namespace cap to use as the
+/// program's slot 1, or None if no profile (run normally). Caller closes the cap.
+fn program_profile_ns(progname: &[u8], i: usize) -> Option<Handle> {
+    let has = unsafe {
+        RULES.iter().any(|r| r.used && r.skind == SUBJ_PROGRAM && r.sname() == progname)
+    };
+    if !has {
+        return None;
+    }
+    let a = &ACCTS[i];
+    let mut m = MsgBuf::new(TAG_FS_NAMESPACE);
+    pack_name(&mut m, a.home);
+    if rt::sys_call(BOOT_FS_ROOT, &mut m).is_err() || m.data[0] != 0 {
+        return None;
+    }
+    let ns = m.handles[0];
+    mount_into(ns, b"bin", FS_RIGHT_RO as u8);
+    unsafe {
+        for r in RULES.iter() {
+            if r.used && r.skind == SUBJ_PROGRAM && r.sname() == progname && r.rkind == RES_PATH {
+                mount_into(ns, r.rname(), r.right);
             }
         }
     }
+    Some(ns)
 }
 
-/// Where root's access-rule policy is persisted so grants survive reboot.
+/// Does `progname` have a profile granting network access?
+fn program_has_net(progname: &[u8]) -> bool {
+    unsafe {
+        RULES.iter().any(|r| r.used && r.skind == SUBJ_PROGRAM && r.sname() == progname && r.rkind == RES_NET)
+    }
+}
+
+/// The net endpoint to hand a spawned program: the session's network cap if allowed,
+/// else NULL (so a program with no network rule simply can't reach the net service).
+fn net_cap() -> Handle {
+    if unsafe { NET_ALLOWED } {
+        BOOT_NET_EP
+    } else {
+        HANDLE_NULL
+    }
+}
+
+/// Where root's access-rule policy is persisted so it survives reboot.
 const RULES_PATH: &[u8] = b"/etc/access.rules";
 
 /// Append `b` to `buf` at `*n` (bounded), advancing `*n`.
@@ -2260,68 +2636,87 @@ fn buf_push(buf: &mut [u8], n: &mut usize, b: &[u8]) {
     }
 }
 
-/// Serialize the RULES table to /etc/access.rules — one rule per line:
-///   `user <name> <dir> <ro|rw>`  or  `group <name> <dir> <ro|rw>`.
-/// Rewritten wholesale on every grant/revoke. The default read-only /bin is NOT
-/// stored (it's implicit for everyone). Root-only operations call this.
+/// Serialize the RULES table to /etc/access.rules. Line format:
+///   `<skind> <sname> path <prefix> <right>` | `<skind> <sname> net`
+///   `<skind> <sname> role <rolename>`  (membership / role-def share the kind word)
+/// where skind is user|group|role|program. Rewritten on every change; default /bin is
+/// implicit (not stored).
 fn save_rules() {
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; 8192];
     let mut n = 0usize;
     unsafe {
         for r in RULES.iter() {
             if !r.used {
                 continue;
             }
-            // Resolve the subject to a name; skip any we can't name (keeps the
-            // file parseable round-trip).
-            let sname: &[u8] = if r.by_uid {
-                match ACCTS.iter().find(|a| a.uid == r.subj) {
-                    Some(a) => a.name,
-                    None => continue,
-                }
-            } else {
-                let g = gid_name(r.subj);
-                if g.is_empty() {
-                    continue;
-                }
-                g
-            };
-            buf_push(&mut buf, &mut n, if r.by_uid { b"user " } else { b"group " });
-            buf_push(&mut buf, &mut n, sname);
+            buf_push(&mut buf, &mut n, skind_word(r.skind));
             buf_push(&mut buf, &mut n, b" ");
-            buf_push(&mut buf, &mut n, &r.name[..r.nlen as usize]);
-            buf_push(&mut buf, &mut n, if r.ro { b" ro\n" } else { b" rw\n" });
+            buf_push(&mut buf, &mut n, r.sname());
+            match r.rkind {
+                RES_NET => buf_push(&mut buf, &mut n, b" net\n"),
+                RES_ROLE => {
+                    buf_push(&mut buf, &mut n, b" role ");
+                    buf_push(&mut buf, &mut n, r.rname());
+                    buf_push(&mut buf, &mut n, b"\n");
+                }
+                _ => {
+                    buf_push(&mut buf, &mut n, b" path ");
+                    buf_push(&mut buf, &mut n, r.rname());
+                    buf_push(&mut buf, &mut n, b" ");
+                    buf_push(&mut buf, &mut n, right_name(r.right));
+                    buf_push(&mut buf, &mut n, b"\n");
+                }
+            }
         }
     }
-    // write_file create-or-truncates and appends a trailing newline (harmless).
     write_file(BOOT_FS_ROOT, RULES_PATH, &buf[..n], false);
+}
+
+/// Parse the skind word; None if unrecognised.
+fn parse_skind(w: &[u8]) -> Option<u8> {
+    match w {
+        b"user" => Some(SUBJ_USER),
+        b"group" => Some(SUBJ_GROUP),
+        b"role" => Some(SUBJ_ROLE),
+        b"program" => Some(SUBJ_PROGRAM),
+        _ => None,
+    }
 }
 
 /// Parse one persisted rule line into the RULES table (no save — used by load).
 fn parse_rule_line(line: &[u8]) {
     let mut it = line.split(|&b| b == b' ' || b == b'\t').filter(|t| !t.is_empty());
-    let (Some(kind), Some(name), Some(dir)) = (it.next(), it.next(), it.next()) else {
+    let (Some(skw), Some(sname), Some(rkw)) = (it.next(), it.next(), it.next()) else {
         return;
     };
-    let ro = it.next() == Some(&b"ro"[..]);
-    let (by_uid, subj) = if kind == b"user" {
-        match ACCTS.iter().find(|a| a.name == name) {
-            Some(a) => (true, a.uid),
-            None => return,
+    let Some(skind) = parse_skind(skw) else { return };
+    // Validate user/group subjects still exist; roles/programs are free-form names.
+    match skind {
+        SUBJ_USER if !is_user(sname) => return,
+        SUBJ_GROUP if group_gid(sname).is_none() => return,
+        _ => {}
+    }
+    match rkw {
+        b"net" => {
+            add_rule(skind, sname, RES_NET, b"net", 0);
         }
-    } else if kind == b"group" {
-        match group_gid(name) {
-            Some(g) => (false, g),
-            None => return,
+        b"role" => {
+            if let Some(role) = it.next() {
+                add_rule(skind, sname, RES_ROLE, role, 0);
+            }
         }
-    } else {
-        return;
-    };
-    add_rule(by_uid, subj, dir, ro);
+        b"path" => {
+            if let Some(prefix) = it.next() {
+                let right = it.next().map_or(FS_RIGHT_RW as u8, parse_right);
+                add_rule(skind, sname, RES_PATH, prefix, right);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Load persisted access rules from /etc/access.rules at startup (before the first
-/// login), so grants survive reboot. Absent file = no extra rules (only /bin).
+/// login), so the policy survives reboot. Absent file = no extra rules (only /bin).
 fn load_rules() {
     let mut o = MsgBuf::new(TAG_FS_OPEN);
     pack_name(&mut o, RULES_PATH);
@@ -2332,7 +2727,7 @@ fn load_rules() {
         return;
     }
     let cap = o.handles[0];
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; 8192];
     let len = unsafe { read_all(cap, &mut buf) };
     let _ = rt::sys_close(cap);
     for line in buf[..len].split(|&b| b == b'\n') {
@@ -2348,6 +2743,12 @@ fn cur_name() -> &'static [u8] {
     } else {
         n
     }
+}
+
+/// Index of the currently-logged-in account in ACCTS, if any.
+fn cur_acct_index() -> Option<usize> {
+    let n = cur_name();
+    ACCTS.iter().position(|a| a.name == n)
 }
 
 /// Salted, iterated blake2b — a real (if modest) password KDF. 4096 rounds.
@@ -2423,10 +2824,11 @@ fn seed_accounts() {
 /// — so they are confined to it (§45). root's session root is the fs root.
 fn set_cwd_home(i: usize, cwd: &mut Handle, path: &mut Path) {
     let a = &ACCTS[i];
-    // Release the previous session's home cap (but never the shared root cap).
+    // Release the previous session's namespace node (so its mounts don't persist for
+    // the next login); never touch the shared root cap.
     unsafe {
         if SESSION_ROOT != BOOT_FS_ROOT {
-            let _ = rt::sys_close(SESSION_ROOT);
+            release_ns(SESSION_ROOT);
         }
     }
     if *cwd != BOOT_FS_ROOT && *cwd != session_root() {
@@ -2435,6 +2837,7 @@ fn set_cwd_home(i: usize, cwd: &mut Handle, path: &mut Path) {
     // Default to root's namespace; override below for users with a real home.
     unsafe {
         SESSION_ROOT = BOOT_FS_ROOT;
+        NET_ALLOWED = a.uid == 0; // root has the network; others earn it via rules
     }
     *path = Path::root();
     if a.home != b"/" {
