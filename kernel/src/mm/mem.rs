@@ -87,6 +87,16 @@ pub fn frame_inc_map(idx: u8) {
     FRAMES.lock()[idx as usize].maps += 1;
 }
 
+/// Account an extra mapping of the shared Frame backing `phys` — fork: the child's
+/// cloned AS re-maps the same shared frame, so its refcount must rise to balance the
+/// extra `frame_unmap` at the child's teardown. No-op if `phys` isn't a tracked Frame.
+pub fn frame_inc_map_by_phys(phys: u64) {
+    let mut f = FRAMES.lock();
+    if let Some(e) = f.iter_mut().find(|e| e.in_use && e.phys == phys) {
+        e.maps += 1;
+    }
+}
+
 /// Drop one mapping of the Frame backing `phys` (called as an address space is
 /// torn down). When the last mapping goes, free the physical frame and the pool
 /// slot — so shared frames are reclaimed exactly when nobody maps them anymore.

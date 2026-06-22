@@ -12,6 +12,7 @@
 int
 main(void)
 {
+	setvbuf(stdout, NULL, _IONBF, 0); /* unbuffered, so output order is deterministic */
 	setvbuf(stdout, NULL, _IONBF, 0); /* unbuffered, so output survives a crash */
 	printf("Hello from musl libc, running on oxbow!\n");
 
@@ -27,15 +28,29 @@ main(void)
 		fclose(f);
 	}
 
-	/* Phase 3: fork + execve + waitpid. The child runs /bin/seq (an oxbow program),
-	 * whose stdout we inherit, then we collect its exit status. */
-	/* Phase 3: exec another program (its stdout is ours), running it to completion.
-	 * execve replaces us, so the `seq 1 5` output below is the last thing we print. */
-	printf("  --- execve(\"/bin/seq\", {seq,1,5}) ---\n");
-	char *args[] = { "seq", "1", "5", NULL };
-	char *envp[] = { NULL };
-	execve("/bin/seq", args, envp);
-	perror("  execve failed"); /* only reached if exec fails */
+	/* Phase 3b: fork + waitpid status propagation. Child exits 42 in its OWN AS;
+	 * the parent must read exactly 42 — proves fork + independent child + waitpid +
+	 * exit-code carry (not a default-0 coincidence). */
+	printf("  --- fork + _exit(42) ---\n");
+	pid_t p1 = fork();
+	if (p1 == 0)
+		_exit(42);
+	int st1 = 0;
+	pid_t w1 = waitpid(p1, &st1, 0);
+	printf("  fork#1: pid=%d waited=%d exit=%d (expect 42)\n", (int)p1, (int)w1, WEXITSTATUS(st1));
+
+	/* fork + execve: the child runs /bin/seq (its stdout is ours), parent reaps it. */
+	printf("  --- fork + exec `seq 1 5` ---\n");
+	pid_t p2 = fork();
+	if (p2 == 0) {
+		char *args[] = { "seq", "1", "5", NULL };
+		char *envp[] = { NULL };
+		execve("/bin/seq", args, envp);
+		_exit(127);
+	}
+	int st2 = 0;
+	pid_t w2 = waitpid(p2, &st2, 0);
+	printf("  fork#2: pid=%d waited=%d exit=%d\n", (int)p2, (int)w2, WEXITSTATUS(st2));
 
 	return 0;
 }

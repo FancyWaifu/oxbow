@@ -123,20 +123,17 @@ seeded from spawn. `open`/`stat`/`access`/`*at` go through it.
 child's exit-notif) — a musl program runs another program. Reuses the existing
 `__oxbow_spawn`/`__oxbow_wait` shims; no kernel change.
 
-**Phase 3b — true `fork()` — REQUIRES A SEPARATE-AS COW FORK (deferred).**
-A shared-stack vfork primitive was built and tested (`SYS_VFORK_SPAWN`/`_RESUME` +
-userland `setjmp`/`longjmp`) and got most of the way — but it can't work: musl's
-`_Fork` (atfork handlers, lock resets) and `main`+`execve` run a deep call chain on
-the **shared** stack, clobbering the parent's suspended call chain. The vfork
-contract ("child does only exec") is violated by musl itself; a scratch-stack switch
-isn't enough.
-
-The correct design: `fork` clones the parent's **address space** (eager copy or COW)
-at the same virtual addresses, then runs a child thread in that copy resuming at the
-parent's RIP with `rax=0`. With a separate AS the `setjmp`/`longjmp` trick works
-unchanged (copied stack at the same VA) and the child never touches the parent's
-memory. Needs: a kernel `clone-AS` (page-table copy + COW page-fault handler) — a
-focused future effort. `fork`/`clone` return `-ENOSYS` until then.
+**Phase 3b — true `fork()` — DONE (separate-AS clone).** `SYS_FORK(entry, rsp,
+exit_notif)` clones the parent's lower-half AS into a new process
+(`mm::vm::clone_user_as` — eager copy at the same virtual addresses; shared frames
+re-mapped with a refcount bump) + copies the handle table (fd/cap inheritance) and
+gives the child its own Memory budget (BOOT_MEM repointed). The child's main thread
+starts at a trampoline that `longjmp`s to the fork point in its OWN copied AS — the
+`setjmp`/`longjmp` does the register save/restore, and because the copied stack lives
+at the same VA, it Just Works with no kernel register-capture and no shared-stack
+hazard. `waitpid` blocks on the child's exit-notif. Verified: a child `_exit(42)` is
+read back as 42 by the parent; fork+exec of `/bin/seq` runs and reaps correctly.
+(The earlier shared-stack vfork attempt is superseded — a separate AS is the fix.)
 
 - `waitpid` → block on the child's exit-notif (`SYS_NOTIF_*`). DONE.
 

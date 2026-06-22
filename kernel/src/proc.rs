@@ -512,6 +512,72 @@ pub fn create(
 }
 
 /// Grant a boot process its standard birth capabilities: a Console (write) and a
+/// fork (§Phase 3b): clone the calling process's address space + handle table into a
+/// NEW process, give it its own Memory budget + the supplied exit notification, and
+/// start its main thread at `entry`/`user_rsp` (the personality's trampoline, which
+/// `longjmp`s the child to the fork point in its OWN copied AS — same virtual
+/// addresses, separate physical, so no shared-stack hazard). Returns the child pid,
+/// or 0 on failure. `notif_idx` is the parent's exit-notif for the child (so waitpid
+/// works); the TLS is copied with the AS, so the child reuses the parent's fs_base.
+pub fn fork_current(entry: u64, user_rsp: u64, notif_idx: Option<u8>) -> u64 {
+    let parent = crate::thread::current_proc();
+    let fs_base = crate::thread::current_fs_base();
+    let parent_pml4 = PROCESSES.lock()[parent].pml4_phys;
+
+    // Heavy work (page copy + budget) OUTSIDE the PROCESSES lock (lock rule).
+    let child_pml4 = mm::vm::clone_user_as(parent_pml4);
+    if child_pml4 == 0 {
+        return 0;
+    }
+    const FORK_BUDGET: u64 = 32 * 1024 * 1024; // enough for the child to exec
+    let Some(child_mem) = mm::mem::grant(FORK_BUDGET) else {
+        mm::vm::free_user_pml4(child_pml4);
+        return 0;
+    };
+
+    let (child, dead_pml4) = {
+        let mut procs = PROCESSES.lock();
+        let slot = (0..MAX_PROCS).find(|&i| match procs[i].state {
+            PState::Free => true,
+            PState::Dead => !crate::thread::proc_has_live_threads(i),
+            _ => false,
+        });
+        let Some(id) = slot else {
+            drop(procs);
+            mm::mem::release(child_mem);
+            mm::vm::free_user_pml4(child_pml4);
+            return 0;
+        };
+        let dead = (procs[id].state == PState::Dead).then_some(procs[id].pml4_phys);
+        // Copy the parent Process — clones the handle table (fd/cap inheritance),
+        // identity, TLS template, pledge, name — then override the per-process fields.
+        let mut copy = procs[parent];
+        copy.pml4_phys = child_pml4;
+        copy.mem_idx = Some(child_mem);
+        copy.exit_notif = notif_idx;
+        copy.parent_mem = None; // fresh grant; nothing to refund the spawner
+        copy.spawn_cost = 0;
+        copy.state = PState::Alive;
+        // Repoint the cloned BOOT_MEM cap to the child's OWN pool, so its allocations
+        // debit its budget and its exit frees its pool (never the parent's).
+        copy.install(
+            BOOT_MEM,
+            HandleEntry {
+                obj: ObjectRef::Memory(child_mem),
+                rights: R_MAP | R_GRANT | R_ATTENUATE,
+                badge: 0,
+            },
+        );
+        procs[id] = copy;
+        (id, dead)
+    };
+    if let Some(old) = dead_pml4 {
+        mm::vm::free_user_pml4(old);
+    }
+    crate::thread::spawn_user(child, child_pml4, entry, user_rsp, fs_base);
+    child as u64
+}
+
 /// fresh Memory budget. Per-name device/endpoint caps are installed separately
 /// by the boot loop. (Spawned processes get the §13 set instead — never this.)
 pub fn grant_standard(id: usize, budget: u64) {

@@ -23,9 +23,32 @@ app → musl (stock) → __syscallN → __oxbow_syscall → oxbow rt/kernel
 - `oxsys.h` — oxbow raw-syscall inline asm + oxbow syscall numbers + rt shim decls.
 - `build-musl.sh` — builds vendored musl with the override + compiles the dispatcher.
 
-## Status — Phase 3a reached: EXEC + SPAWN + WAIT ✅ (true fork = 3b, kernel)
-A musl program now spawns and runs another program. `muslhello` execs `/bin/seq`,
-whose stdout it inherits, and exits with its status:
+## Status — Phase 3b reached: REAL fork() + exec + wait ✅
+`fork()` works via a kernel address-space clone. `muslhello` forks a child that
+`_exit(42)` and the parent reads exactly 42, then forks+execs `/bin/seq`:
+```
+  --- fork + _exit(42) ---
+  fork#1: pid=11 waited=11 exit=42 (expect 42)
+  --- fork + exec `seq 1 5` ---
+  1 2 3 4 5
+```
+How: `SYS_FORK` clones the parent's lower-half address space into a new process
+(`mm::vm::clone_user_as` — eager copy at the same virtual addresses, shared frames
+re-mapped) + copies the handle table (fd/cap inheritance) with its own Memory
+budget; the child's main thread starts at a trampoline that `longjmp`s to the fork
+point in its OWN copied AS (setjmp/longjmp does the register save/restore — same VA
+in the copy, so it Just Works). `waitpid` blocks on the child's exit-notif.
+
+Two bring-up bugs found + fixed: (1) the child's exit-notif handle reached `SYS_FORK`
+as 0 because oxbow returns handles in RDX (rax=status), but `ox_syscall0` read rax;
+(2) — the heisenbug — oxbow syscalls return TWO values (rax+RDX) unlike Linux, so
+RDX is always clobbered, but the Linux-derived `ox_syscallN` asm didn't mark it, and
+the compiler reused a now-zeroed RDX (`a3`=the notif handle) across `SYS_FORK`. Now
+all helpers treat RDX as an output (`+d` for the a3 ones). The earlier vfork attempt
+(shared stack) is superseded — a separate AS is what makes fork correct.
+
+## Status — Phase 3a: EXEC + SPAWN + WAIT ✅
+`muslhello` execs `/bin/seq`, whose stdout it inherits, and exits with its status:
 ```
   --- execve("/bin/seq", {seq,1,5}) ---
 1

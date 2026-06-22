@@ -12,6 +12,7 @@
 #define OX_SYS_CONSOLE_WRITE 6
 #define OX_SYS_EXIT          7
 #define OX_SYS_MAP           8
+#define OX_SYS_NOTIF_CREATE  11
 #define OX_SYS_UPTIME_MS     25
 #define OX_SYS_PROTECT       26
 #define OX_SYS_GETENTROPY    28
@@ -21,38 +22,67 @@
 #define OX_SYS_THREAD_ID     57
 #define OX_SYS_YIELD         58
 #define OX_SYS_SET_FSBASE    63
+#define OX_SYS_FORK          64
 
+/* CRITICAL: oxbow syscalls return TWO values (rax + RDX), unlike Linux (rax only).
+ * So RDX is ALWAYS clobbered by the syscall — it must be an asm output, never left
+ * as an unmentioned register the compiler thinks survives. (A subtle miss here let
+ * the compiler reuse a now-zeroed rdx as a live variable across SYS_FORK.) Helpers
+ * that pass an arg in rdx (a3) use "+d" (in-out); the rest capture+discard it. */
 static __inline long ox_syscall0(long n)
 {
-	unsigned long r;
-	__asm__ __volatile__("syscall" : "=a"(r) : "a"(n) : "rcx", "r11", "memory");
+	unsigned long r, d;
+	__asm__ __volatile__("syscall" : "=a"(r), "=d"(d) : "a"(n) : "rcx", "r11", "memory");
+	(void)d;
 	return r;
+}
+/* sys_notif_create returns the handle in RDX (status in RAX, 0=ok). Create a
+ * Notification and return its handle, or -1 on failure. */
+static __inline long ox_notif_create(void)
+{
+	unsigned long rax, rdx;
+	__asm__ __volatile__("syscall"
+	                     : "=a"(rax), "=d"(rdx)
+	                     : "a"((long)OX_SYS_NOTIF_CREATE)
+	                     : "rcx", "r11", "memory");
+	return rax == 0 ? (long)rdx : -1;
 }
 static __inline long ox_syscall1(long n, long a1)
 {
-	unsigned long r;
-	__asm__ __volatile__("syscall" : "=a"(r) : "a"(n), "D"(a1) : "rcx", "r11", "memory");
+	unsigned long r, d;
+	__asm__ __volatile__("syscall" : "=a"(r), "=d"(d) : "a"(n), "D"(a1) : "rcx", "r11", "memory");
+	(void)d;
 	return r;
 }
 static __inline long ox_syscall2(long n, long a1, long a2)
 {
-	unsigned long r;
-	__asm__ __volatile__("syscall" : "=a"(r) : "a"(n), "D"(a1), "S"(a2) : "rcx", "r11", "memory");
+	unsigned long r, d;
+	__asm__ __volatile__("syscall"
+	                     : "=a"(r), "=d"(d)
+	                     : "a"(n), "D"(a1), "S"(a2)
+	                     : "rcx", "r11", "memory");
+	(void)d;
 	return r;
 }
 static __inline long ox_syscall3(long n, long a1, long a2, long a3)
 {
-	unsigned long r;
-	__asm__ __volatile__("syscall" : "=a"(r) : "a"(n), "D"(a1), "S"(a2), "d"(a3)
+	unsigned long r, d = (unsigned long)a3; /* rdx: in (a3) AND clobbered out */
+	__asm__ __volatile__("syscall"
+	                     : "=a"(r), "+d"(d)
+	                     : "a"(n), "D"(a1), "S"(a2)
 	                     : "rcx", "r11", "memory");
+	(void)d;
 	return r;
 }
 static __inline long ox_syscall4(long n, long a1, long a2, long a3, long a4)
 {
-	unsigned long r;
+	unsigned long r, d = (unsigned long)a3;
 	register long r10 __asm__("r10") = a4;
-	__asm__ __volatile__("syscall" : "=a"(r) : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10)
+	__asm__ __volatile__("syscall"
+	                     : "=a"(r), "+d"(d)
+	                     : "a"(n), "D"(a1), "S"(a2), "r"(r10)
 	                     : "rcx", "r11", "memory");
+	(void)d;
 	return r;
 }
 

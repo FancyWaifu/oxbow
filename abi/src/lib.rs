@@ -221,6 +221,11 @@ pub const SYS_SET_FSBASE: u64 = 63; // (addr) -> 0. Set the calling thread's FS 
                                     // (x86_64 TLS pointer). Backs musl arch_prctl(ARCH_SET_FS)
                                     // for the POSIX/Linux personality. Ambient/unprivileged:
                                     // a thread may relocate its own TLS within its own AS.
+pub const SYS_FORK: u64 = 64; // (entry, user_rsp, exit_notif) -> child pid. Clone the
+                              // caller's AS + handle table into a new process and start
+                              // its main thread at entry/rsp (a trampoline that longjmps
+                              // the child to the fork point in its OWN copied AS). Backs
+                              // the POSIX personality's fork() (Phase 3b). PLEDGE_SPAWN.
 pub const PROC_NAME_LEN: usize = 16;
 pub const PROC_STATE_ALIVE: u32 = 1;
 pub const PROC_STATE_DEAD: u32 = 2; // exited, slot not yet reused (zombie)

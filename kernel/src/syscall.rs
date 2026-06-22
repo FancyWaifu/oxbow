@@ -17,7 +17,8 @@ use oxbow_abi::{
     SYS_PROTECT, SYS_RECV, SYS_RECV_NOTIF, SYS_REPLY,
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_MEMINFO, SYS_UPTIME_MS,
     SYS_WALLTIME, SYS_THREAD_SPAWN, SYS_THREAD_EXIT, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE,
-    SYS_THREAD_ID, SYS_YIELD, SYS_PROC_KILL, SYS_PROC_LIST, SYS_KILL, SYS_SET_FSBASE, ProcInfo,
+    SYS_THREAD_ID, SYS_YIELD, SYS_PROC_KILL, SYS_PROC_LIST, SYS_KILL, SYS_SET_FSBASE, SYS_FORK,
+    ProcInfo,
     SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_PIPE_EOF, CHAN_NONBLOCK, PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT,
     R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM, PLEDGE_SPAWN, PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
     PLEDGE_PROC,
@@ -169,6 +170,7 @@ pub extern "C" fn syscall_dispatch(
             crate::thread::set_fsbase_current(a1);
             SyscallRet { rax: 0, rdx: 0 }
         }
+        SYS_FORK => sys_fork(a1, a2, a3),
         SYS_MEMINFO => {
             let (used, total) = crate::mm::pmm::stats();
             let used_kib = (used / 1024) & 0xffff_ffff;
@@ -658,6 +660,29 @@ fn spawn_common(
         println!("[spawn] pid {} (tcb {}) {} -{} KiB", cid, tcb, label, prep.cost / 1024);
     }
     SyscallRet::ok_handle(cid as Handle)
+}
+
+/// `sys_fork(entry, user_rsp, exit_notif)` — clone the calling process (AS + handle
+/// table) into a new process and start its main thread at `entry`/`user_rsp` (the
+/// personality's trampoline). `exit_notif` is an optional Notification handle the
+/// kernel signals when the child exits (so the parent's waitpid works). Returns the
+/// child pid in rax, or 0 on failure. Backs the POSIX personality's fork() (§3b).
+fn sys_fork(entry: u64, user_rsp: u64, exit_notif_h: u64) -> SyscallRet {
+    let notif_idx = if exit_notif_h != HANDLE_NULL as u64 {
+        match proc::with_current(|p| {
+            p.lookup(exit_notif_h as Handle, ObjType::Notification, R_SIGNAL)
+        }) {
+            Ok(e) => match e.obj {
+                ObjectRef::Notification(n) => Some(n),
+                _ => return SyscallRet::err(SysError::BadType),
+            },
+            Err(e) => return SyscallRet::err(e),
+        }
+    } else {
+        None
+    };
+    let pid = proc::fork_current(entry, user_rsp, notif_idx);
+    SyscallRet { rax: pid, rdx: 0 }
 }
 
 /// `sys_spawn(image, mem, &MsgBuf, exit_notif)` — load a spawnable Image into a
@@ -1399,7 +1424,7 @@ fn pledge_class(nr: u64) -> u64 {
         SYS_MAP | SYS_PROTECT | SYS_IMMUTABLE | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC
         | SYS_DMA_ALLOC_CONTIG | SYS_SHM_CREATE | SYS_SHM_MAP | SYS_SHM_PHYS => PLEDGE_MEM,
         SYS_CAP_TYPE | SYS_CAP_DUP => PLEDGE_IPC,
-        SYS_SPAWN | SYS_SPAWN_BYTES | SYS_PROC_KILL => PLEDGE_SPAWN,
+        SYS_SPAWN | SYS_SPAWN_BYTES | SYS_PROC_KILL | SYS_FORK => PLEDGE_SPAWN,
         SYS_PROC_LIST | SYS_KILL => PLEDGE_PROC,
         SYS_ATTENUATE => PLEDGE_CAP,
         SYS_IO_IN | SYS_IO_OUT | SYS_PCI_READ | SYS_PCI_WRITE | SYS_PCI_BAR_MAP | SYS_IRQ_BIND

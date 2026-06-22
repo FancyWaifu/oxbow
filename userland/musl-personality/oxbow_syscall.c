@@ -6,18 +6,31 @@
  * `syscall` instruction. Failures return Linux-style negative errno; musl's
  * __syscall_ret maps that to errno + (-1).
  *
- * STATUS: Phase 2 (files). Phase 1 (first light: stdout + exit + alloc) plus a
- * per-process fd table + open/read/write/lseek/close/statx over fsd, resolving
- * paths against the process's cwd dir cap (the namespace). fork/exec + signals are
- * still stubbed — see docs/posix-personality-plan.md. */
+ * STATUS: Phase 3b. Phase 1 (stdout/exit/alloc) + Phase 2 (fd table + open/read/
+ * write/lseek/stat over fsd, paths resolved against the cwd dir cap) + Phase 3 real
+ * fork (kernel AS-clone) + execve + waitpid. Signals are next (Phase 4). See
+ * docs/posix-personality-plan.md. */
 #include "oxsys.h"
 #include "linux_nr.h"
 
 #include <stdarg.h>
 #include <stdint.h>
+#include <setjmp.h>
 
 extern void *malloc(unsigned long);
 extern void free(void *);
+
+/* fork (Phase 3b): the kernel SYS_FORK clones our AS + handle table into a new
+ * process and starts its main thread at `fork_trampoline` (in the child's OWN copied
+ * AS). The trampoline longjmps to the context setjmp captured in fork() — at the same
+ * virtual address in the copied AS — so the child resumes at the fork point on its
+ * own copied stack. No shared memory, no corruption: real fork. */
+static jmp_buf fork_buf;
+static char fork_child_stack[8192] __attribute__((aligned(16)));
+static void fork_trampoline(void)
+{
+	longjmp(fork_buf, 1);
+}
 
 struct ox_timespec { long tv_sec; long tv_nsec; };
 
@@ -157,13 +170,12 @@ static long stat_path(const char *path, unsigned char *kst)
 	return 0;
 }
 
-/* ----------------------- process: exec/wait -------------------------------- */
-/* oxbow has no fork (it spawns from an ELF), and userland can't emulate fork purely
- * — fork() must return (popping its frame) to run the child, leaving nothing to
- * longjmp back to; true fork needs a kernel thread-clone primitive (Phase 3b). What
- * works WITHOUT that: execve (spawn the program via __oxbow_spawn, run it to
- * completion, exit with its status — the "exec as the last thing" / launcher case)
- * and waitpid (block on a child's exit-notif). fork()/clone() return -ENOSYS. */
+/* ----------------------- process: fork/exec/wait --------------------------- */
+/* Real fork (Phase 3b): the kernel SYS_FORK clones our AS + handle table into a new
+ * process; the child resumes at the fork point in its OWN copied AS via the
+ * setjmp/longjmp trampoline (see fork_buf above), so there is no shared-stack hazard.
+ * execve spawns a program via __oxbow_spawn and runs it to completion (launcher
+ * model); waitpid blocks on the child's exit-notif and returns its status. */
 #define MAXCHILD 32
 static struct child { int used; unsigned int pid; long notif; } children[MAXCHILD];
 
@@ -244,10 +256,22 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 
 	/* ---- process ---- */
 	case NR_fork:
-	case NR_clone:
-		/* No fork yet — needs a kernel thread-clone primitive (Phase 3b). Returning
-		 * -ENOSYS lets fork-using code take its failure path instead of crashing. */
-		return -E_NOSYS;
+	case NR_clone: {
+		/* Real fork via a kernel AS-clone. setjmp returns 0 here (parent path); the
+		 * child resumes via the trampoline's longjmp in its own copied AS and setjmp
+		 * returns nonzero. The parent creates the child's exit-notif (so waitpid
+		 * works), forks, and remembers pid->notif. */
+		if (setjmp(fork_buf) != 0)
+			return 0; /* child: fork() returns 0, in its own AS */
+		long notif = ox_notif_create(); /* handle is in RDX, not RAX */
+		if (notif < 0)
+			return -E_NOSYS;
+		void *sp = fork_child_stack + sizeof fork_child_stack - 8;
+		long pid = ox_syscall3(OX_SYS_FORK, (long)fork_trampoline, (long)sp, notif);
+		if (pid > 0)
+			remember_child((unsigned int)pid, notif);
+		return pid > 0 ? pid : -E_NOSYS;
+	}
 	case NR_execve: {
 		/* Spawn the program, run it to completion, and exit with its status. This
 		 * covers the launcher / "exec as the last thing" case on a spawn kernel. */

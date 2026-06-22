@@ -153,6 +153,11 @@ fn cr3_of(s: usize) -> u64 {
 fn fs_base_of(s: usize) -> u64 {
     unsafe { (*addr_of!(TCBS[s])).fs_base }
 }
+/// The calling thread's FS base (TLS pointer) — fork hands it to the child, whose
+/// TLS block was copied with the address space at the same virtual address.
+pub fn current_fs_base() -> u64 {
+    fs_base_of(current())
+}
 fn proc_of(s: usize) -> usize {
     unsafe { (*addr_of!(TCBS[s])).proc }
 }

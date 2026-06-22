@@ -154,6 +154,75 @@ pub fn new_user_pml4() -> u64 {
     frame
 }
 
+/// Clone the LOWER half (user) of `src_pml4` into a fresh address space for fork:
+/// every present 4K leaf is copied to a NEW frame at the SAME virtual address with
+/// the SAME R/W/X, so the child gets an independent copy of code+data+heap+stack.
+/// Shared Frames (shmem) are re-mapped to the same phys (refcount bumped) so both
+/// processes keep sharing them. Returns the child pml4 phys, or 0 on out-of-memory
+/// (after freeing whatever it built). Eager copy, not COW — simple and correct.
+/// Caller must NOT have `src_pml4` torn down concurrently.
+pub fn clone_user_as(src_pml4: u64) -> u64 {
+    let new_pml4 = new_user_pml4();
+    if new_pml4 == 0 {
+        return 0;
+    }
+    unsafe {
+        let l4 = &*(super::phys_to_virt(src_pml4) as *const PageTable);
+        for i in 0..256 {
+            let e4 = &l4[i];
+            if !e4.flags().contains(Flags::PRESENT) {
+                continue;
+            }
+            let l3 = &*(super::phys_to_virt(e4.addr().as_u64()) as *const PageTable);
+            for j in 0..512 {
+                let e3 = &l3[j];
+                if !e3.flags().contains(Flags::PRESENT) || e3.flags().contains(Flags::HUGE_PAGE) {
+                    continue;
+                }
+                let l2 = &*(super::phys_to_virt(e3.addr().as_u64()) as *const PageTable);
+                for k in 0..512 {
+                    let e2 = &l2[k];
+                    if !e2.flags().contains(Flags::PRESENT) || e2.flags().contains(Flags::HUGE_PAGE)
+                    {
+                        continue;
+                    }
+                    let l1 = &*(super::phys_to_virt(e2.addr().as_u64()) as *const PageTable);
+                    for m in 0..512 {
+                        let e1 = &l1[m];
+                        if !e1.flags().contains(Flags::PRESENT) {
+                            continue;
+                        }
+                        let fl = e1.flags();
+                        let leaf = e1.addr().as_u64();
+                        let writable = fl.contains(Flags::WRITABLE);
+                        let executable = !fl.contains(Flags::NO_EXECUTE);
+                        let va = ((i as u64) << 39)
+                            | ((j as u64) << 30)
+                            | ((k as u64) << 21)
+                            | ((m as u64) << 12);
+                        if super::mem::is_shared_frame(leaf) {
+                            super::mem::frame_inc_map_by_phys(leaf);
+                            map_user_4k_in(new_pml4, va, leaf, writable, executable);
+                        } else {
+                            let Some(dst) = pmm::alloc_frame() else {
+                                free_user_pml4(new_pml4);
+                                return 0;
+                            };
+                            core::ptr::copy_nonoverlapping(
+                                super::phys_to_virt(leaf) as *const u8,
+                                super::phys_to_virt(dst) as *mut u8,
+                                4096,
+                            );
+                            map_user_4k_in(new_pml4, va, dst, writable, executable);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    new_pml4
+}
+
 /// Free every frame reachable from the LOWER half (user, entries 0..256) of the
 /// address space rooted at `pml4_phys`: the leaf data frames and the intermediate
 /// page-table frames, then the PML4 itself. The upper half (256..512) is the
