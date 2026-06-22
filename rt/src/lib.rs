@@ -1538,6 +1538,18 @@ pub fn sys_kill(pid: u32, code: i32) -> SysResult {
     SysError::from_raw(rax)
 }
 
+/// Designate the controlling-tty foreground process for async Ctrl-C (the shell sets
+/// its foreground child before waiting; 0 clears it). Phase 9.
+pub fn sys_set_foreground(pid: u32) {
+    unsafe { syscall1(oxbow_abi::SYS_SET_FOREGROUND, pid as u64) };
+}
+
+/// Async Ctrl-C: terminate the foreground process (the tty calls this when Ctrl-C
+/// arrives with no reader blocked — a running program). Phase 9.
+pub fn sys_tty_intr() {
+    unsafe { syscall1(oxbow_abi::SYS_TTY_INTR, 0) };
+}
+
 /// Voluntarily reschedule (no_std). The hosted shim is `__oxbow_yield`.
 pub fn sys_yield() {
     unsafe { syscall1(oxbow_abi::SYS_YIELD, 0) };

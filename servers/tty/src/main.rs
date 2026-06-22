@@ -194,6 +194,11 @@ pub extern "C" fn oxbow_main() -> ! {
                         // blank Enter, so a program couldn't see the ^C.)
                         send_marker(pending, 3);
                         pending = HANDLE_NULL;
+                    } else {
+                        // §Phase 9: no reader is blocked — a foreground program is
+                        // RUNNING (not at a read boundary). Deliver async Ctrl-C: the
+                        // kernel terminates the foreground process (default SIGINT).
+                        rt::sys_tty_intr();
                     }
                 }
                 // Ctrl-D: EOF on an empty line; otherwise flush the partial line (no

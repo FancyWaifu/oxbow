@@ -857,7 +857,11 @@ fn run_program(len: usize, cwd: Handle, cmd: &[u8], args: &[u8], bg: bool, sp: &
                 tw_dec_u32(pid as u32);
                 tw(b"\n");
             } else {
+                // §Phase 9: designate this child as the tty foreground so a Ctrl-C
+                // that arrives while it's RUNNING (not at a read) terminates it.
+                rt::sys_set_foreground(pid as u32);
                 wait_exits(sp, 1);
+                rt::sys_set_foreground(0);
                 set_status(rt::sys_notif_status(sp.exit));
             }
         }

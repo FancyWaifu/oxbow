@@ -18,6 +18,7 @@ use oxbow_abi::{
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_MEMINFO, SYS_UPTIME_MS,
     SYS_WALLTIME, SYS_THREAD_SPAWN, SYS_THREAD_EXIT, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE,
     SYS_THREAD_ID, SYS_YIELD, SYS_PROC_KILL, SYS_PROC_LIST, SYS_KILL, SYS_SET_FSBASE, SYS_FORK,
+    SYS_SET_FOREGROUND, SYS_TTY_INTR,
     ProcInfo,
     SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_PIPE_EOF, CHAN_NONBLOCK, PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT,
     R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM, PLEDGE_SPAWN, PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
@@ -166,6 +167,8 @@ pub extern "C" fn syscall_dispatch(
         SYS_PROC_KILL => sys_proc_kill(a1, a2),
         SYS_PROC_LIST => sys_proc_list(a1, a2),
         SYS_KILL => sys_kill(a1, a2),
+        SYS_SET_FOREGROUND => sys_set_foreground(a1),
+        SYS_TTY_INTR => sys_tty_intr(),
         SYS_SET_FSBASE => {
             crate::thread::set_fsbase_current(a1);
             SyscallRet { rax: 0, rdx: 0 }
@@ -800,6 +803,27 @@ fn sys_kill(pid: u64, code: u64) -> SyscallRet {
     } else {
         SyscallRet::err(SysError::Gone)
     }
+}
+
+/// The controlling-tty foreground process for async Ctrl-C (Phase 9). The shell sets
+/// it to its foreground child before waiting (0 = none); the tty terminates it on a
+/// Ctrl-C that arrives while no reader is blocked (a running program).
+static FOREGROUND_PID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn sys_set_foreground(pid: u64) -> SyscallRet {
+    FOREGROUND_PID.store(pid as usize, core::sync::atomic::Ordering::Relaxed);
+    SyscallRet::ok()
+}
+
+/// `sys_tty_intr()` — async Ctrl-C: terminate the foreground process with 130 (the
+/// default SIGINT action). Reuses the kill path; a no-op if no foreground is set.
+fn sys_tty_intr() -> SyscallRet {
+    let pid = FOREGROUND_PID.load(core::sync::atomic::Ordering::Relaxed);
+    if pid != 0 && proc::kill_pid(pid, 130) {
+        crate::thread::mark_proc_dying(pid);
+        FOREGROUND_PID.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+    SyscallRet::ok()
 }
 
 /// `sys_io_in(ioport, port)` — read a byte from a port authorized by an IoPort

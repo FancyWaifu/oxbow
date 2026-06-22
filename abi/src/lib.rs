@@ -226,6 +226,13 @@ pub const SYS_FORK: u64 = 64; // (entry, user_rsp, exit_notif) -> child pid. Clo
                               // its main thread at entry/rsp (a trampoline that longjmps
                               // the child to the fork point in its OWN copied AS). Backs
                               // the POSIX personality's fork() (Phase 3b). PLEDGE_SPAWN.
+/// (pid) -> 0. Designate the controlling-tty FOREGROUND process for async Ctrl-C
+/// (the shell sets its foreground child before waiting; 0 clears it). Phase 9.
+pub const SYS_SET_FOREGROUND: u64 = 65;
+/// () -> 0. The tty's async Ctrl-C: terminate the current foreground process (default
+/// SIGINT action) when no reader is blocked — i.e. a program is running, not at a
+/// read boundary (which the synchronous path already handles). Phase 9.
+pub const SYS_TTY_INTR: u64 = 66;
 pub const PROC_NAME_LEN: usize = 16;
 pub const PROC_STATE_ALIVE: u32 = 1;
 pub const PROC_STATE_DEAD: u32 = 2; // exited, slot not yet reused (zombie)
