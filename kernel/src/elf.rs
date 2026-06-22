@@ -126,6 +126,9 @@ impl<'a> Image<'a> {
     /// `sys_spawn_bytes` from a file is untrusted — a truncated or crafted image
     /// must be REJECTED here, not panic the kernel in `load_into`. See ABI §33.
     pub fn segments_in_bounds(&self) -> bool {
+        // The user half ends here; any segment touching the kernel half is rejected
+        // (defense-in-depth: the loader's map asserts would otherwise PANIC the kernel).
+        const LOWER_HALF_END: u64 = 0x0000_8000_0000_0000;
         // The phdr table itself must be in bounds before we iterate it.
         let phdr_end = match self.phoff.checked_add(self.phnum.saturating_mul(self.phentsize)) {
             Some(e) => e,
@@ -143,6 +146,44 @@ impl<'a> Image<'a> {
                 None => return false,
             };
             if file_end as usize > self.bytes.len() {
+                return false;
+            }
+            // W^X: never accept a writable+executable segment (the kernel's W^X law).
+            if ph.p_flags & PF_W != 0 && ph.p_flags & PF_X != 0 {
+                return false;
+            }
+            // The mapped range [p_vaddr, p_vaddr+p_memsz) must lie wholly in the user
+            // half, with no integer overflow.
+            let v_end = match ph.p_vaddr.checked_add(ph.p_memsz) {
+                Some(e) => e,
+                None => return false,
+            };
+            if v_end > LOWER_HALF_END {
+                return false;
+            }
+        }
+        // PT_TLS was previously UNVALIDATED — its p_filesz feeds an unchecked
+        // copy into a one-frame TLS block. Validate it here: file range in bounds,
+        // filesz ≤ memsz, and the block fits a single frame.
+        if let Some(t) = self.tls() {
+            if t.p_filesz > t.p_memsz {
+                return false;
+            }
+            let tls_end = match t.p_offset.checked_add(t.p_filesz) {
+                Some(e) => e,
+                None => return false,
+            };
+            if tls_end as usize > self.bytes.len() {
+                return false;
+            }
+            // One 4 KiB frame backs the TLS block (see build_tls_block); reject anything
+            // that wouldn't fit (memsz rounded up to align, +16 for the TCB).
+            let align = t.p_align.max(8);
+            let rounded = match t.p_memsz.checked_add(align - 1) {
+                Some(v) => v & !(align - 1),
+                None => return false,
+            };
+            if rounded + 16 > 4096 || t.p_filesz > rounded {
                 return false;
             }
         }

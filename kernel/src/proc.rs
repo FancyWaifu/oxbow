@@ -199,11 +199,21 @@ fn any_pipe_writer(procs: &[Process; MAX_PROCS], pidx: u8) -> bool {
     })
 }
 
-/// Close the current process's handle `h`. Returns `Some(pidx)` if the handle was a
-/// pipe WRITE end and no other process holds a write end any more — the caller then
-/// marks that pipe EOF (so readers see end-of-input once the last writer closes,
-/// which fork/dup-aware pipelines + command substitution rely on). §Phase 11.
-pub fn close_handle(h: Handle) -> Result<Option<u8>, SysError> {
+/// A side effect the SYS_CLOSE dispatcher must perform AFTER `close_handle` returns
+/// (i.e. after the PROCESSES lock is dropped) — both involve waking threads, which must
+/// not happen under that lock (the v0 lock rule).
+pub enum CloseAction {
+    Nothing,
+    /// The last pipe write end closed — mark pipe `pidx` EOF and wake its readers.
+    PipeEof(u8),
+    /// A live Reply handle was closed (a server dropping a call) — abandon reply slot
+    /// `ridx` so its pool slot is freed and the blocked caller wakes with E_GONE.
+    AbandonReply(usize),
+}
+
+/// Close the current process's handle `h`. Returns a `CloseAction` describing any
+/// deferred wake the dispatcher must do once the lock is released. §Phase 11.
+pub fn close_handle(h: Handle) -> Result<CloseAction, SysError> {
     let mut procs = PROCESSES.lock();
     let id = crate::thread::current_proc();
     let idx = h as usize;
@@ -214,10 +224,15 @@ pub fn close_handle(h: Handle) -> Result<Option<u8>, SysError> {
     procs[id].handles[idx] = None;
     if let ObjectRef::Pipe(pidx) = entry.obj {
         if (entry.rights & R_OUT) != 0 && !any_pipe_writer(&procs, pidx) {
-            return Ok(Some(pidx));
+            return Ok(CloseAction::PipeEof(pidx));
         }
     }
-    Ok(None)
+    // A Reply handle closed without replying would otherwise LEAK its global pool slot
+    // (only 8 exist) and hang the caller forever. Tell the dispatcher to abandon it.
+    if let ObjectRef::Reply(ridx) = entry.obj {
+        return Ok(CloseAction::AbandonReply(ridx as usize));
+    }
+    Ok(CloseAction::Nothing)
 }
 
 /// Run `f` with the calling thread's process. The lock is statement-scoped and
@@ -404,8 +419,13 @@ fn build_tls_block(pml4_phys: u64, tls_next: &mut u64, t: &TlsTemplate, src: *co
     let tp = vaddr + tls_size;
     unsafe {
         core::ptr::write_bytes(kbase, 0, FRAME as usize);
-        if t.filesz > 0 {
-            core::ptr::copy_nonoverlapping(src, kbase, t.filesz as usize);
+        // Defense-in-depth: clamp the copy to the TLS block size so a crafted PT_TLS
+        // (filesz > the one-frame block) can NEVER overrun into adjacent kernel frames,
+        // even if it somehow slipped past segments_in_bounds. The validator is the gate;
+        // this is the wall.
+        let copy = core::cmp::min(t.filesz, tls_size) as usize;
+        if copy > 0 {
+            core::ptr::copy_nonoverlapping(src, kbase, copy);
         }
         // TCB self-pointer at the thread pointer (ABI: *tp == tp).
         *(kbase.add(tls_size as usize) as *mut u64) = tp;

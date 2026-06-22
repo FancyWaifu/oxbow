@@ -241,7 +241,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_ATTENUATE => sys_attenuate(a1, a2),
         SYS_CLOSE => match proc::close_handle(a1 as Handle) {
             // §Phase 11: closing the last write end of a pipe marks it EOF.
-            Ok(Some(pidx)) => {
+            Ok(proc::CloseAction::PipeEof(pidx)) => {
                 let mut wake = [0usize; 8];
                 let n = crate::pipe::mark_eof(pidx, &mut wake);
                 for &t in &wake[..n] {
@@ -249,7 +249,13 @@ pub extern "C" fn syscall_dispatch(
                 }
                 SyscallRet::ok()
             }
-            Ok(None) => SyscallRet::ok(),
+            // Closing a live Reply handle: free its pool slot + wake the caller (E_GONE),
+            // done here (lock dropped) to respect the PROCESSES > REPLIES lock order.
+            Ok(proc::CloseAction::AbandonReply(ridx)) => {
+                crate::ipc::reply_abandon(ridx);
+                SyscallRet::ok()
+            }
+            Ok(proc::CloseAction::Nothing) => SyscallRet::ok(),
             Err(e) => SyscallRet::err(e),
         },
         SYS_EXIT => {
@@ -967,12 +973,15 @@ fn sys_frame_alloc(mem: u64) -> SyscallRet {
             return Err(SysError::NoMem);
         }
         let phys = mm::pmm::alloc_frame().ok_or(SysError::NoMem)?;
-        let fidx = mm::mem::frame_record(phys).ok_or(SysError::NoMem)?;
+        let (fidx, fgen) = mm::mem::frame_record(phys).ok_or(SysError::NoMem)?;
         proc::with_current_mut(|p| {
             p.alloc_slot(HandleEntry {
                 obj: ObjectRef::Frame(fidx),
                 rights: R_MAP | R_WRITE | R_GRANT | R_ATTENUATE,
-            badge: 0,
+                // Stamp the slot's generation in the badge; sys_frame_map verifies it,
+                // so a handle to a freed/reused slot is rejected (UAF guard). Copied
+                // verbatim on grant/dup/attenuate, so grantees inherit the generation.
+                badge: fgen as u64,
             })
         })
     })();
@@ -1004,10 +1013,13 @@ fn sys_frame_map(frame: u64, vaddr: u64, prot: u64) -> SyscallRet {
         if vaddr >= LOWER_HALF_END {
             return Err(SysError::Fault);
         }
+        // UAF guard: reject the map if this slot was freed (and maybe reused) since the
+        // handle was minted — the handle's badge carries the generation it was valid for.
+        let phys = mm::mem::frame_phys_checked(fidx, entry.badge as u32)
+            .ok_or(SysError::Gone)?;
         let pml4 = mm::vm::current_pml4();
         mm::vm::probe_user_range(pml4, vaddr, 1).map_err(|_| SysError::Fault)?;
         // Map the SAME physical frame (intermediate tables uncharged in v1).
-        let phys = mm::mem::frame_phys(fidx);
         mm::vm::map_user_4k_live(pml4, vaddr, phys, writable);
         mm::mem::frame_inc_map(fidx); // refcount the mapping (§9 reclamation)
         Ok(())

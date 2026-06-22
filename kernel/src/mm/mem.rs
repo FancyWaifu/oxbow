@@ -38,6 +38,12 @@ struct FrameObj {
     /// this pool slot) is reclaimed when the last mapping is torn down — so a
     /// shared zero-copy frame outlives any single mapper but doesn't leak.
     maps: u32,
+    /// Generation: bumped every time this slot is freed. A Frame HANDLE records the
+    /// generation it was minted at (in its badge); `frame_phys_checked` rejects a
+    /// handle whose generation no longer matches. This closes the use-after-free where
+    /// a grantable Frame handle outlives every mapping (the owner's teardown frees the
+    /// physical frame) and is then mapped again to write a freed/reused frame.
+    gen: u32,
 }
 
 static FRAMES: DiagMutex<[FrameObj; FRAME_POOL]> = DiagMutex::new("FRAMES",
@@ -45,6 +51,7 @@ static FRAMES: DiagMutex<[FrameObj; FRAME_POOL]> = DiagMutex::new("FRAMES",
         in_use: false,
         phys: 0,
         maps: 0,
+        gen: 0,
     }; FRAME_POOL],
 );
 
@@ -108,6 +115,8 @@ pub fn frame_unmap(phys: u64) {
                 e.maps = e.maps.saturating_sub(1);
                 if e.maps == 0 {
                     e.in_use = false;
+                    e.phys = 0; // don't leave a usable phys behind a freed slot
+                    e.gen = e.gen.wrapping_add(1); // invalidate any outstanding handles
                     true
                 } else {
                     false
@@ -139,14 +148,17 @@ pub fn debit(idx: u8, bytes: u64) -> bool {
     }
 }
 
-/// Record a physical frame as a Frame object; returns its pool index.
+/// Record a physical frame as a Frame object; returns `(pool index, generation)`.
+/// The generation is preserved across reuse of the slot (it's only bumped on free),
+/// so a handle minted at an older generation can be detected as stale.
 #[allow(dead_code)] // used by sys_frame_alloc in Phase 4
-pub fn frame_record(phys: u64) -> Option<u8> {
+pub fn frame_record(phys: u64) -> Option<(u8, u32)> {
     let mut f = FRAMES.lock();
     for i in 0..FRAME_POOL {
         if !f[i].in_use {
-            f[i] = FrameObj { in_use: true, phys, maps: 0 };
-            return Some(i as u8);
+            let gen = f[i].gen;
+            f[i] = FrameObj { in_use: true, phys, maps: 0, gen };
+            return Some((i as u8, gen));
         }
     }
     None
@@ -156,4 +168,17 @@ pub fn frame_record(phys: u64) -> Option<u8> {
 #[allow(dead_code)] // used by sys_frame_map in Phase 4
 pub fn frame_phys(idx: u8) -> u64 {
     FRAMES.lock()[idx as usize].phys
+}
+
+/// Physical address behind Frame `idx`, but ONLY if the slot is live AND its current
+/// generation matches `gen` (the generation the caller's handle was minted at). Returns
+/// `None` for a freed/reused slot — the use-after-free guard for `sys_frame_map`.
+pub fn frame_phys_checked(idx: u8, gen: u32) -> Option<u64> {
+    let f = FRAMES.lock();
+    let e = &f[idx as usize];
+    if e.in_use && e.gen == gen {
+        Some(e.phys)
+    } else {
+        None
+    }
 }
