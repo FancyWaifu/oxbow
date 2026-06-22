@@ -17,8 +17,14 @@ TARGET=x86_64-unknown-none
 
 [ -d "$MUSL" ] || { echo "musl tree not found at $MUSL (see header comment)"; exit 1; }
 
-# 1. Install the oxbow syscall override.
+# 1. Install the oxbow overrides:
+#    - syscall_arch.h: routes musl's C __syscallN through __oxbow_syscall.
+#    - __set_thread_area.s: upstream's x86_64 version issues a RAW arch_prctl syscall
+#      that bypasses the C override, so installing musl's thread pointer was dropped by
+#      the oxbow kernel (fs stayed on the kernel's bare TLS block, locale=NULL → the
+#      first setlocale faulted). Ours issues oxbow's SYS_SET_FSBASE directly.
 cp "$PERS/syscall_arch.h" "$MUSL/arch/x86_64/syscall_arch.h"
+cp "$PERS/__set_thread_area.s" "$MUSL/src/thread/x86_64/__set_thread_area.s"
 
 # 2. Configure + build static musl with clang cross-targeting bare x86_64.
 cd "$MUSL"

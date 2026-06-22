@@ -179,7 +179,7 @@ _iso:
     # bare command names here (PATH), reachable by every logged-in user. Stripped
     # (llvm-strip; Apple strip can't touch ELF) so the 56-byte FS_READ loop is quick.
     STRIP=$(find $(rustc --print sysroot) -name llvm-strip | head -1); \
-    for t in hello ls cat mkdir touch rm mv cp thrtest wc head tail find grep true false yes seq basename dirname tee rev cut cmp paste fold comm uniq tr strings od printf split sleep sort nl tac cksum md5sum sha1sum sha256sum sha512sum sha224sum sha384sum sha512-224sum sha512-256sum muslhello ps kill spin; do \
+    for t in hello ls cat mkdir touch rm mv cp thrtest wc head tail find grep true false yes seq basename dirname tee rev cut cmp paste fold comm uniq tr strings od printf split sleep sort nl tac cksum md5sum sha1sum sha256sum sha512sum sha224sum sha384sum sha512-224sum sha512-256sum muslhello awk ps kill spin; do \
       cp target/x86_64-unknown-none/debug/$t build/initrd/bin/$t; \
       "$STRIP" --strip-all build/initrd/bin/$t; \
     done

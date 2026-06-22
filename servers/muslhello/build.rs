@@ -50,6 +50,7 @@ fn main() {
         .flag("-fno-stack-protector")
         .flag("-fno-builtin")
         .flag("-Wno-everything")
+        .define("OXBOW_ARGV0", "\"muslhello\"")
         .opt_level(2)
         .compile("muslprog");
 }

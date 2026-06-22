@@ -23,6 +23,33 @@ app → musl (stock) → __syscallN → __oxbow_syscall → oxbow rt/kernel
 - `oxsys.h` — oxbow raw-syscall inline asm + oxbow syscall numbers + rt shim decls.
 - `build-musl.sh` — builds vendored musl with the override + compiles the dispatcher.
 
+## Status — Phase 5 reached: a REAL upstream app runs (onetrueawk) ✅
+The one true awk (BWK awk, Kernighan's), built unmodified from upstream C, runs on
+oxbow via the musl personality. `awk -f /sum.awk /nums.txt` produces output identical
+to the host awk:
+```
+root@oxbow:/$ awk -f /sum.awk /nums.txt
+lines=6  sum=100  avg=16.67  max=42
+```
+This exercises a large swath of the C runtime end-to-end: field splitting (`$1`),
+associative accumulation, the `END` block, `printf("%.2f")` (hard-float), file reading
+for both the program (`-f`) and the input, `setlocale`, `srandom`, and `malloc`.
+
+Build: `servers/awk-musl` (out of the default build, like muslhello — needs the
+out-of-repo awk at `~/musl-oxbow/onetrueawk`). Its `build.rs` generates awk's parser
+tables on the host (bison + maketab), then cross-compiles awk's C against musl + the
+personality and links the prebuilt musl `libc.a`. Two enablers were needed:
+- **Real argv** (crt_glue): argv now comes from oxbow's `SPAWN_ARGV` page (split on
+  spaces), with a synthesized `argv[0]` (oxbow strips the verb). So `awk -f /p /in`
+  reaches `main()` correctly. A single arg cannot contain a space (oxbow doesn't
+  preserve arg boundaries) — pass a program-with-spaces via `-f file`, not inline.
+- **TLS thread-pointer install** (`__set_thread_area.s` override): musl's x86_64
+  version issues a RAW `arch_prctl(ARCH_SET_FS)` syscall in assembly, which bypasses
+  the `syscall_arch.h` C override and was silently dropped by the oxbow kernel — so
+  `fs` stayed on the kernel's bare TLS block (no pthread struct, `locale`=NULL), and
+  awk's first `setlocale` faulted on a NULL deref. muslhello survived only because it
+  never touched `self->locale`. The override issues oxbow's `SYS_SET_FSBASE` directly.
+
 ## Status — Phase 4 reached: termios + signals ✅
 Interactive-terminal queries and self-directed signals work:
 ```

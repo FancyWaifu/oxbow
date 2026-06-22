@@ -13,6 +13,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "awk-musl"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "badge"
 version = "0.0.0"
 dependencies = [
