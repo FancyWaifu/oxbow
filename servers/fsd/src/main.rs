@@ -209,6 +209,24 @@ fn blk_attach() {
 fn w(s: &[u8]) {
     let _ = rt::sys_console_write(BOOT_CONSOLE, s.as_ptr(), s.len());
 }
+/// Print a seed-progress line: "[fsd] seeding NN%".
+fn wpct(pct: i64) {
+    w(b"[fsd] seeding ");
+    let mut v = if pct < 0 { 0u64 } else { pct as u64 };
+    let mut b = [0u8; 20];
+    let mut i = 20;
+    loop {
+        i -= 1;
+        b[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    w(&b[i..]);
+    w(b"%\n");
+}
+
 fn wn(label: &[u8], n: i64) {
     w(label);
     let neg = n < 0;
@@ -582,6 +600,22 @@ fn seed_from_initrd() {
     let base = FS_INITRD as *const u8;
     let mut off = 0usize;
     let mut files = 0u32;
+    // Pre-walk the headers (cheap — header parsing only, no ext2 writes) to learn the
+    // total tar length, so the slow write loop below can report a progress percentage
+    // by bytes processed (a good proxy for time, since writes dominate).
+    let total = {
+        let mut o = 0usize;
+        loop {
+            let h = unsafe { base.add(o) };
+            if unsafe { *h } == 0 {
+                break;
+            }
+            let sz = parse_octal(unsafe { core::slice::from_raw_parts(h.add(124), 12) });
+            o += 512 + ((sz + 511) & !511);
+        }
+        if o == 0 { 1 } else { o }
+    };
+    let mut next_mark = 10i64;
     loop {
         let hdr = unsafe { base.add(off) };
         if unsafe { *hdr } == 0 {
@@ -638,6 +672,13 @@ fn seed_from_initrd() {
             }
         }
         off += 512 + ((size + 511) & !511);
+        // Report progress as each 10% boundary is crossed (skips multiple at once if
+        // a big file jumps the offset). The "seeded files: N" line marks 100%.
+        let pct = (off as u64 * 100 / total as u64) as i64;
+        while pct >= next_mark && next_mark <= 90 {
+            wpct(next_mark);
+            next_mark += 10;
+        }
     }
     unsafe { oxfs_writeback(0) }; // flush + back to write-through
     wn(b"[fsd] seeded files: ", files as i64);
