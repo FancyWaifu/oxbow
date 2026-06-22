@@ -33,6 +33,9 @@
 #define NR_execve            59
 #define NR_exit              60
 #define NR_wait4             61
+#define NR_kill              62
+#define NR_tkill             200
+#define NR_tgkill            234
 #define NR_uname             63
 #define NR_fcntl             72
 #define NR_getcwd            79

@@ -23,7 +23,30 @@ app → musl (stock) → __syscallN → __oxbow_syscall → oxbow rt/kernel
 - `oxsys.h` — oxbow raw-syscall inline asm + oxbow syscall numbers + rt shim decls.
 - `build-musl.sh` — builds vendored musl with the override + compiles the dispatcher.
 
-## Status — Phase 3b reached: REAL fork() + exec + wait ✅
+## Status — Phase 4 reached: termios + signals ✅
+Interactive-terminal queries and self-directed signals work:
+```
+  --- termios ---
+  isatty(1) = 1
+  winsize: 24 rows x 80 cols
+  tcgetattr: ICANON=1 ECHO=1 ISIG=1
+  tcsetattr(raw) = 0
+  --- signals ---
+  raise(SIGUSR1) -> handler saw sig=10
+```
+- **termios** (in `ioctl`, std streams only): TIOCGWINSZ → 24×80 (makes `isatty`
+  true), TCGETS → a cooked `struct termios` (ICANON|ECHO|ISIG), TCSETS/W/F accepted
+  (a REPL switching to raw mode succeeds). Other fds → ENOTTY.
+- **signals**: `sigaction`/`sigprocmask` keep real per-process handler + blocked
+  state; a self-directed `tkill`/`tgkill`/`kill` (raise/abort) delivers
+  SYNCHRONOUSLY — runs the handler, or the default (terminate, or ignore for
+  SIGCHLD/CONT/URG/WINCH). A signal raised while blocked is latched pending and fired
+  when unblocked (musl's `raise()` blocks around the `tkill`). NOT yet: external/async
+  delivery (SIGINT from the tty, signals from another process) — needs a kernel
+  signal-frame mechanism + sigreturn. Also pending: a stdin-read path for true raw
+  interactive input.
+
+## Status — Phase 3b: REAL fork() + exec + wait ✅
 `fork()` works via a kernel address-space clone. `muslhello` forks a child that
 `_exit(42)` and the parent reads exactly 42, then forks+execs `/bin/seq`:
 ```

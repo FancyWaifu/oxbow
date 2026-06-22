@@ -8,8 +8,12 @@
 #include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+static volatile sig_atomic_t got_sig = 0;
+static void on_usr1(int s) { got_sig = s; }
 
 int
 main(void)
@@ -43,6 +47,12 @@ main(void)
 		raw.c_lflag &= ~(ICANON | ECHO);
 		printf("  tcsetattr(raw) = %d\n", tcsetattr(0, TCSANOW, &raw));
 	}
+
+	/* Phase 4: signals — install a handler, raise it, confirm it ran. */
+	printf("  --- signals ---\n");
+	signal(SIGUSR1, on_usr1);
+	raise(SIGUSR1);
+	printf("  raise(SIGUSR1) -> handler saw sig=%d (expect %d)\n", (int)got_sig, SIGUSR1);
 
 	/* Phase 3b: fork + waitpid status propagation. Child exits 42 in its OWN AS;
 	 * the parent must read exactly 42 — proves fork + independent child + waitpid +

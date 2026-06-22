@@ -249,6 +249,66 @@ static long do_exec_spawn(const char *path, char *const argv[])
 	return (long)pid;
 }
 
+/* ----------------------------- signals ------------------------------------- */
+/* Per-process signal state: sigaction records handlers + the blocked mask, and a
+ * self-directed tkill/tgkill/kill (raise/abort) delivers SYNCHRONOUSLY — it runs the
+ * installed handler, or applies the default action (terminate, or ignore for a few).
+ * External/async delivery (SIGINT from the tty, signals from another process) needs
+ * a kernel signal-frame mechanism + a sigreturn — a later step. */
+#define NSIG 65
+static struct ksigaction { void (*handler)(int); unsigned long flags; void (*restorer)(void); unsigned long mask; } sigtab[NSIG];
+static unsigned long sig_blocked;
+static unsigned long sig_pending;
+
+/* Signals whose default action is "ignore" — SIGCHLD/SIGCONT/SIGURG/SIGWINCH. */
+static int sig_default_ignores(int sig)
+{
+	return sig == 17 || sig == 18 || sig == 23 || sig == 28;
+}
+
+/* Run `sig`'s action NOW (handler, or the default) — caller has checked it's not
+ * blocked. */
+static void run_sig(int sig)
+{
+	void (*h)(int) = sigtab[sig].handler;
+	if (h == (void *)0) { /* SIG_DFL */
+		if (sig_default_ignores(sig))
+			return;
+		ox_syscall1(OX_SYS_EXIT, 128 + sig); /* default: terminate */
+		__builtin_unreachable();
+	}
+	if (h == (void *)1) /* SIG_IGN */
+		return;
+	h(sig); /* run the handler synchronously (self-raise / abort) */
+}
+
+/* Deliver `sig` to ourselves: if blocked, latch it pending (musl's raise() blocks
+ * around the tkill, then unblocks — that's when it must fire); else run it now. */
+static long deliver_self(int sig)
+{
+	if (sig < 1 || sig >= NSIG)
+		return -E_INVAL;
+	if (sig_blocked & (1UL << (sig - 1))) {
+		sig_pending |= (1UL << (sig - 1));
+		return 0;
+	}
+	run_sig(sig);
+	return 0;
+}
+
+/* After a mask change, run any now-unblocked pending signals (the delivery point
+ * for a signal raised while blocked). */
+static void deliver_pending(void)
+{
+	unsigned long ready = sig_pending & ~sig_blocked;
+	for (int sig = 1; sig < NSIG; sig++) {
+		if (ready & (1UL << (sig - 1))) {
+			sig_pending &= ~(1UL << (sig - 1));
+			run_sig(sig);
+		}
+	}
+}
+
 long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6)
 {
 	(void)a6;
@@ -507,10 +567,48 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		}
 	}
 
-	/* ---- signals: accept installs as no-ops ---- */
-	case NR_rt_sigaction:
-	case NR_rt_sigprocmask:
+	/* ---- signals ---- */
+	case NR_rt_sigaction: {
+		int sig = (int)a1;
+		struct ksigaction *na = (struct ksigaction *)a2;
+		struct ksigaction *oa = (struct ksigaction *)a3;
+		if (sig < 1 || sig >= NSIG)
+			return -E_INVAL;
+		if (oa) {
+			oa->handler = sigtab[sig].handler;
+			oa->flags = sigtab[sig].flags;
+			oa->restorer = 0;
+			oa->mask = 0;
+		}
+		if (na) {
+			sigtab[sig].handler = na->handler;
+			sigtab[sig].flags = na->flags;
+		}
 		return 0;
+	}
+	case NR_rt_sigprocmask: {
+		int how = (int)a1;
+		unsigned long *set = (unsigned long *)a2;
+		unsigned long *old = (unsigned long *)a3;
+		if (old)
+			*old = sig_blocked;
+		if (set) {
+			if (how == 0)
+				sig_blocked |= *set; /* SIG_BLOCK */
+			else if (how == 1)
+				sig_blocked &= ~*set; /* SIG_UNBLOCK */
+			else if (how == 2)
+				sig_blocked = *set; /* SIG_SETMASK */
+			deliver_pending(); /* fire anything that just became unblocked */
+		}
+		return 0;
+	}
+	case NR_tkill: /* raise(): (tid, sig) */
+		return deliver_self((int)a2);
+	case NR_tgkill: /* (tgid, tid, sig) */
+		return deliver_self((int)a3);
+	case NR_kill: /* (pid, sig) — self-delivery only for now */
+		return deliver_self((int)a2);
 
 	/* ---- single-user identity (root) ---- */
 	case NR_getuid:
