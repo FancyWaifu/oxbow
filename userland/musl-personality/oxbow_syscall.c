@@ -60,6 +60,7 @@ static long do_clock_gettime(long id, struct ox_timespec *ts)
 #define K_PIPE_R 1
 #define K_PIPE_W 2
 #define K_DIR    3  /* an open directory; .off is the readdir cursor */
+#define K_TTY    4  /* a dup of a std tty stream (.handle = 0/1/2); shells dup these */
 struct oxfd {
 	int used;
 	int kind;
@@ -110,7 +111,19 @@ static void fd_release(int fd)
 	} else if (fds[fd].kind == K_PIPE_R) {
 		__oxbow_pipe_close((unsigned int)fds[fd].handle);
 	} else if (fds[fd].kind == K_FILE || fds[fd].kind == K_DIR) {
-		__oxbow_fs_close(fds[fd].handle);
+		/* dup2/F_DUPFD share the fsd handle, so only release it when NO other fd
+		 * still references it (shells dup a fd then close the original — closing the
+		 * shared handle would kill the dup). */
+		int shared = 0;
+		for (int i = 0; i < MAXFD; i++)
+			if (i != fd && fds[i].used &&
+			    (fds[i].kind == K_FILE || fds[i].kind == K_DIR) &&
+			    fds[i].handle == fds[fd].handle) {
+				shared = 1;
+				break;
+			}
+		if (!shared)
+			__oxbow_fs_close(fds[fd].handle);
 	}
 	fds[fd].used = 0;
 }
@@ -156,6 +169,8 @@ static long do_read(long fd, void *buf, unsigned long len)
 				fds[fd].off += (unsigned long)n;
 			return n;
 		}
+		if (fds[fd].kind == K_TTY)
+			return do_read(fds[fd].handle, buf, len); /* route to the std stream */
 		return -E_BADF; /* read on a write-only pipe end */
 	}
 	if (fd < 3) {
@@ -183,6 +198,8 @@ static long do_write(long fd, const void *buf, unsigned long len)
 			}
 			return n;
 		}
+		if (fds[fd].kind == K_TTY)
+			return do_write(fds[fd].handle, buf, len); /* route to the std stream */
 		return -E_BADF; /* write on a read-only pipe end */
 	}
 	if (fd == 1 || fd == 2)
@@ -696,6 +713,8 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 	case NR_gettid:
 	case NR_getpid:
 		return ox_syscall0(OX_SYS_THREAD_ID);
+	case NR_getppid:
+		return 1; /* oxbow doesn't expose the parent pid; a stable value suffices */
 
 	/* ---- scheduling / time / entropy ---- */
 	case NR_sched_yield:
@@ -885,13 +904,49 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 				return do_dup2(a1, i);
 		return -E_MFILE;
 	}
+	case NR_fcntl: {
+		/* Shells (dash) rely on this for fd juggling around redirections. */
+		long fd = a1;
+		unsigned long cmd = (unsigned long)a2;
+		long arg = a3;
+		switch (cmd) {
+		case F_DUPFD:
+		case F_DUPFD_CLOEXEC: {
+			/* Lowest free fd >= arg referring to the same object. CLOEXEC isn't
+			 * enforced (we have no exec-time fd close), which is harmless here. */
+			int start = (arg < 3) ? 3 : (int)arg;
+			for (int i = start; i < MAXFD; i++) {
+				if (fds[i].used)
+					continue;
+				if (fd >= 0 && fd < 3 && !fds[fd].used) {
+					/* dup of a bare std tty stream -> a K_TTY alias */
+					fds[i].used = 1;
+					fds[i].kind = K_TTY;
+					fds[i].handle = fd;
+					fds[i].off = 0;
+					fds[i].size = 0;
+					return i;
+				}
+				return do_dup2(fd, i);
+			}
+			return -E_MFILE;
+		}
+		case F_GETFD:
+			return 0; /* no FD_CLOEXEC tracked */
+		case F_SETFD:
+			return 0; /* accept (CLOEXEC not enforced) */
+		case F_GETFL:
+			return 2; /* O_RDWR */
+		case F_SETFL:
+			return 0; /* accept O_NONBLOCK/etc. */
+		default:
+			return 0; /* accept other fcntls benignly */
+		}
+	}
 
 	/* ---- not yet: the rest ---- */
-	case NR_fcntl:
-	case NR_access:
 	case NR_readlink:
 	case NR_uname:
-	case NR_nanosleep:
 	default:
 		return -E_NOSYS;
 	}

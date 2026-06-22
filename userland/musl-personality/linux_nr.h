@@ -37,6 +37,7 @@
 #define NR_ftruncate         77
 #define NR_getdents64        217
 #define NR_getpid            39
+#define NR_getppid           110
 #define NR_clone             56
 #define NR_fork              57
 #define NR_execve            59
@@ -98,6 +99,14 @@
 #define E_EXIST  17
 #define E_MFILE  24
 #define E_NOTTY  25
+
+/* fcntl commands */
+#define F_DUPFD         0
+#define F_GETFD         1
+#define F_SETFD         2
+#define F_GETFL         3
+#define F_SETFL         4
+#define F_DUPFD_CLOEXEC 1030
 
 /* openat dirfd / flags */
 #define AT_FDCWD       (-100)

@@ -252,6 +252,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dash-musl"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "defmt"
 version = "0.3.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
