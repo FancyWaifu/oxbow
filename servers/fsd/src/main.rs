@@ -25,7 +25,7 @@ use oxbow_abi::{
     FS_DIR, FS_FILE, FS_INITRD, FS_O_CREATE, FS_O_EXCL, FS_O_TRUNC, FS_ROOT, FS_SYMLINK,
     MSG_DATA_WORDS, PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_BLK_ATTACH,
     TAG_BLK_FLUSH, TAG_BLK_READ, TAG_BLK_READN, TAG_BLK_WRITE, TAG_BLK_WRITEN, TAG_FS_CREATE,
-    TAG_FS_LINK, TAG_FS_MKDIR, TAG_FS_NAMESPACE, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_FS_READLINK,
+    TAG_FS_LINK, TAG_FS_MKDIR, TAG_FS_NAMESPACE, TAG_FS_NS_MOUNT, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_FS_READLINK,
     TAG_FS_RELEASE, TAG_FS_RENAME, TAG_FS_SETTIMES, TAG_FS_SYMLINK, TAG_FS_SYNC, TAG_FS_TRUNCATE,
     TAG_FS_UNLINK, TAG_FS_WRITE,
 };
@@ -425,19 +425,57 @@ static mut USED: [bool; MAXID] = [false; MAXID];
 // TAG_FS_RELEASE (client File/ReadDir close). The slot is reclaimed when this hits 0, so
 // only CONCURRENTLY-open paths occupy the table (sequential opens reuse slots).
 static mut REFS: [u16; MAXID] = [0; MAXID];
-// A NAMESPACE node (TAG_FS_NAMESPACE): resolves `bin/...` against the shared read-only
-// /bin (under the ext2 root) and everything else under its home path (PATHS[id]). The
-// per-user session root; inherited by spawned programs so /bin tools work everywhere.
+// A NAMESPACE node (TAG_FS_NAMESPACE): everything resolves under its home path
+// (PATHS[id]) EXCEPT the top-level dirs root's access rules mounted into it (a MOUNT,
+// below) — those resolve against the real fs root. The per-user session root, inherited
+// by spawned programs. So homes stay private; mounts (e.g. read-only /bin) are shared.
 static mut NS: [bool; MAXID] = [false; MAXID];
+
+// The mount table (TAG_FS_NS_MOUNT): each row makes a top-level component NM_NAME
+// resolve against the fs root for namespace NM_NS (vs its home), optionally read-only.
+// Composed at login from root's access rules — this is "root decides who reaches what".
+const MAX_NSMNT: usize = 128;
+static mut NM_USED: [bool; MAX_NSMNT] = [false; MAX_NSMNT];
+static mut NM_NS: [u16; MAX_NSMNT] = [0; MAX_NSMNT];
+static mut NM_NAME: [[u8; 32]; MAX_NSMNT] = [[0; 32]; MAX_NSMNT];
+static mut NM_NLEN: [u8; MAX_NSMNT] = [0; MAX_NSMNT];
+static mut NM_RO: [bool; MAX_NSMNT] = [false; MAX_NSMNT];
+
+/// A capability's badge carries this bit when it was minted READ-ONLY (handed out
+/// for a read-only mount, or derived from a read-only cap). Node ids are < MAXID
+/// (512), so the high bits are free to flag the cap. The ro-ness travels WITH the
+/// capability: writes/creates/etc. through it are denied, and any child cap it
+/// opens inherits it — so read-only is enforced down the whole subtree.
+const RO_CAP: u64 = 1 << 31;
 
 fn rel(id: usize) -> &'static [u8] {
     unsafe { &PATHS[id][..PLENS[id] as usize] }
 }
 
-/// Does a namespace node route `name` to the shared /bin (vs the user's home)?
-fn ns_to_bin(id: usize, name: &[u8]) -> bool {
-    let is_ns = unsafe { NS[id] };
-    is_ns && name.split(|&b| b == b'/').find(|c| !c.is_empty()) == Some(&b"bin"[..])
+/// Should a name-based mutation through cap (`id`, `cap_ro`) be denied? True if the
+/// cap itself is read-only, or `name`'s top-level component is a read-only mount.
+fn deny_ro(id: usize, cap_ro: bool, name: &[u8]) -> bool {
+    cap_ro || ns_mount_for(id, name) == Some(true)
+}
+
+/// If `name`'s top-level component is mounted in namespace `id`, return Some(read_only).
+/// A mounted component resolves against the fs root (shared) instead of home (private).
+fn ns_mount_for(id: usize, name: &[u8]) -> Option<bool> {
+    if !unsafe { NS[id] } {
+        return None;
+    }
+    let first = name.split(|&b| b == b'/').find(|c| !c.is_empty())?;
+    for i in 0..MAX_NSMNT {
+        unsafe {
+            if NM_USED[i]
+                && NM_NS[i] as usize == id
+                && &NM_NAME[i][..NM_NLEN[i] as usize] == first
+            {
+                return Some(NM_RO[i]);
+            }
+        }
+    }
+    None
 }
 
 /// Absolute lwext4 path ("/mp/" + relpath) into `out`, NUL-terminated. An empty
@@ -465,11 +503,11 @@ fn full_path(id: usize, out: &mut [u8; 256]) -> Option<usize> {
 /// the child rel length, or None if it overflows. Caller built `out` via
 /// full_from_rel(&relbuf[..len]).
 fn join_child(id: usize, name: &[u8], relbuf: &mut [u8; PLEN]) -> Option<usize> {
-    // A namespace node routes `bin/...` to the real /bin (base = root, "") and
-    // everything else under its home (base = the node's path). name_ok already blocks
-    // ".."/"." so neither subtree can be escaped.
+    // A namespace node routes a MOUNTED top-level dir against the fs root (base = "")
+    // and everything else under its home (base = the node's path). name_ok already
+    // blocks ".."/"." so neither subtree can be escaped.
     let p: &[u8] = if unsafe { NS[id] } {
-        if ns_to_bin(id, name) {
+        if ns_mount_for(id, name).is_some() {
             &[]
         } else {
             rel(id)
@@ -754,7 +792,8 @@ pub extern "C" fn oxbow_main() -> ! {
             Ok(r) => r,
             Err(_) => continue,
         };
-        let id = m.badge as usize;
+        let cap_ro = m.badge & RO_CAP != 0; // a read-only capability (see RO_CAP)
+        let id = (m.badge & !RO_CAP) as usize;
         let valid = id > 0 && id < MAXID && unsafe { USED[id] };
 
         match m.tag {
@@ -773,8 +812,10 @@ pub extern "C" fn oxbow_main() -> ! {
                     if !(valid && name_ok(name)) {
                         break 'open;
                     }
-                    // §namespace: the shared /bin is READ-ONLY — deny create/truncate.
-                    if ns_to_bin(id, name) && flags & (FS_O_CREATE | FS_O_TRUNC) != 0 {
+                    // §namespace: a read-only location (a read-only mount, or reached
+                    // via a read-only cap) — deny create/truncate.
+                    let here_ro = deny_ro(id, cap_ro, name);
+                    if here_ro && flags & (FS_O_CREATE | FS_O_TRUNC) != 0 {
                         status = 3; // write to a read-only location
                         break 'open;
                     }
@@ -829,7 +870,10 @@ pub extern "C" fn oxbow_main() -> ! {
                     if cid == 0 {
                         break 'open;
                     }
-                    let Ok(cap) = rt::sys_mint(BOOT_EP, cid as u64, R_SEND | R_GRANT) else {
+                    // Propagate read-only down: a cap opened in a read-only location is
+                    // itself read-only, so writes through it AND anything it opens are denied.
+                    let badge = cid as u64 | if here_ro { RO_CAP } else { 0 };
+                    let Ok(cap) = rt::sys_mint(BOOT_EP, badge, R_SEND | R_GRANT) else {
                         break 'open;
                     };
                     // Live cap for `cid`; reclaimed only when its FS_RELEASE brings refs to 0.
@@ -857,8 +901,8 @@ pub extern "C" fn oxbow_main() -> ! {
             }
             TAG_FS_NAMESPACE => {
                 // Mint a namespace cap rooted at the given home path (e.g. "home/bryson"):
-                // routes bin/... -> shared /bin, else under home. Inherited as a confined
-                // user's session root. (The badge isn't used — composed from the root.)
+                // everything resolves under home until root MOUNTS top-level dirs into it
+                // (TAG_FS_NS_MOUNT). Inherited as a confined user's session root.
                 let name = msg_name(&m);
                 let home = name.strip_prefix(b"/").unwrap_or(name); // "" = the ext2 root
                 let mut r = MsgBuf::new(0);
@@ -888,6 +932,63 @@ pub extern "C" fn oxbow_main() -> ! {
                 if status != 0 {
                     reply_status(reply, status);
                 }
+            }
+            TAG_FS_NS_MOUNT => {
+                // Mount a top-level dir into a namespace: the message is sent TO the
+                // namespace cap (badge = its node id), so `id` IS the namespace. The
+                // component `name` then resolves against the fs root (shared) instead of
+                // home. data[63] = 1 makes it read-only. This is how root's access rules
+                // reach a user: the shell composes them into the namespace at login.
+                let name = msg_name(&m);
+                let ro = m.data[63] == 1;
+                let mut status = 1u64;
+                'mnt: {
+                    // Must target a real namespace node; name a single clean component
+                    // that fits the mount-name field.
+                    if !(valid && unsafe { NS[id] } && name_ok(name)) {
+                        break 'mnt;
+                    }
+                    let comp = match name.split(|&b| b == b'/').find(|c| !c.is_empty()) {
+                        Some(c) if c.len() <= 32 => c,
+                        _ => break 'mnt,
+                    };
+                    // Idempotent: if already mounted in this ns, just update the ro flag.
+                    let mut slot = None;
+                    for i in 0..MAX_NSMNT {
+                        unsafe {
+                            if NM_USED[i]
+                                && NM_NS[i] as usize == id
+                                && &NM_NAME[i][..NM_NLEN[i] as usize] == comp
+                            {
+                                slot = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                    let i = match slot {
+                        Some(i) => i,
+                        None => {
+                            let mut free = None;
+                            for j in 0..MAX_NSMNT {
+                                if !unsafe { NM_USED[j] } {
+                                    free = Some(j);
+                                    break;
+                                }
+                            }
+                            let Some(j) = free else { break 'mnt };
+                            unsafe {
+                                NM_USED[j] = true;
+                                NM_NS[j] = id as u16;
+                                NM_NLEN[j] = comp.len() as u8;
+                                NM_NAME[j][..comp.len()].copy_from_slice(comp);
+                            }
+                            j
+                        }
+                    };
+                    unsafe { NM_RO[i] = ro };
+                    status = 0;
+                }
+                reply_status(reply, status);
             }
             TAG_FS_READ => {
                 sync_writes(); // §94: reads must see buffered writes
@@ -934,7 +1035,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut relbuf = [0u8; PLEN];
                 let mut r = MsgBuf::new(0);
                 let mut done = false;
-                if valid && name_ok(name) {
+                if valid && name_ok(name) && !deny_ro(id, cap_ro, name) {
                     let clen = join_child(id, name, &mut relbuf);
                     if let Some(childlen) = clen {
                         full_from_rel(&relbuf[..childlen], &mut full);
@@ -967,7 +1068,8 @@ pub extern "C" fn oxbow_main() -> ! {
                 let count = (m.data[1] as usize).min(480); // payload past the 16 B header
                 let mut full = [0u8; 256];
                 let mut written = 0usize;
-                if valid && full_path(id, &mut full).is_some() {
+                // A read-only cap (e.g. a file under a read-only mount) cannot be written.
+                if valid && !cap_ro && full_path(id, &mut full).is_some() {
                     let src = unsafe { (m.data.as_ptr() as *const u8).add(16) };
                     // §94: coalesce into 4 KiB blocks instead of open+write+flush
                     // per write — the difference between seconds and minutes for
@@ -985,7 +1087,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut full = [0u8; 256];
                 let mut relbuf = [0u8; PLEN];
                 let mut status = 1u64;
-                if valid && name_ok(name) {
+                if valid && name_ok(name) && !deny_ro(id, cap_ro, name) {
                     if let Some(clen) = join_child(id, name, &mut relbuf) {
                         full_from_rel(&relbuf[..clen], &mut full);
                         if clen > 0 && unsafe { oxfs_mkdir(full.as_ptr()) } == 0 {
@@ -1003,7 +1105,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut full = [0u8; 256];
                 let mut relbuf = [0u8; PLEN];
                 let mut status = 1u64;
-                if valid && name_ok(name) {
+                if valid && name_ok(name) && !deny_ro(id, cap_ro, name) {
                     if let Some(clen) = join_child(id, name, &mut relbuf) {
                         full_from_rel(&relbuf[..clen], &mut full);
                         if clen > 0 && unsafe { oxfs_remove(full.as_ptr()) } == 0 {
@@ -1037,7 +1139,9 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut rb1 = [0u8; PLEN];
                 let mut rb2 = [0u8; PLEN];
                 let mut status = 1u64;
-                if valid && name_ok(old) && name_ok(new) {
+                if valid && name_ok(old) && name_ok(new)
+                    && !deny_ro(id, cap_ro, old) && !deny_ro(id, cap_ro, new)
+                {
                     let o = join_child(id, old, &mut rb1);
                     let n = join_child(id, new, &mut rb2);
                     if let (Some(ol), Some(nl)) = (o, n) {
@@ -1076,7 +1180,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 let size = m.data[0];
                 let mut full = [0u8; 256];
                 let mut ok = false;
-                if valid && full_path(id, &mut full).is_some() {
+                if valid && !cap_ro && full_path(id, &mut full).is_some() {
                     ok = unsafe { oxfs_truncate(full.as_ptr(), size) } == 0;
                     if ok {
                         unsafe { oxfs_flush() };
@@ -1091,7 +1195,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 let flags = m.data[2];
                 let mut full = [0u8; 256];
                 let mut ok = false;
-                if valid && full_path(id, &mut full).is_some() {
+                if valid && !cap_ro && full_path(id, &mut full).is_some() {
                     let set_m = (flags & 1) as c_int;
                     let set_a = ((flags >> 1) & 1) as c_int;
                     ok = unsafe { oxfs_set_times(full.as_ptr(), mtime, atime, set_m, set_a) } == 0;
@@ -1123,7 +1227,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut rb = [0u8; PLEN];
                 let mut tbuf = [0u8; 256];
                 let mut status = 1u64;
-                if valid && name_ok(link) && tlen < tbuf.len() {
+                if valid && name_ok(link) && tlen < tbuf.len() && !deny_ro(id, cap_ro, link) {
                     if let Some(ll) = join_child(id, link, &mut rb) {
                         full_from_rel(&rb[..ll], &mut lf);
                         tbuf[..tlen].copy_from_slice(target);
@@ -1178,7 +1282,9 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut rb1 = [0u8; PLEN];
                 let mut rb2 = [0u8; PLEN];
                 let mut status = 1u64;
-                if valid && name_ok(src) && name_ok(dst) {
+                if valid && name_ok(src) && name_ok(dst)
+                    && !deny_ro(id, cap_ro, src) && !deny_ro(id, cap_ro, dst)
+                {
                     let s = join_child(id, src, &mut rb1);
                     let d = join_child(id, dst, &mut rb2);
                     if let (Some(sl), Some(dl)) = (s, d) {

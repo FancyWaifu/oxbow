@@ -16,7 +16,7 @@ use oxbow_abi::{
     BOOT_IMG_HELLO, BOOT_IMG_PONG,
     BOOT_IMG_CCHELLO, BOOT_IMG_DRIFT, BOOT_IMG_TCC, BOOT_IMG_LUA, BOOT_IMG_UPY, BOOT_IMG_QJS, BOOT_IMG_CURL, BOOT_IMG_CARES, BOOT_IMG_FFI, BOOT_IMG_WL, BOOT_IMG_XKB, BOOT_IMG_VTERM, BOOT_IMG_FT, BOOT_IMG_JAIL, BOOT_IMG_FSTEST, BOOT_MEM, BOOT_SESSION_CHAN, BOOT_TICK, BOOT_TTY,
     HANDLE_NULL, IdentRec, R_GRANT, R_IN, R_OUT, R_RECV,
-    R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_NAMESPACE, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_FLUSH, TAG_TTY_READ, TAG_TTY_WRITE,
+    R_SEND, R_WAIT, R_WRITE, TAG_FS_CREATE, TAG_FS_MKDIR, TAG_FS_NAMESPACE, TAG_FS_NS_MOUNT, TAG_FS_OPEN, TAG_FS_WRITE, TAG_TTY_FLUSH, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 use blake2::{Blake2b, Digest};
@@ -1866,6 +1866,8 @@ fn run_command(line0: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"groups" => groups_cmd(),
         b"su" => su_cmd(rest, cwd, path),
         b"passwd" => passwd_cmd(),
+        b"grant" => grant_cmd(rest),
+        b"rules" => rules_cmd(),
         b"logout" | b"exit" => {
             // §92: end the session and return to the graphical greeter — notify it
             // (it re-appears), then block for the next verified login.
@@ -1909,6 +1911,8 @@ fn run_command(line0: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  id / groups     print uid/gid and group membership\n");
             tw(b"  su [user]       switch user (re-authenticate; default root)\n");
             tw(b"  passwd          change your password\n");
+            tw(b"  grant <u> <dir> root: let a user/@group reach a top-level dir [ro|rw]\n");
+            tw(b"  rules           show the access rules (who can reach what)\n");
             tw(b"  logout          end the session and return to the login prompt\n");
             tw(b"  help            this list\n");
         }
@@ -1982,6 +1986,204 @@ fn cur_ident() -> &'static IdentRec {
 
 fn session_root() -> Handle {
     unsafe { SESSION_ROOT }
+}
+
+// ===========================================================================
+// §namespace — root-defined access rules. The shell is the policy authority:
+// it holds the broad fs root, mints each user a confined namespace at login,
+// and decides which top-level dirs (and at what permission) get MOUNTED into
+// that namespace. /bin (read-only) is mounted for EVERYONE by default; root
+// grants further dirs to a user or group with `grant`. A program inherits the
+// namespace from its parent shell (slot 1), so the rules apply automatically to
+// everything the user runs — no per-program configuration.
+// ===========================================================================
+
+#[derive(Clone, Copy)]
+struct Rule {
+    used: bool,
+    by_uid: bool, // true: match the subject's uid; false: match a group gid
+    subj: u32,    // the uid or gid this rule grants to
+    name: [u8; 32],
+    nlen: u8,
+    ro: bool, // mount read-only (deny create/truncate under it)
+}
+const EMPTY_RULE: Rule = Rule { used: false, by_uid: false, subj: 0, name: [0; 32], nlen: 0, ro: false };
+const MAX_RULES: usize = 64;
+/// Root's access rules, in shell memory (the policy store). In-memory for now —
+/// granting persists for the session; reboot reverts to defaults (a future arc
+/// seeds these from /etc).
+static mut RULES: [Rule; MAX_RULES] = [EMPTY_RULE; MAX_RULES];
+
+/// Add/replace a rule. `subj`/`by_uid` pick the user or group; `comp` is a single
+/// top-level dir name. Idempotent on (subject, name): updates the ro flag.
+fn add_rule(by_uid: bool, subj: u32, comp: &[u8], ro: bool) -> bool {
+    if comp.is_empty() || comp.len() > 32 {
+        return false;
+    }
+    unsafe {
+        // Update an existing rule for the same subject + dir.
+        for r in RULES.iter_mut() {
+            if r.used
+                && r.by_uid == by_uid
+                && r.subj == subj
+                && &r.name[..r.nlen as usize] == comp
+            {
+                r.ro = ro;
+                return true;
+            }
+        }
+        for r in RULES.iter_mut() {
+            if !r.used {
+                r.used = true;
+                r.by_uid = by_uid;
+                r.subj = subj;
+                r.nlen = comp.len() as u8;
+                r.name[..comp.len()].copy_from_slice(comp);
+                r.ro = ro;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Send a TAG_FS_NS_MOUNT to the namespace cap: makes top-level `name` resolve
+/// against the fs root (shared), read-only iff `ro`. Returns true on success.
+fn mount_into(ns_cap: Handle, name: &[u8], ro: bool) -> bool {
+    let mut m = MsgBuf::new(TAG_FS_NS_MOUNT);
+    pack_name(&mut m, name);
+    m.data[63] = if ro { 1 } else { 0 };
+    // The ro flag lives in data[63]; the kernel copies only `data_len` words, so
+    // send the whole message (like TAG_FS_OPEN's flags) — else the flag is dropped.
+    m.data_len = 64;
+    rt::sys_call(ns_cap, &mut m).is_ok() && m.data[0] == 0
+}
+
+/// Map a group name to its gid (the reverse of `gid_name`); None if unknown.
+fn group_gid(name: &[u8]) -> Option<u32> {
+    match name {
+        b"root" => Some(0),
+        b"wheel" => Some(27),
+        b"users" => Some(100),
+        b"bryson" => Some(1000),
+        _ => None,
+    }
+}
+
+/// The first non-empty top-level component of a path (`/bin/x` -> `bin`).
+fn top_component(path: &[u8]) -> &[u8] {
+    path.split(|&b| b == b'/').find(|c| !c.is_empty()).unwrap_or(&[])
+}
+
+/// `grant <user|@group> <dir> [ro|rw]` — root only. Adds an access rule that
+/// mounts a top-level dir into the subject's namespace at their next login.
+fn grant_cmd(rest: &[u8]) {
+    if cur_ident().uid != 0 {
+        tw(b"grant: permission denied (root only)\n");
+        set_status(1);
+        return;
+    }
+    let (subj, r1) = split_cmd(rest);
+    let (patharg, r2) = split_cmd(r1);
+    let (mode, _) = split_cmd(r2);
+    if subj.is_empty() || patharg.is_empty() {
+        tw(b"grant: usage: grant <user|@group> <dir> [ro|rw]  (default rw)\n");
+        return;
+    }
+    let (by_uid, sval) = if let Some(gn) = subj.strip_prefix(b"@") {
+        match group_gid(gn) {
+            Some(g) => (false, g),
+            None => {
+                tw(b"grant: unknown group\n");
+                set_status(1);
+                return;
+            }
+        }
+    } else {
+        match ACCTS.iter().find(|a| a.name == subj) {
+            Some(a) => (true, a.uid),
+            None => {
+                tw(b"grant: unknown user\n");
+                set_status(1);
+                return;
+            }
+        }
+    };
+    let comp = top_component(patharg);
+    if comp.is_empty() {
+        tw(b"grant: invalid dir\n");
+        set_status(1);
+        return;
+    }
+    let ro = mode == b"ro";
+    if add_rule(by_uid, sval, comp, ro) {
+        tw(b"granted ");
+        tw(subj);
+        tw(b" -> /");
+        tw(comp);
+        tw(if ro { b" (read-only)" } else { b" (read-write)" });
+        tw(b" - takes effect at next login\n");
+    } else {
+        tw(b"grant: rule table full\n");
+        set_status(1);
+    }
+}
+
+/// `rules` — print the current access rules (root's namespace policy).
+fn rules_cmd() {
+    let mut any = false;
+    unsafe {
+        for r in RULES.iter() {
+            if !r.used {
+                continue;
+            }
+            any = true;
+            if r.by_uid {
+                tw(b"user ");
+                match ACCTS.iter().find(|a| a.uid == r.subj) {
+                    Some(a) => tw(a.name),
+                    None => tw_dec_u32(r.subj),
+                }
+            } else {
+                tw(b"group ");
+                let gn = gid_name(r.subj);
+                if gn.is_empty() {
+                    tw_dec_u32(r.subj);
+                } else {
+                    tw(gn);
+                }
+            }
+            tw(b" -> /");
+            tw(&r.name[..r.nlen as usize]);
+            tw(if r.ro { b" (ro)\n" } else { b" (rw)\n" });
+        }
+    }
+    tw(b"default: everyone -> /bin (ro)\n");
+    if !any {
+        tw(b"(no additional grants)\n");
+    }
+}
+
+/// Compose account `i`'s namespace `ns_cap`: the default read-only /bin for
+/// everyone, plus every rule that matches the account's uid or its groups.
+fn apply_namespace_mounts(ns_cap: Handle, i: usize) {
+    let a = &ACCTS[i];
+    mount_into(ns_cap, b"bin", true); // shared system tools, read-only — for all users
+    unsafe {
+        for r in RULES.iter() {
+            if !r.used {
+                continue;
+            }
+            let matches = if r.by_uid {
+                r.subj == a.uid
+            } else {
+                a.groups.contains(&r.subj)
+            };
+            if matches {
+                mount_into(ns_cap, &r.name[..r.nlen as usize], r.ro);
+            }
+        }
+    }
 }
 
 /// Current login name, defaulting to "root" before/without a name.
@@ -2082,17 +2284,19 @@ fn set_cwd_home(i: usize, cwd: &mut Handle, path: &mut Path) {
     }
     *path = Path::root();
     if a.home != b"/" {
-        // §namespace: mint a per-user NAMESPACE cap (the user's home + the shared,
-        // read-only /bin) and adopt it as the session root. Because the shell already
+        // §namespace: mint a per-user NAMESPACE cap rooted at the user's home, then
+        // MOUNT the dirs root's access rules permit (always read-only /bin; plus any
+        // `grant`ed dirs). Adopt it as the session root. Because the shell already
         // passes the session root as slot 1 to every program it spawns, each program
-        // INHERITS this namespace automatically — so /bin tools work with no
-        // per-program wiring, while the rest of the fs stays confined to home.
+        // INHERITS this namespace automatically — so the rules apply to everything the
+        // user runs, while the rest of the fs stays confined to home.
         let mut m = MsgBuf::new(TAG_FS_NAMESPACE);
         pack_name(&mut m, a.home);
         if rt::sys_call(BOOT_FS_ROOT, &mut m).is_ok() && m.data[0] == 0 {
             unsafe {
                 SESSION_ROOT = m.handles[0];
             }
+            apply_namespace_mounts(session_root(), i);
         }
     }
     *cwd = session_root();

@@ -513,10 +513,16 @@ pub const FS_SYMLINK: u64 = 3;
 /// AlreadyExists), `data[1]` = kind, `data[2]` = size, `data[3]`/`data[4]` = mtime/atime.
 pub const TAG_FS_OPEN: u64 = u32::from_le_bytes(*b"FSOP") as u64;
 /// Mint a per-user NAMESPACE cap rooted at the given home path (the message name).
-/// The cap routes `bin/...` to the shared read-only `/bin` and everything else under
-/// home — a confined user's session root, inherited by every program they spawn so
-/// the shared tools "just work" with no per-program wiring. Reply: a dir cap.
+/// By itself it confines everything to home; root's access rules then add MOUNTS
+/// (TAG_FS_NS_MOUNT) for the top-level dirs the user may reach (e.g. `bin` read-only).
+/// A confined user's session root, inherited by every program they spawn so the shared
+/// tools "just work" with no per-program wiring. Reply: a dir cap.
 pub const TAG_FS_NAMESPACE: u64 = u32::from_le_bytes(*b"FSNS") as u64;
+/// Add a MOUNT to a namespace cap (send to the namespace cap): the top-level component
+/// `name` resolves against the real fs root instead of home (so the user can reach
+/// `/<name>/...`). `data[63]` = 1 for read-only, 0 for read-write. This is the
+/// primitive root's access rules are composed from. Reply: a status.
+pub const TAG_FS_NS_MOUNT: u64 = u32::from_le_bytes(*b"FSNM") as u64;
 /// Open flags (in `TAG_FS_OPEN` `data[63]`): create-if-missing, exclusive-create
 /// (fail if exists), truncate-existing-to-zero.
 pub const FS_O_CREATE: u64 = 1;
