@@ -60,6 +60,20 @@
 #define CLOCK_REALTIME  0
 #define CLOCK_MONOTONIC 1
 
+/* termios ioctls (x86_64) — struct termios is 44 bytes (NCCS=19); winsize is 8. */
+#define TCGETS      0x5401
+#define TCSETS      0x5402
+#define TCSETSW     0x5403
+#define TCSETSF     0x5404
+#define TIOCGWINSZ  0x5413
+/* termios c_lflag bits / c_cc indices used in the cooked default */
+#define T_ISIG   0x0001
+#define T_ICANON 0x0002
+#define T_ECHO   0x0008
+#define T_ECHOE  0x0010
+#define T_ECHOK  0x0020
+#define T_IEXTEN 0x8000
+
 /* a few errnos we return as negatives */
 #define E_NOSYS  38
 #define E_BADF   9

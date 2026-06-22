@@ -455,9 +455,57 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		return -E_INVAL;
 	}
 
-	/* ---- terminal: report "not a tty" so musl stdio stays block-buffered ---- */
-	case NR_ioctl:
-		return -E_NOTTY;
+	/* ---- terminal (termios) on the std streams ---- */
+	case NR_ioctl: {
+		long fd = a1;
+		unsigned long req = (unsigned long)a2;
+		void *arg = (void *)a3;
+		if (fd < 0 || fd > 2) /* only stdin/out/err are ttys for now */
+			return -E_NOTTY;
+		switch (req) {
+		case TIOCGWINSZ: {
+			/* {ws_row, ws_col, ws_xpixel, ws_ypixel}. A nonzero size + success is
+			 * what makes isatty() true (musl's isatty issues TIOCGWINSZ). */
+			unsigned short *ws = (unsigned short *)arg;
+			if (ws) {
+				ws[0] = 24;
+				ws[1] = 80;
+				ws[2] = 0;
+				ws[3] = 0;
+			}
+			return 0;
+		}
+		case TCGETS: {
+			/* struct termios (44 bytes): cooked defaults so tcgetattr reports a
+			 * line-disciplined terminal (ICANON|ECHO|ISIG). */
+			unsigned char *t = (unsigned char *)arg;
+			if (t) {
+				for (int i = 0; i < 44; i++)
+					t[i] = 0;
+				*(uint32_t *)(t + 0)  = 0x0500; /* c_iflag: ICRNL|IXON */
+				*(uint32_t *)(t + 4)  = 0x0005; /* c_oflag: OPOST|ONLCR */
+				*(uint32_t *)(t + 8)  = 0x00bf; /* c_cflag: B38400|CS8|CREAD */
+				*(uint32_t *)(t + 12) = T_ISIG | T_ICANON | T_ECHO | T_ECHOE | T_ECHOK | T_IEXTEN;
+				t[17 + 0] = 3;    /* VINTR  = ^C   */
+				t[17 + 1] = 0x1c; /* VQUIT  = ^\   */
+				t[17 + 2] = 0x7f; /* VERASE = DEL  */
+				t[17 + 3] = 0x15; /* VKILL  = ^U   */
+				t[17 + 4] = 4;    /* VEOF   = ^D   */
+				t[17 + 6] = 1;    /* VMIN   = 1    */
+			}
+			return 0;
+		}
+		case TCSETS:
+		case TCSETSW:
+		case TCSETSF:
+			/* Accept attribute changes (e.g. a REPL switching to raw mode). The
+			 * tty input path honoring raw mode is a later step; succeeding here
+			 * lets the program run rather than erroring out. */
+			return 0;
+		default:
+			return -E_NOTTY;
+		}
+	}
 
 	/* ---- signals: accept installs as no-ops ---- */
 	case NR_rt_sigaction:

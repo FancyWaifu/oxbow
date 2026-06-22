@@ -1,11 +1,13 @@
 /* Test program for the oxbow musl personality. Stock C against musl's headers.
  *   Phase 1: printf + exit.   Phase 2: heap + buffered stdio + file I/O.
- *   Phase 3: fork + execve + waitpid — spawn another program, collect its exit. */
+ *   Phase 3: fork + execve + waitpid.   Phase 4: termios (isatty/winsize/raw). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <termios.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -13,7 +15,6 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0); /* unbuffered, so output order is deterministic */
-	setvbuf(stdout, NULL, _IONBF, 0); /* unbuffered, so output survives a crash */
 	printf("Hello from musl libc, running on oxbow!\n");
 
 	/* heap + buffered file read (Phase 2) */
@@ -26,6 +27,21 @@ main(void)
 		if (fgets(line, sizeof line, f))
 			printf("  first line: %s", line);
 		fclose(f);
+	}
+
+	/* Phase 4: termios — isatty, window size, and a raw-mode round-trip. */
+	printf("  --- termios ---\n");
+	printf("  isatty(1) = %d (expect 1)\n", isatty(1));
+	struct winsize ws;
+	if (ioctl(1, TIOCGWINSZ, &ws) == 0)
+		printf("  winsize: %d rows x %d cols\n", ws.ws_row, ws.ws_col);
+	struct termios tio;
+	if (tcgetattr(0, &tio) == 0) {
+		printf("  tcgetattr: ICANON=%d ECHO=%d ISIG=%d\n", !!(tio.c_lflag & ICANON),
+		       !!(tio.c_lflag & ECHO), !!(tio.c_lflag & ISIG));
+		struct termios raw = tio;
+		raw.c_lflag &= ~(ICANON | ECHO);
+		printf("  tcsetattr(raw) = %d\n", tcsetattr(0, TCSANOW, &raw));
 	}
 
 	/* Phase 3b: fork + waitpid status propagation. Child exits 42 in its OWN AS;
