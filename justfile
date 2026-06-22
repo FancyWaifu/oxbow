@@ -248,6 +248,15 @@ run-isolation: build build-server-isolation _iso
 run-tty: iso
     qemu-system-x86_64 -M q35 -m 512M -smp 4 -cdrom {{ISO}} -boot d -serial stdio -display cocoa -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive file=oxbow-disk.img,if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0
 
+# `just play` — hop into oxbow for hands-on use. Opens a graphical window (the
+# virtio-GPU desktop), with your PERSISTENT disk (files survive reboots) and
+# networking. Log in ON SCREEN as root/root (Tab moves between the username and
+# password fields, Enter submits). Kernel + serial logs stream to this terminal.
+# Try: ls, cd /, muslhello, `muslhello tty`, awk -f /sum.awk /nums.txt.
+# Release the cocoa keyboard/mouse grab with Ctrl-Alt-G; quit by closing the window.
+play: iso
+    qemu-system-x86_64 -M q35 -m 512M -smp 4 -cdrom {{ISO}} -boot d -serial stdio -display cocoa -no-reboot -no-shutdown -drive file=oxbow-disk.img,if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0 -vga none -device virtio-gpu-pci -netdev user,id=net0 -device e1000,netdev=net0
+
 # Headless serial-console test target: COM1 routed to a TCP socket so a harness
 # can both TYPE (write) and READ on one stream. server=on,wait=on makes QEMU
 # block at startup until the harness connects, so no boot output is lost.
@@ -263,6 +272,10 @@ clean:
     cargo clean
     rm -rf iso_root {{ISO}}
 
-# Create the persistent-storage disk image (16 MiB raw) if it does not exist.
+# Create the persistent-storage disk image (256 MiB raw) if it does not exist.
+# The first boot seeds it from the ~10 MiB initrd via ext2; 16 MiB was too tight
+# (4 KiB-block rounding on many small files could exhaust it mid-seed), so give the
+# seed generous headroom + room for user files. Recreate after a size change:
+#   rm oxbow-disk.img && just disk
 disk:
-    [ -f oxbow-disk.img ] || dd if=/dev/zero of=oxbow-disk.img bs=1m count=16
+    [ -f oxbow-disk.img ] || dd if=/dev/zero of=oxbow-disk.img bs=1m count=256
