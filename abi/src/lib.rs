@@ -518,11 +518,28 @@ pub const TAG_FS_OPEN: u64 = u32::from_le_bytes(*b"FSOP") as u64;
 /// A confined user's session root, inherited by every program they spawn so the shared
 /// tools "just work" with no per-program wiring. Reply: a dir cap.
 pub const TAG_FS_NAMESPACE: u64 = u32::from_le_bytes(*b"FSNS") as u64;
-/// Add a MOUNT to a namespace cap (send to the namespace cap): the top-level component
-/// `name` resolves against the real fs root instead of home (so the user can reach
-/// `/<name>/...`). `data[63]` = 1 for read-only, 0 for read-write. This is the
-/// primitive root's access rules are composed from. Reply: a status.
+/// Add a MOUNT to a namespace cap (send to the namespace cap): the path PREFIX
+/// `name` (one OR MORE components, e.g. `bin` or `projects/oxbow`, or even a single
+/// file) resolves against the real fs root instead of home (so the user can reach
+/// `/<name>/...`). `data[63]` carries the RIGHTS the mount is granted at (one of the
+/// `FS_RIGHT_*` values). This is the primitive root's access rules compose from.
+/// Reply: a status.
 pub const TAG_FS_NS_MOUNT: u64 = u32::from_le_bytes(*b"FSNM") as u64;
+/// Mount/cap RIGHTS — the permission a namespace mount (and every cap opened through
+/// it) is granted at. The right travels WITH the capability (badge-encoded) and is
+/// checked per-operation in fsd, so it holds down the whole subtree, including writes
+/// through an already-open handle. Op matrix (Y=allowed):
+///   right      read readdir create write@end write@mid trunc mkdir unlink rename
+///   RW          Y     Y      Y      Y        Y         Y     Y     Y      Y
+///   RO          Y     Y      .      .        .         .     .     .      .
+///   APPEND      Y     Y      Y      Y        .         .     .     .      .
+///   LIST        .     Y      .      .        .         .     .     .      .
+///   NODELETE    Y     Y      Y      Y        Y         Y     Y     .      .
+pub const FS_RIGHT_RW: u64 = 0; // full read-write (the default)
+pub const FS_RIGHT_RO: u64 = 1; // read-only: no mutation at all
+pub const FS_RIGHT_APPEND: u64 = 2; // read + append-write (no overwrite/truncate/delete)
+pub const FS_RIGHT_LIST: u64 = 3; // readdir only: see names, not contents, no mutation
+pub const FS_RIGHT_NODELETE: u64 = 4; // read-write but cannot unlink/rename (create-but-not-delete)
 /// Open flags (in `TAG_FS_OPEN` `data[63]`): create-if-missing, exclusive-create
 /// (fail if exists), truncate-existing-to-zero.
 pub const FS_O_CREATE: u64 = 1;

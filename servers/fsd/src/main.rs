@@ -22,7 +22,8 @@ extern crate oxbow_libc as _;
 use core::ffi::{c_int, c_void};
 use oxbow_abi::{
     Handle, MsgBuf, BLK_CHUNK, BLK_XFER_SECTORS, BOOT_BLK_EP, BOOT_CONSOLE, BOOT_EP, BOOT_MEM,
-    FS_DIR, FS_FILE, FS_INITRD, FS_O_CREATE, FS_O_EXCL, FS_O_TRUNC, FS_ROOT, FS_SYMLINK,
+    FS_DIR, FS_FILE, FS_INITRD, FS_O_CREATE, FS_O_EXCL, FS_O_TRUNC, FS_RIGHT_APPEND, FS_RIGHT_LIST,
+    FS_RIGHT_NODELETE, FS_RIGHT_RW, FS_ROOT, FS_SYMLINK,
     MSG_DATA_WORDS, PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_BLK_ATTACH,
     TAG_BLK_FLUSH, TAG_BLK_READ, TAG_BLK_READN, TAG_BLK_WRITE, TAG_BLK_WRITEN, TAG_FS_CREATE,
     TAG_FS_LINK, TAG_FS_MKDIR, TAG_FS_NAMESPACE, TAG_FS_NS_MOUNT, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_FS_READLINK,
@@ -431,51 +432,106 @@ static mut REFS: [u16; MAXID] = [0; MAXID];
 // by spawned programs. So homes stay private; mounts (e.g. read-only /bin) are shared.
 static mut NS: [bool; MAXID] = [false; MAXID];
 
-// The mount table (TAG_FS_NS_MOUNT): each row makes a top-level component NM_NAME
-// resolve against the fs root for namespace NM_NS (vs its home), optionally read-only.
+// The mount table (TAG_FS_NS_MOUNT): each row makes a path PREFIX NM_NAME (one or
+// more components, e.g. `bin` or `projects/oxbow`, or a single file) resolve against
+// the fs root for namespace NM_NS (vs its home), at the granted RIGHTS NM_RIGHT.
 // Composed at login from root's access rules — this is "root decides who reaches what".
 const MAX_NSMNT: usize = 128;
+const NM_NAMELEN: usize = 96; // a path prefix, not just a top-level component
 static mut NM_USED: [bool; MAX_NSMNT] = [false; MAX_NSMNT];
 static mut NM_NS: [u16; MAX_NSMNT] = [0; MAX_NSMNT];
-static mut NM_NAME: [[u8; 32]; MAX_NSMNT] = [[0; 32]; MAX_NSMNT];
+static mut NM_NAME: [[u8; NM_NAMELEN]; MAX_NSMNT] = [[0; NM_NAMELEN]; MAX_NSMNT];
 static mut NM_NLEN: [u8; MAX_NSMNT] = [0; MAX_NSMNT];
-static mut NM_RO: [bool; MAX_NSMNT] = [false; MAX_NSMNT];
+static mut NM_RIGHT: [u8; MAX_NSMNT] = [0; MAX_NSMNT]; // an FS_RIGHT_* value
 
-/// A capability's badge carries this bit when it was minted READ-ONLY (handed out
-/// for a read-only mount, or derived from a read-only cap). Node ids are < MAXID
-/// (512), so the high bits are free to flag the cap. The ro-ness travels WITH the
-/// capability: writes/creates/etc. through it are denied, and any child cap it
-/// opens inherits it — so read-only is enforced down the whole subtree.
-const RO_CAP: u64 = 1 << 31;
+// A capability's badge carries its RIGHTS (an FS_RIGHT_* value) in bits 28-30 — node
+// ids are < MAXID (512, 9 bits) so the high bits are free. RW (0) leaves the badge =
+// node id (backward-compatible). The rights travel WITH the capability: every
+// mutating/reading op through it is checked, and any child cap it opens INHERITS the
+// rights — so a restriction holds down the whole subtree, including writes through an
+// already-open handle.
+const RIGHT_SHIFT: u64 = 28;
+
+fn badge_make(id: usize, right: u8) -> u64 {
+    id as u64 | ((right as u64) << RIGHT_SHIFT)
+}
+fn badge_id(b: u64) -> usize {
+    (b & ((1 << RIGHT_SHIFT) - 1)) as usize
+}
+fn badge_right(b: u64) -> u8 {
+    ((b >> RIGHT_SHIFT) & 0x7) as u8
+}
+
+// ---- per-operation permission, given a right (an FS_RIGHT_* value) ----
+fn allows_read(r: u8) -> bool {
+    r as u64 != FS_RIGHT_LIST // everything but LIST can read file content
+}
+fn allows_create(r: u8) -> bool {
+    matches!(r as u64, FS_RIGHT_RW | FS_RIGHT_APPEND | FS_RIGHT_NODELETE)
+}
+fn allows_overwrite(r: u8) -> bool {
+    matches!(r as u64, FS_RIGHT_RW | FS_RIGHT_NODELETE) // write@offset<size, truncate
+}
+fn allows_append(r: u8) -> bool {
+    matches!(r as u64, FS_RIGHT_RW | FS_RIGHT_APPEND | FS_RIGHT_NODELETE) // write@end
+}
+fn allows_mkdir(r: u8) -> bool {
+    matches!(r as u64, FS_RIGHT_RW | FS_RIGHT_NODELETE)
+}
+fn allows_delete(r: u8) -> bool {
+    r as u64 == FS_RIGHT_RW // unlink/rmdir/rename: full RW only
+}
+fn allows_link(r: u8) -> bool {
+    matches!(r as u64, FS_RIGHT_RW | FS_RIGHT_NODELETE)
+}
 
 fn rel(id: usize) -> &'static [u8] {
     unsafe { &PATHS[id][..PLENS[id] as usize] }
 }
 
-/// Should a name-based mutation through cap (`id`, `cap_ro`) be denied? True if the
-/// cap itself is read-only, or `name`'s top-level component is a read-only mount.
-fn deny_ro(id: usize, cap_ro: bool, name: &[u8]) -> bool {
-    cap_ro || ns_mount_for(id, name) == Some(true)
+/// Do `name`'s leading path components match `prefix`'s components exactly? (So mount
+/// `projects/oxbow` matches `projects/oxbow/x` and `projects/oxbow`, but NOT `projects`
+/// or `projectsX`.) Empty components are skipped on both sides.
+fn comp_prefix(name: &[u8], prefix: &[u8]) -> bool {
+    let mut n = name.split(|&b| b == b'/').filter(|c| !c.is_empty());
+    let p = prefix.split(|&b| b == b'/').filter(|c| !c.is_empty());
+    for pc in p {
+        match n.next() {
+            Some(nc) if nc == pc => continue,
+            _ => return false,
+        }
+    }
+    true
 }
 
-/// If `name`'s top-level component is mounted in namespace `id`, return Some(read_only).
-/// A mounted component resolves against the fs root (shared) instead of home (private).
-fn ns_mount_for(id: usize, name: &[u8]) -> Option<bool> {
+/// If `name` falls under a mount of namespace `id`, return Some(its rights). A mounted
+/// prefix resolves against the fs root (shared) instead of home (private). Longest
+/// matching prefix wins (a deeper mount can override a shallower one).
+fn ns_mount_for(id: usize, name: &[u8]) -> Option<u8> {
     if !unsafe { NS[id] } {
         return None;
     }
-    let first = name.split(|&b| b == b'/').find(|c| !c.is_empty())?;
+    let mut best: Option<(usize, u8)> = None; // (prefix len in bytes, right)
     for i in 0..MAX_NSMNT {
         unsafe {
-            if NM_USED[i]
-                && NM_NS[i] as usize == id
-                && &NM_NAME[i][..NM_NLEN[i] as usize] == first
-            {
-                return Some(NM_RO[i]);
+            if NM_USED[i] && NM_NS[i] as usize == id {
+                let prefix = &NM_NAME[i][..NM_NLEN[i] as usize];
+                if comp_prefix(name, prefix) {
+                    let plen = prefix.len();
+                    if best.map_or(true, |(bl, _)| plen > bl) {
+                        best = Some((plen, NM_RIGHT[i]));
+                    }
+                }
             }
         }
     }
-    None
+    best.map(|(_, r)| r)
+}
+
+/// The effective right for a NAME-based op through cap (`id`, `cap_right`): the mount's
+/// right if `name` is mounted, else the cap's inherited right (home/confined subtree).
+fn eff_right(id: usize, cap_right: u8, name: &[u8]) -> u8 {
+    ns_mount_for(id, name).unwrap_or(cap_right)
 }
 
 /// Absolute lwext4 path ("/mp/" + relpath) into `out`, NUL-terminated. An empty
@@ -560,6 +616,36 @@ fn intern(relpath: &[u8]) -> usize {
     0
 }
 
+/// Allocate a FRESH node for `relpath` WITHOUT deduping. Every namespace gets an
+/// independent identity (hence its own mount set), even when two namespaces share the
+/// same home path — e.g. a `confine`/profile namespace alongside the session one. (The
+/// interning dedup is right for FILES but wrong for namespaces, which must not share.)
+fn fresh_node(relpath: &[u8]) -> usize {
+    unsafe {
+        for i in 2..MAXID {
+            if !USED[i] {
+                PATHS[i][..relpath.len()].copy_from_slice(relpath);
+                PLENS[i] = relpath.len() as u16;
+                USED[i] = true;
+                return i;
+            }
+        }
+    }
+    0
+}
+
+/// Drop every mount belonging to namespace node `id` (so a reused node slot never
+/// inherits a previous namespace's mounts).
+fn ns_clear_mounts(id: usize) {
+    unsafe {
+        for i in 0..MAX_NSMNT {
+            if NM_USED[i] && NM_NS[i] as usize == id {
+                NM_USED[i] = false;
+            }
+        }
+    }
+}
+
 /// Release the intern slot for a now-removed `relpath`, so the fixed-size `PATHS`
 /// table is reclaimed instead of leaking. Without this, a long-lived process that
 /// creates+removes many distinct paths (or one that opens >MAXID paths total) would
@@ -588,6 +674,12 @@ fn release_intern(id: usize) {
             if REFS[id] == 0 {
                 USED[id] = false;
                 PLENS[id] = 0;
+                // A namespace node: drop its flag + mounts so a later reuse of this slot
+                // starts clean (and a logout/login with changed rules sees no stale mount).
+                if NS[id] {
+                    NS[id] = false;
+                    ns_clear_mounts(id);
+                }
             }
         }
     }
@@ -792,8 +884,8 @@ pub extern "C" fn oxbow_main() -> ! {
             Ok(r) => r,
             Err(_) => continue,
         };
-        let cap_ro = m.badge & RO_CAP != 0; // a read-only capability (see RO_CAP)
-        let id = (m.badge & !RO_CAP) as usize;
+        let cap_right = badge_right(m.badge); // the rights this capability carries
+        let id = badge_id(m.badge);
         let valid = id > 0 && id < MAXID && unsafe { USED[id] };
 
         match m.tag {
@@ -812,11 +904,15 @@ pub extern "C" fn oxbow_main() -> ! {
                     if !(valid && name_ok(name)) {
                         break 'open;
                     }
-                    // §namespace: a read-only location (a read-only mount, or reached
-                    // via a read-only cap) — deny create/truncate.
-                    let here_ro = deny_ro(id, cap_ro, name);
-                    if here_ro && flags & (FS_O_CREATE | FS_O_TRUNC) != 0 {
-                        status = 3; // write to a read-only location
+                    // §namespace: the effective rights at this name (the mount's, or the
+                    // cap's inherited rights) gate create/truncate.
+                    let er = eff_right(id, cap_right, name);
+                    if flags & FS_O_CREATE != 0 && !allows_create(er) {
+                        status = 3; // create denied by rights
+                        break 'open;
+                    }
+                    if flags & FS_O_TRUNC != 0 && !allows_overwrite(er) {
+                        status = 3; // truncate denied by rights
                         break 'open;
                     }
                     let Some(clen) = join_child(id, name, &mut relbuf) else { break 'open };
@@ -870,9 +966,9 @@ pub extern "C" fn oxbow_main() -> ! {
                     if cid == 0 {
                         break 'open;
                     }
-                    // Propagate read-only down: a cap opened in a read-only location is
-                    // itself read-only, so writes through it AND anything it opens are denied.
-                    let badge = cid as u64 | if here_ro { RO_CAP } else { 0 };
+                    // Propagate rights down: a cap opened in a restricted location carries
+                    // those rights, so ops through it AND anything it opens are governed.
+                    let badge = badge_make(cid, er);
                     let Ok(cap) = rt::sys_mint(BOOT_EP, badge, R_SEND | R_GRANT) else {
                         break 'open;
                     };
@@ -911,11 +1007,17 @@ pub extern "C" fn oxbow_main() -> ! {
                     if home.len() >= PLEN || !name_ok(if home.is_empty() { b"x" } else { home }) {
                         break 'ns;
                     }
-                    let cid = intern(home);
+                    // A FRESH node (not interned): each namespace is independent, so a
+                    // confine/profile namespace doesn't share the session's mounts even at
+                    // the same home path.
+                    let cid = fresh_node(home);
                     if cid == 0 {
                         break 'ns;
                     }
-                    unsafe { NS[cid] = true };
+                    unsafe {
+                        NS[cid] = true;
+                        ns_clear_mounts(cid); // defensive: a reused slot starts with no mounts
+                    }
                     let Ok(cap) = rt::sys_mint(BOOT_EP, cid as u64, R_SEND | R_GRANT) else {
                         break 'ns;
                     };
@@ -934,31 +1036,48 @@ pub extern "C" fn oxbow_main() -> ! {
                 }
             }
             TAG_FS_NS_MOUNT => {
-                // Mount a top-level dir into a namespace: the message is sent TO the
+                // Mount a path PREFIX into a namespace: the message is sent TO the
                 // namespace cap (badge = its node id), so `id` IS the namespace. The
-                // component `name` then resolves against the fs root (shared) instead of
-                // home. data[63] = 1 makes it read-only. This is how root's access rules
-                // reach a user: the shell composes them into the namespace at login.
+                // prefix `name` (one or more components, or a single file) then resolves
+                // against the fs root (shared) instead of home, at the rights in data[63]
+                // (an FS_RIGHT_* value). This is how root's access rules reach a user: the
+                // shell composes them into the namespace at login (or per-spawn confine).
                 let name = msg_name(&m);
-                let ro = m.data[63] == 1;
+                let right = (m.data[63] & 0x7) as u8;
                 let mut status = 1u64;
                 'mnt: {
-                    // Must target a real namespace node; name a single clean component
-                    // that fits the mount-name field.
+                    // Must target a real namespace node; name a clean prefix that fits.
                     if !(valid && unsafe { NS[id] } && name_ok(name)) {
                         break 'mnt;
                     }
-                    let comp = match name.split(|&b| b == b'/').find(|c| !c.is_empty()) {
-                        Some(c) if c.len() <= 32 => c,
-                        _ => break 'mnt,
-                    };
-                    // Idempotent: if already mounted in this ns, just update the ro flag.
+                    // Normalise the prefix: drop empty components, join with single '/'.
+                    let mut pbuf = [0u8; NM_NAMELEN];
+                    let mut plen = 0usize;
+                    for c in name.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
+                        if plen != 0 {
+                            if plen >= NM_NAMELEN {
+                                break 'mnt;
+                            }
+                            pbuf[plen] = b'/';
+                            plen += 1;
+                        }
+                        if plen + c.len() > NM_NAMELEN {
+                            break 'mnt;
+                        }
+                        pbuf[plen..plen + c.len()].copy_from_slice(c);
+                        plen += c.len();
+                    }
+                    if plen == 0 {
+                        break 'mnt;
+                    }
+                    let prefix = &pbuf[..plen];
+                    // Idempotent: if already mounted in this ns, just update the rights.
                     let mut slot = None;
                     for i in 0..MAX_NSMNT {
                         unsafe {
                             if NM_USED[i]
                                 && NM_NS[i] as usize == id
-                                && &NM_NAME[i][..NM_NLEN[i] as usize] == comp
+                                && &NM_NAME[i][..NM_NLEN[i] as usize] == prefix
                             {
                                 slot = Some(i);
                                 break;
@@ -979,13 +1098,13 @@ pub extern "C" fn oxbow_main() -> ! {
                             unsafe {
                                 NM_USED[j] = true;
                                 NM_NS[j] = id as u16;
-                                NM_NLEN[j] = comp.len() as u8;
-                                NM_NAME[j][..comp.len()].copy_from_slice(comp);
+                                NM_NLEN[j] = plen as u8;
+                                NM_NAME[j][..plen].copy_from_slice(prefix);
                             }
                             j
                         }
                     };
-                    unsafe { NM_RO[i] = ro };
+                    unsafe { NM_RIGHT[i] = right };
                     status = 0;
                 }
                 reply_status(reply, status);
@@ -996,7 +1115,8 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut r = MsgBuf::new(0);
                 let mut full = [0u8; 256];
                 let mut count = 0usize;
-                if valid && full_path(id, &mut full).is_some() {
+                // LIST rights can enumerate names (readdir) but not read file content.
+                if valid && allows_read(cap_right) && full_path(id, &mut full).is_some() {
                     let dst = unsafe { (r.data.as_mut_ptr() as *mut u8).add(8) };
                     // §94: served from the one-block cache — collapses the ~73
                     // path-resolved disk reads per 4 KiB into one.
@@ -1035,7 +1155,26 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut relbuf = [0u8; PLEN];
                 let mut r = MsgBuf::new(0);
                 let mut done = false;
-                if valid && name_ok(name) && !deny_ro(id, cap_ro, name) {
+                let er = eff_right(id, cap_right, name);
+                // CREATE is create-OR-TRUNCATE: making a new file needs create rights, but
+                // clobbering an existing one needs overwrite rights (so APPEND can't use a
+                // truncating `>` to erase a log it may only append to).
+                let create_ok = if valid && name_ok(name) {
+                    let mut rb = [0u8; PLEN];
+                    let mut fp = [0u8; 256];
+                    let exists = join_child(id, name, &mut rb)
+                        .filter(|&c| c > 0)
+                        .map(|c| {
+                            full_from_rel(&rb[..c], &mut fp);
+                            let (mut k, mut sz, mut mt, mut at) = (0, 0u64, 0u32, 0u32);
+                            unsafe { oxfs_statx2(fp.as_ptr(), &mut k, &mut sz, &mut mt, &mut at) == 0 }
+                        })
+                        .unwrap_or(false);
+                    if exists { allows_overwrite(er) } else { allows_create(er) }
+                } else {
+                    false
+                };
+                if create_ok {
                     let clen = join_child(id, name, &mut relbuf);
                     if let Some(childlen) = clen {
                         full_from_rel(&relbuf[..childlen], &mut full);
@@ -1043,7 +1182,8 @@ pub extern "C" fn oxbow_main() -> ! {
                             flush();
                             let cid = intern(&relbuf[..childlen]);
                             if cid != 0 {
-                                if let Ok(cap) = rt::sys_mint(BOOT_EP, cid as u64, R_SEND | R_GRANT)
+                                let badge = badge_make(cid, eff_right(id, cap_right, name));
+                                if let Ok(cap) = rt::sys_mint(BOOT_EP, badge, R_SEND | R_GRANT)
                                 {
                                     unsafe { REFS[cid] += 1 }; // live cap; released on close
                                     r.data[0] = 0;
@@ -1068,8 +1208,21 @@ pub extern "C" fn oxbow_main() -> ! {
                 let count = (m.data[1] as usize).min(480); // payload past the 16 B header
                 let mut full = [0u8; 256];
                 let mut written = 0usize;
-                // A read-only cap (e.g. a file under a read-only mount) cannot be written.
-                if valid && !cap_ro && full_path(id, &mut full).is_some() {
+                // Rights gate writes: RO/LIST deny entirely; APPEND allows only writes at
+                // or past EOF (so a log can't be rewritten); RW/NODELETE allow any offset.
+                let mut write_ok = allows_append(cap_right);
+                if write_ok && cap_right as u64 == FS_RIGHT_APPEND && full_path(id, &mut full).is_some() {
+                    sync_writes(); // flush buffered writes so the size check is accurate
+                    let mut kind = 0;
+                    let mut size = 0u64;
+                    let mut mt = 0u32;
+                    let mut at = 0u32;
+                    unsafe { oxfs_statx2(full.as_ptr(), &mut kind, &mut size, &mut mt, &mut at) };
+                    if off < size {
+                        write_ok = false; // append-only: no overwriting existing bytes
+                    }
+                }
+                if valid && write_ok && full_path(id, &mut full).is_some() {
                     let src = unsafe { (m.data.as_ptr() as *const u8).add(16) };
                     // §94: coalesce into 4 KiB blocks instead of open+write+flush
                     // per write — the difference between seconds and minutes for
@@ -1087,7 +1240,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut full = [0u8; 256];
                 let mut relbuf = [0u8; PLEN];
                 let mut status = 1u64;
-                if valid && name_ok(name) && !deny_ro(id, cap_ro, name) {
+                if valid && name_ok(name) && allows_mkdir(eff_right(id, cap_right, name)) {
                     if let Some(clen) = join_child(id, name, &mut relbuf) {
                         full_from_rel(&relbuf[..clen], &mut full);
                         if clen > 0 && unsafe { oxfs_mkdir(full.as_ptr()) } == 0 {
@@ -1105,7 +1258,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut full = [0u8; 256];
                 let mut relbuf = [0u8; PLEN];
                 let mut status = 1u64;
-                if valid && name_ok(name) && !deny_ro(id, cap_ro, name) {
+                if valid && name_ok(name) && allows_delete(eff_right(id, cap_right, name)) {
                     if let Some(clen) = join_child(id, name, &mut relbuf) {
                         full_from_rel(&relbuf[..clen], &mut full);
                         if clen > 0 && unsafe { oxfs_remove(full.as_ptr()) } == 0 {
@@ -1139,8 +1292,11 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut rb1 = [0u8; PLEN];
                 let mut rb2 = [0u8; PLEN];
                 let mut status = 1u64;
+                // Rename = remove old + create new: need delete rights on the source and
+                // create rights on the destination.
                 if valid && name_ok(old) && name_ok(new)
-                    && !deny_ro(id, cap_ro, old) && !deny_ro(id, cap_ro, new)
+                    && allows_delete(eff_right(id, cap_right, old))
+                    && allows_create(eff_right(id, cap_right, new))
                 {
                     let o = join_child(id, old, &mut rb1);
                     let n = join_child(id, new, &mut rb2);
@@ -1180,7 +1336,8 @@ pub extern "C" fn oxbow_main() -> ! {
                 let size = m.data[0];
                 let mut full = [0u8; 256];
                 let mut ok = false;
-                if valid && !cap_ro && full_path(id, &mut full).is_some() {
+                // Truncate rewrites the file, so it needs overwrite rights (RW/NODELETE).
+                if valid && allows_overwrite(cap_right) && full_path(id, &mut full).is_some() {
                     ok = unsafe { oxfs_truncate(full.as_ptr(), size) } == 0;
                     if ok {
                         unsafe { oxfs_flush() };
@@ -1195,7 +1352,8 @@ pub extern "C" fn oxbow_main() -> ! {
                 let flags = m.data[2];
                 let mut full = [0u8; 256];
                 let mut ok = false;
-                if valid && !cap_ro && full_path(id, &mut full).is_some() {
+                // Setting times is a metadata write — any writable right permits it.
+                if valid && allows_append(cap_right) && full_path(id, &mut full).is_some() {
                     let set_m = (flags & 1) as c_int;
                     let set_a = ((flags >> 1) & 1) as c_int;
                     ok = unsafe { oxfs_set_times(full.as_ptr(), mtime, atime, set_m, set_a) } == 0;
@@ -1227,7 +1385,9 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut rb = [0u8; PLEN];
                 let mut tbuf = [0u8; 256];
                 let mut status = 1u64;
-                if valid && name_ok(link) && tlen < tbuf.len() && !deny_ro(id, cap_ro, link) {
+                if valid && name_ok(link) && tlen < tbuf.len()
+                    && allows_link(eff_right(id, cap_right, link))
+                {
                     if let Some(ll) = join_child(id, link, &mut rb) {
                         full_from_rel(&rb[..ll], &mut lf);
                         tbuf[..tlen].copy_from_slice(target);
@@ -1283,7 +1443,7 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut rb2 = [0u8; PLEN];
                 let mut status = 1u64;
                 if valid && name_ok(src) && name_ok(dst)
-                    && !deny_ro(id, cap_ro, src) && !deny_ro(id, cap_ro, dst)
+                    && allows_link(eff_right(id, cap_right, dst))
                 {
                     let s = join_child(id, src, &mut rb1);
                     let d = join_child(id, dst, &mut rb2);
