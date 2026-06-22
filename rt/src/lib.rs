@@ -21,7 +21,7 @@ use oxbow_abi::{
     SPAWN_STDIN, SPAWN_STDOUT, SYS_ATTENUATE, SYS_CALL, SYS_CLOSE, SYS_CONSOLE_WRITE, SYS_EXIT, SYS_FRAME_ALLOC,
     SYS_FRAME_MAP, SYS_IO_IN, SYS_IO_OUT, SYS_IRQ_ACK, SYS_IRQ_BIND, SYS_MAP, SYS_NOTIF_CREATE,
     SYS_NOTIF_SIGNAL, SYS_NOTIF_STATUS, SYS_NOTIF_WAIT, SYS_RECV, SYS_REPLY, SYS_SEND, SYS_EP_CREATE, SYS_MINT,
-    SYS_SPAWN, SYS_SPAWN_BYTES, TAG_TTY_READ, TAG_TTY_WRITE,
+    SYS_SPAWN, SYS_SPAWN_BYTES, TAG_TTY_MODE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 
 // --- Heap (so `alloc` works) ----------------------------------------------
@@ -448,6 +448,17 @@ pub unsafe extern "C" fn __oxbow_write(_fd: i32, buf: *const u8, len: usize) -> 
     stdout_write(slice);
     len as isize
 }
+/// Switch the tty line discipline (Phase 7): raw != 0 -> raw keystroke delivery for a
+/// TUI app (~ICANON), 0 -> cooked. Sent one-way to the tty (the SPAWN_STDOUT endpoint).
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_tty_mode(raw: i32) {
+    let mut m = MsgBuf::new(TAG_TTY_MODE);
+    m.data[0] = if raw != 0 { 1 } else { 0 };
+    m.data_len = 1;
+    let _ = sys_send(SPAWN_STDOUT, &m);
+}
+
 /// Sentinel returned by `__oxbow_read` when a tty read was interrupted by Ctrl-C —
 /// the musl personality turns this into a SIGINT delivery + EINTR. (= -EINTR; a
 /// normal read never returns a small negative, so the dispatcher tests for it.)
@@ -482,6 +493,19 @@ pub unsafe extern "C" fn __oxbow_read(_fd: i32, buf: *mut u8, len: usize) -> isi
         match m.data[1] {
             2 => return total as isize,    // EOF: 0 if nothing buffered yet
             3 => return OXBOW_READ_EINTR,  // Ctrl-C
+            5 => {
+                // Raw-mode bytes (TUI): copy verbatim and return — no line/newline.
+                let n = (m.data[0] as usize).min(48);
+                let take = n.min(len - total);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (m.data.as_ptr() as *const u8).add(16),
+                        buf.add(total),
+                        take,
+                    );
+                }
+                return (total + take) as isize;
+            }
             _ => {}
         }
         let n = (m.data[0] as usize).min(48);

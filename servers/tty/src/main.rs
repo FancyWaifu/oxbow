@@ -17,7 +17,7 @@
 
 use oxbow_abi::{
     Handle, MsgBuf, BOOT_CONSOLE, BOOT_TERM_CHAN, BOOT_TTY, HANDLE_NULL, TAG_TTY_CHAR,
-    TAG_TTY_FLUSH, TAG_TTY_LINE, TAG_TTY_READ, TAG_TTY_WRITE,
+    TAG_TTY_FLUSH, TAG_TTY_LINE, TAG_TTY_MODE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -48,6 +48,21 @@ fn send_marker(reply: Handle, marker: u64) {
     let mut m = MsgBuf::new(TAG_TTY_LINE);
     m.data[0] = 0;
     m.data[1] = marker;
+    m.data_len = 8;
+    let _ = rt::sys_reply(reply, &m);
+}
+
+/// Reply with raw bytes (marker 5 in data[1]): the reader copies them verbatim with
+/// no line/newline semantics. Used in raw mode for TUI keystroke delivery.
+fn send_raw(reply: Handle, bytes: &[u8]) {
+    let n = core::cmp::min(CHUNK, bytes.len());
+    let mut m = MsgBuf::new(TAG_TTY_LINE);
+    m.data[0] = n as u64;
+    m.data[1] = 5;
+    let dst = m.data.as_mut_ptr() as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(16), n);
+    }
     m.data_len = 8;
     let _ = rt::sys_reply(reply, &m);
 }
@@ -91,6 +106,12 @@ pub extern "C" fn oxbow_main() -> ! {
     let mut deliver = [0u8; LINE_BUF];
     let mut dvlen = 0usize;
     let mut dvoff = 0usize;
+    // Phase 7 raw mode (for TUI apps with ~ICANON, e.g. editors): keystrokes are
+    // delivered to the reader byte-for-byte with no echo, editing, or signals. `raw`
+    // is toggled by TAG_TTY_MODE; `rawbuf` holds bytes typed ahead of a READ.
+    let mut raw = false;
+    let mut rawbuf = [0u8; 256];
+    let mut rawlen = 0usize;
 
     loop {
         let mut m = MsgBuf::new(0);
@@ -100,6 +121,27 @@ pub extern "C" fn oxbow_main() -> ! {
         };
 
         match m.tag {
+            // Phase 7: raw-mode keystroke — deliver byte-for-byte, no echo/editing/
+            // signals. Ctrl-C/Ctrl-D are just bytes here (the app's ISIG is off).
+            TAG_TTY_CHAR if raw && m.data_len >= 1 => {
+                let b = m.data[0] as u8;
+                if rawlen < rawbuf.len() {
+                    rawbuf[rawlen] = b;
+                    rawlen += 1;
+                }
+                if pending != HANDLE_NULL {
+                    send_raw(pending, &rawbuf[..rawlen]);
+                    pending = HANDLE_NULL;
+                    rawlen = 0;
+                }
+            }
+            // Switch line discipline (raw <-> cooked); reset both buffers.
+            TAG_TTY_MODE if m.data_len >= 1 => {
+                raw = m.data[0] != 0;
+                elen = 0;
+                echoed = 0;
+                rawlen = 0;
+            }
             TAG_TTY_CHAR if m.data_len >= 1 => match m.data[0] as u8 {
                 // PS/2 backspace is 0x08; serial terminals send DEL (0x7F).
                 0x08 | 0x7F => {
@@ -204,6 +246,16 @@ pub extern "C" fn oxbow_main() -> ! {
                 }
                 _ => {}
             },
+            // Phase 7: raw read — return buffered keystrokes now, or stash the reply
+            // and deliver the next keystroke the moment it arrives (VMIN=1 semantics).
+            TAG_TTY_READ if raw => {
+                if rawlen > 0 {
+                    send_raw(reply, &rawbuf[..rawlen]);
+                    rawlen = 0;
+                } else {
+                    pending = reply;
+                }
+            }
             TAG_TTY_READ => {
                 if dvoff < dvlen {
                     // Mid-delivery: stream the next chunk of the current line.

@@ -849,3 +849,8 @@ pub const TAG_TTY_WRITE: u64 = 0x54495257; // "WRIT"
 /// user typed into the greeter (which the kbd driver also forwarded to the tty)
 /// can't leak into the session as phantom commands.
 pub const TAG_TTY_FLUSH: u64 = 0x53554C46; // "FLUS"
+/// Phase 7: switch the tty line discipline. data[0] = 1 -> RAW (each keystroke is
+/// delivered to the reader immediately, no echo/editing/signals — for TUI apps like
+/// editors that set `~ICANON`), 0 -> COOKED (the default line discipline). The musl
+/// personality sends this on `tcsetattr` based on the ICANON flag.
+pub const TAG_TTY_MODE: u64 = 0x45444F4D; // "MODE"

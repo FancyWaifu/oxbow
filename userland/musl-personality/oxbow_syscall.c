@@ -504,6 +504,19 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 			return (a1 < 3) ? 0 : -E_BADF; /* bare std streams: nothing to close */
 		fd_release((int)a1); /* pipe ends + files freed by kind */
 		return 0;
+	case NR_ftruncate: {
+		/* ftruncate(fd, len): set a file's length. Editors (kilo) rewrite a file as
+		 * ftruncate(len) + write(len); without this, the dirty flag never clears. */
+		long fd = a1;
+		if (fd < 0 || fd >= MAXFD || !fds[fd].used || fds[fd].kind != K_FILE)
+			return -E_BADF;
+		if (__oxbow_fs_truncate(fds[fd].handle, (unsigned long)a2) != 0)
+			return -E_INVAL;
+		fds[fd].size = (unsigned long)a2;
+		if (fds[fd].off > fds[fd].size)
+			fds[fd].off = fds[fd].size;
+		return 0;
+	}
 	case NR_lseek: {
 		long fd = a1, off = a2;
 		int whence = (int)a3;
@@ -657,9 +670,14 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		case TCSETS:
 		case TCSETSW:
 		case TCSETSF:
-			/* Accept attribute changes (e.g. a REPL switching to raw mode). The
-			 * tty input path honoring raw mode is a later step; succeeding here
-			 * lets the program run rather than erroring out. */
+			/* Switch the tty line discipline by the ICANON bit: a TUI app (editor)
+			 * clears ICANON for raw keystroke input; a shell/REPL keeps it. Only the
+			 * std tty streams drive the console mode (a redirected/piped fd doesn't). */
+			if (a1 >= 0 && a1 < 3 && !(fds[a1].used && fds[a1].kind != K_FILE)) {
+				const unsigned char *t = (const unsigned char *)arg;
+				unsigned int lflag = t ? *(const uint32_t *)(t + 12) : T_ICANON;
+				__oxbow_tty_mode((lflag & T_ICANON) ? 0 : 1);
+			}
 			return 0;
 		default:
 			return -E_NOTTY;

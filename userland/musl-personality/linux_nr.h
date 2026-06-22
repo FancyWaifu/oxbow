@@ -30,6 +30,7 @@
 #define NR_pipe2             293
 #define NR_dup3              292
 #define NR_nanosleep         35
+#define NR_ftruncate         77
 #define NR_getpid            39
 #define NR_clone             56
 #define NR_fork              57

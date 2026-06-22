@@ -103,6 +103,7 @@ extern long __oxbow_fs_open(const char *path, unsigned long len, unsigned int fl
 extern long __oxbow_fs_pread(long file, void *buf, unsigned long len, unsigned long off);
 extern long __oxbow_fs_pwrite(long file, const void *buf, unsigned long len, unsigned long off);
 extern void __oxbow_fs_close(long file);
+extern int  __oxbow_fs_truncate(long file, unsigned long size);
 
 /* process spawn/wait (Phase 3), reusing the std::process::Command shims. spawn
  * loads `elf` via SYS_SPAWN_BYTES inheriting cwd+stdout, returns the exit-notif
@@ -122,5 +123,9 @@ extern long __oxbow_pipe_write(unsigned int pipe, const void *buf, unsigned long
 extern void __oxbow_pipe_close(unsigned int pipe);
 extern long __oxbow_pipe_dup(unsigned int pipe);
 extern void __oxbow_pipe_eof(unsigned int pipe);
+
+/* tty line discipline (Phase 7): raw != 0 -> raw keystroke delivery (TUI apps with
+ * ~ICANON), 0 -> cooked. Sent on tcsetattr based on the ICANON flag. */
+extern void __oxbow_tty_mode(int raw);
 
 #endif

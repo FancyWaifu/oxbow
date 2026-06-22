@@ -82,6 +82,7 @@ members = [
     "servers/sha512-256sum",
     "servers/muslhello",
     "servers/awk-musl",
+    "servers/kilo-musl",
     "servers/ps",
     "servers/kill",
     "servers/spin",

@@ -23,6 +23,50 @@ app → musl (stock) → __syscallN → __oxbow_syscall → oxbow rt/kernel
 - `oxsys.h` — oxbow raw-syscall inline asm + oxbow syscall numbers + rt shim decls.
 - `build-musl.sh` — builds vendored musl with the override + compiles the dispatcher.
 
+## Status — Phase 7 reached: a real interactive TUI editor runs (kilo) ✅
+antirez's `kilo` editor, built unmodified from upstream C, runs on oxbow via the musl
+personality — raw-mode keystroke input, a TUI rendered with ANSI escapes, and saving
+to the persistent disk. Verified on QEMU: opened `/edit.txt`, inserted "hello", saved
+(`55 bytes written on disk`), quit, and `cat` showed the edit persisted
+(`helloEdit me on oxbow with kilo!`).
+- **raw-mode tty** (the enabler): the tty server gained a raw line discipline
+  (`TAG_TTY_MODE`) — each keystroke is delivered to the reader byte-for-byte with no
+  echo/editing/signals. `tcsetattr` clearing ICANON flips the tty to raw (and back);
+  `read` returns raw bytes as-is (marker 5, no newline). This is what lets an editor
+  read arrow keys / Ctrl-combos one byte at a time.
+- **ftruncate**: editors rewrite a file as `ftruncate(len)` + `write` — wired to the
+  rt `__oxbow_fs_truncate` shim, so saves clear the dirty flag and persist.
+
+Build: `servers/kilo-musl` (out of the default build; kilo source out-of-repo at
+`~/musl-oxbow/kilo`). Same recipe as awk — cross-compile the single `kilo.c` vs musl +
+the personality, link `libc.a`.
+
+## Status — Phase 6 reached: interactive I/O — stdin, pipes, Ctrl-C ✅
+Interactive musl programs work end to end:
+```
+root@oxbow:/$ muslhello tty
+musltty: type a line + Enter:
+hello world
+  you typed: hello world
+musltty: now press Ctrl-C:
+^C
+  caught SIGINT (sig=2)
+root@oxbow:/$ muslhello          # self-contained pipe/dup2
+  pipe got: "ping" (4 bytes)
+  dup2(pipe,7) read: "dup2ok"
+```
+- **stdin read**: `read(0)` reads a pipeline's `SPAWN_STDIN` when it's a pipe, else a
+  keyboard line via `TAG_TTY_READ` on the tty (the `SPAWN_STDOUT` endpoint serves both
+  read and write). Returns the line incl. its trailing `\n`. EOF = Ctrl-D.
+- **pipe/dup2**: `pipe`/`pipe2`/`dup`/`dup2`/`dup3`. The fd table carries a kind
+  (file/pipe-r/pipe-w); read/write/close dispatch on it, so a dup2'd pipe end works on
+  any fd including 0/1/2. `fork` inherits pipes; `execve` honors a dup2'd stdout, so
+  the `popen` / `awk | cmd` idiom hands the child the pipe.
+- **Ctrl-C SIGINT**: a program blocked in `read()` gets the interrupt → `read` returns
+  EINTR and the dispatcher delivers SIGINT (the Phase-4 handler, or default-terminate
+  130). The tty marks EOF/interrupt in the reply so they're distinct from a blank line.
+  NOT yet: async delivery to CPU-bound code (needs a kernel signal frame).
+
 ## Status — Phase 5 reached: a REAL upstream app runs (onetrueawk) ✅
 The one true awk (BWK awk, Kernighan's), built unmodified from upstream C, runs on
 oxbow via the musl personality. `awk -f /sum.awk /nums.txt` produces output identical
