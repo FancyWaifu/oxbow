@@ -103,12 +103,11 @@ static void fd_release(int fd)
 {
 	if (fd < 0 || fd >= MAXFD || !fds[fd].used)
 		return;
-	if (fds[fd].kind == K_PIPE_W) {
-		/* Closing a write end signals EOF to readers (oxbow pipes don't refcount
-		 * writers, so the holder must do this — mirrors the shell's pipeline). */
-		__oxbow_pipe_eof((unsigned int)fds[fd].handle);
-		__oxbow_pipe_close((unsigned int)fds[fd].handle);
-	} else if (fds[fd].kind == K_PIPE_R) {
+	if (fds[fd].kind == K_PIPE_R || fds[fd].kind == K_PIPE_W) {
+		/* Just close the handle. The KERNEL marks the pipe EOF when its LAST write
+		 * end is dropped (§Phase 11 writer-refcount) — so a fork+exec child closing
+		 * its copy of a write end no longer EOFs the pipe out from under siblings
+		 * (which broke fork-based pipelines + command substitution). */
 		__oxbow_pipe_close((unsigned int)fds[fd].handle);
 	} else if (fds[fd].kind == K_FILE || fds[fd].kind == K_DIR) {
 		/* dup2/F_DUPFD share the fsd handle, so only release it when NO other fd

@@ -5,7 +5,7 @@
 //! process" is resolved from the current thread (`thread::current_proc`).
 use oxbow_abi::{
     Handle, SysError, BOOT_CONSOLE, BOOT_MEM, HANDLE_TABLE_SIZE, R_ATTENUATE, R_GRANT, R_MAP,
-    R_WRITE,
+    R_OUT, R_WRITE,
 };
 use crate::sync::DiagMutex;
 
@@ -188,6 +188,38 @@ impl Process {
     }
 }
 
+/// §Phase 11 pipe writer-refcount: does any ALIVE process still hold a write end
+/// (an R_OUT Pipe handle) of pipe `pidx`? Used to decide EOF when a write end drops.
+fn any_pipe_writer(procs: &[Process; MAX_PROCS], pidx: u8) -> bool {
+    procs.iter().any(|p| {
+        matches!(p.state, PState::Alive)
+            && p.handles.iter().flatten().any(|h| {
+                matches!(h.obj, ObjectRef::Pipe(i) if i == pidx) && (h.rights & R_OUT) != 0
+            })
+    })
+}
+
+/// Close the current process's handle `h`. Returns `Some(pidx)` if the handle was a
+/// pipe WRITE end and no other process holds a write end any more — the caller then
+/// marks that pipe EOF (so readers see end-of-input once the last writer closes,
+/// which fork/dup-aware pipelines + command substitution rely on). §Phase 11.
+pub fn close_handle(h: Handle) -> Result<Option<u8>, SysError> {
+    let mut procs = PROCESSES.lock();
+    let id = crate::thread::current_proc();
+    let idx = h as usize;
+    if idx == 0 || idx >= HANDLE_TABLE_SIZE || procs[id].handles[idx].is_none() {
+        return Err(SysError::BadHandle);
+    }
+    let entry = procs[id].handles[idx].unwrap();
+    procs[id].handles[idx] = None;
+    if let ObjectRef::Pipe(pidx) = entry.obj {
+        if (entry.rights & R_OUT) != 0 && !any_pipe_writer(&procs, pidx) {
+            return Ok(Some(pidx));
+        }
+    }
+    Ok(None)
+}
+
 /// Run `f` with the calling thread's process. The lock is statement-scoped and
 /// never held across a context switch or an IPC side effect (the v0 lock rule).
 pub fn with_current<R>(f: impl FnOnce(&Process) -> R) -> R {
@@ -282,11 +314,32 @@ pub fn sig_dispatch_of(pid: usize) -> u64 {
 /// (it may be the live CR3 — the dying thread is still running on it); its frames
 /// are reclaimed when the slot is reused (`create`). The slot becomes `Dead`.
 pub fn kill(id: usize, code: i32) {
+    // §Phase 11: pipes whose last write end the dying process held must EOF (its
+    // readers — e.g. a shell capturing $(...) — would otherwise block forever).
+    let mut eof_pipes = [0u8; 16];
+    let mut eof_n = 0usize;
     let (exit_notif, mem_idx, parent_mem, cost) = {
         let mut procs = PROCESSES.lock();
+        // Gather the pipe write ends this process holds (deduped).
+        let mut wp = [0u8; 16];
+        let mut wn = 0usize;
+        for h in procs[id].handles.iter().flatten() {
+            if let ObjectRef::Pipe(pidx) = h.obj {
+                if (h.rights & R_OUT) != 0 && wn < wp.len() && !wp[..wn].contains(&pidx) {
+                    wp[wn] = pidx;
+                    wn += 1;
+                }
+            }
+        }
         procs[id].for_each_reply(|idx| ipc::reply_abandon(idx as usize));
         procs[id].close_all();
-        procs[id].state = PState::Dead;
+        procs[id].state = PState::Dead; // now this proc is skipped by any_pipe_writer
+        for k in 0..wn {
+            if !any_pipe_writer(&procs, wp[k]) && eof_n < eof_pipes.len() {
+                eof_pipes[eof_n] = wp[k];
+                eof_n += 1;
+            }
+        }
         (
             procs[id].exit_notif.take(),
             procs[id].mem_idx.take(),
@@ -294,6 +347,14 @@ pub fn kill(id: usize, code: i32) {
             procs[id].spawn_cost,
         )
     };
+    // Outside the PROCESSES lock: EOF the orphaned pipes + wake their blocked readers.
+    for k in 0..eof_n {
+        let mut wake = [0usize; 8];
+        let n = crate::pipe::mark_eof(eof_pipes[k], &mut wake);
+        for &t in &wake[..n] {
+            crate::thread::wake(t);
+        }
+    }
     // Outside the PROCESSES lock (lock rule): reclaim the budget slot, refund the
     // spawner, wake the parent.
     if let Some(mi) = mem_idx {

@@ -239,7 +239,19 @@ pub extern "C" fn syscall_dispatch(
         }
         SYS_CONSOLE_WRITE => sys_console_write(a1, a2, a3),
         SYS_ATTENUATE => sys_attenuate(a1, a2),
-        SYS_CLOSE => SyscallRet::from_result(proc::with_current_mut(|p| p.close(a1 as Handle))),
+        SYS_CLOSE => match proc::close_handle(a1 as Handle) {
+            // §Phase 11: closing the last write end of a pipe marks it EOF.
+            Ok(Some(pidx)) => {
+                let mut wake = [0usize; 8];
+                let n = crate::pipe::mark_eof(pidx, &mut wake);
+                for &t in &wake[..n] {
+                    crate::thread::wake(t);
+                }
+                SyscallRet::ok()
+            }
+            Ok(None) => SyscallRet::ok(),
+            Err(e) => SyscallRet::err(e),
+        },
         SYS_EXIT => {
             proc::kill(crate::thread::current_proc(), a1 as i32); // exit code → parent
             if crate::verbose() {

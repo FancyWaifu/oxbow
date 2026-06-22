@@ -206,10 +206,10 @@ main(int argc, char **argv)
 
 	/* Phase 8: execve stdin-redirect — pipe + fork + dup2(pipe,0) + exec /bin/cat,
 	 * then write to the pipe; cat reads its stdin (the pipe) and echoes to our
-	 * stdout. The popen("w") / pipeline-to-subprocess path. The child closes only its
-	 * READ end after dup2 — closing the write end would signal EOF (oxbow has no
-	 * writer refcount), racing the parent. The parent is the sole writer and EOFs on
-	 * close; cat doesn't inherit the write end (only stdin is passed). */
+	 * stdout. The popen("w") / pipeline-to-subprocess path. The child closes BOTH pipe
+	 * ends after dup2 (standard) — with the kernel's writer-refcount (§Phase 11) that
+	 * no longer races the parent; the pipe EOFs only when the last write end (the
+	 * parent's) closes. */
 	printf("  --- exec with redirected stdin (cat) ---\n");
 	int cp[2];
 	if (pipe(cp) == 0) {
@@ -217,6 +217,7 @@ main(int argc, char **argv)
 		if (cc == 0) {
 			dup2(cp[0], 0);
 			close(cp[0]);
+			close(cp[1]);
 			char *av[] = { "cat", NULL };
 			char *ev[] = { NULL };
 			execve("/bin/cat", av, ev);
@@ -224,7 +225,7 @@ main(int argc, char **argv)
 		}
 		close(cp[0]);
 		write(cp[1], "  cat<stdin: piped-stdin-ok\n", 28);
-		close(cp[1]); /* signals EOF so cat finishes */
+		close(cp[1]); /* last write end -> kernel EOFs the pipe, cat finishes */
 		int ws;
 		waitpid(cc, &ws, 0);
 	}
