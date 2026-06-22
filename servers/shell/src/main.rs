@@ -1867,6 +1867,7 @@ fn run_command(line0: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
         b"su" => su_cmd(rest, cwd, path),
         b"passwd" => passwd_cmd(),
         b"grant" => grant_cmd(rest),
+        b"revoke" => revoke_cmd(rest),
         b"rules" => rules_cmd(),
         b"logout" | b"exit" => {
             // §92: end the session and return to the graphical greeter — notify it
@@ -1912,7 +1913,8 @@ fn run_command(line0: &[u8], sp: &Spawner, cwd: &mut Handle, path: &mut Path) {
             tw(b"  su [user]       switch user (re-authenticate; default root)\n");
             tw(b"  passwd          change your password\n");
             tw(b"  grant <u> <dir> root: let a user/@group reach a top-level dir [ro|rw]\n");
-            tw(b"  rules           show the access rules (who can reach what)\n");
+            tw(b"  revoke <u> <dir> root: remove a granted rule\n");
+            tw(b"  rules           show the access rules (persisted in /etc/access.rules)\n");
             tw(b"  logout          end the session and return to the login prompt\n");
             tw(b"  help            this list\n");
         }
@@ -2009,9 +2011,9 @@ struct Rule {
 }
 const EMPTY_RULE: Rule = Rule { used: false, by_uid: false, subj: 0, name: [0; 32], nlen: 0, ro: false };
 const MAX_RULES: usize = 64;
-/// Root's access rules, in shell memory (the policy store). In-memory for now —
-/// granting persists for the session; reboot reverts to defaults (a future arc
-/// seeds these from /etc).
+/// Root's access rules, in shell memory (the live policy store). Persisted to
+/// /etc/access.rules on every change (see save_rules) and reloaded at boot, so
+/// grants survive reboot.
 static mut RULES: [Rule; MAX_RULES] = [EMPTY_RULE; MAX_RULES];
 
 /// Add/replace a rule. `subj`/`by_uid` pick the user or group; `comp` is a single
@@ -2040,6 +2042,23 @@ fn add_rule(by_uid: bool, subj: u32, comp: &[u8], ro: bool) -> bool {
                 r.nlen = comp.len() as u8;
                 r.name[..comp.len()].copy_from_slice(comp);
                 r.ro = ro;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Remove a rule for (subject, dir). Returns true if one was found and cleared.
+fn remove_rule(by_uid: bool, subj: u32, comp: &[u8]) -> bool {
+    unsafe {
+        for r in RULES.iter_mut() {
+            if r.used
+                && r.by_uid == by_uid
+                && r.subj == subj
+                && &r.name[..r.nlen as usize] == comp
+            {
+                *r = EMPTY_RULE;
                 return true;
             }
         }
@@ -2117,6 +2136,7 @@ fn grant_cmd(rest: &[u8]) {
     }
     let ro = mode == b"ro";
     if add_rule(by_uid, sval, comp, ro) {
+        save_rules(); // persist to /etc/access.rules so it survives reboot
         tw(b"granted ");
         tw(subj);
         tw(b" -> /");
@@ -2125,6 +2145,47 @@ fn grant_cmd(rest: &[u8]) {
         tw(b" - takes effect at next login\n");
     } else {
         tw(b"grant: rule table full\n");
+        set_status(1);
+    }
+}
+
+/// Resolve a `<user|@group>` subject to (by_uid, value). None if unknown.
+fn resolve_subject(subj: &[u8]) -> Option<(bool, u32)> {
+    if let Some(gn) = subj.strip_prefix(b"@") {
+        group_gid(gn).map(|g| (false, g))
+    } else {
+        ACCTS.iter().find(|a| a.name == subj).map(|a| (true, a.uid))
+    }
+}
+
+/// `revoke <user|@group> <dir>` — root only. Removes a previously granted rule.
+fn revoke_cmd(rest: &[u8]) {
+    if cur_ident().uid != 0 {
+        tw(b"revoke: permission denied (root only)\n");
+        set_status(1);
+        return;
+    }
+    let (subj, r1) = split_cmd(rest);
+    let (patharg, _) = split_cmd(r1);
+    if subj.is_empty() || patharg.is_empty() {
+        tw(b"revoke: usage: revoke <user|@group> <dir>\n");
+        return;
+    }
+    let Some((by_uid, sval)) = resolve_subject(subj) else {
+        tw(b"revoke: unknown user/group\n");
+        set_status(1);
+        return;
+    };
+    let comp = top_component(patharg);
+    if remove_rule(by_uid, sval, comp) {
+        save_rules();
+        tw(b"revoked ");
+        tw(subj);
+        tw(b" -> /");
+        tw(comp);
+        tw(b" - takes effect at next login\n");
+    } else {
+        tw(b"revoke: no such rule\n");
         set_status(1);
     }
 }
@@ -2183,6 +2244,99 @@ fn apply_namespace_mounts(ns_cap: Handle, i: usize) {
                 mount_into(ns_cap, &r.name[..r.nlen as usize], r.ro);
             }
         }
+    }
+}
+
+/// Where root's access-rule policy is persisted so grants survive reboot.
+const RULES_PATH: &[u8] = b"/etc/access.rules";
+
+/// Append `b` to `buf` at `*n` (bounded), advancing `*n`.
+fn buf_push(buf: &mut [u8], n: &mut usize, b: &[u8]) {
+    for &c in b {
+        if *n < buf.len() {
+            buf[*n] = c;
+            *n += 1;
+        }
+    }
+}
+
+/// Serialize the RULES table to /etc/access.rules — one rule per line:
+///   `user <name> <dir> <ro|rw>`  or  `group <name> <dir> <ro|rw>`.
+/// Rewritten wholesale on every grant/revoke. The default read-only /bin is NOT
+/// stored (it's implicit for everyone). Root-only operations call this.
+fn save_rules() {
+    let mut buf = [0u8; 4096];
+    let mut n = 0usize;
+    unsafe {
+        for r in RULES.iter() {
+            if !r.used {
+                continue;
+            }
+            // Resolve the subject to a name; skip any we can't name (keeps the
+            // file parseable round-trip).
+            let sname: &[u8] = if r.by_uid {
+                match ACCTS.iter().find(|a| a.uid == r.subj) {
+                    Some(a) => a.name,
+                    None => continue,
+                }
+            } else {
+                let g = gid_name(r.subj);
+                if g.is_empty() {
+                    continue;
+                }
+                g
+            };
+            buf_push(&mut buf, &mut n, if r.by_uid { b"user " } else { b"group " });
+            buf_push(&mut buf, &mut n, sname);
+            buf_push(&mut buf, &mut n, b" ");
+            buf_push(&mut buf, &mut n, &r.name[..r.nlen as usize]);
+            buf_push(&mut buf, &mut n, if r.ro { b" ro\n" } else { b" rw\n" });
+        }
+    }
+    // write_file create-or-truncates and appends a trailing newline (harmless).
+    write_file(BOOT_FS_ROOT, RULES_PATH, &buf[..n], false);
+}
+
+/// Parse one persisted rule line into the RULES table (no save — used by load).
+fn parse_rule_line(line: &[u8]) {
+    let mut it = line.split(|&b| b == b' ' || b == b'\t').filter(|t| !t.is_empty());
+    let (Some(kind), Some(name), Some(dir)) = (it.next(), it.next(), it.next()) else {
+        return;
+    };
+    let ro = it.next() == Some(&b"ro"[..]);
+    let (by_uid, subj) = if kind == b"user" {
+        match ACCTS.iter().find(|a| a.name == name) {
+            Some(a) => (true, a.uid),
+            None => return,
+        }
+    } else if kind == b"group" {
+        match group_gid(name) {
+            Some(g) => (false, g),
+            None => return,
+        }
+    } else {
+        return;
+    };
+    add_rule(by_uid, subj, dir, ro);
+}
+
+/// Load persisted access rules from /etc/access.rules at startup (before the first
+/// login), so grants survive reboot. Absent file = no extra rules (only /bin).
+fn load_rules() {
+    let mut o = MsgBuf::new(TAG_FS_OPEN);
+    pack_name(&mut o, RULES_PATH);
+    if rt::sys_call(BOOT_FS_ROOT, &mut o).is_err()
+        || o.data[0] != 0
+        || o.data[1] != oxbow_abi::FS_FILE
+    {
+        return;
+    }
+    let cap = o.handles[0];
+    let mut buf = [0u8; 4096];
+    let len = unsafe { read_all(cap, &mut buf) };
+    let _ = rt::sys_close(cap);
+    for line in buf[..len].split(|&b| b == b'\n') {
+        parse_rule_line(line);
     }
 }
 
@@ -2482,6 +2636,12 @@ pub extern "C" fn oxbow_main() -> ! {
     let mut cwd: Handle = BOOT_FS_ROOT;
     let mut path = Path::root();
     let mut line = [0u8; 256];
+    // Load root's persisted access rules (/etc/access.rules) BEFORE the first login,
+    // so set_cwd_home composes each user's namespace from the saved policy. seed_accounts
+    // (run inside session_gate) ensures /etc exists; the rules file persists on the disk
+    // across reboots independently.
+    seed_accounts();
+    load_rules();
     // §44/§92: authenticate before the first prompt. The graphical greeter (in the
     // compositor) collects the credentials and relays them over the session
     // channel; session_gate verifies them here — the shell is the sole credential
