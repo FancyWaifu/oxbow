@@ -24,7 +24,7 @@ pub enum ObjType {
 
 /// What a handle points at: a pool index for Endpoint/Reply/Memory/Frame, or the
 /// singleton console.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ObjectRef {
     Endpoint(u8),
     Reply(u8),

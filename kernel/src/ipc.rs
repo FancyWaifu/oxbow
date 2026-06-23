@@ -285,14 +285,32 @@ fn stage_entries(staging_tid: usize, src_proc: usize, msg: &MsgBuf) -> SysResult
     Ok(())
 }
 
-/// Move the snapshotted granted handles from `staging_tid`'s slot into `dst_proc`'s
-/// table (§3.4: a COPY — same rights, sender retains), rewriting the staged indices to
-/// the receiver's. Uses the entries FROZEN by `stage_entries`, not a fresh re-resolve.
-fn transfer_into(dst_proc: usize, staging_tid: usize) -> SysResult {
+/// Move the granted handles from `staging_tid`'s slot into `dst_proc`'s table (§3.4: a
+/// COPY — same rights, sender retains), rewriting the staged indices to the receiver's.
+///
+/// Two complementary checks defeat a sibling thread racing the sender's shared table
+/// between stage and transfer (a sender-first send transfers only when a receiver later
+/// arrives):
+///   - install the FROZEN snapshot's rights (so a swap to a higher-rights cap at the
+///     same index can't escalate — the round-1 fix); and
+///   - re-resolve the staged index in `src_proc` and require it STILL names the SAME
+///     object (so a close — and, for a reclaimable Channel/Pipe, a close+reuse onto a
+///     different resource — is caught; if it's gone or changed, refuse the transfer).
+fn transfer_into(src_proc: usize, dst_proc: usize, staging_tid: usize) -> SysResult {
     let n = unsafe { (*slot(staging_tid)).staging.handle_count as usize };
     for i in 0..n {
-        let entry = unsafe { (*slot(staging_tid)).staged_entries[i] }.ok_or(SysError::BadHandle)?;
-        let new_h = proc::with_proc_mut(dst_proc, |p| p.alloc_slot(entry))?;
+        let snap = unsafe { (*slot(staging_tid)).staged_entries[i] }.ok_or(SysError::BadHandle)?;
+        let src_h = unsafe { (*slot(staging_tid)).staging.handles[i] };
+        // Sender must still hold the same object at that index (catches close / swap /
+        // reclaim-reuse). We INSTALL the snapshot, not the re-resolved entry, so rights
+        // stay frozen.
+        let same = proc::with_proc_mut(src_proc, |p| p.get(src_h))
+            .map(|e| e.obj == snap.obj)
+            .unwrap_or(false);
+        if !same {
+            return Err(SysError::BadHandle);
+        }
+        let new_h = proc::with_proc_mut(dst_proc, |p| p.alloc_slot(snap))?;
         unsafe { (*slot(staging_tid)).staging.handles[i] = new_h };
     }
     Ok(())
@@ -326,7 +344,7 @@ pub fn send_or_call(ep_idx: u8, msg: &MsgBuf, msg_uptr: u64, is_call: bool) -> (
             (*slot(r)).staging = *msg;
             (*slot(r)).staged_entries = (*slot(me)).staged_entries;
         }
-        if let Err(e) = transfer_into(thread::process_of(r), r) {
+        if let Err(e) = transfer_into(thread::current_proc(), thread::process_of(r), r) {
             ENDPOINTS.lock()[ep_idx as usize].recv_waiter = Some(r);
             return (e as u64, HANDLE_NULL as u64);
         }
@@ -395,7 +413,7 @@ pub fn recv(ep_idx: u8, msg_uptr: u64) -> (u64, u64) {
             let is_call = unsafe { (*slot(s)).is_call };
             // Move any granted handles from the sender's table into ours, rewriting
             // the staged indices to our table's (we are the running receiver).
-            if let Err(e) = transfer_into(thread::current_proc(), s) {
+            if let Err(e) = transfer_into(thread::process_of(s), thread::current_proc(), s) {
                 unsafe {
                     (*slot(s)).ret_rax = e as u64;
                     (*slot(s)).ret_rdx = HANDLE_NULL as u64;
@@ -480,7 +498,7 @@ pub fn recv_notif(ep_idx: u8, notif_idx: u8, msg_uptr: u64, timeout_ticks: u64) 
         if let Some(s) = ep.send_q.pop() {
             // ---- sender-first: identical to `recv` ----
             let is_call = unsafe { (*slot(s)).is_call };
-            if let Err(e) = transfer_into(thread::current_proc(), s) {
+            if let Err(e) = transfer_into(thread::process_of(s), thread::current_proc(), s) {
                 unsafe {
                     (*slot(s)).ret_rax = e as u64;
                     (*slot(s)).ret_rdx = HANDLE_NULL as u64;
@@ -574,7 +592,7 @@ pub fn do_reply(reply_idx: usize, reply: &MsgBuf) {
     // install them (same freeze-then-transfer discipline as the send path).
     let transfer = if reply.handle_count > 0 {
         stage_entries(caller, thread::current_proc(), reply)
-            .and_then(|()| transfer_into(thread::process_of(caller), caller))
+            .and_then(|()| transfer_into(thread::current_proc(), thread::process_of(caller), caller))
     } else {
         Ok(())
     };
