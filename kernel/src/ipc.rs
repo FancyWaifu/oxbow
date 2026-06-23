@@ -15,7 +15,7 @@
 //! contention-free; the only hazard is a lock held across a switch.
 use core::mem::size_of;
 use core::ptr::addr_of_mut;
-use oxbow_abi::{Handle, MsgBuf, SysError, SysResult, HANDLE_NULL, MSG_DATA_WORDS, MSG_HANDLES};
+use oxbow_abi::{Handle, MsgBuf, SysError, SysResult, HANDLE_NULL, MSG_DATA_WORDS, MSG_HANDLES, R_GRANT};
 use crate::sync::DiagMutex;
 
 use crate::object::{HandleEntry, ObjectRef};
@@ -91,6 +91,13 @@ static ENDPOINTS: DiagMutex<[Endpoint; EP_POOL]> = DiagMutex::new("ENDPOINTS",
 #[derive(Clone, Copy)]
 struct IpcSlot {
     staging: MsgBuf,
+    /// SNAPSHOT of the sender's granted handle ENTRIES, captured at send time. The
+    /// staged MsgBuf only holds handle INDICES, and for a sender-first send the actual
+    /// transfer happens later (when a receiver arrives) — re-resolving those indices
+    /// then is a TOCTOU: a sibling thread (same table) can swap the slot meanwhile and
+    /// smuggle a different / non-grantable cap. We freeze the validated entries here so
+    /// the later transfer installs exactly what was sent and authorized.
+    staged_entries: [Option<HandleEntry>; MSG_HANDLES],
     msg_uptr: u64, // the thread's OWN user MsgBuf*, validated before blocking
     is_call: bool, // meaningful while queued in a send_q
     copy_out: bool, // resume epilogue must copy staging -> msg_uptr
@@ -100,6 +107,7 @@ struct IpcSlot {
 
 static mut IPC_SLOTS: [IpcSlot; MAX_THREADS] = [IpcSlot {
     staging: MsgBuf::new(0),
+    staged_entries: [None; MSG_HANDLES],
     msg_uptr: 0,
     is_call: false,
     copy_out: false,
@@ -260,14 +268,30 @@ fn mint_reply(caller: usize, to_proc: usize) -> Result<(Handle, usize), SysError
     }
 }
 
-/// Move the granted handles in `staging_tid`'s staged message from `src_proc`'s
-/// table into `dst_proc`'s table (§3.4: a COPY — same rights, sender retains),
-/// rewriting the staged indices to the receiver's. Validated R_GRANT already.
-fn transfer_into(src_proc: usize, dst_proc: usize, staging_tid: usize) -> SysResult {
+/// Snapshot the sender's granted handle ENTRIES into `staging_tid`'s slot, resolving
+/// each staged index against `src_proc` and requiring R_GRANT. Called the instant the
+/// staging MsgBuf is set (in the sender's own non-preemptible syscall window), so the
+/// frozen entries can't be swapped before the later transfer (closes the TOCTOU). On
+/// any invalid / non-grantable handle the whole send is rejected.
+fn stage_entries(staging_tid: usize, src_proc: usize, msg: &MsgBuf) -> SysResult {
+    let n = msg.handle_count as usize;
+    for i in 0..n {
+        let entry = proc::with_proc_mut(src_proc, |p| p.get(msg.handles[i]))?;
+        if entry.rights & R_GRANT == 0 {
+            return Err(SysError::Rights);
+        }
+        unsafe { (*slot(staging_tid)).staged_entries[i] = Some(entry) };
+    }
+    Ok(())
+}
+
+/// Move the snapshotted granted handles from `staging_tid`'s slot into `dst_proc`'s
+/// table (§3.4: a COPY — same rights, sender retains), rewriting the staged indices to
+/// the receiver's. Uses the entries FROZEN by `stage_entries`, not a fresh re-resolve.
+fn transfer_into(dst_proc: usize, staging_tid: usize) -> SysResult {
     let n = unsafe { (*slot(staging_tid)).staging.handle_count as usize };
     for i in 0..n {
-        let src_h = unsafe { (*slot(staging_tid)).staging.handles[i] };
-        let entry = proc::with_proc_mut(src_proc, |p| p.get(src_h))?;
+        let entry = unsafe { (*slot(staging_tid)).staged_entries[i] }.ok_or(SysError::BadHandle)?;
         let new_h = proc::with_proc_mut(dst_proc, |p| p.alloc_slot(entry))?;
         unsafe { (*slot(staging_tid)).staging.handles[i] = new_h };
     }
@@ -279,6 +303,14 @@ fn transfer_into(src_proc: usize, dst_proc: usize, staging_tid: usize) -> SysRes
 pub fn send_or_call(ep_idx: u8, msg: &MsgBuf, msg_uptr: u64, is_call: bool) -> (u64, u64) {
     let me = thread::current();
 
+    // Freeze our granted handle entries up front, under no lock, in our own
+    // non-preemptible syscall window — so the later transfer (which may run after we
+    // block, in a receiver's syscall) installs exactly these, immune to a sibling
+    // thread mutating our handle table in between (the TOCTOU this closes).
+    if let Err(e) = stage_entries(me, thread::current_proc(), msg) {
+        return (e as u64, HANDLE_NULL as u64);
+    }
+
     let mut eps = ENDPOINTS.lock();
     let ep = &mut eps[ep_idx as usize];
     if !ep.in_use {
@@ -288,10 +320,13 @@ pub fn send_or_call(ep_idx: u8, msg: &MsgBuf, msg_uptr: u64, is_call: bool) -> (
     if let Some(r) = ep.recv_waiter.take() {
         // ---- receiver-first: a receiver is blocked waiting for us ----
         drop(eps);
-        // Deposit our message into the receiver's staging, then move any granted
-        // handles into the receiver's table (rewriting the staged indices).
-        unsafe { (*slot(r)).staging = *msg };
-        if let Err(e) = transfer_into(thread::current_proc(), thread::process_of(r), r) {
+        // Deposit our message + the frozen entry snapshot into the receiver's staging,
+        // then move the granted handles into the receiver's table.
+        unsafe {
+            (*slot(r)).staging = *msg;
+            (*slot(r)).staged_entries = (*slot(me)).staged_entries;
+        }
+        if let Err(e) = transfer_into(thread::process_of(r), r) {
             ENDPOINTS.lock()[ep_idx as usize].recv_waiter = Some(r);
             return (e as u64, HANDLE_NULL as u64);
         }
@@ -360,7 +395,7 @@ pub fn recv(ep_idx: u8, msg_uptr: u64) -> (u64, u64) {
             let is_call = unsafe { (*slot(s)).is_call };
             // Move any granted handles from the sender's table into ours, rewriting
             // the staged indices to our table's (we are the running receiver).
-            if let Err(e) = transfer_into(thread::process_of(s), thread::current_proc(), s) {
+            if let Err(e) = transfer_into(thread::current_proc(), s) {
                 unsafe {
                     (*slot(s)).ret_rax = e as u64;
                     (*slot(s)).ret_rdx = HANDLE_NULL as u64;
@@ -445,7 +480,7 @@ pub fn recv_notif(ep_idx: u8, notif_idx: u8, msg_uptr: u64, timeout_ticks: u64) 
         if let Some(s) = ep.send_q.pop() {
             // ---- sender-first: identical to `recv` ----
             let is_call = unsafe { (*slot(s)).is_call };
-            if let Err(e) = transfer_into(thread::process_of(s), thread::current_proc(), s) {
+            if let Err(e) = transfer_into(thread::current_proc(), s) {
                 unsafe {
                     (*slot(s)).ret_rax = e as u64;
                     (*slot(s)).ret_rdx = HANDLE_NULL as u64;
@@ -533,12 +568,13 @@ pub fn recv_notif(ep_idx: u8, notif_idx: u8, msg_uptr: u64, timeout_ticks: u64) 
 pub fn do_reply(reply_idx: usize, reply: &MsgBuf) {
     let caller = reply_caller(reply_idx);
     unsafe { (*slot(caller)).staging = *reply };
-    // Transfer any handles in the reply from the replier's table into the
-    // caller's, rewriting the staged indices (the reply path mirrors §3.4 — a
-    // server returns a freshly-minted cap in OPEN this way). R_GRANT was already
-    // validated in sys_reply. If the caller's table is full, it wakes E_NOSLOTS.
+    // Transfer any handles in the reply from the replier's table into the caller's
+    // (the reply path mirrors §3.4 — a server returns a freshly-minted cap in OPEN
+    // this way). Snapshot the replier's entries into the caller's slot first, then
+    // install them (same freeze-then-transfer discipline as the send path).
     let transfer = if reply.handle_count > 0 {
-        transfer_into(thread::current_proc(), thread::process_of(caller), caller)
+        stage_entries(caller, thread::current_proc(), reply)
+            .and_then(|()| transfer_into(thread::process_of(caller), caller))
     } else {
         Ok(())
     };

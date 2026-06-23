@@ -5,7 +5,7 @@
 //! process" is resolved from the current thread (`thread::current_proc`).
 use oxbow_abi::{
     Handle, SysError, BOOT_CONSOLE, BOOT_MEM, HANDLE_TABLE_SIZE, R_ATTENUATE, R_GRANT, R_MAP,
-    R_OUT, R_WRITE,
+    R_OUT, R_WRITE, SPAWN_ARGV, SPAWN_IDENT,
 };
 use crate::sync::DiagMutex;
 
@@ -394,6 +394,57 @@ const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
 /// stack-hungry in a debug build (it overflowed 64 KiB), so give every process
 /// generous headroom — frames come from the pmm, not the process budget.
 const USER_STACK_PAGES: u64 = 128;
+/// Max ASLR slide (in pages) applied to the stack top — see `load_into`.
+const STACK_ASLR_PAGES: u64 = 512;
+
+/// Do `[a0,a1)` and `[b0,b1)` overlap?
+fn ranges_overlap(a0: u64, a1: u64, b0: u64, b1: u64) -> bool {
+    a0 < b1 && b0 < a1
+}
+
+/// Validate that an untrusted ELF's PT_LOAD segments don't overlap each other OR the
+/// regions the loader maps AFTER them (argv, ident, the ASLR stack window, the TLS
+/// region). Without this, a crafted segment placed on a reserved vaddr makes a later
+/// `map_to` panic (`PageAlreadyMapped`) → whole-system DoS from any spawn-capable
+/// process. Returns false (reject the spawn) on any collision. Assumes
+/// `segments_in_bounds` already passed (so vaddr+memsz is lower-half, no overflow).
+pub fn elf_layout_ok(img: &Image) -> bool {
+    // Reserved windows the loader will map post-segments (page-granular, half-open).
+    let stack_lo = USER_STACK_TOP - (STACK_ASLR_PAGES + USER_STACK_PAGES) * FRAME;
+    let reserved: [(u64, u64); 4] = [
+        (SPAWN_ARGV, SPAWN_ARGV + FRAME),
+        (SPAWN_IDENT, SPAWN_IDENT + FRAME),
+        (stack_lo, USER_STACK_TOP),
+        // Generous TLS guard (per-thread frames bump up from the base).
+        (TLS_REGION_BASE, TLS_REGION_BASE + 0x1000_0000),
+    ];
+    let mut prev: [(u64, u64); 16] = [(0, 0); 16];
+    let mut nprev = 0usize;
+    for ph in img.loads() {
+        let lo = ph.p_vaddr & !(FRAME - 1);
+        let hi = (ph.p_vaddr + ph.p_memsz + FRAME - 1) & !(FRAME - 1);
+        if hi <= lo {
+            continue; // empty segment
+        }
+        for &(r0, r1) in &reserved {
+            if ranges_overlap(lo, hi, r0, r1) {
+                return false;
+            }
+        }
+        for &(p0, p1) in &prev[..nprev] {
+            if ranges_overlap(lo, hi, p0, p1) {
+                return false;
+            }
+        }
+        if nprev < prev.len() {
+            prev[nprev] = (lo, hi);
+            nprev += 1;
+        } else {
+            return false; // absurd number of segments — refuse rather than skip a check
+        }
+    }
+    true
+}
 
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;

@@ -812,7 +812,7 @@ fn sys_spawn_bytes(buf: u64, len: u64, mem_h: u64, msg_ptr: u64, exit_notif_h: u
     };
     // Untrusted image: reject out-of-bounds segments here so the loader's asserts
     // are never reached (a truncated/crafted ELF is an error, not a panic).
-    if !img.segments_in_bounds() {
+    if !img.segments_in_bounds() || !proc::elf_layout_ok(&img) {
         return SyscallRet::err(SysError::Msg);
     }
     spawn_common(&img, mem_h, msg_ptr, exit_notif_h, "exec")
@@ -1233,6 +1233,11 @@ fn sys_pci_bar_map(dev: u64, bar: u64, vaddr: u64) -> SyscallRet {
         }
         let pml4 = mm::vm::current_pml4();
         let pages = (size + 0xfff) / 0x1000;
+        // The whole range must stay in the user half (checking only the start lets a
+        // multi-page BAR cross LOWER_HALF_END → non-canonical → kernel panic).
+        if (vaddr as u128) + (pages as u128) * 0x1000 > LOWER_HALF_END as u128 {
+            return Err(SysError::Fault);
+        }
         for i in 0..pages {
             mm::vm::map_mmio_4k_in(pml4, vaddr + i * 0x1000, base + i * 0x1000);
         }
@@ -1277,6 +1282,10 @@ fn sys_fb_map(fb: u64, vaddr: u64) -> SyscallRet {
         let info = crate::fb::info().ok_or(SysError::Gone)?;
         let pml4 = mm::vm::current_pml4();
         let pages = info.size_bytes() / 0x1000;
+        // Keep the whole framebuffer range in the user half (multi-MiB region).
+        if (vaddr as u128) + (pages as u128) * 0x1000 > LOWER_HALF_END as u128 {
+            return Err(SysError::Fault);
+        }
         for i in 0..pages {
             mm::vm::map_mmio_4k_in(pml4, vaddr + i * 0x1000, info.phys + i * 0x1000);
         }
@@ -1331,7 +1340,8 @@ fn sys_dma_alloc_contig(mem: u64, vaddr: u64, pages: u64) -> SyscallRet {
         if pages == 0 || pages > 4096 {
             return Err(SysError::Msg);
         }
-        if vaddr & 0xfff != 0 || vaddr >= LOWER_HALF_END {
+        // Page-aligned start AND the whole range within the user half.
+        if vaddr & 0xfff != 0 || (vaddr as u128) + (pages as u128) * 4096 > LOWER_HALF_END as u128 {
             return Err(SysError::Fault);
         }
         if !mm::mem::debit(midx, pages * 4096) {
@@ -1394,7 +1404,11 @@ fn sys_shm_map(shm: u64, vaddr: u64) -> SyscallRet {
         let ObjectRef::Shm(idx) = entry.obj else {
             return Err(SysError::BadType);
         };
-        if vaddr & 0xfff != 0 || vaddr >= LOWER_HALF_END {
+        // The WHOLE mapped range must stay in the user half — checking only the start
+        // lets a multi-page region cross LOWER_HALF_END into a non-canonical address and
+        // panic the kernel (unprivileged DoS). Use the region's real size, overflow-safe.
+        let end = (vaddr as u128) + (crate::shm::size(idx) as u128);
+        if vaddr & 0xfff != 0 || vaddr >= LOWER_HALF_END || end > LOWER_HALF_END as u128 {
             return Err(SysError::Fault);
         }
         let writable = entry.rights & R_WRITE != 0;
