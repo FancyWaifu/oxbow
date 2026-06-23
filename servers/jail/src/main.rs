@@ -18,7 +18,8 @@
 
 use oxbow_abi::{
     Handle, MsgBuf, SysError, BOOT_MEM, PLEDGE_IPC, PLEDGE_STDIO, PROT_EXEC, PROT_READ, PROT_WRITE,
-    R_ATTENUATE, R_RECV, R_SEND, SPAWN_STDOUT, TAG_FS_CREATE, TAG_FS_OPEN, TAG_TTY_WRITE,
+    R_ATTENUATE, R_RECV, R_SEND, SPAWN_STDOUT, TAG_FS_CREATE, TAG_FS_NAMESPACE, TAG_FS_OPEN,
+    TAG_FS_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -186,6 +187,48 @@ pub extern "C" fn oxbow_main() -> ! {
     total += 1;
     let escape = fs_call(DIR_CAP, TAG_FS_OPEN, b"../etc/passwd");
     held += report(b"[L3] escape via ../etc/passwd      ", escape != 0, b"no-such-path");
+
+    // [PT] PENTEST 2026-06: namespace-control escape. TAG_FS_NAMESPACE used to be
+    // UNAUTHENTICATED — ANY fs cap (even our /tmp cell) could mint a namespace rooted
+    // at the disk root, at full RW, defeating ALL confinement. We try it, and if it
+    // works, read /etc/passwd (far outside our cell) to prove the escape. The fix
+    // gates namespace creation on the FS_ROOT authority cap, so we get DENIED.
+    total += 1;
+    let mut ns = MsgBuf::new(TAG_FS_NAMESPACE);
+    unsafe { *(ns.data.as_mut_ptr() as *mut u8) = 0 }; // home = "" (the ext2 root)
+    ns.data_len = 8;
+    let got_ns = rt::sys_call(DIR_CAP, &mut ns).is_ok() && ns.data[0] == 0 && ns.handle_count >= 1;
+    if !got_ns {
+        held += report(b"[PT] mint a disk-root namespace    ", true, b"E_DENIED");
+    } else {
+        // We escaped the sandbox — now read a file we must never reach.
+        let root_ns = ns.handles[0];
+        let mut op = MsgBuf::new(TAG_FS_OPEN);
+        let name = b"etc/passwd";
+        let dst = op.data.as_mut_ptr() as *mut u8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(name.as_ptr(), dst, name.len());
+            *dst.add(name.len()) = 0;
+        }
+        op.data_len = 8;
+        let opened = rt::sys_call(root_ns, &mut op).is_ok() && op.data[0] == 0 && op.handle_count >= 1;
+        if opened {
+            let fcap = op.handles[0];
+            let mut rd = MsgBuf::new(TAG_FS_READ);
+            rd.data[0] = 0;
+            rd.data_len = 1;
+            let read = rt::sys_call(fcap, &mut rd).is_ok() && rd.data[0] > 0;
+            let _ = rt::sys_close(fcap);
+            if read {
+                w(b"  [PT] mint root NS + read /etc/passwd-> ESCAPED, leaked bytes [LEAK!]\n");
+            } else {
+                w(b"  [PT] mint root NS, open /etc/passwd -> ESCAPED (opened) [LEAK!]\n");
+            }
+        } else {
+            w(b"  [PT] mint a disk-root namespace    -> ESCAPED the cell [LEAK!]\n");
+        }
+        let _ = rt::sys_close(root_ns);
+    }
 
     // L6 — memory accountability. Ask to map far more than our metered budget. The
     // kernel refuses; even memory is funded by a capability.
