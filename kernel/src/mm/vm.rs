@@ -15,6 +15,24 @@ use x86_64::structures::paging::{
 use x86_64::{PhysAddr, VirtAddr};
 
 use super::pmm;
+use crate::sync::DiagMutex;
+use spin::MutexGuard;
+
+/// Serializes USER address-space MUTATIONS (the probe→map sequences in the mapping
+/// syscalls). The syscall entry clears IF only on the LOCAL core, so under SMP two
+/// threads of one process — sharing a page table — can run mapping syscalls
+/// concurrently on different cores. Without this lock their probe→map races corrupt
+/// the shared page tables (both allocating the same intermediate table) or hit a
+/// double-map panic. A caller holds it across probe+debit+map and nothing that blocks,
+/// so it never spans a context switch. It is the OUTERMOST lock in a mapping syscall
+/// (taken after the cap lookup releases PROCESSES, before MEMORY/PMM/FRAMES).
+static VM_MUT: DiagMutex<()> = DiagMutex::new("VM_MUT", ());
+
+/// Acquire the VM-mutation lock; hold the returned guard across the whole probe→map
+/// critical section of a mapping syscall (see `VM_MUT`).
+pub fn lock_mut() -> MutexGuard<'static, ()> {
+    VM_MUT.lock()
+}
 
 const PAGE_4K: u64 = 4096;
 const PAGE_2M: u64 = 2 * 1024 * 1024;

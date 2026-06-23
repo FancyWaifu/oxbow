@@ -343,6 +343,10 @@ fn sys_map(mem: u64, vaddr: u64, len: u64, prot: u64) -> SyscallRet {
         if end > LOWER_HALF_END {
             return Err(SysError::Fault);
         }
+        // §SMP: serialize the probe→map sequence so two threads of this process can't
+        // race the shared page tables on another core (the loser's probe now sees the
+        // winner's committed mapping and returns E_FAULT instead of corrupting/panicking).
+        let _vm = mm::vm::lock_mut();
         // 5. Probe: overlap → E_FAULT; also the exact missing-table count.
         let pml4 = mm::vm::current_pml4();
         let missing = mm::vm::probe_user_range(pml4, vaddr, pages).map_err(|_| SysError::Fault)?;
@@ -351,7 +355,7 @@ fn sys_map(mem: u64, vaddr: u64, len: u64, prot: u64) -> SyscallRet {
         if !mm::mem::debit(midx, cost) {
             return Err(SysError::NoMem);
         }
-        // 7. Map (infallible now: budget reserved, no page present, single CPU).
+        // 7. Map (infallible now: budget reserved, no page present, lock held).
         let writable = prot & PROT_WRITE != 0;
         for p in 0..pages {
             let frame = mm::pmm::alloc_frame().expect("sys_map: PMM exhausted under budget");
@@ -1017,6 +1021,8 @@ fn sys_frame_map(frame: u64, vaddr: u64, prot: u64) -> SyscallRet {
         // handle was minted — the handle's badge carries the generation it was valid for.
         let phys = mm::mem::frame_phys_checked(fidx, entry.badge as u32)
             .ok_or(SysError::Gone)?;
+        // §SMP: serialize the probe→map against concurrent maps in this AS.
+        let _vm = mm::vm::lock_mut();
         let pml4 = mm::vm::current_pml4();
         mm::vm::probe_user_range(pml4, vaddr, 1).map_err(|_| SysError::Fault)?;
         // Map the SAME physical frame (intermediate tables uncharged in v1).
@@ -1231,13 +1237,14 @@ fn sys_pci_bar_map(dev: u64, bar: u64, vaddr: u64) -> SyscallRet {
         if base == 0 || size == 0 || size > 0x10_0000 {
             return Err(SysError::Msg); // not a memory BAR, or implausibly large
         }
-        let pml4 = mm::vm::current_pml4();
         let pages = (size + 0xfff) / 0x1000;
         // The whole range must stay in the user half (checking only the start lets a
         // multi-page BAR cross LOWER_HALF_END → non-canonical → kernel panic).
         if (vaddr as u128) + (pages as u128) * 0x1000 > LOWER_HALF_END as u128 {
             return Err(SysError::Fault);
         }
+        let _vm = mm::vm::lock_mut(); // §SMP: serialize the mapping in this AS
+        let pml4 = mm::vm::current_pml4();
         for i in 0..pages {
             mm::vm::map_mmio_4k_in(pml4, vaddr + i * 0x1000, base + i * 0x1000);
         }
@@ -1280,12 +1287,13 @@ fn sys_fb_map(fb: u64, vaddr: u64) -> SyscallRet {
             return Err(SysError::Fault);
         }
         let info = crate::fb::info().ok_or(SysError::Gone)?;
-        let pml4 = mm::vm::current_pml4();
         let pages = info.size_bytes() / 0x1000;
         // Keep the whole framebuffer range in the user half (multi-MiB region).
         if (vaddr as u128) + (pages as u128) * 0x1000 > LOWER_HALF_END as u128 {
             return Err(SysError::Fault);
         }
+        let _vm = mm::vm::lock_mut(); // §SMP: serialize the mapping in this AS
+        let pml4 = mm::vm::current_pml4();
         for i in 0..pages {
             mm::vm::map_mmio_4k_in(pml4, vaddr + i * 0x1000, info.phys + i * 0x1000);
         }
@@ -1314,6 +1322,7 @@ fn sys_dma_alloc(mem: u64, vaddr: u64) -> SyscallRet {
             return Err(SysError::NoMem);
         }
         let phys = mm::pmm::alloc_frame().ok_or(SysError::NoMem)?;
+        let _vm = mm::vm::lock_mut(); // §SMP: serialize probe→map in this AS
         let pml4 = mm::vm::current_pml4();
         mm::vm::probe_user_range(pml4, vaddr, 1).map_err(|_| SysError::Fault)?;
         mm::vm::map_user_4k_live(pml4, vaddr, phys, true);
@@ -1348,6 +1357,7 @@ fn sys_dma_alloc_contig(mem: u64, vaddr: u64, pages: u64) -> SyscallRet {
             return Err(SysError::NoMem);
         }
         let phys = mm::pmm::alloc_contig(pages).ok_or(SysError::NoMem)?;
+        let _vm = mm::vm::lock_mut(); // §SMP: serialize probe→map in this AS
         let pml4 = mm::vm::current_pml4();
         mm::vm::probe_user_range(pml4, vaddr, pages).map_err(|_| SysError::Fault)?;
         for i in 0..pages {
@@ -1412,6 +1422,7 @@ fn sys_shm_map(shm: u64, vaddr: u64) -> SyscallRet {
             return Err(SysError::Fault);
         }
         let writable = entry.rights & R_WRITE != 0;
+        let _vm = mm::vm::lock_mut(); // §SMP: serialize the region's probe→map in this AS
         let pml4 = mm::vm::current_pml4();
         let n = crate::shm::map(idx, pml4, vaddr, writable);
         if n == 0 {
@@ -1507,6 +1518,8 @@ fn sys_protect(mem: u64, vaddr: u64, len: u64, prot: u64) -> SyscallRet {
         if proc::with_current(|p| p.is_immutable(vaddr, end)) {
             return Err(SysError::Rights);
         }
+        // §SMP: serialize against concurrent map/protect of this AS (page-table walk).
+        let _vm = mm::vm::lock_mut();
         let pml4 = mm::vm::current_pml4();
         mm::vm::protect_user_range(pml4, vaddr, pages, writable, executable)
             .map_err(|_| SysError::Fault)?;
