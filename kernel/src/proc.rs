@@ -199,6 +199,26 @@ fn any_pipe_writer(procs: &[Process; MAX_PROCS], pidx: u8) -> bool {
     })
 }
 
+/// Atomically CLAIM a Reply handle: if `h` names a live Reply in the current process,
+/// remove it from the table and return its pool index — all under one PROCESSES lock.
+/// This is the single point that consumes a reply, so two cores invoking sys_reply (or
+/// sys_reply racing SYS_CLOSE) can't both resolve-then-free the same pool slot (a
+/// double-free + double-wake). The loser sees the slot already gone (BadHandle).
+pub fn take_reply(h: Handle) -> Result<u8, SysError> {
+    let mut procs = PROCESSES.lock();
+    let id = crate::thread::current_proc();
+    let idx = h as usize;
+    if idx == 0 || idx >= HANDLE_TABLE_SIZE {
+        return Err(SysError::BadHandle);
+    }
+    let entry = procs[id].handles[idx].ok_or(SysError::BadHandle)?;
+    let ObjectRef::Reply(ridx) = entry.obj else {
+        return Err(SysError::BadType);
+    };
+    procs[id].handles[idx] = None; // claim it — a concurrent reply/close now misses
+    Ok(ridx)
+}
+
 /// A side effect the SYS_CLOSE dispatcher must perform AFTER `close_handle` returns
 /// (i.e. after the PROCESSES lock is dropped) — both involve waking threads, which must
 /// not happen under that lock (the v0 lock rule).

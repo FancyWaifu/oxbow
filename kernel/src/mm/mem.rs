@@ -89,11 +89,6 @@ pub fn is_shared_frame(phys: u64) -> bool {
     FRAMES.lock().iter().any(|f| f.in_use && f.phys == phys)
 }
 
-/// Account a new mapping of Frame `idx` (called by `sys_frame_map`).
-pub fn frame_inc_map(idx: u8) {
-    FRAMES.lock()[idx as usize].maps += 1;
-}
-
 /// Account an extra mapping of the shared Frame backing `phys` — fork: the child's
 /// cloned AS re-maps the same shared frame, so its refcount must rise to balance the
 /// extra `frame_unmap` at the child's teardown. No-op if `phys` isn't a tracked Frame.
@@ -164,19 +159,18 @@ pub fn frame_record(phys: u64) -> Option<(u8, u32)> {
     None
 }
 
-/// Physical address behind Frame `idx`.
-#[allow(dead_code)] // used by sys_frame_map in Phase 4
-pub fn frame_phys(idx: u8) -> u64 {
-    FRAMES.lock()[idx as usize].phys
-}
-
-/// Physical address behind Frame `idx`, but ONLY if the slot is live AND its current
-/// generation matches `gen` (the generation the caller's handle was minted at). Returns
-/// `None` for a freed/reused slot — the use-after-free guard for `sys_frame_map`.
-pub fn frame_phys_checked(idx: u8, gen: u32) -> Option<u64> {
-    let f = FRAMES.lock();
-    let e = &f[idx as usize];
+/// Atomically CHECK that Frame `idx` is live at generation `gen` AND account a new
+/// mapping (`maps += 1`), returning its phys — all under one FRAMES lock. Doing the
+/// gen-check and the map-count bump together means a concurrent address-space teardown
+/// (`frame_unmap`, also under FRAMES) can't drive `maps` to 0 and free the physical
+/// frame in the window between the check and the actual `map_to` (the use-after-free the
+/// bare check-then-later-inc left open). Returns `None` (caller maps nothing) for a
+/// freed/reused slot or a generation mismatch — the UAF guard for `sys_frame_map`.
+pub fn frame_checkout(idx: u8, gen: u32) -> Option<u64> {
+    let mut f = FRAMES.lock();
+    let e = &mut f[idx as usize];
     if e.in_use && e.gen == gen {
+        e.maps += 1;
         Some(e.phys)
     } else {
         None

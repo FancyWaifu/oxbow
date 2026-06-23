@@ -1017,17 +1017,16 @@ fn sys_frame_map(frame: u64, vaddr: u64, prot: u64) -> SyscallRet {
         if vaddr >= LOWER_HALF_END {
             return Err(SysError::Fault);
         }
-        // UAF guard: reject the map if this slot was freed (and maybe reused) since the
-        // handle was minted — the handle's badge carries the generation it was valid for.
-        let phys = mm::mem::frame_phys_checked(fidx, entry.badge as u32)
-            .ok_or(SysError::Gone)?;
         // §SMP: serialize the probe→map against concurrent maps in this AS.
         let _vm = mm::vm::lock_mut();
         let pml4 = mm::vm::current_pml4();
         mm::vm::probe_user_range(pml4, vaddr, 1).map_err(|_| SysError::Fault)?;
+        // UAF guard + map accounting in ONE atomic step: verify the slot is still live at
+        // the handle's generation AND pin it (maps += 1) before mapping, so a concurrent
+        // teardown can't free the physical frame between the check and the map_to.
+        let phys = mm::mem::frame_checkout(fidx, entry.badge as u32).ok_or(SysError::Gone)?;
         // Map the SAME physical frame (intermediate tables uncharged in v1).
         mm::vm::map_user_4k_live(pml4, vaddr, phys, writable);
-        mm::mem::frame_inc_map(fidx); // refcount the mapping (§9 reclamation)
         Ok(())
     })())
 }
@@ -1118,11 +1117,17 @@ fn sys_reply(reply: u64, msg_ptr: u64) -> SyscallRet {
         Ok((idx, m))
     })();
     match prepared {
-        Ok((idx, m)) => {
-            ipc::do_reply(idx as usize, &m); // copies to caller staging, wakes it
-            // Consume the Reply handle from our own table (success path, §4.3).
-            let _ = proc::with_current_mut(|p| p.close(reply as Handle));
-            SyscallRet::ok()
+        Ok((_idx, m)) => {
+            // Atomically CLAIM the reply (removes the handle + returns its pool idx) so a
+            // concurrent sys_reply/close on another core can't deliver it twice. Only the
+            // winner runs do_reply; the loser gets BadHandle (already consumed).
+            match proc::take_reply(reply as Handle) {
+                Ok(ridx) => {
+                    ipc::do_reply(ridx as usize, &m); // copies to caller staging, wakes it
+                    SyscallRet::ok()
+                }
+                Err(e) => SyscallRet::err(e),
+            }
         }
         Err(e) => SyscallRet::err(e),
     }
@@ -1512,6 +1517,13 @@ fn sys_protect(mem: u64, vaddr: u64, len: u64, prot: u64) -> SyscallRet {
             return Err(SysError::Msg); // must be readable; W^X forbids W|X (L4)
         }
         let pages = (len + 0xfff) / 0x1000;
+        // The WHOLE range must stay in the user half — protect_user_range walks it page
+        // by page through VirtAddr::new, which PANICS on a non-canonical address. Only
+        // the start was bounded above; a multi-page protect off the top user pages would
+        // crash the kernel (unprivileged DoS). u128 math, mirrors the mapping syscalls.
+        if (vaddr as u128) + (pages as u128) * 0x1000 > LOWER_HALF_END as u128 {
+            return Err(SysError::Fault);
+        }
         // mimmutable (§38): refuse to re-protect a range locked immutable, even a
         // W^X-legal flip.
         let end = vaddr + pages * 0x1000;

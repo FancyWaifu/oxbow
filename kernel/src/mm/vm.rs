@@ -440,7 +440,14 @@ pub fn protect_user_range(
     let l4: &mut PageTable = unsafe { &mut *(super::phys_to_virt(pml4_phys) as *mut PageTable) };
     let mut mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
     for i in 0..pages {
-        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr + i * 4096));
+        // Defense-in-depth (matches map_user_4k_in's lower-half assert): never let a page
+        // cross into the non-canonical/kernel half — VirtAddr::new would PANIC. Callers
+        // bound the range, but fail closed here too rather than crash the kernel.
+        let va = vaddr + i * 4096;
+        if va >= 0x0000_8000_0000_0000 {
+            return Err(());
+        }
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
         match unsafe { mapper.update_flags(page, flags) } {
             Ok(flush) => flush.flush(),
             Err(_) => return Err(()),

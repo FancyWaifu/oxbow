@@ -381,9 +381,12 @@ pub fn register_running_idle(kstack_top: u64) -> usize {
 // before the CPU returns to IF=1 — so the timer IRQ can never fire while a CPU
 // holds it, and there is no lock-order cycle.
 // CANONICAL KERNEL LOCK ORDER (§73 audit — acquire high→low, NEVER the reverse):
-//   ENDPOINTS > PROCESSES > REPLIES > REGIONS > SCHED_LOCK > BINDINGS
+//   ENDPOINTS > PROCESSES > REPLIES > REGIONS > SCHED_LOCK > BINDINGS > VM_MUT
 //             > { CONNS, PIPES, POOL, RNG, IMAGES, MEMORY, FRAMES, BUMP }  (leaves)
 //             > SERIAL  (bottom — pure I/O, acquires nothing).
+// VM_MUT (mm::vm) serializes user address-space mutations; a mapping syscall takes it
+// AFTER the cap lookup releases PROCESSES and holds it across probe→map over the leaf
+// locks (MEMORY/PMM/FRAMES) — never the reverse, and never across a block.
 // The graph is acyclic, so cross-CPU spinning never deadlocks. The deeper reason:
 // every kernel critical section runs IF=0 (SFMask on syscall; IRQ gates), so a core
 // never takes an IRQ while holding a lock — only OTHER cores spin, and they always
