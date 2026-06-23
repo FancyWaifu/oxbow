@@ -1440,6 +1440,44 @@ pub extern "C" fn __oxbow_sock_close(sock: i64) {
     let _ = sys_close(sock as Handle);
 }
 
+/// Listen on `port` and return a badged listener cap, or -1. Backs the personality's
+/// `listen()` — a musl program becomes a TCP server.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_sock_tcp_listen(port: u16) -> i64 {
+    match tcp::listen(oxbow_abi::BOOT_NET_EP, port) {
+        Some(h) => h as i64,
+        None => -1,
+    }
+}
+
+/// Non-blocking accept on a listener cap: returns a fresh connected socket cap (>=0) and
+/// writes the peer's IPv4 (packed big-endian = dotted order) + port, or -1 when no
+/// connection is pending yet. The personality's `accept()` polls this with a yield so
+/// the BSD call blocks until a client arrives.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_sock_tcp_accept(
+    listener: i64,
+    peer_ip: *mut u32,
+    peer_port: *mut u16,
+) -> i64 {
+    match tcp::accept(listener as Handle) {
+        Some((h, addr, _is_v6, port)) => {
+            unsafe {
+                if !peer_ip.is_null() {
+                    *peer_ip = u32::from_be_bytes([addr[0], addr[1], addr[2], addr[3]]);
+                }
+                if !peer_port.is_null() {
+                    *peer_port = port;
+                }
+            }
+            h as i64
+        }
+        None => -1,
+    }
+}
+
 /// Bind a UDP socket (port 0 = ephemeral) and return its socket cap, or -1. Backs the
 /// personality's `socket(SOCK_DGRAM)`+`bind()` — musl's DNS resolver binds a wildcard
 /// UDP socket then sendto/recvmsg's the nameserver.

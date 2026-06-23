@@ -63,6 +63,7 @@ static long do_clock_gettime(long id, struct ox_timespec *ts)
 #define K_TTY    4  /* a dup of a std tty stream (.handle = 0/1/2); shells dup these */
 #define K_SOCK   5  /* a TCP socket; .handle = socket cap (-1 until connect succeeds) */
 #define K_UDP    6  /* a UDP socket; .handle = socket cap (-1 until bind/first send) */
+#define K_LISTEN 7  /* a TCP listener; .handle = listener cap (accept mints K_SOCK fds) */
 struct oxfd {
 	int used;
 	int kind;
@@ -111,9 +112,9 @@ static void fd_release(int fd)
 		 * its copy of a write end no longer EOFs the pipe out from under siblings
 		 * (which broke fork-based pipelines + command substitution). */
 		__oxbow_pipe_close((unsigned int)fds[fd].handle);
-	} else if (fds[fd].kind == K_SOCK) {
+	} else if (fds[fd].kind == K_SOCK || fds[fd].kind == K_LISTEN) {
 		if (fds[fd].handle >= 0)
-			__oxbow_sock_close(fds[fd].handle); /* FIN + drop the socket cap */
+			__oxbow_sock_close(fds[fd].handle); /* FIN / drop the socket|listener cap */
 	} else if (fds[fd].kind == K_UDP) {
 		if (fds[fd].handle >= 0)
 			__oxbow_sock_udp_close(fds[fd].handle);
@@ -639,20 +640,66 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		return 0;
 	}
 	case NR_bind: {
-		/* Only UDP binds (wildcard, port from the sockaddr; the resolver uses 0 =
-		 * ephemeral). TCP sockets don't bind on the client path. */
+		/* UDP: bind the socket now (wildcard; resolver uses port 0 = ephemeral).
+		 * TCP: just remember the port in .off — listen() opens the listener with it. */
 		int fd = (int)a1;
 		const unsigned char *sa = (const unsigned char *)a2;
 		if (fd < 0 || fd >= MAXFD || !fds[fd].used)
 			return -E_BADF;
-		if (fds[fd].kind != K_UDP)
-			return 0; /* benign for the client TCP path */
 		unsigned short port = (sa && a3 >= 8) ? (unsigned short)((sa[2] << 8) | sa[3]) : 0;
-		long h = __oxbow_sock_udp_bind(port);
-		if (h < 0)
-			return -E_INVAL;
-		fds[fd].handle = h;
+		if (fds[fd].kind == K_UDP) {
+			long h = __oxbow_sock_udp_bind(port);
+			if (h < 0)
+				return -E_INVAL;
+			fds[fd].handle = h;
+			return 0;
+		}
+		if (fds[fd].kind == K_SOCK) {
+			fds[fd].off = port; /* stash the listen port for listen() */
+			return 0;
+		}
 		return 0;
+	}
+	case NR_listen: {
+		/* Turn a bound TCP socket into a listener. The net server opens the listen
+		 * port and badges a listener cap; accept() polls it. backlog (a2) is advisory. */
+		int fd = (int)a1;
+		if (fd < 0 || fd >= MAXFD || !fds[fd].used || fds[fd].kind != K_SOCK)
+			return -E_BADF;
+		long h = __oxbow_sock_tcp_listen((unsigned short)fds[fd].off);
+		if (h < 0)
+			return -E_INVAL; /* port unavailable / no socket slot */
+		fds[fd].handle = h;
+		fds[fd].kind = K_LISTEN;
+		return 0;
+	}
+	case NR_accept:
+	case NR_accept4: {
+		/* Block until a client connects (the net server's accept is non-blocking, so
+		 * poll it with a yield), then install the connected socket as a fresh K_SOCK fd
+		 * and report the peer address. accept4 flags (a4) are ignored. */
+		int fd = (int)a1;
+		if (fd < 0 || fd >= MAXFD || !fds[fd].used || fds[fd].kind != K_LISTEN)
+			return -E_INVAL;
+		unsigned int pip = 0;
+		unsigned short pport = 0;
+		long sock;
+		for (;;) {
+			sock = __oxbow_sock_tcp_accept(fds[fd].handle, &pip, &pport);
+			if (sock >= 0)
+				break;
+			ox_syscall0(OX_SYS_YIELD); /* nothing pending — yield, then retry */
+		}
+		int nfd = fd_alloc_kind(sock, 0, K_SOCK);
+		if (nfd < 0) {
+			__oxbow_sock_close(sock);
+			return -E_MFILE;
+		}
+		unsigned char *sa = (unsigned char *)a2;
+		unsigned int *sl = (unsigned int *)a3;
+		if (sa && sl && *sl >= 16)
+			fill_sockaddr_in(sa, sl, pip, pport);
+		return nfd;
 	}
 	case NR_sendto: {
 		/* TCP (connected): ignore the address, just send. UDP: the destination rides

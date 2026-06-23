@@ -140,6 +140,13 @@ extern long __oxbow_sock_send(long sock, const void *buf, unsigned long len);
 extern long __oxbow_sock_recv(long sock, void *buf, unsigned long len);
 extern void __oxbow_sock_close(long sock);
 
+/* TCP server path: listen returns a listener cap; accept (non-blocking) returns a fresh
+ * connected socket cap + the peer IPv4 (packed a<<24|… dotted order) + port, or -1 when
+ * nothing is pending (the personality polls with a yield to block). */
+extern long __oxbow_sock_tcp_listen(unsigned short port);
+extern long __oxbow_sock_tcp_accept(long listener, unsigned int *peer_ip,
+                                    unsigned short *peer_port);
+
 /* UDP (Phase 2: powers musl's DNS resolver). bind returns a socket cap; sendto/recvfrom
  * carry the peer address. recvfrom writes the sender IPv4 (packed a<<24|… dotted order)
  * + port so the resolver can validate the reply source. */

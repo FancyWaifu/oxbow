@@ -107,6 +107,64 @@ dns_test(const char *host, int port)
 	return 0;
 }
 
+/* Phase 3 (sockets): a stock-musl TCP SERVER. `muslhello serve <port>` does the full
+ * server path — socket/bind/listen/accept/read/write/close — then serves ONE request and
+ * exits. Proves the personality's accept/listen onto oxbow's capability TCP listener.
+ * Reach it from the host via a QEMU hostfwd (host:PORT -> guest:<port>). */
+static int
+serve_test(int port)
+{
+	setvbuf(stdout, NULL, _IONBF, 0);
+	int ls = socket(AF_INET, SOCK_STREAM, 0);
+	if (ls < 0) {
+		printf("[srv] socket() failed: %d\n", ls);
+		return 1;
+	}
+	struct sockaddr_in sa;
+	memset(&sa, 0, sizeof sa);
+	sa.sin_family = AF_INET;
+	sa.sin_port = htons((unsigned short)port);
+	sa.sin_addr.s_addr = INADDR_ANY;
+	if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0) {
+		printf("[srv] bind failed\n");
+		return 1;
+	}
+	if (listen(ls, 4) != 0) {
+		printf("[srv] listen failed\n");
+		return 1;
+	}
+	printf("[srv] listening on port %d\n", port);
+	struct sockaddr_in peer;
+	socklen_t pl = sizeof peer;
+	int cs = accept(ls, (struct sockaddr *)&peer, &pl);
+	if (cs < 0) {
+		printf("[srv] accept failed\n");
+		close(ls);
+		return 1;
+	}
+	unsigned char *pa = (unsigned char *)&peer.sin_addr;
+	printf("[srv] accepted from %d.%d.%d.%d:%d\n", pa[0], pa[1], pa[2], pa[3],
+	       ntohs(peer.sin_port));
+	char buf[512];
+	int n = read(cs, buf, sizeof buf - 1);
+	if (n > 0) {
+		buf[n] = 0;
+		char *eol = strpbrk(buf, "\r\n");
+		if (eol)
+			*eol = 0;
+		printf("[srv] request: %s\n", buf);
+	}
+	const char *body = "hello-from-oxbow-musl";
+	const char *resp = "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+	                   "Content-Length: 21\r\nConnection: close\r\n\r\nhello-from-oxbow-musl";
+	(void)body;
+	write(cs, resp, strlen(resp));
+	close(cs);
+	close(ls);
+	printf("[srv] served one request OK\n");
+	return 0;
+}
+
 static volatile sig_atomic_t got_int = 0;
 static void on_int(int s) { got_int = s; }
 
@@ -177,6 +235,10 @@ main(int argc, char **argv)
 		const char *host = argc > 2 ? argv[2] : "example.com";
 		int port = argc > 3 ? atoi(argv[3]) : 0;
 		return dns_test(host, port);
+	}
+	if (argc > 1 && strcmp(argv[1], "serve") == 0) {
+		int port = argc > 2 ? atoi(argv[2]) : 8080;
+		return serve_test(port);
 	}
 	setvbuf(stdout, NULL, _IONBF, 0); /* unbuffered, so output order is deterministic */
 	printf("Hello from musl libc, running on oxbow!\n");
