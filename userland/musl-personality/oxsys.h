@@ -132,4 +132,12 @@ extern void __oxbow_pipe_eof(unsigned int pipe);
  * ~ICANON), 0 -> cooked. Sent on tcsetattr based on the ICANON flag. */
 extern void __oxbow_tty_mode(int raw);
 
+/* BSD sockets (Phase 1: TCP client). Map Linux socket()/connect()/send/recv onto
+ * oxbow's capability TCP API via the session net cap. `ip` is packed a<<24|b<<16|c<<8|d
+ * (dotted-quad order); `port` is host order. connect returns a socket cap (>=0) or -1. */
+extern long __oxbow_sock_tcp_connect(unsigned int ip, unsigned short port);
+extern long __oxbow_sock_send(long sock, const void *buf, unsigned long len);
+extern long __oxbow_sock_recv(long sock, void *buf, unsigned long len);
+extern void __oxbow_sock_close(long sock);
+
 #endif

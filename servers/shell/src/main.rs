@@ -3241,7 +3241,12 @@ pub extern "C" fn oxbow_main() -> ! {
     // §44/§92: authenticate before the first prompt. The graphical greeter (in the
     // compositor) collects the credentials and relays them over the session
     // channel; session_gate verifies them here — the shell is the sole credential
-    // authority — then adopts the identity + the user's home capability.
+    // authority — then adopts the identity + the user's home capability. With the
+    // `serial-login` feature (headless boots / automated tests) we authenticate on
+    // the tty directly via login_gate instead — same credential check.
+    #[cfg(feature = "serial-login")]
+    login_gate(&mut cwd, &mut path);
+    #[cfg(not(feature = "serial-login"))]
     session_gate(&mut cwd, &mut path);
     // §94: cache the /bin directory cap so bare command names resolve to system
     // tools on the filesystem (reachable by every user, independent of the

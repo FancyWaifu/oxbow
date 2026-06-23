@@ -1391,6 +1391,55 @@ pub extern "C" fn __oxbow_pipe_eof(pipe: u32) {
     let _ = sys_pipe_eof(pipe as Handle);
 }
 
+// --- BSD socket shims for the musl/POSIX personality (Phase 1: TCP client) ---
+// The personality dispatcher maps Linux socket()/connect()/send/recv onto these,
+// which drive oxbow's capability TCP socket API (rt::tcp) over the session's net
+// control cap BOOT_NET_EP. Network access is capability-gated: a program without a
+// `net` grant has HANDLE_NULL at BOOT_NET_EP, so connect simply fails — networking
+// stays a capability, not ambient.
+
+/// `connect`: open a TCP connection to `ip` (big-endian a.b.c.d packed a<<24|...|d)
+/// on `port` (host order). Returns the socket cap (>=0), or -1 on failure.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_sock_tcp_connect(ip: u32, port: u16) -> i64 {
+    match tcp::connect(oxbow_abi::BOOT_NET_EP, ip.to_be_bytes(), port) {
+        Some(h) => h as i64,
+        None => -1,
+    }
+}
+
+/// `send`/`write` on a connected socket cap. Returns bytes accepted (caller loops for
+/// the rest, like a short write), or -1 on error.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_sock_send(sock: i64, buf: *const u8, len: usize) -> isize {
+    let data = unsafe { core::slice::from_raw_parts(buf, len) };
+    match tcp::send(sock as Handle, data) {
+        Some(n) => n as isize,
+        None => -1,
+    }
+}
+
+/// `recv`/`read` on a connected socket cap (blocks server-side until data or close).
+/// Returns the byte count (0 = peer closed).
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_sock_recv(sock: i64, buf: *mut u8, len: usize) -> isize {
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    tcp::recv(sock as Handle, out) as isize
+}
+
+/// `close`/`shutdown` on a socket cap: best-effort FIN, then drop the capability.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_sock_close(sock: i64) {
+    let mut m = MsgBuf::new(oxbow_abi::TAG_TCP_CLOSE);
+    m.data_len = 0;
+    let _ = sys_send(sock as Handle, &m);
+    let _ = sys_close(sock as Handle);
+}
+
 // --- Raw syscall stubs ----------------------------------------------------
 // nr in rax; args rdi, rsi, rdx, r10, r8, r9; returns rax (+ rdx). rcx/r11 are
 // clobbered by the `syscall` instruction. No `nomem`/`nostack` options: the

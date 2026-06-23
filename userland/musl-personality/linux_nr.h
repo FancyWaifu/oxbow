@@ -8,6 +8,14 @@
 #define NR_write             1
 #define NR_open              2
 #define NR_close             3
+/* BSD sockets (Phase 1: TCP client) */
+#define NR_socket            41
+#define NR_connect           42
+#define NR_sendto            44
+#define NR_recvfrom          45
+#define NR_shutdown          48
+#define NR_setsockopt        54
+#define NR_getsockopt        55
 #define NR_stat              4
 #define NR_fstat             5
 #define NR_lstat             6
@@ -99,6 +107,15 @@
 #define E_EXIST  17
 #define E_MFILE  24
 #define E_NOTTY  25
+#define E_AFNOSUPPORT 97
+#define E_NETUNREACH  101
+#define E_CONNREFUSED 111
+
+/* socket() domain/type/protocol */
+#define LAF_INET      2
+#define LSOCK_STREAM  1
+#define LSOCK_DGRAM   2
+#define LSOCK_TYPE_MASK 0xff   /* SOCK_CLOEXEC/SOCK_NONBLOCK are ORed above this */
 
 /* fcntl commands */
 #define F_DUPFD         0

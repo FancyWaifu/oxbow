@@ -61,6 +61,7 @@ static long do_clock_gettime(long id, struct ox_timespec *ts)
 #define K_PIPE_W 2
 #define K_DIR    3  /* an open directory; .off is the readdir cursor */
 #define K_TTY    4  /* a dup of a std tty stream (.handle = 0/1/2); shells dup these */
+#define K_SOCK   5  /* a TCP socket; .handle = socket cap (-1 until connect succeeds) */
 struct oxfd {
 	int used;
 	int kind;
@@ -109,6 +110,9 @@ static void fd_release(int fd)
 		 * its copy of a write end no longer EOFs the pipe out from under siblings
 		 * (which broke fork-based pipelines + command substitution). */
 		__oxbow_pipe_close((unsigned int)fds[fd].handle);
+	} else if (fds[fd].kind == K_SOCK) {
+		if (fds[fd].handle >= 0)
+			__oxbow_sock_close(fds[fd].handle); /* FIN + drop the socket cap */
 	} else if (fds[fd].kind == K_FILE || fds[fd].kind == K_DIR) {
 		/* dup2/F_DUPFD share the fsd handle, so only release it when NO other fd
 		 * still references it (shells dup a fd then close the original — closing the
@@ -170,6 +174,9 @@ static long do_read(long fd, void *buf, unsigned long len)
 		}
 		if (fds[fd].kind == K_TTY)
 			return do_read(fds[fd].handle, buf, len); /* route to the std stream */
+		if (fds[fd].kind == K_SOCK)
+			return fds[fd].handle < 0 ? -E_INVAL
+			                          : __oxbow_sock_recv(fds[fd].handle, buf, len);
 		return -E_BADF; /* read on a write-only pipe end */
 	}
 	if (fd < 3) {
@@ -199,6 +206,9 @@ static long do_write(long fd, const void *buf, unsigned long len)
 		}
 		if (fds[fd].kind == K_TTY)
 			return do_write(fds[fd].handle, buf, len); /* route to the std stream */
+		if (fds[fd].kind == K_SOCK)
+			return fds[fd].handle < 0 ? -E_INVAL
+			                          : __oxbow_sock_send(fds[fd].handle, buf, len);
 		return -E_BADF; /* write on a read-only pipe end */
 	}
 	if (fd == 1 || fd == 2)
@@ -561,6 +571,48 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		if (!fds[a1].used)
 			return (a1 < 3) ? 0 : -E_BADF; /* bare std streams: nothing to close */
 		fd_release((int)a1); /* pipe ends + files freed by kind */
+		return 0;
+
+	/* ---- BSD sockets (Phase 1: TCP client) ----
+	 * socket() reserves a K_SOCK fd (unconnected, .handle = -1); connect() drives
+	 * oxbow's capability TCP API and stores the resulting socket cap. read/write/
+	 * send/recv on the fd then route to the socket (see do_read/do_write). DNS and
+	 * UDP are Phase 2; only AF_INET + SOCK_STREAM is supported here. */
+	case NR_socket: {
+		long domain = a1, type = a2;
+		if (domain != LAF_INET)
+			return -E_AFNOSUPPORT;
+		if ((type & LSOCK_TYPE_MASK) != LSOCK_STREAM)
+			return -E_INVAL; /* SOCK_DGRAM (UDP) is Phase 2 */
+		int fd = fd_alloc_kind(-1, 0, K_SOCK); /* -1 = not yet connected */
+		return fd < 0 ? -E_MFILE : fd;
+	}
+	case NR_connect: {
+		int fd = (int)a1;
+		const unsigned char *sa = (const unsigned char *)a2;
+		if (fd < 0 || fd >= MAXFD || !fds[fd].used || fds[fd].kind != K_SOCK)
+			return -E_BADF;
+		if (!sa || a3 < 8)
+			return -E_INVAL;
+		/* sockaddr_in: sin_port @2 (net order), sin_addr @4 (net order = a.b.c.d). */
+		unsigned short port = (unsigned short)((sa[2] << 8) | sa[3]);
+		unsigned int ip = ((unsigned int)sa[4] << 24) | ((unsigned int)sa[5] << 16) |
+		                  ((unsigned int)sa[6] << 8) | (unsigned int)sa[7];
+		long h = __oxbow_sock_tcp_connect(ip, port);
+		if (h < 0)
+			return -E_CONNREFUSED;
+		fds[fd].handle = h;
+		return 0;
+	}
+	case NR_sendto: /* send(fd,buf,len,flags[,addr,addrlen]) — addr ignored (connected) */
+		return do_write(a1, (const void *)a2, (unsigned long)a3);
+	case NR_recvfrom: /* recv(fd,buf,len,flags[,addr,addrlen]) — src addr not filled */
+		if (a5)
+			*(unsigned int *)a6 = 0; /* report a 0-length source address */
+		return do_read(a1, (void *)a2, (unsigned long)a3);
+	case NR_shutdown: /* half-close: treat as a no-op; close() does the teardown */
+	case NR_setsockopt: /* accept option sets benignly (no real options yet) */
+	case NR_getsockopt:
 		return 0;
 	case NR_ftruncate: {
 		/* ftruncate(fd, len): set a file's length. Editors (kilo) rewrite a file as

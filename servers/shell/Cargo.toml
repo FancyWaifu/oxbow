@@ -10,6 +10,13 @@ repository.workspace = true
 name = "shell"
 path = "src/main.rs"
 
+[features]
+# Headless boots (and automated serial-console tests): authenticate over the tty
+# instead of waiting on the compositor's graphical greeter. Same credential check
+# (login_gate -> verify_credentials), just driven from the serial line. Off by
+# default — production builds use the graphical session_gate.
+serial-login = []
+
 [dependencies]
 oxbow-rt = { path = "../../rt" }
 oxbow-abi = { path = "../../abi" }

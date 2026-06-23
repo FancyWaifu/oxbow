@@ -14,9 +14,57 @@
 #include <dirent.h>
 #include <poll.h>
 #include <sched.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 static volatile sig_atomic_t got_sig = 0;
 static void on_usr1(int s) { got_sig = s; }
+
+/* Phase 1 (sockets): an unmodified-stock-musl TCP client. `muslhello net <ip> <port>`
+ * opens a TCP connection, sends an HTTP GET, and prints the response — proving the
+ * socket()/connect()/write()/read() syscalls route through the personality onto
+ * oxbow's capability TCP stack. Needs a `net` grant (root has it). */
+static int
+net_test(const char *ipstr, int port)
+{
+	setvbuf(stdout, NULL, _IONBF, 0);
+	int s = socket(AF_INET, SOCK_STREAM, 0);
+	if (s < 0) {
+		printf("[net] socket() failed: %d\n", s);
+		return 1;
+	}
+	struct sockaddr_in sa;
+	memset(&sa, 0, sizeof sa);
+	sa.sin_family = AF_INET;
+	sa.sin_port = htons((unsigned short)port);
+	sa.sin_addr.s_addr = inet_addr(ipstr);
+	printf("[net] connecting to %s:%d ...\n", ipstr, port);
+	if (connect(s, (struct sockaddr *)&sa, sizeof sa) != 0) {
+		printf("[net] connect failed\n");
+		close(s);
+		return 1;
+	}
+	printf("[net] connected; sending HTTP GET\n");
+	const char *req = "GET / HTTP/1.0\r\nHost: oxbow\r\nConnection: close\r\n\r\n";
+	if (write(s, req, strlen(req)) < 0) {
+		printf("[net] write failed\n");
+		close(s);
+		return 1;
+	}
+	char buf[1024];
+	int total = 0, n;
+	while ((n = read(s, buf, sizeof buf - 1)) > 0) {
+		buf[n] = 0;
+		fwrite(buf, 1, (size_t)n, stdout);
+		total += n;
+		if (total > 4000)
+			break; /* cap the echoed response */
+	}
+	printf("\n[net] received %d bytes total — socket round-trip OK\n", total);
+	close(s);
+	return total > 0 ? 0 : 1;
+}
 
 static volatile sig_atomic_t got_int = 0;
 static void on_int(int s) { got_int = s; }
@@ -79,6 +127,11 @@ main(int argc, char **argv)
 		return tty_test();
 	if (argc > 1 && strcmp(argv[1], "loop") == 0)
 		return loop_test();
+	if (argc > 1 && strcmp(argv[1], "net") == 0) {
+		const char *ip = argc > 2 ? argv[2] : "10.0.2.2";
+		int port = argc > 3 ? atoi(argv[3]) : 80;
+		return net_test(ip, port);
+	}
 	setvbuf(stdout, NULL, _IONBF, 0); /* unbuffered, so output order is deterministic */
 	printf("Hello from musl libc, running on oxbow!\n");
 
