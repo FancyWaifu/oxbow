@@ -17,9 +17,9 @@
 #![no_main]
 
 use oxbow_abi::{
-    Handle, MsgBuf, SysError, BOOT_MEM, PLEDGE_IPC, PLEDGE_STDIO, PROT_EXEC, PROT_READ, PROT_WRITE,
-    R_ATTENUATE, R_RECV, R_SEND, SPAWN_STDOUT, TAG_FS_CREATE, TAG_FS_NAMESPACE, TAG_FS_OPEN,
-    TAG_FS_READ, TAG_TTY_WRITE,
+    Handle, HANDLE_NULL, MsgBuf, SysError, BOOT_MEM, PLEDGE_IPC, PLEDGE_STDIO, PROT_EXEC, PROT_READ,
+    PROT_WRITE, R_ATTENUATE, R_RECV, R_SEND, SPAWN_STDOUT, TAG_FS_CREATE, TAG_FS_NAMESPACE,
+    TAG_FS_OPEN, TAG_FS_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -90,6 +90,125 @@ fn fs_call(cap: Handle, tag: u64, name: &[u8]) -> u64 {
         let _ = rt::sys_close(m.handles[0]);
     }
     m.data[0]
+}
+
+// ---- crafted-ELF fuzzer: the kernel's sys_spawn_bytes validator must REJECT every
+// malformed image (never panic, never load it). Each case is a one-field mutation of an
+// otherwise-valid ELF64 ET_EXEC; we spawn it and require an error. This is an executable
+// regression for the round-1/2 ELF-loader hardening (bounds, W^X, vaddr range, overlap,
+// PT_TLS, phdr-table). jail is unpledged here, so PLEDGE_SPAWN is available.
+static mut FBUF: [u8; 8192] = [0; 8192];
+unsafe fn w16(o: usize, v: u16) {
+    FBUF[o] = v as u8;
+    FBUF[o + 1] = (v >> 8) as u8;
+}
+unsafe fn w32(o: usize, v: u32) {
+    for i in 0..4 {
+        FBUF[o + i] = (v >> (8 * i)) as u8;
+    }
+}
+unsafe fn w64(o: usize, v: u64) {
+    for i in 0..8 {
+        FBUF[o + i] = (v >> (8 * i)) as u8;
+    }
+}
+/// Lay down a VALID ELF64 ET_EXEC/x86_64 with `nph` program headers; PH0 is a clean
+/// PT_LOAD (R+X, filesz=0, memsz=4 KiB @ 0x400000). Returns the header-region length.
+unsafe fn build_base(nph: u16) -> usize {
+    for b in FBUF.iter_mut() {
+        *b = 0;
+    }
+    FBUF[0] = 0x7f;
+    FBUF[1] = b'E';
+    FBUF[2] = b'L';
+    FBUF[3] = b'F';
+    FBUF[4] = 2; // ELFCLASS64
+    FBUF[5] = 1; // little-endian
+    FBUF[6] = 1; // version
+    w16(16, 2); // e_type = ET_EXEC
+    w16(18, 62); // e_machine = x86_64
+    w32(20, 1); // e_version
+    w64(24, 0x400000); // e_entry
+    w64(32, 64); // e_phoff
+    w16(52, 64); // e_ehsize
+    w16(54, 56); // e_phentsize
+    w16(56, nph); // e_phnum
+    let p0 = 64;
+    w32(p0, 1); // PT_LOAD
+    w32(p0 + 4, 5); // R+X
+    w64(p0 + 16, 0x400000); // p_vaddr
+    w64(p0 + 40, 0x1000); // p_memsz
+    w64(p0 + 48, 0x1000); // p_align
+    64 + (nph as usize) * 56
+}
+/// Spawn `FBUF[..len]`; true iff the kernel REJECTED it (Err) — the desired outcome.
+unsafe fn rejected(len: usize) -> bool {
+    let m = MsgBuf::new(0);
+    rt::sys_spawn_bytes(&FBUF[..len], BOOT_MEM, &m, HANDLE_NULL).is_err()
+}
+
+/// Run the crafted-ELF battery; returns (rejected_count, total). Each mutation must be
+/// refused by the loader.
+fn elf_fuzz() -> (u32, u32) {
+    let mut total = 0u32;
+    let mut rej = 0u32;
+    let mut t = |ok: bool| {
+        total += 1;
+        if ok {
+            rej += 1;
+        }
+    };
+    unsafe {
+        let l = build_base(1);
+        t(rejected(40)); // 1. truncated below the ELF header
+        let l = build_base(1);
+        FBUF[0] = 0;
+        t(rejected(l)); // 2. bad magic
+        let l = build_base(1);
+        FBUF[4] = 1;
+        t(rejected(l)); // 3. ELFCLASS32
+        let l = build_base(1);
+        w16(16, 3);
+        t(rejected(l)); // 4. ET_DYN (PIE — unsupported)
+        let l = build_base(1);
+        w16(18, 0);
+        t(rejected(l)); // 5. wrong machine
+        let l = build_base(1);
+        w16(56, 100);
+        t(rejected(l)); // 6. phnum > MAX_PHDRS
+        let l = build_base(1);
+        w16(54, 32);
+        t(rejected(l)); // 7. phentsize < sizeof(phdr)
+        let l = build_base(1);
+        w64(32, 0xF000);
+        t(rejected(l)); // 8. phdr table past end
+        let l = build_base(1);
+        w32(64 + 4, 7);
+        t(rejected(l)); // 9. W+X segment (L4)
+        let l = build_base(1);
+        w64(64 + 16, 0xFFFF_8000_0000_0000);
+        t(rejected(l)); // 10. kernel-half p_vaddr
+        let l = build_base(1);
+        w64(64 + 16, 0xFFFF_FFFF_FFFF_F000);
+        w64(64 + 40, 0x2000);
+        t(rejected(l)); // 11. p_vaddr + p_memsz overflow
+        let l = build_base(1);
+        w64(64 + 16, 0x0F00_0000);
+        t(rejected(l)); // 12. overlaps the reserved SPAWN_ARGV page
+        let l = build_base(1);
+        w64(64 + 8, 0xF000);
+        t(rejected(l)); // 13. segment file range past the buffer
+        let l = build_base(2);
+        let p1 = 64 + 56;
+        w32(p1, 7); // PT_TLS
+        w64(p1 + 32, 0x4000); // p_filesz huge (the overflow we fixed)
+        t(rejected(l)); // 14. PT_TLS filesz > memsz / past a frame
+        let l = build_base(1);
+        w64(64 + 32, 0x2000);
+        w64(64 + 40, 0x1000);
+        t(rejected(l)); // 15. p_filesz > p_memsz
+    }
+    (rej, total)
 }
 
 #[no_mangle]
@@ -237,6 +356,39 @@ pub extern "C" fn oxbow_main() -> ! {
         Err(e) => report(b"[L6] map 64 MiB past my budget     ", true, errname(e)),
         Ok(_) => report(b"[L6] map 64 MiB past my budget     ", false, b""),
     };
+
+    // [FUZZ] crafted-ELF rejection: the kernel's untrusted-image validator must refuse
+    // every malformed ELF (no panic, no load). One executable regression for the whole
+    // ELF-loader hardening arc.
+    let (frej, ftot) = elf_fuzz();
+    total += ftot;
+    held += frej;
+    w(b"  [FUZZ] crafted ELFs rejected: ");
+    let mut fb = [0u8; 8];
+    let fwrite = |v: u32, b: &mut [u8; 8]| -> usize {
+        let mut i = 8;
+        let mut x = v;
+        loop {
+            i -= 1;
+            b[i] = b'0' + (x % 10) as u8;
+            x /= 10;
+            if x == 0 {
+                break;
+            }
+        }
+        i
+    };
+    let fi = fwrite(frej, &mut fb);
+    w(&fb[fi..]);
+    w(b"/");
+    let mut fb2 = [0u8; 8];
+    let fi2 = fwrite(ftot, &mut fb2);
+    w(&fb2[fi2..]);
+    if frej == ftot {
+        w(b" [ok]\n");
+    } else {
+        w(b" [LEAK! a malformed ELF was accepted]\n");
+    }
 
     // Tally.
     w(b"jail: ");
