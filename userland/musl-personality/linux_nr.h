@@ -8,12 +8,16 @@
 #define NR_write             1
 #define NR_open              2
 #define NR_close             3
-/* BSD sockets (Phase 1: TCP client) */
+/* BSD sockets (Phase 1 TCP client; Phase 2 adds UDP + DNS) */
 #define NR_socket            41
 #define NR_connect           42
 #define NR_sendto            44
 #define NR_recvfrom          45
+#define NR_sendmsg           46
+#define NR_recvmsg           47   /* musl's DNS resolver reads UDP replies via recvmsg */
 #define NR_shutdown          48
+#define NR_bind              49
+#define NR_getsockname       51
 #define NR_setsockopt        54
 #define NR_getsockopt        55
 #define NR_stat              4

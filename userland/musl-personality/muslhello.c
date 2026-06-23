@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 
 static volatile sig_atomic_t got_sig = 0;
 static void on_usr1(int s) { got_sig = s; }
@@ -64,6 +65,46 @@ net_test(const char *ipstr, int port)
 	printf("\n[net] received %d bytes total — socket round-trip OK\n", total);
 	close(s);
 	return total > 0 ? 0 : 1;
+}
+
+/* Phase 2 (sockets): stock-musl getaddrinfo() — proves DNS over real UDP. musl's
+ * resolver reads /etc/resolv.conf, opens a UDP socket, and sendto/recvmsg's the
+ * nameserver (10.0.2.3 under QEMU SLIRP, which forwards to the host's resolver).
+ * `muslhello dns <host> [port]` resolves <host>, prints the address(es), and — if a
+ * port is given — connects + fetches over HTTP using the first result. */
+static int
+dns_test(const char *host, int port)
+{
+	setvbuf(stdout, NULL, _IONBF, 0);
+	struct addrinfo hints, *res = NULL;
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_INET;     /* A records only -> a single DNS query */
+	hints.ai_socktype = SOCK_STREAM;
+	printf("[dns] resolving %s ...\n", host);
+	int rc = getaddrinfo(host, NULL, &hints, &res);
+	if (rc != 0) {
+		printf("[dns] getaddrinfo(%s) failed: rc=%d\n", host, rc);
+		return 1;
+	}
+	int count = 0;
+	char first[32] = {0};
+	for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+		struct sockaddr_in *sin = (struct sockaddr_in *)ai->ai_addr;
+		unsigned char *a = (unsigned char *)&sin->sin_addr;
+		printf("[dns] %s -> %d.%d.%d.%d\n", host, a[0], a[1], a[2], a[3]);
+		if (count == 0)
+			snprintf(first, sizeof first, "%d.%d.%d.%d", a[0], a[1], a[2], a[3]);
+		count++;
+	}
+	freeaddrinfo(res);
+	if (count == 0) {
+		printf("[dns] no addresses\n");
+		return 1;
+	}
+	printf("[dns] resolved OK (%d address(es))\n", count);
+	if (port > 0)
+		return net_test(first, port);
+	return 0;
 }
 
 static volatile sig_atomic_t got_int = 0;
@@ -131,6 +172,11 @@ main(int argc, char **argv)
 		const char *ip = argc > 2 ? argv[2] : "10.0.2.2";
 		int port = argc > 3 ? atoi(argv[3]) : 80;
 		return net_test(ip, port);
+	}
+	if (argc > 1 && strcmp(argv[1], "dns") == 0) {
+		const char *host = argc > 2 ? argv[2] : "example.com";
+		int port = argc > 3 ? atoi(argv[3]) : 0;
+		return dns_test(host, port);
 	}
 	setvbuf(stdout, NULL, _IONBF, 0); /* unbuffered, so output order is deterministic */
 	printf("Hello from musl libc, running on oxbow!\n");

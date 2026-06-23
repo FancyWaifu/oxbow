@@ -1440,6 +1440,69 @@ pub extern "C" fn __oxbow_sock_close(sock: i64) {
     let _ = sys_close(sock as Handle);
 }
 
+/// Bind a UDP socket (port 0 = ephemeral) and return its socket cap, or -1. Backs the
+/// personality's `socket(SOCK_DGRAM)`+`bind()` — musl's DNS resolver binds a wildcard
+/// UDP socket then sendto/recvmsg's the nameserver.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_sock_udp_bind(port: u16) -> i64 {
+    match udp::bind(oxbow_abi::BOOT_NET_EP, port) {
+        Some((h, _assigned)) => h as i64,
+        None => -1,
+    }
+}
+
+/// `sendto` on a UDP socket cap to `ip:port`. Returns bytes sent, or -1.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_sock_udp_sendto(
+    sock: i64,
+    ip: u32,
+    port: u16,
+    buf: *const u8,
+    len: usize,
+) -> isize {
+    let data = unsafe { core::slice::from_raw_parts(buf, len) };
+    if udp::sendto(sock as Handle, ip.to_be_bytes(), port, data) {
+        len as isize
+    } else {
+        -1
+    }
+}
+
+/// `recvfrom` on a UDP socket cap (blocks). Writes the sender's IPv4 (packed big-endian
+/// = dotted-quad order) to `*src_ip` and port to `*src_port`, and returns the payload
+/// length. The DNS resolver validates the reply's source address, so it must be exact.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_sock_udp_recvfrom(
+    sock: i64,
+    buf: *mut u8,
+    len: usize,
+    src_ip: *mut u32,
+    src_port: *mut u16,
+) -> isize {
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    let (n, ip, port) = udp::recvfrom_src(sock as Handle, out);
+    unsafe {
+        if !src_ip.is_null() {
+            *src_ip = u32::from_be_bytes(ip);
+        }
+        if !src_port.is_null() {
+            *src_port = port;
+        }
+    }
+    n as isize
+}
+
+/// Close a UDP socket cap: release the server-side socket + drop the capability
+/// (`udp::close` does both, incl. detaching any zero-copy frame).
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_sock_udp_close(sock: i64) {
+    udp::close(sock as Handle);
+}
+
 // --- Raw syscall stubs ----------------------------------------------------
 // nr in rax; args rdi, rsi, rdx, r10, r8, r9; returns rax (+ rdx). rcx/r11 are
 // clobbered by the `syscall` instruction. No `nomem`/`nostack` options: the

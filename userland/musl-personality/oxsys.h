@@ -140,4 +140,14 @@ extern long __oxbow_sock_send(long sock, const void *buf, unsigned long len);
 extern long __oxbow_sock_recv(long sock, void *buf, unsigned long len);
 extern void __oxbow_sock_close(long sock);
 
+/* UDP (Phase 2: powers musl's DNS resolver). bind returns a socket cap; sendto/recvfrom
+ * carry the peer address. recvfrom writes the sender IPv4 (packed a<<24|… dotted order)
+ * + port so the resolver can validate the reply source. */
+extern long __oxbow_sock_udp_bind(unsigned short port);
+extern long __oxbow_sock_udp_sendto(long sock, unsigned int ip, unsigned short port,
+                                    const void *buf, unsigned long len);
+extern long __oxbow_sock_udp_recvfrom(long sock, void *buf, unsigned long len,
+                                      unsigned int *src_ip, unsigned short *src_port);
+extern void __oxbow_sock_udp_close(long sock);
+
 #endif

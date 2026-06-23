@@ -62,6 +62,7 @@ static long do_clock_gettime(long id, struct ox_timespec *ts)
 #define K_DIR    3  /* an open directory; .off is the readdir cursor */
 #define K_TTY    4  /* a dup of a std tty stream (.handle = 0/1/2); shells dup these */
 #define K_SOCK   5  /* a TCP socket; .handle = socket cap (-1 until connect succeeds) */
+#define K_UDP    6  /* a UDP socket; .handle = socket cap (-1 until bind/first send) */
 struct oxfd {
 	int used;
 	int kind;
@@ -113,6 +114,9 @@ static void fd_release(int fd)
 	} else if (fds[fd].kind == K_SOCK) {
 		if (fds[fd].handle >= 0)
 			__oxbow_sock_close(fds[fd].handle); /* FIN + drop the socket cap */
+	} else if (fds[fd].kind == K_UDP) {
+		if (fds[fd].handle >= 0)
+			__oxbow_sock_udp_close(fds[fd].handle);
 	} else if (fds[fd].kind == K_FILE || fds[fd].kind == K_DIR) {
 		/* dup2/F_DUPFD share the fsd handle, so only release it when NO other fd
 		 * still references it (shells dup a fd then close the original — closing the
@@ -278,6 +282,28 @@ static void fill_kstat(unsigned char *s, unsigned long size, int kind, unsigned 
 	*(long *)(s + 72)  = (long)mtime;       /* st_atime_sec */
 	*(long *)(s + 88)  = (long)mtime;       /* st_mtime_sec */
 	*(long *)(s + 104) = (long)mtime;       /* st_ctime_sec */
+}
+
+/* Fill a `struct sockaddr_in` (16 bytes): sin_family=AF_INET @0, sin_port (net order)
+ * @2, sin_addr (net/dotted order) @4, 8 zero pad @8. `ip` is packed big-endian
+ * (a<<24|b<<16|c<<8|d), `port` host order. The pad MUST be zero — musl's resolver
+ * memcmp's the reply source against the nameserver sockaddr, pad included. Updates
+ * *addrlen to 16 if provided. */
+static void fill_sockaddr_in(unsigned char *sa, unsigned int *addrlen,
+                             unsigned int ip, unsigned short port)
+{
+	for (int i = 0; i < 16; i++)
+		sa[i] = 0;
+	sa[0] = LAF_INET & 0xff;        /* sin_family low byte  */
+	sa[1] = (LAF_INET >> 8) & 0xff; /* sin_family high byte */
+	sa[2] = (unsigned char)(port >> 8);   /* sin_port, network order */
+	sa[3] = (unsigned char)(port & 0xff);
+	sa[4] = (unsigned char)(ip >> 24);    /* sin_addr, network/dotted order */
+	sa[5] = (unsigned char)(ip >> 16);
+	sa[6] = (unsigned char)(ip >> 8);
+	sa[7] = (unsigned char)(ip & 0xff);
+	if (addrlen)
+		*addrlen = 16;
 }
 
 /* stat a path into a kstat buffer (open-to-stat-then-close). */
@@ -573,19 +599,27 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		fd_release((int)a1); /* pipe ends + files freed by kind */
 		return 0;
 
-	/* ---- BSD sockets (Phase 1: TCP client) ----
-	 * socket() reserves a K_SOCK fd (unconnected, .handle = -1); connect() drives
-	 * oxbow's capability TCP API and stores the resulting socket cap. read/write/
-	 * send/recv on the fd then route to the socket (see do_read/do_write). DNS and
-	 * UDP are Phase 2; only AF_INET + SOCK_STREAM is supported here. */
+	/* ---- BSD sockets ----
+	 * TCP client (Phase 1): socket()->K_SOCK; connect() drives oxbow's capability TCP
+	 *   API and stores the socket cap; read/write/send/recv route to it.
+	 * UDP + DNS (Phase 2): socket(SOCK_DGRAM)->K_UDP; bind() binds an ephemeral UDP
+	 *   socket; sendto()/recvmsg() carry the peer address. This is exactly what musl's
+	 *   resolver uses — so unmodified getaddrinfo() resolves over real DNS.
+	 * Only AF_INET is supported (SOCK_CLOEXEC/NONBLOCK type-flags are masked off). */
 	case NR_socket: {
 		long domain = a1, type = a2;
 		if (domain != LAF_INET)
 			return -E_AFNOSUPPORT;
-		if ((type & LSOCK_TYPE_MASK) != LSOCK_STREAM)
-			return -E_INVAL; /* SOCK_DGRAM (UDP) is Phase 2 */
-		int fd = fd_alloc_kind(-1, 0, K_SOCK); /* -1 = not yet connected */
-		return fd < 0 ? -E_MFILE : fd;
+		int t = (int)(type & LSOCK_TYPE_MASK);
+		if (t == LSOCK_STREAM) {
+			int fd = fd_alloc_kind(-1, 0, K_SOCK); /* -1 = not yet connected */
+			return fd < 0 ? -E_MFILE : fd;
+		}
+		if (t == LSOCK_DGRAM) {
+			int fd = fd_alloc_kind(-1, 0, K_UDP); /* -1 = not yet bound */
+			return fd < 0 ? -E_MFILE : fd;
+		}
+		return -E_INVAL;
 	}
 	case NR_connect: {
 		int fd = (int)a1;
@@ -604,12 +638,101 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		fds[fd].handle = h;
 		return 0;
 	}
-	case NR_sendto: /* send(fd,buf,len,flags[,addr,addrlen]) — addr ignored (connected) */
+	case NR_bind: {
+		/* Only UDP binds (wildcard, port from the sockaddr; the resolver uses 0 =
+		 * ephemeral). TCP sockets don't bind on the client path. */
+		int fd = (int)a1;
+		const unsigned char *sa = (const unsigned char *)a2;
+		if (fd < 0 || fd >= MAXFD || !fds[fd].used)
+			return -E_BADF;
+		if (fds[fd].kind != K_UDP)
+			return 0; /* benign for the client TCP path */
+		unsigned short port = (sa && a3 >= 8) ? (unsigned short)((sa[2] << 8) | sa[3]) : 0;
+		long h = __oxbow_sock_udp_bind(port);
+		if (h < 0)
+			return -E_INVAL;
+		fds[fd].handle = h;
+		return 0;
+	}
+	case NR_sendto: {
+		/* TCP (connected): ignore the address, just send. UDP: the destination rides
+		 * in the sockaddr at a5 (len a6); auto-bind an ephemeral socket on first use. */
+		int fd = (int)a1;
+		if (fd >= 0 && fd < MAXFD && fds[fd].used && fds[fd].kind == K_UDP) {
+			const unsigned char *sa = (const unsigned char *)a5;
+			if (!sa || a6 < 8)
+				return -E_INVAL;
+			if (fds[fd].handle < 0) {
+				long h = __oxbow_sock_udp_bind(0);
+				if (h < 0)
+					return -E_INVAL;
+				fds[fd].handle = h;
+			}
+			unsigned short port = (unsigned short)((sa[2] << 8) | sa[3]);
+			unsigned int ip = ((unsigned int)sa[4] << 24) | ((unsigned int)sa[5] << 16) |
+			                  ((unsigned int)sa[6] << 8) | (unsigned int)sa[7];
+			return __oxbow_sock_udp_sendto(fds[fd].handle, ip, port,
+			                               (const void *)a2, (unsigned long)a3);
+		}
 		return do_write(a1, (const void *)a2, (unsigned long)a3);
-	case NR_recvfrom: /* recv(fd,buf,len,flags[,addr,addrlen]) — src addr not filled */
+	}
+	case NR_recvfrom: {
+		/* TCP: plain recv (src addr not filled). UDP: fill the sender's sockaddr_in. */
+		int fd = (int)a1;
+		if (fd >= 0 && fd < MAXFD && fds[fd].used && fds[fd].kind == K_UDP) {
+			if (fds[fd].handle < 0)
+				return -E_INVAL;
+			unsigned int sip = 0;
+			unsigned short sport = 0;
+			long n = __oxbow_sock_udp_recvfrom(fds[fd].handle, (void *)a2,
+			                                   (unsigned long)a3, &sip, &sport);
+			if (a5)
+				fill_sockaddr_in((unsigned char *)a5, (unsigned int *)a6, sip, sport);
+			return n;
+		}
 		if (a5)
-			*(unsigned int *)a6 = 0; /* report a 0-length source address */
+			*(unsigned int *)a6 = 0; /* TCP: report a 0-length source address */
 		return do_read(a1, (void *)a2, (unsigned long)a3);
+	}
+	case NR_recvmsg: {
+		/* musl's DNS resolver reads UDP replies via recvmsg (single iov + msg_name for
+		 * the source address, which it validates). Support that shape for K_UDP. */
+		int fd = (int)a1;
+		struct msghdr_x {
+			void *msg_name;
+			unsigned int msg_namelen;
+			unsigned int _pad;
+			struct iovec_x { void *base; unsigned long len; } *msg_iov;
+			unsigned long msg_iovlen;
+			void *msg_control;
+			unsigned long msg_controllen;
+			int msg_flags;
+		} *mh = (struct msghdr_x *)a2;
+		if (fd < 0 || fd >= MAXFD || !fds[fd].used || fds[fd].kind != K_UDP)
+			return -E_INVAL;
+		if (!mh || !mh->msg_iov || mh->msg_iovlen < 1)
+			return -E_INVAL;
+		if (fds[fd].handle < 0)
+			return -E_INVAL;
+		unsigned int sip = 0;
+		unsigned short sport = 0;
+		long n = __oxbow_sock_udp_recvfrom(fds[fd].handle, mh->msg_iov[0].base,
+		                                   mh->msg_iov[0].len, &sip, &sport);
+		if (n < 0)
+			return n;
+		if (mh->msg_name && mh->msg_namelen >= 16)
+			fill_sockaddr_in((unsigned char *)mh->msg_name, &mh->msg_namelen, sip, sport);
+		mh->msg_flags = 0; /* datagram fit (no MSG_TRUNC) — recvfrom caps at the iov len */
+		return n;
+	}
+	case NR_getsockname: {
+		/* Report an unspecified AF_INET address; the resolver doesn't need the real one. */
+		unsigned char *sa = (unsigned char *)a2;
+		unsigned int *sl = (unsigned int *)a3;
+		if (sa && sl && *sl >= 16)
+			fill_sockaddr_in(sa, sl, 0, 0);
+		return 0;
+	}
 	case NR_shutdown: /* half-close: treat as a no-op; close() does the teardown */
 	case NR_setsockopt: /* accept option sets benignly (no real options yet) */
 	case NR_getsockopt:
