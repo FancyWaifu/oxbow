@@ -54,13 +54,31 @@ fn read<T: Copy>(bytes: &[u8], off: usize) -> T {
     unsafe { core::ptr::read_unaligned(bytes.as_ptr().add(off) as *const T) }
 }
 
-/// A validated view of the module: its entry point and program headers.
+const ZERO_PHDR: Elf64Phdr = Elf64Phdr {
+    p_type: 0,
+    p_flags: 0,
+    p_offset: 0,
+    p_vaddr: 0,
+    p_paddr: 0,
+    p_filesz: 0,
+    p_memsz: 0,
+    p_align: 0,
+};
+/// Cap on program headers we snapshot. Static ET_EXEC images have a handful; an image
+/// with more than this is rejected (and far beyond any real oxbow binary).
+const MAX_PHDRS: usize = 32;
+
+/// A validated view of the module: its entry point and a SNAPSHOT of its program
+/// headers. The headers are copied into the kernel at validation time, NOT re-read from
+/// the (user-owned) byte buffer on each access — otherwise, for a `sys_spawn_bytes`
+/// from a multithreaded process, a peer thread could mutate the headers AFTER validation
+/// but BEFORE the loader reads them (a double-fetch TOCTOU) and bypass every bounds /
+/// W^X / layout check. The snapshot makes validation and loading see identical headers.
 pub struct Image<'a> {
     pub entry: u64,
     bytes: &'a [u8],
-    phoff: usize,
-    phentsize: usize,
-    phnum: usize,
+    phdrs: [Elf64Phdr; MAX_PHDRS],
+    nphdr: usize,
 }
 
 impl<'a> Image<'a> {
@@ -86,33 +104,53 @@ impl<'a> Image<'a> {
         {
             return Err(SysError::Msg);
         }
+        let phoff = eh.e_phoff as usize;
+        let phentsize = eh.e_phentsize as usize;
+        let phnum = eh.e_phnum as usize;
+        // Bound the program-header table BEFORE snapshotting it (so the reads below can't
+        // run off the end), and cap the count.
+        if phentsize < core::mem::size_of::<Elf64Phdr>() || phnum > MAX_PHDRS {
+            return Err(SysError::Msg);
+        }
+        let table_end = phnum
+            .checked_mul(phentsize)
+            .and_then(|n| phoff.checked_add(n))
+            .ok_or(SysError::Msg)?;
+        if table_end > bytes.len() {
+            return Err(SysError::Msg);
+        }
+        // Snapshot every program header into the kernel. From here on, loads()/tls() and
+        // all validation read THIS frozen copy, never the user buffer.
+        let mut phdrs = [ZERO_PHDR; MAX_PHDRS];
+        for (i, slot) in phdrs.iter_mut().enumerate().take(phnum) {
+            *slot = read(bytes, phoff + i * phentsize);
+        }
         Ok(Image {
             entry: eh.e_entry,
             bytes,
-            phoff: eh.e_phoff as usize,
-            phentsize: eh.e_phentsize as usize,
-            phnum: eh.e_phnum as usize,
+            phdrs,
+            nphdr: phnum,
         })
     }
 
-    /// Iterate the PT_LOAD program headers.
+    /// Iterate the PT_LOAD program headers (from the frozen snapshot).
     pub fn loads(&self) -> impl Iterator<Item = Elf64Phdr> + '_ {
-        (0..self.phnum).filter_map(move |i| {
-            let ph: Elf64Phdr = read(self.bytes, self.phoff + i * self.phentsize);
-            (ph.p_type == PT_LOAD).then_some(ph)
-        })
+        self.phdrs[..self.nphdr]
+            .iter()
+            .copied()
+            .filter(|ph| ph.p_type == PT_LOAD)
     }
 
-    /// The PT_TLS program header, if the image has thread-local storage. Describes
-    /// the TLS template: `p_vaddr` = where `.tdata` lives in the loaded image,
-    /// `p_filesz` = initialized `.tdata` bytes, `p_memsz` = total TLS size
-    /// (`.tdata` + `.tbss`), `p_align` = required alignment. Per-thread TLS blocks
-    /// are copied from this template (§101 native ELF TLS).
+    /// The PT_TLS program header (from the snapshot), if the image has thread-local
+    /// storage. Describes the TLS template: `p_vaddr` = where `.tdata` lives in the
+    /// loaded image, `p_filesz` = initialized `.tdata` bytes, `p_memsz` = total TLS size
+    /// (`.tdata` + `.tbss`), `p_align` = required alignment. Per-thread TLS blocks are
+    /// copied from this template (§101 native ELF TLS).
     pub fn tls(&self) -> Option<Elf64Phdr> {
-        (0..self.phnum).find_map(|i| {
-            let ph: Elf64Phdr = read(self.bytes, self.phoff + i * self.phentsize);
-            (ph.p_type == PT_TLS).then_some(ph)
-        })
+        self.phdrs[..self.nphdr]
+            .iter()
+            .copied()
+            .find(|ph| ph.p_type == PT_TLS)
     }
 
     /// The raw module bytes (for the loader to copy from).
@@ -128,15 +166,8 @@ impl<'a> Image<'a> {
     pub fn segments_in_bounds(&self) -> bool {
         // The user half ends here; any segment touching the kernel half is rejected
         // (defense-in-depth: the loader's map asserts would otherwise PANIC the kernel).
+        // (The phdr table bounds were checked in try_validate, before the snapshot.)
         const LOWER_HALF_END: u64 = 0x0000_8000_0000_0000;
-        // The phdr table itself must be in bounds before we iterate it.
-        let phdr_end = match self.phoff.checked_add(self.phnum.saturating_mul(self.phentsize)) {
-            Some(e) => e,
-            None => return false,
-        };
-        if phdr_end > self.bytes.len() {
-            return false;
-        }
         for ph in self.loads() {
             if ph.p_filesz > ph.p_memsz {
                 return false;
