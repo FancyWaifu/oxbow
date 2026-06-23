@@ -316,16 +316,29 @@ fn sys_ipc(ep: u64, msg_ptr: u64, is_call: bool) -> SyscallRet {
     }
 }
 
+/// Resolve a Memory cap handle to its budget index — the SINGLE chokepoint every
+/// budget-spending / Memory-authorized syscall routes through, so the full check (type
+/// + R_MAP + GENERATION, the stale-grant guard) is applied uniformly and can't be
+/// forgotten at one site. Returns E_GONE for a cap whose budget slot was released and
+/// reused since the cap was minted.
+fn resolve_mem(mem: u64) -> SysResult<u8> {
+    let entry = proc::with_current(|p| p.lookup(mem as Handle, ObjType::Memory, R_MAP))?;
+    let ObjectRef::Memory(midx) = entry.obj else {
+        return Err(SysError::BadType);
+    };
+    if !mm::mem::mem_gen_ok(midx, entry.badge as u32) {
+        return Err(SysError::Gone);
+    }
+    Ok(midx)
+}
+
 /// `sys_map(mem, vaddr, len, prot)` — map anonymous zeroed pages into the
 /// caller's own address space, debiting the Memory budget `mem` (law L6). All
 /// validation precedes any side effect; the map cannot partially fail.
 fn sys_map(mem: u64, vaddr: u64, len: u64, prot: u64) -> SyscallRet {
     SyscallRet::from_result((|| -> SysResult {
-        // 1. Capability: a Memory handle with R_MAP.
-        let entry = proc::with_current(|p| p.lookup(mem as Handle, ObjType::Memory, R_MAP))?;
-        let ObjectRef::Memory(midx) = entry.obj else {
-            return Err(SysError::BadType);
-        };
+        // 1. Capability: a Memory handle with R_MAP (+ generation = the stale-grant guard).
+        let midx = resolve_mem(mem)?;
         // 2. Shape: 4 KiB-aligned vaddr+len, nonzero, valid prot (read implied).
         if vaddr & 0xfff != 0 || len == 0 || len & 0xfff != 0 {
             return Err(SysError::Msg);
@@ -694,7 +707,7 @@ fn spawn_common(
             HandleEntry {
                 obj: ObjectRef::Memory(child_mem),
                 rights: R_MAP | R_GRANT | R_ATTENUATE,
-            badge: 0,
+                badge: mm::mem::mem_gen(child_mem) as u64, // stale-grant guard
             },
         );
         for i in 0..prep.grant_count {
@@ -969,10 +982,7 @@ fn sys_io_out(io: u64, port: u64, value: u64) -> SyscallRet {
 /// (a nameable, mappable, shareable physical frame), returned as a handle.
 fn sys_frame_alloc(mem: u64) -> SyscallRet {
     let result = (|| -> SysResult<Handle> {
-        let entry = proc::with_current(|p| p.lookup(mem as Handle, ObjType::Memory, R_MAP))?;
-        let ObjectRef::Memory(midx) = entry.obj else {
-            return Err(SysError::BadType);
-        };
+        let midx = resolve_mem(mem)?;
         if !mm::mem::debit(midx, 4096) {
             return Err(SysError::NoMem);
         }
@@ -1316,10 +1326,7 @@ fn sys_fb_map(fb: u64, vaddr: u64) -> SyscallRet {
 /// physical address of its own frames adds no authority it lacked.
 fn sys_dma_alloc(mem: u64, vaddr: u64) -> SyscallRet {
     let result = (|| -> SysResult<u64> {
-        let entry = proc::with_current(|p| p.lookup(mem as Handle, ObjType::Memory, R_MAP))?;
-        let ObjectRef::Memory(midx) = entry.obj else {
-            return Err(SysError::BadType);
-        };
+        let midx = resolve_mem(mem)?;
         if vaddr & 0xfff != 0 || vaddr >= LOWER_HALF_END {
             return Err(SysError::Fault);
         }
@@ -1347,10 +1354,7 @@ fn sys_dma_alloc(mem: u64, vaddr: u64) -> SyscallRet {
 /// (16 MiB) per call.
 fn sys_dma_alloc_contig(mem: u64, vaddr: u64, pages: u64) -> SyscallRet {
     let result = (|| -> SysResult<u64> {
-        let entry = proc::with_current(|p| p.lookup(mem as Handle, ObjType::Memory, R_MAP))?;
-        let ObjectRef::Memory(midx) = entry.obj else {
-            return Err(SysError::BadType);
-        };
+        let midx = resolve_mem(mem)?;
         if pages == 0 || pages > 4096 {
             return Err(SysError::Msg);
         }
@@ -1381,10 +1385,7 @@ fn sys_dma_alloc_contig(mem: u64, vaddr: u64, pages: u64) -> SyscallRet {
 /// (passes over a channel) and maps writable — it backs memfd/wl_shm buffers.
 fn sys_shm_create(mem: u64, pages: u64) -> SyscallRet {
     let result = (|| -> SysResult<Handle> {
-        let entry = proc::with_current(|p| p.lookup(mem as Handle, ObjType::Memory, R_MAP))?;
-        let ObjectRef::Memory(midx) = entry.obj else {
-            return Err(SysError::BadType);
-        };
+        let midx = resolve_mem(mem)?;
         let pages = pages as usize;
         let bytes = (pages as u64).checked_mul(4096).ok_or(SysError::Msg)?;
         if !mm::mem::debit(midx, bytes) {
@@ -1504,10 +1505,7 @@ fn sys_cap_type(h: u64) -> SyscallRet {
 /// only RW↔RX transitions are allowed. Gated on the Memory cap (R_MAP), like map.
 fn sys_protect(mem: u64, vaddr: u64, len: u64, prot: u64) -> SyscallRet {
     SyscallRet::from_result((|| -> SysResult {
-        let entry = proc::with_current(|p| p.lookup(mem as Handle, ObjType::Memory, R_MAP))?;
-        if !matches!(entry.obj, ObjectRef::Memory(_)) {
-            return Err(SysError::BadType);
-        }
+        let _midx = resolve_mem(mem)?; // type + R_MAP + generation (stale-grant guard)
         if vaddr & 0xfff != 0 || vaddr >= LOWER_HALF_END {
             return Err(SysError::Fault);
         }
@@ -1543,10 +1541,7 @@ fn sys_protect(mem: u64, vaddr: u64, len: u64, prot: u64) -> SyscallRet {
 /// range (mimmutable, §38). Gated on the Memory cap (R_MAP), like protect.
 fn sys_immutable(mem: u64, vaddr: u64, len: u64) -> SyscallRet {
     SyscallRet::from_result((|| -> SysResult {
-        let entry = proc::with_current(|p| p.lookup(mem as Handle, ObjType::Memory, R_MAP))?;
-        if !matches!(entry.obj, ObjectRef::Memory(_)) {
-            return Err(SysError::BadType);
-        }
+        let _midx = resolve_mem(mem)?; // type + R_MAP + generation (stale-grant guard)
         if vaddr & 0xfff != 0 || vaddr >= LOWER_HALF_END {
             return Err(SysError::Fault);
         }

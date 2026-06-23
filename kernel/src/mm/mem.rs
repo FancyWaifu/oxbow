@@ -21,12 +21,20 @@ pub const BOOT_BUDGET: u64 = 64 * 4096;
 struct MemObj {
     in_use: bool,
     remaining: u64,
+    /// Generation, bumped on release. A Memory HANDLE records the gen it was minted at
+    /// (in its badge); a stale grant — a Memory cap that outlived its owner (it's
+    /// grantable) while the slot was released and reused for another process's budget —
+    /// is rejected, so it can't debit/map against the wrong budget. (Same reclaimable
+    /// pattern as Frame/Reply. Today no flow grants a Memory cap cross-process, so this
+    /// is defense for when one does — the cap's R_GRANT bit makes it a latent risk.)
+    gen: u32,
 }
 
 static MEMORY: DiagMutex<[MemObj; MEM_POOL]> = DiagMutex::new("MEMORY",
     [MemObj {
         in_use: false,
         remaining: 0,
+        gen: 0,
     }; MEM_POOL],
 );
 
@@ -61,19 +69,33 @@ pub fn grant(budget: u64) -> Option<u8> {
     let mut m = MEMORY.lock();
     for i in 0..MEM_POOL {
         if !m[i].in_use {
-            m[i] = MemObj {
-                in_use: true,
-                remaining: budget,
-            };
+            let gen = m[i].gen; // preserved across reuse; only release bumps it
+            m[i] = MemObj { in_use: true, remaining: budget, gen };
             return Some(i as u8);
         }
     }
     None
 }
 
-/// Release a Memory budget slot (on process exit) — frees the pool slot.
+/// The current generation of Memory slot `idx` (stamped into a freshly-minted cap's
+/// badge so a later stale-grant can be detected).
+pub fn mem_gen(idx: u8) -> u32 {
+    MEMORY.lock()[idx as usize].gen
+}
+
+/// True iff Memory slot `idx` is live AND at generation `gen` (the cap's badge value).
+pub fn mem_gen_ok(idx: u8, gen: u32) -> bool {
+    let m = MEMORY.lock();
+    let e = &m[idx as usize];
+    e.in_use && e.gen == gen
+}
+
+/// Release a Memory budget slot (on process exit) — frees the pool slot and bumps its
+/// generation so any outstanding (granted-away) cap to it is detected as stale.
 pub fn release(idx: u8) {
-    MEMORY.lock()[idx as usize].in_use = false;
+    let mut m = MEMORY.lock();
+    m[idx as usize].in_use = false;
+    m[idx as usize].gen = m[idx as usize].gen.wrapping_add(1);
 }
 
 /// Refund `bytes` to Memory budget `idx` (a spawner is credited the cost of a

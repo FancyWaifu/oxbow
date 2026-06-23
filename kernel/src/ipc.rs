@@ -140,30 +140,49 @@ pub(crate) fn take_ret(tid: usize) -> (u64, u64) {
 struct Reply {
     in_use: bool,
     caller_tid: usize,
+    /// Generation, bumped every time the slot is freed (reply delivered, or the caller
+    /// died and the reply was abandoned). A Reply HANDLE records the generation it was
+    /// minted at (in its badge); a stale handle to a freed/reused slot — e.g. a receiver
+    /// that held a reply while the original caller died and the slot was reused for a NEW
+    /// caller — is rejected, so it can't misdirect a reply to the wrong client. Same
+    /// reclaimable-pool pattern as Frame/Memory.
+    gen: u32,
 }
 
 static REPLIES: DiagMutex<[Reply; REPLY_POOL]> = DiagMutex::new("REPLIES", [Reply {
     in_use: false,
     caller_tid: 0,
+    gen: 0,
 }; REPLY_POOL]);
 
-/// Allocate a Reply pool slot recording the caller thread; `None` if exhausted.
-fn alloc_reply(caller_tid: usize) -> Option<usize> {
+/// Allocate a Reply pool slot recording the caller thread; returns `(idx, gen)` or
+/// `None` if exhausted. The generation is preserved across reuse (only bumped on free).
+fn alloc_reply(caller_tid: usize) -> Option<(usize, u32)> {
     let mut replies = REPLIES.lock();
     for i in 0..REPLY_POOL {
         if !replies[i].in_use {
-            replies[i] = Reply {
-                in_use: true,
-                caller_tid,
-            };
-            return Some(i);
+            let gen = replies[i].gen;
+            replies[i] = Reply { in_use: true, caller_tid, gen };
+            return Some((i, gen));
         }
     }
     None
 }
 
 fn free_reply(idx: usize) {
-    REPLIES.lock()[idx].in_use = false;
+    let mut r = REPLIES.lock();
+    r[idx].in_use = false;
+    r[idx].gen = r[idx].gen.wrapping_add(1); // invalidate any stale handles to this slot
+}
+
+/// True iff Reply slot `idx` is live AND at generation `gen` (the one the caller's
+/// handle was minted at). The use-after-free / wrong-caller guard for `take_reply`.
+pub fn reply_gen_ok(idx: usize, gen: u32) -> bool {
+    if idx >= REPLY_POOL {
+        return false;
+    }
+    let r = REPLIES.lock();
+    r[idx].in_use && r[idx].gen == gen
 }
 
 fn reply_caller(idx: usize) -> usize {
@@ -252,12 +271,12 @@ pub fn ep_create() -> Option<u8> {
 /// Mint a Reply for `caller` and install it (rights 0) in process `to_proc`'s
 /// table. Returns `(table_handle, pool_idx)` or an error (caller restores state).
 fn mint_reply(caller: usize, to_proc: usize) -> Result<(Handle, usize), SysError> {
-    let idx = alloc_reply(caller).ok_or(SysError::NoMem)?;
+    let (idx, gen) = alloc_reply(caller).ok_or(SysError::NoMem)?;
     match proc::with_proc_mut(to_proc, |p| {
         p.alloc_slot(HandleEntry {
             obj: ObjectRef::Reply(idx as u8),
             rights: 0,
-        badge: 0,
+            badge: gen as u64, // stamp the generation; take_reply verifies it
         })
     }) {
         Ok(h) => Ok((h, idx)),

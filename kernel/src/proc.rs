@@ -215,6 +215,14 @@ pub fn take_reply(h: Handle) -> Result<u8, SysError> {
     let ObjectRef::Reply(ridx) = entry.obj else {
         return Err(SysError::BadType);
     };
+    // Reject a STALE reply handle: if the slot was freed (caller died / already replied)
+    // and reused for a different caller since this handle was minted, its generation no
+    // longer matches — delivering through it would misdirect the reply to the wrong
+    // client. Drop the dead handle and refuse.
+    if !crate::ipc::reply_gen_ok(ridx as usize, entry.badge as u32) {
+        procs[id].handles[idx] = None;
+        return Err(SysError::BadHandle);
+    }
     procs[id].handles[idx] = None; // claim it — a concurrent reply/close now misses
     Ok(ridx)
 }
@@ -736,7 +744,7 @@ pub fn fork_current(entry: u64, user_rsp: u64, notif_idx: Option<u8>) -> u64 {
             HandleEntry {
                 obj: ObjectRef::Memory(child_mem),
                 rights: R_MAP | R_GRANT | R_ATTENUATE,
-                badge: 0,
+                badge: mm::mem::mem_gen(child_mem) as u64, // stale-grant guard
             },
         );
         procs[id] = copy;
@@ -771,7 +779,7 @@ pub fn grant_standard(id: usize, budget: u64) {
             HandleEntry {
                 obj: ObjectRef::Memory(mem_idx),
                 rights: R_MAP | R_GRANT | R_ATTENUATE,
-            badge: 0,
+                badge: mm::mem::mem_gen(mem_idx) as u64, // stale-grant guard
             },
         );
     }
