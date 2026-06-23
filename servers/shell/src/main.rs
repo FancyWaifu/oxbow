@@ -1999,6 +1999,10 @@ const NACCT: usize = 2;
 static mut SALTS: [[u8; 16]; NACCT] = [[0; 16]; NACCT];
 static mut HASHES: [[u8; 32]; NACCT] = [[0; 32]; NACCT];
 static mut SEEDED: bool = false;
+/// Per-account "must change password at next login" flag — set for every seeded
+/// DEFAULT credential, cleared once the user picks their own password. Persisted in
+/// /etc/shadow so a changed password (and the cleared flag) survive reboot.
+static mut MUST_CHANGE: [bool; NACCT] = [false; NACCT];
 /// The shell's current identity — set by the login gate, read by whoami/id and
 /// stamped on every spawned child.
 static mut CUR_IDENT: IdentRec = IdentRec::zeroed();
@@ -2813,26 +2817,180 @@ fn mkdir_one(path: &[u8]) {
     let _ = rt::sys_call(BOOT_FS_ROOT, &mut m);
 }
 
-/// First-boot seed: random per-account salts + hashes, home directories, and a
-/// human-readable /etc/passwd + /etc/group (cosmetic — auth uses the table).
+/// The persisted credential store. Root-only in practice — /etc is never mounted into
+/// a confined user's namespace, so only root/the shell can reach it. Holds the salt,
+/// the iterated-blake2b hash, and the must-change flag per account.
+const SHADOW_PATH: &[u8] = b"/etc/shadow";
+
+/// Append `bytes` to `buf` as lowercase hex (2 chars/byte), advancing `*n`.
+fn hex_push(buf: &mut [u8], n: &mut usize, bytes: &[u8]) {
+    const H: &[u8; 16] = b"0123456789abcdef";
+    for &b in bytes {
+        if *n + 2 <= buf.len() {
+            buf[*n] = H[(b >> 4) as usize];
+            buf[*n + 1] = H[(b & 0xf) as usize];
+            *n += 2;
+        }
+    }
+}
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+/// Decode hex `s` into `out`; true iff exactly `out.len()` bytes were produced.
+fn parse_hex(s: &[u8], out: &mut [u8]) -> bool {
+    if s.len() != out.len() * 2 {
+        return false;
+    }
+    for (i, o) in out.iter_mut().enumerate() {
+        match (hex_val(s[i * 2]), hex_val(s[i * 2 + 1])) {
+            (Some(hi), Some(lo)) => *o = (hi << 4) | lo,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Persist SALTS/HASHES/MUST_CHANGE to /etc/shadow — one line per account:
+///   `<name> <hexsalt> <hexhash> <0|1>`.  Called on first-boot seed and on any
+/// password change, so a real password (and its cleared must-change flag) survive reboot.
+fn save_shadow() {
+    let mut buf = [0u8; 2048];
+    let mut n = 0usize;
+    unsafe {
+        for (i, a) in ACCTS.iter().enumerate() {
+            buf_push(&mut buf, &mut n, a.name);
+            buf_push(&mut buf, &mut n, b" ");
+            hex_push(&mut buf, &mut n, &SALTS[i]);
+            buf_push(&mut buf, &mut n, b" ");
+            hex_push(&mut buf, &mut n, &HASHES[i]);
+            buf_push(&mut buf, &mut n, if MUST_CHANGE[i] { b" 1\n" } else { b" 0\n" });
+        }
+    }
+    write_file(BOOT_FS_ROOT, SHADOW_PATH, &buf[..n], false);
+}
+
+/// Load /etc/shadow into the credential store. Returns true iff EVERY account's
+/// credentials were found and decoded (so we never re-seed defaults over a real store).
+fn load_shadow() -> bool {
+    let mut o = MsgBuf::new(TAG_FS_OPEN);
+    pack_name(&mut o, SHADOW_PATH);
+    if rt::sys_call(BOOT_FS_ROOT, &mut o).is_err()
+        || o.data[0] != 0
+        || o.data[1] != oxbow_abi::FS_FILE
+    {
+        return false;
+    }
+    let cap = o.handles[0];
+    let mut data = [0u8; 2048];
+    let len = unsafe { read_all(cap, &mut data) };
+    let _ = rt::sys_close(cap);
+    let mut found = [false; NACCT];
+    for line in data[..len].split(|&b| b == b'\n') {
+        let mut it = line.split(|&b| b == b' ').filter(|t| !t.is_empty());
+        let (Some(name), Some(salt_h), Some(hash_h)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let mc = it.next() == Some(&b"1"[..]);
+        if let Some(i) = ACCTS.iter().position(|a| a.name == name) {
+            let mut salt = [0u8; 16];
+            let mut hash = [0u8; 32];
+            if parse_hex(salt_h, &mut salt) && parse_hex(hash_h, &mut hash) {
+                unsafe {
+                    SALTS[i] = salt;
+                    HASHES[i] = hash;
+                    MUST_CHANGE[i] = mc;
+                }
+                found[i] = true;
+            }
+        }
+    }
+    found.iter().all(|&f| f)
+}
+
+/// Set account `i`'s password (fresh random salt), clear its must-change flag, and
+/// persist the whole store. The single mutation point for a credential.
+fn set_password(i: usize, pw: &[u8]) {
+    let mut salt = [0u8; 16];
+    let _ = rt::sys_getentropy(&mut salt);
+    unsafe {
+        SALTS[i] = salt;
+        HASHES[i] = hash_pw(&salt, pw);
+        MUST_CHANGE[i] = false;
+    }
+    save_shadow();
+}
+
+/// Initialise the credential store: load the persisted /etc/shadow if present, else
+/// (first boot) seed random salts over the DEFAULT passwords with must-change set, and
+/// write the store. Also (re)creates the home dirs + cosmetic /etc/passwd,/etc/group.
 fn seed_accounts() {
     unsafe {
         if SEEDED {
             return;
         }
+    }
+    mkdir_one(b"/etc");
+    mkdir_one(b"/home");
+    mkdir_one(b"/home/bryson");
+    if load_shadow() {
+        unsafe { SEEDED = true };
+        return;
+    }
+    // First boot: no shadow yet. Seed defaults and force a change at first login.
+    unsafe {
         for (i, a) in ACCTS.iter().enumerate() {
             let mut salt = [0u8; 16];
             let _ = rt::sys_getentropy(&mut salt);
             SALTS[i] = salt;
             HASHES[i] = hash_pw(&salt, a.default_pw);
+            MUST_CHANGE[i] = true;
         }
         SEEDED = true;
     }
-    mkdir_one(b"/home");
-    mkdir_one(b"/home/bryson");
-    mkdir_one(b"/etc");
     write_file(BOOT_FS_ROOT, b"/etc/passwd", b"root:x:0:0:/:/bin/sh\nbryson:x:1000:1000:/home/bryson:/bin/sh\n", false);
     write_file(BOOT_FS_ROOT, b"/etc/group", b"root:0:\nwheel:27:root,bryson\nbryson:1000:\n", false);
+    save_shadow();
+}
+
+/// If account `i` still carries a default (must-change) password, require a new one
+/// NOW — read at the tty, looping until a non-empty, non-default password is set and
+/// confirmed. Persisted immediately. Called right after every successful login.
+fn force_change(i: usize) {
+    if !unsafe { MUST_CHANGE[i] } {
+        return;
+    }
+    tw(b"\nThis account uses a default password and must change it before continuing.\n");
+    let mut line = [0u8; 256];
+    loop {
+        tw(b"new password: ");
+        let n = read_line(&mut line);
+        let np = trim(&line[..n]);
+        if np.is_empty() {
+            tw(b"passwd: password cannot be empty\n");
+            continue;
+        }
+        if np == ACCTS[i].default_pw {
+            tw(b"passwd: cannot reuse the default password\n");
+            continue;
+        }
+        let mut nb = [0u8; 128];
+        let nl = core::cmp::min(np.len(), 128);
+        nb[..nl].copy_from_slice(&np[..nl]);
+        tw(b"retype new password: ");
+        let n2 = read_line(&mut line);
+        if trim(&line[..n2]) != &nb[..nl] {
+            tw(b"passwd: passwords do not match\n");
+            continue;
+        }
+        set_password(i, &nb[..nl]);
+        tw(b"passwd: password updated and saved.\n");
+        return;
+    }
 }
 
 /// Establish account `i`'s session: SESSION_ROOT becomes their home capability
@@ -2940,6 +3098,7 @@ fn session_gate(cwd: &mut Handle, path: &mut Path) {
             set_cwd_home(i, cwd, path);
             let _ = rt::channel::send(BOOT_SESSION_CHAN, b"1", &[]);
             tty_flush(); // discard the greeter's keystrokes before the first prompt
+            force_change(i); // first-login default-password change, at the terminal
             return;
         }
         let _ = rt::channel::send(BOOT_SESSION_CHAN, b"0", &[]);
@@ -2968,6 +3127,7 @@ fn login_gate(cwd: &mut Handle, path: &mut Path) {
             tw(b"Welcome, ");
             tw(ACCTS[i].name);
             tw(b".\n");
+            force_change(i);
             return;
         }
         tw(b"Login incorrect\n");
@@ -2986,6 +3146,7 @@ fn su_cmd(arg: &[u8], cwd: &mut Handle, path: &mut Path) {
         if h == unsafe { HASHES[i] } {
             set_ident(i);
             set_cwd_home(i, cwd, path);
+            force_change(i);
         } else {
             tw(b"su: Authentication failure\n");
         }
@@ -2996,9 +3157,8 @@ fn su_cmd(arg: &[u8], cwd: &mut Handle, path: &mut Path) {
     }
 }
 
-/// `passwd`: change the current user's password (re-hash with a fresh salt).
-/// In-memory only — the seeded defaults are restored at the next boot until the
-/// credential store is persisted (next arc).
+/// `passwd`: change the current user's password (re-hash with a fresh salt), persisted
+/// to /etc/shadow so it survives reboot.
 fn passwd_cmd() {
     let i = match ACCTS.iter().position(|a| a.name == cur_name()) {
         Some(i) => i,
@@ -3026,13 +3186,8 @@ fn passwd_cmd() {
         tw(b"passwd: passwords do not match\n");
         return;
     }
-    let mut salt = [0u8; 16];
-    let _ = rt::sys_getentropy(&mut salt);
-    unsafe {
-        SALTS[i] = salt;
-        HASHES[i] = hash_pw(&salt, &nb[..nl]);
-    }
-    tw(b"passwd: updated (in-memory; resets to the default at reboot)\n");
+    set_password(i, &nb[..nl]);
+    tw(b"passwd: password updated and saved.\n");
 }
 
 #[no_mangle]
