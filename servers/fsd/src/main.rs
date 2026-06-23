@@ -599,7 +599,10 @@ fn join_child(id: usize, name: &[u8], relbuf: &mut [u8; PLEN]) -> Option<usize> 
 /// Find an existing id for `relpath`, or allocate a fresh one. 0 = table full.
 fn intern(relpath: &[u8]) -> usize {
     unsafe {
-        for i in 1..MAXID {
+        // Dedup starts at node 2: node 1 is FS_ROOT (the root-authority badge) and must
+        // NEVER be handed out by interning a path (esp. the empty path) — only the boot
+        // grant holds it. (OPEN handles "open-self" without interning; see TAG_FS_OPEN.)
+        for i in 2..MAXID {
             if USED[i] && &PATHS[i][..PLENS[i] as usize] == relpath {
                 return i;
             }
@@ -647,18 +650,20 @@ fn ns_clear_mounts(id: usize) {
 }
 
 /// Release the intern slot for a now-removed `relpath`, so the fixed-size `PATHS`
-/// table is reclaimed instead of leaking. Without this, a long-lived process that
-/// creates+removes many distinct paths (or one that opens >MAXID paths total) would
-/// exhaust the table and have every later open/mkdir fail. Note: a client still
-/// holding a cap to this id after unlink would see the slot reused for a future path
-/// — unusual (you'd have to keep an open File across its own deletion), accepted here.
+/// table is reclaimed instead of leaking. If a client still holds a live cap to this id
+/// (REFS > 0 — an open File across its own unlink), DO NOT free the slot: reusing it for
+/// a different path would let that stale cap alias the new (possibly cross-user) path.
+/// The slot is left interned — the on-disk file is already gone, so the stale cap just
+/// resolves to a deleted path (NotFound) — and `release_intern` reclaims it when the
+/// last cap closes.
 fn free_intern(relpath: &[u8]) {
     unsafe {
         for i in 2..MAXID {
             if USED[i] && &PATHS[i][..PLENS[i] as usize] == relpath {
-                USED[i] = false;
-                PLENS[i] = 0;
-                REFS[i] = 0;
+                if REFS[i] == 0 {
+                    USED[i] = false;
+                    PLENS[i] = 0;
+                }
                 return;
             }
         }
@@ -962,7 +967,12 @@ pub extern "C" fn oxbow_main() -> ! {
                         }
                     }
 
-                    let cid = intern(&relbuf[..clen]);
+                    // "open `/` (or `.`)" yields a cap to the SAME node, NOT a re-intern of
+                    // the empty path — which `intern` would resolve to node 1 (FS_ROOT),
+                    // forging the root-authority badge for any base-empty cap (e.g. a
+                    // namespace `confine`d at the disk root). Reusing `id` keeps open-self
+                    // correct without ever minting FS_ROOT.
+                    let cid = if clen == 0 { id } else { intern(&relbuf[..clen]) };
                     if cid == 0 {
                         break 'open;
                     }
@@ -1421,7 +1431,9 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut full = [0u8; 256];
                 let mut relbuf = [0u8; PLEN];
                 let mut r = MsgBuf::new(0);
-                if valid && name_ok(name) {
+                // A symlink target is file content — gate it like TAG_FS_READ so a LIST
+                // cap (readdir-only) can't read it.
+                if valid && name_ok(name) && allows_read(eff_right(id, cap_right, name)) {
                     if let Some(clen) = join_child(id, name, &mut relbuf) {
                         full_from_rel(&relbuf[..clen], &mut full);
                         let dst = unsafe { (r.data.as_mut_ptr() as *mut u8).add(8) };

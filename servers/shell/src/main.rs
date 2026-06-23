@@ -2287,7 +2287,15 @@ fn add_resource_rule(skind: u8, sname: &[u8], res: &[u8], mode: &[u8]) -> bool {
         if dir.is_empty() {
             return false;
         }
-        add_rule(skind, sname, RES_PATH, dir, parse_right(mode))
+        // Refuse to mount the credential/policy store into a user's namespace — granting
+        // /etc (the shadow + access.rules backing) is full escalation, and /bin must stay
+        // read-only for everyone. The top-level component is what matters.
+        let top = dir.split(|&b| b == b'/').next().unwrap_or(dir);
+        let right = parse_right(mode);
+        if top == b"etc" || (top == b"bin" && right != FS_RIGHT_RO as u8) {
+            return false;
+        }
+        add_rule(skind, sname, RES_PATH, dir, right)
     }
 }
 
@@ -2874,22 +2882,23 @@ fn save_shadow() {
     write_file(BOOT_FS_ROOT, SHADOW_PATH, &buf[..n], false);
 }
 
-/// Load /etc/shadow into the credential store. Returns true iff EVERY account's
-/// credentials were found and decoded (so we never re-seed defaults over a real store).
-fn load_shadow() -> bool {
+/// Load /etc/shadow into the credential store, PER ACCOUNT. Returns a per-account
+/// `found` array — the caller seeds a default only for accounts that were missing or
+/// malformed, so one corrupt line can't wipe out a valid credential for another account.
+fn load_shadow() -> [bool; NACCT] {
+    let mut found = [false; NACCT];
     let mut o = MsgBuf::new(TAG_FS_OPEN);
     pack_name(&mut o, SHADOW_PATH);
     if rt::sys_call(BOOT_FS_ROOT, &mut o).is_err()
         || o.data[0] != 0
         || o.data[1] != oxbow_abi::FS_FILE
     {
-        return false;
+        return found; // no store yet — all accounts unfound
     }
     let cap = o.handles[0];
     let mut data = [0u8; 2048];
     let len = unsafe { read_all(cap, &mut data) };
     let _ = rt::sys_close(cap);
-    let mut found = [false; NACCT];
     for line in data[..len].split(|&b| b == b'\n') {
         let mut it = line.split(|&b| b == b' ').filter(|t| !t.is_empty());
         let (Some(name), Some(salt_h), Some(hash_h)) = (it.next(), it.next(), it.next()) else {
@@ -2909,7 +2918,7 @@ fn load_shadow() -> bool {
             }
         }
     }
-    found.iter().all(|&f| f)
+    found
 }
 
 /// Set account `i`'s password (fresh random salt), clear its must-change flag, and
@@ -2937,24 +2946,28 @@ fn seed_accounts() {
     mkdir_one(b"/etc");
     mkdir_one(b"/home");
     mkdir_one(b"/home/bryson");
-    if load_shadow() {
-        unsafe { SEEDED = true };
-        return;
-    }
-    // First boot: no shadow yet. Seed defaults and force a change at first login.
+    // Load what's persisted; seed a default ONLY for accounts that were missing/corrupt
+    // (so one bad /etc/shadow line can't wipe a valid credential for another account).
+    let found = load_shadow();
+    let mut changed = false;
     unsafe {
         for (i, a) in ACCTS.iter().enumerate() {
-            let mut salt = [0u8; 16];
-            let _ = rt::sys_getentropy(&mut salt);
-            SALTS[i] = salt;
-            HASHES[i] = hash_pw(&salt, a.default_pw);
-            MUST_CHANGE[i] = true;
+            if !found[i] {
+                let mut salt = [0u8; 16];
+                let _ = rt::sys_getentropy(&mut salt);
+                SALTS[i] = salt;
+                HASHES[i] = hash_pw(&salt, a.default_pw);
+                MUST_CHANGE[i] = true; // a freshly-seeded default must be changed at login
+                changed = true;
+            }
         }
         SEEDED = true;
     }
-    write_file(BOOT_FS_ROOT, b"/etc/passwd", b"root:x:0:0:/:/bin/sh\nbryson:x:1000:1000:/home/bryson:/bin/sh\n", false);
-    write_file(BOOT_FS_ROOT, b"/etc/group", b"root:0:\nwheel:27:root,bryson\nbryson:1000:\n", false);
-    save_shadow();
+    if changed {
+        write_file(BOOT_FS_ROOT, b"/etc/passwd", b"root:x:0:0:/:/bin/sh\nbryson:x:1000:1000:/home/bryson:/bin/sh\n", false);
+        write_file(BOOT_FS_ROOT, b"/etc/group", b"root:0:\nwheel:27:root,bryson\nbryson:1000:\n", false);
+        save_shadow(); // persist the newly-seeded accounts alongside the loaded ones
+    }
 }
 
 /// If account `i` still carries a default (must-change) password, require a new one
