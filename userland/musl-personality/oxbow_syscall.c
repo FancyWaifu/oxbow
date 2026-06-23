@@ -307,6 +307,39 @@ static void fill_sockaddr_in(unsigned char *sa, unsigned int *addrlen,
 		*addrlen = 16;
 }
 
+/* Honest readiness for TCP listeners in select()/poll(). The net server's accept is
+ * non-blocking, so to report a listener "readable" we PEEK by accepting now and stashing
+ * the connection; the next accept() consumes the stash without blocking. One slot is
+ * enough (a server has a single listener). Without this, a select-loop server like
+ * darkhttpd would call accept() on an always-"ready" listener with nothing pending and
+ * block — never servicing the connection it already holds. */
+static struct {
+	int active;
+	int listener_fd;
+	long sock;
+	unsigned int ip;
+	unsigned short port;
+} accept_stash;
+
+static int listener_pending(int fd)
+{
+	if (fd < 0 || fd >= MAXFD || !fds[fd].used || fds[fd].kind != K_LISTEN)
+		return 0;
+	if (accept_stash.active)
+		return accept_stash.listener_fd == fd; /* single slot is taken */
+	unsigned int ip = 0;
+	unsigned short port = 0;
+	long sock = __oxbow_sock_tcp_accept(fds[fd].handle, &ip, &port);
+	if (sock < 0)
+		return 0; /* nothing pending */
+	accept_stash.active = 1;
+	accept_stash.listener_fd = fd;
+	accept_stash.sock = sock;
+	accept_stash.ip = ip;
+	accept_stash.port = port;
+	return 1;
+}
+
 /* stat a path into a kstat buffer (open-to-stat-then-close). */
 static long stat_path(const char *path, unsigned char *kst)
 {
@@ -675,20 +708,28 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 	}
 	case NR_accept:
 	case NR_accept4: {
-		/* Block until a client connects (the net server's accept is non-blocking, so
-		 * poll it with a yield), then install the connected socket as a fresh K_SOCK fd
-		 * and report the peer address. accept4 flags (a4) are ignored. */
+		/* Consume a connection a prior select()/poll() already peeked (the common path
+		 * for a select-loop server); otherwise block until a client connects (the net
+		 * server's accept is non-blocking, so poll it with a yield). Then install the
+		 * connected socket as a fresh K_SOCK fd and report the peer. accept4 flags ignored. */
 		int fd = (int)a1;
 		if (fd < 0 || fd >= MAXFD || !fds[fd].used || fds[fd].kind != K_LISTEN)
 			return -E_INVAL;
 		unsigned int pip = 0;
 		unsigned short pport = 0;
 		long sock;
-		for (;;) {
-			sock = __oxbow_sock_tcp_accept(fds[fd].handle, &pip, &pport);
-			if (sock >= 0)
-				break;
-			ox_syscall0(OX_SYS_YIELD); /* nothing pending — yield, then retry */
+		if (accept_stash.active && accept_stash.listener_fd == fd) {
+			sock = accept_stash.sock;
+			pip = accept_stash.ip;
+			pport = accept_stash.port;
+			accept_stash.active = 0;
+		} else {
+			for (;;) {
+				sock = __oxbow_sock_tcp_accept(fds[fd].handle, &pip, &pport);
+				if (sock >= 0)
+					break;
+				ox_syscall0(OX_SYS_YIELD); /* nothing pending — yield, then retry */
+			}
 		}
 		int nfd = fd_alloc_kind(sock, 0, K_SOCK);
 		if (nfd < 0) {
@@ -773,11 +814,17 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		return n;
 	}
 	case NR_getsockname: {
-		/* Report an unspecified AF_INET address; the resolver doesn't need the real one. */
+		/* Report 0.0.0.0 + the socket's bound port (stashed in .off at bind). Enough for
+		 * a server that getsockname()'s its listener to learn/print its own port. */
+		int fd = (int)a1;
 		unsigned char *sa = (unsigned char *)a2;
 		unsigned int *sl = (unsigned int *)a3;
+		unsigned short port = 0;
+		if (fd >= 0 && fd < MAXFD && fds[fd].used &&
+		    (fds[fd].kind == K_SOCK || fds[fd].kind == K_LISTEN))
+			port = (unsigned short)fds[fd].off;
 		if (sa && sl && *sl >= 16)
-			fill_sockaddr_in(sa, sl, 0, 0);
+			fill_sockaddr_in(sa, sl, 0, port);
 		return 0;
 	}
 	case NR_shutdown: /* half-close: treat as a no-op; close() does the teardown */
@@ -1080,32 +1127,72 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		unsigned long nfds = (unsigned long)a2;
 		int ready = 0;
 		for (unsigned long i = 0; i < nfds && pf; i++) {
-			short re = (pf[i].fd >= 0) ? (short)(pf[i].events & 0x7) : 0; /* IN|PRI|OUT */
+			int fd = pf[i].fd;
+			short re = (fd >= 0) ? (short)(pf[i].events & 0x7) : 0; /* IN|PRI|OUT */
+			/* A listener reports POLLIN only when a connection is actually pending. */
+			if (fd >= 0 && fd < MAXFD && fds[fd].used && fds[fd].kind == K_LISTEN &&
+			    (re & 0x1) && !listener_pending(fd))
+				re &= ~0x1;
 			pf[i].revents = re;
 			if (re)
 				ready++;
 		}
+		if (ready == 0)
+			ox_syscall0(OX_SYS_YIELD); /* idle (e.g. awaiting a connection) — be polite */
 		return ready;
 	}
 	case NR_select:
 	case NR_pselect6: {
-		/* nfds=a1; readfds=a2, writefds=a3 (fd_set bitmaps). Leave the sets as-is
-		 * (all requested fds reported ready) + clear exceptfds; return the count. */
+		/* nfds=a1; readfds=a2, writefds=a3, exceptfds=a4, timeout=a5 (NULL => block
+		 * forever). Report requested fds ready, EXCEPT a listener in readfds is "ready"
+		 * only when a connection is actually pending (peek + stash, so the following
+		 * accept() doesn't block). A select-loop server (darkhttpd) passes a NULL timeout
+		 * when idle and treats a 0 return as fatal — so with NULL timeout and nothing
+		 * ready we must BLOCK (yield-loop) until something becomes ready, not return 0. */
 		int nfds = (int)a1;
 		unsigned long *rd = (unsigned long *)a2;
 		unsigned long *wr = (unsigned long *)a3;
 		unsigned long *ex = (unsigned long *)a4;
+		const void *timeout = (const void *)a5; /* a5 == 0 => NULL => block forever */
+		int nwords = (nfds + 63) / 64;
+		if (nwords > 16)
+			nwords = 16;
+		unsigned long saved_rd[16], saved_wr[16];
+		for (int w = 0; w < nwords; w++) {
+			saved_rd[w] = rd ? rd[w] : 0;
+			saved_wr[w] = wr ? wr[w] : 0;
+		}
 		int ready = 0;
-		for (int fd = 0; fd < nfds && fd < 1024; fd++) {
-			unsigned long bit = 1UL << (fd & 63);
-			int w = fd >> 6;
-			if (rd && (rd[w] & bit))
-				ready++;
-			if (wr && (wr[w] & bit))
-				ready++;
+		for (;;) {
+			ready = 0;
+			for (int w = 0; w < nwords; w++) {
+				if (rd)
+					rd[w] = saved_rd[w];
+				if (wr)
+					wr[w] = saved_wr[w];
+			}
+			for (int fd = 0; fd < nfds && fd < 1024; fd++) {
+				unsigned long bit = 1UL << (fd & 63);
+				int w = fd >> 6;
+				if (rd && (saved_rd[w] & bit)) {
+					if (fd < MAXFD && fds[fd].used && fds[fd].kind == K_LISTEN &&
+					    !listener_pending(fd))
+						rd[w] &= ~bit; /* listener, nothing pending -> not ready */
+					else
+						ready++;
+				}
+				if (wr && (saved_wr[w] & bit))
+					ready++;
+			}
+			if (ready > 0)
+				break;
+			ox_syscall0(OX_SYS_YIELD); /* nothing ready — yield */
+			if (timeout != 0)
+				break; /* a finite/zero timeout was requested: return 0 now */
+			/* else NULL timeout: keep blocking until a fd becomes ready */
 		}
 		if (ex)
-			for (int w = 0; w < (nfds + 63) / 64 && w < 16; w++)
+			for (int w = 0; w < nwords; w++)
 				ex[w] = 0;
 		return ready;
 	}

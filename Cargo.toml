@@ -84,6 +84,7 @@ members = [
     "servers/awk-musl",
     "servers/kilo-musl",
     "servers/dash-musl",
+    "servers/darkhttpd-musl",
     "servers/ps",
     "servers/kill",
     "servers/spin",

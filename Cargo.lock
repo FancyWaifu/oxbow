@@ -252,6 +252,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "darkhttpd-musl"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "dash-musl"
 version = "0.0.0"
 dependencies = [

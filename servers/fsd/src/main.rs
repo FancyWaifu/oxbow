@@ -806,6 +806,7 @@ fn seed_from_initrd() {
                     // stream the file body into ext2
                     let data = unsafe { hdr.add(512) };
                     let mut done = 0usize;
+                    let mut since_flush = 0usize;
                     while done < size {
                         let chunk = core::cmp::min(size - done, 4096);
                         let mut wr = 0usize;
@@ -822,7 +823,19 @@ fn seed_from_initrd() {
                             break;
                         }
                         done += wr;
+                        // Seeding runs in batch write-back mode (no per-write flush), so
+                        // dirty lwext4 cache blocks accumulate across the whole ~11 MB
+                        // initrd. Left unbounded the cache exhausts and ext4_fwrite starts
+                        // returning 0 mid-file — silently TRUNCATING files written late in
+                        // the seed (a >150 KB /bin program would fail to spawn). Flush every
+                        // 64 KiB to bound the dirty set while keeping the batch-mode speed.
+                        since_flush += wr;
+                        if since_flush >= 64 * 1024 {
+                            unsafe { oxfs_flush() };
+                            since_flush = 0;
+                        }
                     }
+                    unsafe { oxfs_flush() }; // flush each file before starting the next
                     files += 1;
                 }
             }
