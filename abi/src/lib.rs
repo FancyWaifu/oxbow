@@ -802,6 +802,37 @@ pub const SPAWN_ARGV: u64 = 0x0F00_0000;
 /// which `rt` reads as root (uid 0, home "/").
 pub const SPAWN_IDENT: u64 = 0x0F00_1000;
 
+/// §96 dynamic linking: when a spawned image has a PT_INTERP (it is dynamically
+/// linked), the kernel loads the interpreter (`/lib/ld-oxbow`) alongside it, sets
+/// the thread entry to the interpreter, and maps a read-only page at this vaddr in
+/// the child holding a [`DynInfo`] record so the interpreter can find the real
+/// executable's program headers + entry. A statically-linked image never has this
+/// page mapped (its `magic` reads 0). The interpreter reads `/lib` via its slot-1
+/// fs capability (the executable's fs cap, shared in-process).
+pub const DYN_INFO: u64 = 0x0F00_2000;
+
+/// The record the kernel writes at [`DYN_INFO`] for a dynamically-linked image.
+/// `repr(C)` so the kernel and the interpreter agree on the layout.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DynInfo {
+    /// `DYN_INFO_MAGIC` when this is a real dynamic spawn (0 on a zeroed page).
+    pub magic: u64,
+    /// The executable's true entry point (AT_ENTRY) — where the interpreter jumps
+    /// after linking.
+    pub exe_entry: u64,
+    /// Vaddr of the executable's program-header table (AT_PHDR), mapped because the
+    /// dynamic linker script keeps the ehdr+phdrs in the first PT_LOAD.
+    pub exe_phdr: u64,
+    /// Number of program headers (AT_PHNUM).
+    pub exe_phnum: u64,
+    /// Size of one program header (AT_PHENT, normally 56).
+    pub exe_phent: u64,
+    /// Executable load base (0 for a non-PIE ET_EXEC; vaddrs are absolute).
+    pub exe_base: u64,
+}
+pub const DYN_INFO_MAGIC: u64 = u64::from_le_bytes(*b"OXDYNFO1");
+
 /// Max bytes for the username and home-path fields of [`IdentRec`] (NUL-padded).
 pub const IDENT_NAME_MAX: usize = 32;
 pub const IDENT_HOME_MAX: usize = 128;
