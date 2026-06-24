@@ -45,7 +45,9 @@ const R_X86_64_RELATIVE: u32 = 8;
 
 const PAGE: u64 = 4096;
 const SCRATCH: u64 = 0x5000_0000; // where we read a .so file before mapping its segments
-const SCRATCH_LEN: u64 = 32 * 1024 * 1024;
+// Sized to fit the default 256 KiB program budget (a small .so + its mapping). Phase
+// 3's liboxui.so will need a larger spawn budget; bump both then.
+const SCRATCH_LEN: u64 = 128 * 1024;
 const SO_BASE_START: u64 = 0x3000_0000; // shared objects bump from here
 
 const MAX_OBJS: usize = 8;

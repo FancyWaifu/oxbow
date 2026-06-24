@@ -205,6 +205,12 @@ _iso:
     RUSTFLAGS="-C relocation-model=static" cargo build -p oxbow-libc --release
     mkdir -p build/initrd/lib
     cp target/x86_64-unknown-none/release/liboxbow_libc.a build/initrd/lib/c.a
+    # §96 dyntest: the dynamic-linking hello-world. /lib/libadd.so + /bin/dynhello,
+    # copied only if prebuilt (servers/dyntest/build.sh). dynhello is a dynamically
+    # linked ELF (PT_INTERP=/lib/ld-oxbow, DT_NEEDED libadd.so) — exec'ing it runs
+    # ld-oxbow, which links libadd.so and prints "ld-oxbow OK: 3+4=7".
+    [ -f servers/dyntest/out/libadd.so ] && cp servers/dyntest/out/libadd.so build/initrd/lib/libadd.so || true
+    [ -f servers/dyntest/out/dynhello ] && cp servers/dyntest/out/dynhello build/initrd/bin/dynhello || true
     # /usr/include (§36): oxbow-libc headers (stdio.h, string.h, …) at
     # /usr/include + tcc's own builtin headers (stdarg.h, stddef.h, …) at
     # /usr/lib/tcc/include. tcc's default sysinclude path is "{B}/include:

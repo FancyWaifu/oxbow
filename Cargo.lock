@@ -529,6 +529,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ld-oxbow"
+version = "0.0.0"
+dependencies = [
+ "oxbow-abi",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
