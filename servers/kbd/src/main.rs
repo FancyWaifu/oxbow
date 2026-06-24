@@ -206,6 +206,7 @@ fn drain(mods: &mut Mods, mouse: &mut Mouse) {
                 0x53 => 111, // Delete
                 0x1c => 96,  // Keypad Enter
                 0x35 => 98,  // Keypad /
+                0x5b => 125, // Left Super/Meta (GNOME window mgmt + Activities)
                 _ => 0,
             };
             if evdev != 0 {

@@ -165,6 +165,35 @@ static int draw_text(int x, int y, const char *s, unsigned int color)
 /* Pixel width of a string at the 8px advance. */
 static int text_width(const char *s) { int n = 0; while (s[n]) n++; return n * 8; }
 
+/* §93: scale a bw*bh source image into the screen rect [dx0,dx1)×[dy0,dy1),
+ * nearest-neighbor, clipped to g_clip + screen. Single source of truth for the
+ * window content scaler AND the overview/Alt-Tab live cards. */
+static void blit_scaled(const unsigned int *src, int bw, int bh, int dx0, int dy0,
+                        int dx1, int dy1)
+{
+  if (!src || bw <= 0 || bh <= 0 || dx1 <= dx0 || dy1 <= dy0)
+    return;
+  int dw = dx1 - dx0, dh = dy1 - dy0;
+  int cx0 = dx0 < g_clip_x0 ? g_clip_x0 : dx0;
+  int cy0 = dy0 < g_clip_y0 ? g_clip_y0 : dy0;
+  int cx1 = dx1 > g_clip_x1 ? g_clip_x1 : dx1;
+  int cy1 = dy1 > g_clip_y1 ? g_clip_y1 : dy1;
+  if (cx0 < 0) cx0 = 0;
+  if (cy0 < 0) cy0 = 0;
+  if (cx1 > g_w) cx1 = g_w;
+  if (cy1 > g_h) cy1 = g_h;
+  for (int y = cy0; y < cy1; y++) {
+    int sy = (y - dy0) * bh / dh;
+    if (sy >= bh) sy = bh - 1;
+    const unsigned int *srow = src + (long)sy * bw;
+    for (int x = cx0; x < cx1; x++) {
+      int sx = (x - dx0) * bw / dw;
+      if (sx >= bw) sx = bw - 1;
+      g_back[(long)y * g_pitch_words + x] = srow[sx];
+    }
+  }
+}
+
 struct surf {
   struct wl_resource *buffer;       /* pending/current attached wl_buffer */
   struct wl_resource *surface;      /* the wl_surface resource itself */
@@ -182,6 +211,10 @@ struct surf {
   unsigned int       *backing;
   long                backing_cap;
   char                title[48]; /* §91: xdg_toplevel.set_title, drawn in the bar */
+  /* §93 GNOME-feel window management. */
+  int                 maximized;   /* 1 = maximized OR edge-snapped (has saved geom) */
+  int                 minimized;   /* 1 = hidden from desktop, reachable via overview/alt-tab */
+  int                 sx, sy, sw, sh; /* saved floating geom, valid while maximized */
 };
 
 /* The scene: views ordered bottom→top (last = topmost/focused). */
@@ -255,10 +288,18 @@ static void update_tty_mute(void)
  * machine (tinywl) for interactive move. */
 #define TBH 22 /* titlebar height in px */
 #define RESIZE_ZONE 18 /* bottom-right corner grip for resize */
+#define SNAP_ZONE 12   /* §93: drop a dragged window this close to an edge → tile */
 enum { MODE_PASSTHROUGH, MODE_MOVE, MODE_RESIZE };
 static int          g_cursor_mode;
 static struct surf *g_grab;        /* view being dragged/resized */
 static int          g_grab_dx, g_grab_dy; /* cursor offset within the window */
+/* §93: Alt-Tab window switcher state. */
+static int          g_alt_down;    /* left Alt held (evdev 0x38) */
+static int          g_switching;   /* the switcher overlay is up */
+static int          g_switch_index; /* selected slot in the switch ring */
+/* §93: Super (Meta) window-management chords, GNOME-style. */
+static int          g_super_down;  /* left Super held (evdev 125) */
+static int          g_super_used;  /* a chord fired during this Super hold */
 
 /* ---- §91 GNOME-style shell: a top bar + an Activities app launcher --------- */
 #define PANEL_H 28                 /* top bar height */
@@ -269,6 +310,66 @@ static int          g_grab_dx, g_grab_dy; /* cursor offset within the window */
 #define CARD_BG    0x00363b42u     /* app card */
 static int   g_overview;           /* is the Activities overview open? */
 static void *g_display;            /* the wl_display, for launching apps at runtime */
+
+/* §93: GNOME-style titlebar window controls — three TBH-wide cells at the right
+ * edge of the bar (right→left: close, maximize, minimize). ONE geometry source so
+ * the draw code and the hit-test can never drift. */
+enum { BTN_MIN, BTN_MAX, BTN_CLOSE };
+static void tb_btn_xrange(struct surf *s, int which, int *x0, int *x1)
+{
+  int right = s->x + s->w; /* close occupies the last cell, then max, then min */
+  int cell  = which == BTN_CLOSE ? 0 : which == BTN_MAX ? 1 : 2;
+  *x1 = right - cell * TBH;
+  *x0 = *x1 - TBH;
+}
+/* The button under (px,py) on s's titlebar, or -1. Titlebar rows are [y-TBH, y). */
+static int tb_btn_hit(struct surf *s, int px, int py)
+{
+  if (py < s->y - TBH || py >= s->y)
+    return -1;
+  for (int b = 0; b < 3; b++) {
+    int x0, x1;
+    tb_btn_xrange(s, b, &x0, &x1);
+    if (px >= x0 && px < x1)
+      return b;
+  }
+  return -1;
+}
+/* Paint the three control glyphs into s's titlebar (called after the bar fill, so
+ * it overdraws). Clipped via g_clip by fill_rect. */
+static void draw_tb_buttons(struct surf *s)
+{
+  for (int b = 0; b < 3; b++) {
+    int x0, x1;
+    tb_btn_xrange(s, b, &x0, &x1);
+    int gy0 = s->y - TBH + 6, gy1 = s->y - 6; /* glyph inset within the cell */
+    int gx0 = x0 + 6, gx1 = x1 - 6;
+    if (b == BTN_CLOSE) {
+      fill_rect(x0, s->y - TBH, x1, s->y, 0x00c04040u); /* red cell */
+      int span = gx1 - gx0 > 0 ? gx1 - gx0 : 1; /* a small white X */
+      for (int t = 0; t < span; t++) {
+        int yy = gy0 + t * (gy1 - gy0) / span;
+        fill_rect(gx0 + t, yy, gx0 + t + 1, yy + 1, 0x00ffffffu);
+        fill_rect(gx1 - 1 - t, yy, gx1 - t, yy + 1, 0x00ffffffu);
+      }
+    } else if (b == BTN_MIN) {
+      fill_rect(gx0, gy1 - 2, gx1, gy1, PANEL_FG); /* low horizontal bar */
+    } else { /* BTN_MAX: hollow square, or a double square when maximized (restore) */
+      if (s->maximized) {
+        fill_rect(gx0 + 2, gy0, gx1, gy0 + 2, PANEL_FG);
+        fill_rect(gx1 - 2, gy0, gx1, gy1 - 2, PANEL_FG);
+        fill_rect(gx0, gy0 + 2, gx0 + 2, gy1, PANEL_FG);
+        fill_rect(gx0, gy1 - 2, gx1 - 2, gy1, PANEL_FG);
+        fill_rect(gx0 + 2, gy0 + 2, gx1 - 2, gy1 - 2, 0x00444444u);
+      } else {
+        fill_rect(gx0, gy0, gx1, gy0 + 2, PANEL_FG);
+        fill_rect(gx0, gy1 - 2, gx1, gy1, PANEL_FG);
+        fill_rect(gx0, gy0, gx0 + 2, gy1, PANEL_FG);
+        fill_rect(gx1 - 2, gy0, gx1, gy1, PANEL_FG);
+      }
+    }
+  }
+}
 
 /* Launch an app by id (provided by Rust main.rs): 0=terminal, 1=monitor, 2=rings.
  * Returns a Wayland-socket fd to attach, or -1. */
@@ -286,6 +387,32 @@ static void app_card_rect(int i, int *cx, int *cy, int *cw, int *ch)
   int total = NAPPS * w + (NAPPS - 1) * gap;
   *cx = (g_w - total) / 2 + i * (w + gap);
   *cy = (g_h - h) / 2;
+  *cw = w;
+  *ch = h;
+}
+
+/* §93: the window-switch ring — mapped views top→bottom (topmost first), INCLUDING
+ * minimized ones (the overview + Alt-Tab are how you reach them). Fills `out` (cap
+ * MAXVIEWS), returns the count. */
+static int switch_ring(struct surf **out)
+{
+  int n = 0;
+  for (int v = g_nviews - 1; v >= 0; v--)
+    if (g_views[v]->mapped)
+      out[n++] = g_views[v];
+  return n;
+}
+/* Geometry of live window card `i` of `n` — a centered row above the app cards. */
+static void win_card_rect(int i, int n, int *cx, int *cy, int *cw, int *ch)
+{
+  int margin = 40, gap = 16, maxw = 200, h = 120;
+  int avail = g_w - 2 * margin - (n - 1) * gap;
+  int w = n > 0 ? avail / n : maxw;
+  if (w > maxw) w = maxw;
+  if (w < 60) w = 60;
+  int total = n * w + (n - 1) * gap;
+  *cx = (g_w - total) / 2 + i * (w + gap);
+  *cy = g_h / 2 - 170; /* a row above the app-launch cards (centered at g_h/2) */
   *cw = w;
   *ch = h;
 }
@@ -317,6 +444,24 @@ static void draw_panel(void)
 static void draw_overview(void)
 {
   fill_rect(0, PANEL_H, g_w, g_h, OVL_BG);
+  /* §93: a row of LIVE window cards (running + minimized) — GNOME's overview.
+   * Click one to focus/restore it. */
+  struct surf *ring[MAXVIEWS];
+  int rn = switch_ring(ring);
+  for (int i = 0; i < rn; i++) {
+    int x, y, w, h;
+    win_card_rect(i, rn, &x, &y, &w, &h);
+    fill_rect(x, y, x + w, y + h, CARD_BG);
+    if (ring[i]->backing)
+      blit_scaled(ring[i]->backing, ring[i]->bw, ring[i]->bh, x + 4, y + 4, x + w - 4,
+                  y + h - 20);
+    int saved = g_clip_x1;
+    if (g_clip_x1 > x + w) g_clip_x1 = x + w; /* keep the title inside the card */
+    int tw = text_width(ring[i]->title);
+    draw_text(x + (w - tw) / 2, y + h - 14, ring[i]->title,
+              ring[i]->minimized ? 0x00808080u : PANEL_FG);
+    g_clip_x1 = saved;
+  }
   for (int i = 0; i < NAPPS; i++) {
     int x, y, w, h;
     app_card_rect(i, &x, &y, &w, &h);
@@ -324,6 +469,36 @@ static void draw_overview(void)
     fill_rect(x + 30, y + 22, x + w - 30, y + h - 40, app_icon[i]); /* icon swatch */
     int tw = text_width(app_label[i]);
     draw_text(x + (w - tw) / 2, y + h - 26, app_label[i], PANEL_FG);
+  }
+}
+
+/* §93: the Alt-Tab switcher — a centered strip of live window cards with the
+ * selected one highlighted. Drawn over everything while Alt+Tab is held. */
+static void draw_switcher(void)
+{
+  struct surf *ring[MAXVIEWS];
+  int rn = switch_ring(ring);
+  if (rn < 1)
+    return;
+  int cw = 140, ch = 96, gap = 14, pad = 16;
+  int total = rn * cw + (rn - 1) * gap;
+  int x0 = (g_w - total) / 2 - pad, y0 = g_h / 2 - ch / 2 - pad;
+  int x1 = (g_w + total) / 2 + pad, y1 = g_h / 2 + ch / 2 + pad + 12;
+  fill_rect(x0, y0, x1, y1, OVL_BG); /* the switcher backdrop */
+  int sel = ((g_switch_index % rn) + rn) % rn;
+  for (int i = 0; i < rn; i++) {
+    int cx = (g_w - total) / 2 + i * (cw + gap), cy = g_h / 2 - ch / 2;
+    if (i == sel)
+      fill_rect(cx - 3, cy - 3, cx + cw + 3, cy + ch + 3, PANEL_HL); /* highlight */
+    fill_rect(cx, cy, cx + cw, cy + ch, CARD_BG);
+    if (ring[i]->backing)
+      blit_scaled(ring[i]->backing, ring[i]->bw, ring[i]->bh, cx + 3, cy + 3, cx + cw - 3,
+                  cy + ch - 3);
+    int saved = g_clip_x1;
+    if (g_clip_x1 > cx + cw) g_clip_x1 = cx + cw;
+    int tw = text_width(ring[i]->title);
+    draw_text(cx + (cw - tw) / 2, cy + ch + 2, ring[i]->title, PANEL_FG);
+    g_clip_x1 = saved;
   }
 }
 
@@ -566,7 +741,7 @@ static void composite_rect(int x0, int y0, int x1, int y1)
       g_back[(long)y * g_pitch_words + x] = 0x000d3b45u; /* desktop bg */
   for (int v = 0; v < g_nviews; v++) {
     struct surf *s = g_views[v];
-    if (!s->mapped || !s->backing)
+    if (!s->mapped || !s->backing || s->minimized)
       continue;
     unsigned int bar = (s == g_focus_view) ? 0x003a6ea5u : 0x00444444u;
     /* titlebar rows [s->y-TBH, s->y) clipped to the damage rect */
@@ -574,35 +749,21 @@ static void composite_rect(int x0, int y0, int x1, int y1)
     int b1 = (s->y < y1) ? s->y : y1;
     int a0 = (s->x > x0) ? s->x : x0;
     int a1 = (s->x + s->w < x1) ? s->x + s->w : x1;
-    for (int y = b0; y < b1; y++) {
-      int j = y - (s->y - TBH);
-      for (int x = a0; x < a1; x++) {
-        int i = x - s->x;
-        int in_close = i >= s->w - TBH + 4 && i < s->w - 4 && j >= 4 && j < TBH - 4;
-        g_back[(long)y * g_pitch_words + x] = in_close ? 0x00c04040u : bar;
-      }
-    }
-    /* §91: the window title in the bar, clipped short of the close box. */
+    for (int y = b0; y < b1; y++)
+      for (int x = a0; x < a1; x++)
+        g_back[(long)y * g_pitch_words + x] = bar;
+    /* §93: the three window-control buttons (min/max/close) over the bar fill. */
+    draw_tb_buttons(s);
+    /* §91: the window title in the bar, clipped short of the control buttons. */
     if (s->title[0]) {
       int saved = g_clip_x1;
-      if (g_clip_x1 > s->x + s->w - TBH - 2) g_clip_x1 = s->x + s->w - TBH - 2;
+      if (g_clip_x1 > s->x + s->w - 3 * TBH - 2) g_clip_x1 = s->x + s->w - 3 * TBH - 2;
       draw_text(s->x + 8, s->y - TBH + (TBH - 8) / 2, s->title, 0x00ffffffu);
       g_clip_x1 = saved;
     }
-    /* content rows [s->y, s->y+s->h) clipped — scale the bw*bh backing to w*h. */
-    int cy0 = (s->y > y0) ? s->y : y0;
-    int cy1 = (s->y + s->h < y1) ? s->y + s->h : y1;
+    /* content rows [s->y, s->y+s->h) — scale the bw*bh backing to w*h (clipped). */
     if (s->w > 0 && s->h > 0)
-      for (int y = cy0; y < cy1; y++) {
-        int sy = (y - s->y) * s->bh / s->h;
-        if (sy >= s->bh) sy = s->bh - 1;
-        const unsigned int *srow = s->backing + (long)sy * s->bw;
-        for (int x = a0; x < a1; x++) {
-          int sx = (x - s->x) * s->bw / s->w;
-          if (sx >= s->bw) sx = s->bw - 1;
-          g_back[(long)y * g_pitch_words + x] = srow[sx];
-        }
-      }
+      blit_scaled(s->backing, s->bw, s->bh, s->x, s->y, s->x + s->w, s->y + s->h);
     /* §91: a resize grip — 3 diagonal ticks in the bottom-right corner. */
     for (int t = 1; t <= 3; t++)
       for (int k = 0; k < 3; k++) {
@@ -617,6 +778,8 @@ static void composite_rect(int x0, int y0, int x1, int y1)
   if (g_overview)
     draw_overview();
   draw_panel();
+  if (g_switching) /* §93: Alt-Tab overlay, on top of the panel */
+    draw_switcher();
   } /* §92: end of the !g_greeter desktop block */
   if (g_hwcur) {
     /* Hardware cursor: the gpu composites it on the device side; just publish the
@@ -733,7 +896,7 @@ static void wake_unoccluded(void)
 {
   for (int v = 0; v < g_nviews; v++) {
     struct surf *s = g_views[v];
-    if (s->mapped && s->frame_cb && !content_fully_occluded(s)) {
+    if (s->mapped && !s->minimized && s->frame_cb && !content_fully_occluded(s)) {
       wl_callback_send_done(s->frame_cb, ox_now_ms());
       wl_resource_destroy(s->frame_cb);
       s->frame_cb = NULL;
@@ -857,10 +1020,12 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
       wl_array_release(&keys);
     }
     composite_scene(); /* new window: place + focus → full recomposite */
-  } else {
+  } else if (!s->minimized) {
     /* §59: an animation frame only changed THIS window — damage just its area.
      * §61: and skip the parts hidden behind windows above, so a window animating
-     * behind an opaque one costs only its VISIBLE area, not its full size. */
+     * behind an opaque one costs only its VISIBLE area, not its full size.
+     * §93: a minimized window draws nothing (but still releases its buffer below
+     * and has its frame callback withheld, so the client pauses). */
     composite_occluded(s, s->x, s->y - TBH, s->x + s->w, s->y + s->h);
   }
   g_composited = 1;
@@ -870,7 +1035,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
    * §62: but if this window is now FULLY hidden behind opaque windows, withhold
    * the callback — the client blocks, the hidden animation pauses (no wasted CPU),
    * and wake_unoccluded() re-delivers it when the window becomes visible again. */
-  if (s->frame_cb && !content_fully_occluded(s)) {
+  if (s->frame_cb && !s->minimized && !content_fully_occluded(s)) {
     wl_callback_send_done(s->frame_cb, ox_now_ms());
     wl_resource_destroy(s->frame_cb);
     s->frame_cb = NULL;
@@ -1169,7 +1334,8 @@ static struct surf *view_at(int px, int py)
 {
   for (int v = g_nviews - 1; v >= 0; v--) {
     struct surf *s = g_views[v];
-    if (s->mapped && px >= s->x && px < s->x + s->w && py >= s->y && py < s->y + s->h)
+    if (s->mapped && !s->minimized && px >= s->x && px < s->x + s->w && py >= s->y &&
+        py < s->y + s->h)
       return s;
   }
   return NULL;
@@ -1207,6 +1373,11 @@ static void pointer_update(void)
 /* Click-to-focus + raise (tinywl focus_view): give the clicked window keyboard
  * focus and raise it, then forward the button. */
 static void focus_view(struct surf *s);
+/* §93 window-management actions (defined just after focus_view). */
+static void toggle_maximize(struct surf *s);
+static void minimize_view(struct surf *s);
+static void unminimize_focus(struct surf *s);
+static void snap_view(struct surf *s, int zone);
 /* §91: launch app `id`, attach its Wayland socket to the display, close the
  * overview. */
 static void launch_and_attach(int id)
@@ -1226,6 +1397,19 @@ static void pointer_button(int left)
     /* §91: the GNOME-style shell intercepts clicks on the top bar + overview
      * BEFORE windows. */
     if (g_overview) {
+      /* §93: a live window card focuses/restores that window. */
+      struct surf *ring[MAXVIEWS];
+      int rn = switch_ring(ring);
+      for (int i = 0; i < rn; i++) {
+        int x, y, w, h;
+        win_card_rect(i, rn, &x, &y, &w, &h);
+        if (g_cx >= x && g_cx < x + w && g_cy >= y && g_cy < y + h) {
+          g_overview = 0;
+          unminimize_focus(ring[i]);
+          composite_scene();
+          return;
+        }
+      }
       for (int i = 0; i < NAPPS; i++) {
         int x, y, w, h;
         app_card_rect(i, &x, &y, &w, &h);
@@ -1250,13 +1434,19 @@ static void pointer_button(int left)
      * move drag (tinywl begin_interactive). Topmost titlebar wins. */
     for (int v = g_nviews - 1; v >= 0; v--) {
       struct surf *s = g_views[v];
-      if (!s->mapped)
+      if (!s->mapped || s->minimized)
         continue;
       if (g_cx >= s->x && g_cx < s->x + s->w && g_cy >= s->y - TBH && g_cy < s->y) {
         focus_view(s);
-        if (g_cx >= s->x + s->w - TBH + 4 && g_cx < s->x + s->w - 4 && s->xdg_toplevel)
-          xdg_toplevel_send_close(s->xdg_toplevel); /* close box → ask client to quit */
-        else {
+        int b = tb_btn_hit(s, g_cx, g_cy); /* §93: min/max/close cells */
+        if (b == BTN_CLOSE) {
+          if (s->xdg_toplevel)
+            xdg_toplevel_send_close(s->xdg_toplevel); /* ask the client to quit */
+        } else if (b == BTN_MAX) {
+          toggle_maximize(s);
+        } else if (b == BTN_MIN) {
+          minimize_view(s);
+        } else { /* drag the bar → move (tinywl begin_interactive) */
           g_cursor_mode = MODE_MOVE;
           g_grab = s;
           g_grab_dx = g_cx - s->x;
@@ -1286,6 +1476,12 @@ static void pointer_button(int left)
                              WL_POINTER_BUTTON_STATE_PRESSED);
   } else {
     if (g_cursor_mode == MODE_MOVE || g_cursor_mode == MODE_RESIZE) { /* end drag/resize */
+      /* §93: dropping a moved window into a screen-edge zone tiles it. */
+      if (g_cursor_mode == MODE_MOVE && g_grab) {
+        if (g_cy <= PANEL_H + SNAP_ZONE)        snap_view(g_grab, 0); /* top → max */
+        else if (g_cx <= SNAP_ZONE)             snap_view(g_grab, 1); /* left half */
+        else if (g_cx >= g_w - SNAP_ZONE)       snap_view(g_grab, 2); /* right half */
+      }
       g_cursor_mode = MODE_PASSTHROUGH;
       g_grab = NULL;
       return;
@@ -1328,6 +1524,86 @@ static void focus_view(struct surf *s)
   wake_unoccluded(); /* §62: raising `s` to the top uncovers whatever it hid */
 }
 
+/* §93: maximize to the work area (below the panel) or restore the saved geometry.
+ * The titlebar lives in rows [y-TBH, y), so y=PANEL_H+TBH puts it flush under the
+ * panel. Content scales (clients don't reflow) — same as drag-resize. */
+static void toggle_maximize(struct surf *s)
+{
+  if (!s->maximized) {
+    s->sx = s->x; s->sy = s->y; s->sw = s->w; s->sh = s->h;
+    s->maximized = 1;
+    s->x = 0;
+    s->y = PANEL_H + TBH;
+    s->w = g_w;
+    s->h = g_h - (PANEL_H + TBH);
+  } else {
+    s->x = s->sx; s->y = s->sy; s->w = s->sw; s->h = s->sh;
+    s->maximized = 0;
+  }
+  composite_scene();
+}
+/* §93: tile a dragged window — zone 0=top(maximize), 1=left half, 2=right half.
+ * Saves the floating geom (only if not already tiled, so the restore target
+ * survives a max→snap transition); the max button (a restore glyph now) un-tiles. */
+static void snap_view(struct surf *s, int zone)
+{
+  if (!s->maximized) {
+    s->sx = s->x; s->sy = s->y; s->sw = s->w; s->sh = s->h;
+  }
+  s->maximized = 1;
+  int top = PANEL_H + TBH, hh = g_h - (PANEL_H + TBH);
+  s->y = top;
+  s->h = hh;
+  if (zone == 1) { s->x = 0; s->w = g_w / 2; }
+  else if (zone == 2) { s->x = g_w / 2; s->w = g_w - g_w / 2; }
+  else { s->x = 0; s->w = g_w; } /* top → maximize */
+  composite_scene();
+}
+/* The topmost mapped, non-minimized view other than `except` (for focus handoff). */
+static struct surf *topmost_normal(struct surf *except)
+{
+  for (int v = g_nviews - 1; v >= 0; v--) {
+    struct surf *s = g_views[v];
+    if (s != except && s->mapped && !s->minimized)
+      return s;
+  }
+  return NULL;
+}
+/* §93: hide a window from the desktop; it stays in g_views (gated by ->minimized)
+ * and is reachable via the overview / Alt-Tab. Hands focus to the next window. */
+static void minimize_view(struct surf *s)
+{
+  if (!s || s->minimized)
+    return;
+  s->minimized = 1;
+  if (g_grab == s) { g_cursor_mode = MODE_PASSTHROUGH; g_grab = NULL; }
+  if (g_ptr_view == s)
+    g_ptr_view = NULL;
+  if (g_focus_view == s) {
+    if (s->surface) {
+      struct seatc *osc = seat_for(wl_resource_get_client(s->surface));
+      if (osc && osc->kbd)
+        wl_keyboard_send_leave(osc->kbd, ++g_serial, s->surface);
+    }
+    g_focus_view = NULL; /* null first so focus_view() below isn't a no-op */
+    struct surf *n = topmost_normal(s);
+    if (n)
+      focus_view(n);
+    else
+      update_tty_mute(); /* nothing left focused → restore shell input */
+  }
+  composite_scene();
+  wake_unoccluded();
+}
+/* §93: restore a minimized window and give it focus (overview/Alt-Tab path). */
+static void unminimize_focus(struct surf *s)
+{
+  if (!s)
+    return;
+  s->minimized = 0;
+  focus_view(s);
+}
+
 static int on_input(int fd, uint32_t mask, void *data)
 {
   (void)mask;
@@ -1345,6 +1621,66 @@ static int on_input(int fd, uint32_t mask, void *data)
        * forward them to clients while the login screen is up. */
       greeter_key(buf[i]);
       continue;
+    }
+    /* §93: Alt-Tab window switcher — intercept Alt (0x38) + Tab (0x0f) HERE, before
+     * the focus guard, so it works even with no client focused. These keys are
+     * consumed (never forwarded), so clients can't see Alt chords. */
+    unsigned int code = buf[i] & 0x7f;
+    int          rel  = buf[i] & 0x80;
+    if (code == 0x38) { /* left Alt */
+      if (!rel) {
+        g_alt_down = 1;
+      } else {
+        if (g_switching) {
+          struct surf *ring[MAXVIEWS];
+          int rn = switch_ring(ring);
+          g_switching = 0;
+          if (rn > 0)
+            unminimize_focus(ring[((g_switch_index % rn) + rn) % rn]);
+          composite_scene();
+          /* focus may have changed → recompute the kbd target for later keys. */
+          kbd = NULL;
+          if (g_focus_view && g_focus_view->surface) {
+            struct seatc *sc2 = seat_for(wl_resource_get_client(g_focus_view->surface));
+            kbd = sc2 ? sc2->kbd : NULL;
+          }
+        }
+        g_alt_down = 0;
+      }
+      continue;
+    }
+    if (g_alt_down && code == 0x0f) { /* Tab while Alt held → cycle the selection */
+      if (!rel) {
+        if (!g_switching) { g_switching = 1; g_switch_index = 1; } /* start on "previous" */
+        else g_switch_index++;
+        composite_scene();
+      }
+      continue;
+    }
+    /* §93: Super (Meta, evdev 125) — GNOME window management. A bare tap toggles the
+     * Activities overview; Super+arrow tiles/maximizes/minimizes the focused window.
+     * All consumed (clients never see Super chords). */
+    if (code == 125) {
+      if (!rel) {
+        g_super_down = 1; g_super_used = 0;
+      } else {
+        if (g_super_down && !g_super_used) { /* bare tap → toggle Activities */
+          g_overview = !g_overview;
+          composite_scene();
+        }
+        g_super_down = 0;
+      }
+      continue;
+    }
+    if (g_super_down && (code == 103 || code == 108 || code == 105 || code == 106)) {
+      if (!rel && g_focus_view) {
+        if (code == 103) toggle_maximize(g_focus_view);      /* Super+Up    = maximize */
+        else if (code == 108) minimize_view(g_focus_view);   /* Super+Down  = minimize */
+        else if (code == 105) snap_view(g_focus_view, 1);    /* Super+Left  = tile left */
+        else if (code == 106) snap_view(g_focus_view, 2);    /* Super+Right = tile right */
+        g_super_used = 1;
+      }
+      continue; /* consume press AND release */
     }
     if (!kbd)
       continue;
