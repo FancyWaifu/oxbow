@@ -487,13 +487,20 @@ pub const TLS_REGION_BASE: u64 = 0x0000_7000_0000_0000;
 /// the TCB self-pointer at the thread pointer. Returns the thread pointer (= %fs
 /// base). The static-TLS block sits BELOW the TP, so a TLS symbol at template offset
 /// `s` is reached at `%fs:(s - tls_size)` = user `vaddr + s` (local-exec model).
-fn build_tls_block(pml4_phys: u64, tls_next: &mut u64, t: &TlsTemplate, src: *const u8) -> u64 {
+fn build_tls_block(
+    pml4_phys: u64,
+    tls_next: &mut u64,
+    t: &TlsTemplate,
+    src: *const u8,
+) -> Option<u64> {
     let align = t.align.max(8);
     let tls_size = (t.memsz + align - 1) & !(align - 1);
     assert!(tls_size + 16 <= FRAME, "tls: block too large for one frame");
     let vaddr = *tls_next;
     *tls_next += FRAME;
-    let frame = pmm::alloc_frame().expect("tls: out of frames");
+    // OOM is NOT fatal: return None so the caller can fail the spawn/thread-spawn with
+    // E_NOMEM (and reclaim any partial address space) instead of panicking the kernel.
+    let frame = pmm::alloc_frame()?;
     let kbase = mm::phys_to_virt(frame) as *mut u8;
     let tp = vaddr + tls_size;
     unsafe {
@@ -510,22 +517,24 @@ fn build_tls_block(pml4_phys: u64, tls_next: &mut u64, t: &TlsTemplate, src: *co
         *(kbase.add(tls_size as usize) as *mut u64) = tp;
     }
     mm::vm::map_user_4k_in(pml4_phys, vaddr, frame, true, false); // RW, NX
-    tp
+    Some(tp)
 }
 
 /// Set up the TLS block for a NEWLY SPAWNED thread of a live process, reading the
 /// `.tdata` template from the process's own mapped memory (the current address space
 /// is the process's when it calls SYS_THREAD_SPAWN). Returns the thread pointer, or 0
 /// if the process has no TLS. §101.
-pub fn build_thread_tls(proc_id: usize) -> u64 {
+pub fn build_thread_tls(proc_id: usize) -> Option<u64> {
     let mut procs = PROCESSES.lock();
     let p = &mut procs[proc_id];
-    let Some(t) = p.tls else { return 0 };
+    // No TLS template is a SUCCESS with fs_base 0; only a frame-alloc failure is None,
+    // so the thread-spawn caller can tell "no TLS" apart from "out of memory".
+    let Some(t) = p.tls else { return Some(0) };
     let pml4 = p.pml4_phys;
     let mut next = p.tls_next;
-    let tp = build_tls_block(pml4, &mut next, &t, t.vaddr as *const u8);
+    let tp = build_tls_block(pml4, &mut next, &t, t.vaddr as *const u8)?;
     p.tls_next = next;
-    tp
+    Some(tp)
 }
 
 /// Map an ELF image's PT_LOAD segments (W^X-clean, U=1) and a guarded 64 KiB
@@ -541,7 +550,10 @@ struct LoadResult {
 
 /// stack into the given address space. The `fs_base` in the result is the main
 /// thread's TLS thread pointer (0 if the image has no TLS).
-fn load_into(img: &Image, pml4_phys: u64) -> LoadResult {
+/// Returns `None` on PMM exhaustion partway through (some frames may already be mapped
+/// into `pml4_phys`; the caller reclaims the partial address space with `free_user_pml4`
+/// and fails the spawn with E_NOMEM — never a kernel panic).
+fn load_into(img: &Image, pml4_phys: u64) -> Option<LoadResult> {
     let bytes = img.bytes();
     let mut segments = 0u32;
 
@@ -566,7 +578,7 @@ fn load_into(img: &Image, pml4_phys: u64) -> LoadResult {
 
         let mut page = v_start & !(FRAME - 1);
         while page < v_end_aligned {
-            let frame = pmm::alloc_frame().expect("elf: out of frames");
+            let frame = pmm::alloc_frame()?;
             let copy_start = core::cmp::max(page, v_start);
             let copy_end = core::cmp::min(page + FRAME, file_end);
             if copy_end > copy_start {
@@ -596,7 +608,7 @@ fn load_into(img: &Image, pml4_phys: u64) -> LoadResult {
     let stack_top = USER_STACK_TOP - slide;
     let stack_base = stack_top - USER_STACK_PAGES * FRAME;
     for i in 0..USER_STACK_PAGES {
-        let frame = pmm::alloc_frame().expect("elf: out of stack frames");
+        let frame = pmm::alloc_frame()?;
         mm::vm::map_user_4k_in(pml4_phys, stack_base + i * FRAME, frame, true, false);
     }
 
@@ -625,7 +637,7 @@ fn load_into(img: &Image, pml4_phys: u64) -> LoadResult {
             align: ph.p_align,
         };
         let src = unsafe { img.bytes().as_ptr().add(ph.p_offset as usize) };
-        fs_base = build_tls_block(pml4_phys, &mut tls_next, &t, src);
+        fs_base = build_tls_block(pml4_phys, &mut tls_next, &t, src)?;
         tls = Some(t);
         if crate::verbose() {
             println!(
@@ -634,7 +646,7 @@ fn load_into(img: &Image, pml4_phys: u64) -> LoadResult {
             );
         }
     }
-    LoadResult { entry: img.entry, user_rsp: stack_top, fs_base, tls, tls_next }
+    Some(LoadResult { entry: img.entry, user_rsp: stack_top, fs_base, tls, tls_next })
 }
 
 /// Create a process: claim a pool slot (reusing a `Dead` one), map the image
@@ -651,13 +663,20 @@ pub fn create(
         // §103: a Dead slot is reusable only once ALL its threads are gone — reusing
         // it frees the old address space, which a still-winding-down killed thread is
         // running on (use-after-free otherwise). Free slots are always reusable.
-        let id = (0..MAX_PROCS)
-            .find(|&i| match procs[i].state {
-                PState::Free => true,
-                PState::Dead => !crate::thread::proc_has_live_threads(i),
-                _ => false,
-            })
-            .ok_or(SysError::NoMem)?;
+        let id = match (0..MAX_PROCS).find(|&i| match procs[i].state {
+            PState::Free => true,
+            PState::Dead => !crate::thread::proc_has_live_threads(i),
+            _ => false,
+        }) {
+            Some(i) => i,
+            // Pool full: the caller's fresh (still-empty) pml4 would leak otherwise —
+            // create() owns its cleanup on every Err path.
+            None => {
+                drop(procs);
+                mm::vm::free_user_pml4(pml4_phys);
+                return Err(SysError::NoMem);
+            }
+        };
         // If we're reusing a Dead slot, its old address space is no longer live
         // (the owner switched away on exit) — reclaim its frames below.
         let dead_pml4 = (procs[id].state == PState::Dead).then_some(procs[id].pml4_phys);
@@ -676,7 +695,17 @@ pub fn create(
         mm::vm::free_user_pml4(old);
     }
 
-    let lr = load_into(img, pml4_phys);
+    // OOM partway through building the address space: reclaim the partial AS (frames +
+    // page tables already mapped), release the just-claimed pool slot, and fail with
+    // E_NOMEM — a memory-pressure spawn must never panic the kernel.
+    let Some(lr) = load_into(img, pml4_phys) else {
+        {
+            let mut procs = PROCESSES.lock();
+            procs[id] = Process::new(); // back to Free; reusable
+        }
+        mm::vm::free_user_pml4(pml4_phys);
+        return Err(SysError::NoMem);
+    };
     // Record the TLS template + bumped vaddr on the Process (lock dropped during the
     // mm-heavy load_into; re-take it for this small write).
     if lr.tls.is_some() {
@@ -688,6 +717,21 @@ pub fn create(
         println!("[proc] {} = proc {} (as pml4={:#x})", name, id, pml4_phys);
     }
     Ok((id, lr.entry, lr.user_rsp, lr.fs_base))
+}
+
+/// Reclaim a process slot that was `create`d but never started (no thread has run on
+/// its address space yet) — frees its address space (frames + page tables) and returns
+/// the slot to `Free`. Used when a spawn fails AFTER `create` succeeds (e.g. the budget
+/// grant can't be funded), so neither the slot nor the address space leaks. MUST be
+/// called before any thread is scheduled on the AS (nothing is executing on it).
+pub fn release_unstarted(id: usize) {
+    let pml4 = {
+        let mut procs = PROCESSES.lock();
+        let pml4 = procs[id].pml4_phys;
+        procs[id] = Process::new(); // -> Free, reusable
+        pml4
+    };
+    mm::vm::free_user_pml4(pml4);
 }
 
 /// Grant a boot process its standard birth capabilities: a Console (write) and a

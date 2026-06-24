@@ -802,7 +802,11 @@ pub fn spawn_thread_in_current(entry: u64, user_rsp: u64) -> usize {
         let t = &*addr_of!(TCBS[cur]);
         (t.proc, t.cr3)
     };
-    let fs_base = crate::proc::build_thread_tls(proc);
+    // OOM building the per-thread TLS block fails the spawn (0 = no tid), rather than
+    // panicking the kernel — matches the TCB-exhaustion failure return.
+    let Some(fs_base) = crate::proc::build_thread_tls(proc) else {
+        return 0;
+    };
     spawn_user(proc, cr3, entry, user_rsp, fs_base)
 }
 

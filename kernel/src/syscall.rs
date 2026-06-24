@@ -699,7 +699,13 @@ fn spawn_common(
     };
     let child_mem = match mm::mem::grant(prep.child_budget) {
         Some(m) => m,
-        None => return SyscallRet::err(SysError::NoMem),
+        // create() succeeded but the child can't be funded: reclaim its slot + address
+        // space (it has no threads yet) instead of leaking a zombie process. Nothing was
+        // debited from the parent yet.
+        None => {
+            proc::release_unstarted(cid);
+            return SyscallRet::err(SysError::NoMem);
+        }
     };
     proc::with_proc_mut(cid, |p| {
         p.install(
