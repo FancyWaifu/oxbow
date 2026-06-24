@@ -839,19 +839,33 @@ pub unsafe extern "C" fn __oxbow_fs_link(
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __oxbow_fs_pread(file: i64, buf: *mut u8, len: usize, off: u64) -> isize {
-    let mut m = MsgBuf::new(oxbow_abi::TAG_FS_READ);
-    m.data[0] = off;
-    m.data_len = 1;
-    if sys_call(file as Handle, &mut m).is_err() {
-        return -1;
-    }
-    let count = (m.data[0] as usize).min(len);
-    if count > 0 {
-        unsafe {
-            core::ptr::copy_nonoverlapping((m.data.as_ptr() as *const u8).add(8), buf, count);
+    // §perf: BULK reads — fsd deposits up to a page straight into `buf` via
+    // SYS_REPLY_BULK, so one round trip carries 4 KiB instead of the old ~504 B inline
+    // payload (~8x fewer cross-process IPCs, each costing a CR3 switch both ways). This
+    // is the musl/POSIX read path (do_read on a K_FILE fd); regular-file read semantics
+    // let us fill the whole `len` in a loop (short only at EOF), cutting musl-level
+    // read(2) calls too. fsd caps each reply at 4 KiB, so we chunk.
+    let mut total: usize = 0;
+    while total < len {
+        let want = (len - total).min(4096);
+        let mut m = MsgBuf::new(oxbow_abi::TAG_FS_READ_BULK);
+        m.data[0] = off + total as u64;
+        m.data[1] = want as u64;
+        m.data[2] = unsafe { buf.add(total) } as u64; // dst: the kernel copies here
+        m.data_len = 3;
+        if sys_call(file as Handle, &mut m).is_err() {
+            return if total > 0 { total as isize } else { -1 };
+        }
+        let count = m.data[0] as usize;
+        if count == 0 || count > want {
+            break; // EOF (or a deposit failure -> count 0)
+        }
+        total += count;
+        if count < want {
+            break; // short read: EOF reached
         }
     }
-    count as isize
+    total as isize
 }
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
