@@ -335,6 +335,27 @@ fn transfer_into(src_proc: usize, dst_proc: usize, staging_tid: usize) -> SysRes
     Ok(())
 }
 
+/// Stage `m` into a thread's `staging` slot copying ONLY the used words (header +
+/// data_len payload + handle_count handles + badge), not all 552 bytes of MsgBuf. The
+/// receiver's `copy_msg_to_user` only ever reads `data[..data_len]`/`handles[..count]`,
+/// so the unused tail is never observed — leaving it stale is safe, and skips a ~512 B
+/// memcpy on every send (most messages are tiny: an empty call stages ~24 B). §perf.
+#[inline]
+unsafe fn stage_msg(dst: *mut MsgBuf, m: &MsgBuf) {
+    (*dst).tag = m.tag;
+    (*dst).data_len = m.data_len;
+    (*dst).handle_count = m.handle_count;
+    (*dst).badge = m.badge;
+    let dl = (m.data_len as usize).min(MSG_DATA_WORDS);
+    for i in 0..dl {
+        (*dst).data[i] = m.data[i];
+    }
+    let hc = (m.handle_count as usize).min(MSG_HANDLES);
+    for i in 0..hc {
+        (*dst).handles[i] = m.handles[i];
+    }
+}
+
 /// `sys_send`/`sys_call`: `msg` is the dispatcher's validated copy-in (read under
 /// our CR3). Returns the final `(rax, rdx)`.
 pub fn send_or_call(ep_idx: u8, msg: &MsgBuf, msg_uptr: u64, is_call: bool) -> (u64, u64) {
@@ -360,7 +381,7 @@ pub fn send_or_call(ep_idx: u8, msg: &MsgBuf, msg_uptr: u64, is_call: bool) -> (
         // Deposit our message + the frozen entry snapshot into the receiver's staging,
         // then move the granted handles into the receiver's table.
         unsafe {
-            (*slot(r)).staging = *msg;
+            stage_msg(&mut (*slot(r)).staging, msg);
             (*slot(r)).staged_entries = (*slot(me)).staged_entries;
         }
         if let Err(e) = transfer_into(thread::current_proc(), thread::process_of(r), r) {
@@ -401,7 +422,7 @@ pub fn send_or_call(ep_idx: u8, msg: &MsgBuf, msg_uptr: u64, is_call: bool) -> (
     } else {
         // ---- sender-first: no receiver yet, stage ourselves and block ----
         unsafe {
-            (*slot(me)).staging = *msg;
+            stage_msg(&mut (*slot(me)).staging, msg);
             (*slot(me)).msg_uptr = msg_uptr;
             (*slot(me)).is_call = is_call;
             (*slot(me)).copy_out = false;
