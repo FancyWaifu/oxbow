@@ -112,6 +112,79 @@ fn bench_ipc() {
     );
 }
 
+// ---------------- Phase 2b: context-switch isolation (notif ping-pong) ----------------
+// Same shape as the IPC round-trip — main wakes a responder and blocks for the answer,
+// two context switches per iteration — but over notifications, which carry NO message,
+// NO handle transfer, NO reply mint/copy. So (ipc_rtt - ctxsw_rtt) is the cost of the
+// IPC MESSAGE machinery, while ctxsw_rtt itself is the scheduler + context-switch floor
+// (pick_next's O(n) scan, the per-switch WRMSR fs-base load, CR3 reload). This is the
+// profile: it tells us which half of the 88k-cycle round trip to attack.
+static NP_RESP: AtomicU64 = AtomicU64::new(0);
+static NP_MAIN: AtomicU64 = AtomicU64::new(0);
+static NP_STOP: AtomicU32 = AtomicU32::new(0);
+static mut NP_STACK: [u8; 32 * 1024] = [0; 32 * 1024];
+
+extern "C" fn np_responder(_: u64) -> ! {
+    let nresp = NP_RESP.load(Acquire) as u32;
+    let nmain = NP_MAIN.load(Acquire) as u32;
+    loop {
+        let _ = rt::sys_notif_wait(nresp);
+        if NP_STOP.load(Acquire) != 0 {
+            break;
+        }
+        let _ = rt::sys_notif_signal(nmain);
+    }
+    rt::sys_thread_exit()
+}
+
+fn bench_ctxsw() {
+    let nresp = match rt::sys_notif_create() {
+        Ok(n) => n,
+        Err(_) => {
+            rt::println!("[bench] ctxsw    : SKIP (no notif)");
+            return;
+        }
+    };
+    let nmain = match rt::sys_notif_create() {
+        Ok(n) => n,
+        Err(_) => {
+            rt::println!("[bench] ctxsw    : SKIP (no notif)");
+            return;
+        }
+    };
+    NP_RESP.store(nresp as u64, Release);
+    NP_MAIN.store(nmain as u64, Release);
+    let tid = unsafe { rt::spawn_thread(&mut *core::ptr::addr_of_mut!(NP_STACK), np_responder, 0) };
+    if tid == 0 {
+        rt::println!("[bench] ctxsw    : SKIP (responder thread spawn failed)");
+        return;
+    }
+    for _ in 0..50_000 {
+        core::hint::spin_loop();
+    }
+    const N: u64 = 100_000;
+    for _ in 0..2000 {
+        let _ = rt::sys_notif_signal(nresp);
+        let _ = rt::sys_notif_wait(nmain);
+    }
+    let w0 = rt::sys_uptime_ms();
+    let t0 = tsc();
+    for _ in 0..N {
+        let _ = rt::sys_notif_signal(nresp);
+        let _ = rt::sys_notif_wait(nmain);
+    }
+    let dt = tsc().wrapping_sub(t0);
+    let wall = rt::sys_uptime_ms().wrapping_sub(w0).max(1);
+    NP_STOP.store(1, Release);
+    let _ = rt::sys_notif_signal(nresp); // unblock responder so it exits
+    rt::println!(
+        "[bench] ctxsw rtt: {} cyc/rt   ({} ping-pongs in {} ms) [notif: sched+switch, no IPC msg]",
+        dt / N,
+        N,
+        wall
+    );
+}
+
 // ---------------- Phase 3: memory-map throughput + graceful exhaustion ----------------
 // Map fresh 4 KiB RW pages until the budget/PMM is exhausted. Measures map throughput
 // AND that exhaustion returns E_NOMEM (loop ends) rather than panicking the kernel.
@@ -197,6 +270,7 @@ pub extern "C" fn oxbow_main() -> ! {
     rt::println!("[bench] oxbow microbenchmarks + exhaustion probes");
     bench_syscall();
     bench_ipc();
+    bench_ctxsw(); // isolates scheduler+context-switch from IPC message logic
     bench_thread_spawn();
     bench_mmap(); // LAST: it deliberately exhausts the whole budget (terminal phase)
     rt::println!("[bench] DONE — kernel survived all phases");
