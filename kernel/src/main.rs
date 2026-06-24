@@ -646,6 +646,17 @@ fn kmain_stage2() -> ! {
                         badge: oxbow_abi::FS_ROOT,
                     },
                 );
+                // §92: a SEND cap on the TTY endpoint so the compositor can mute/unmute
+                // the kbd→tty character path on focus changes (TAG_TTY_MUTE). Send-only:
+                // it never reads the tty, just gates keystroke delivery to the shell.
+                p.install(
+                    oxbow_abi::BOOT_TTY,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Endpoint(ipc::EP1),
+                        rights: oxbow_abi::R_SEND,
+                        badge: 0,
+                    },
+                );
             });
         }
         // The tty is the sole receiver on the TTY endpoint.

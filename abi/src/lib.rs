@@ -897,3 +897,9 @@ pub const TAG_TTY_FLUSH: u64 = 0x53554C46; // "FLUS"
 /// editors that set `~ICANON`), 0 -> COOKED (the default line discipline). The musl
 /// personality sends this on `tcsetattr` based on the ICANON flag.
 pub const TAG_TTY_MODE: u64 = 0x45444F4D; // "MODE"
+/// §92: gate the kbd→tty character path. data[0] = 1 -> MUTED (the tty drops
+/// incoming TAG_TTY_CHAR keystrokes), 0 -> live. The compositor sends MUTED when a
+/// non-terminal graphical window (e.g. DOOM) holds keyboard focus, so keystrokes go
+/// only to that window's wl_keyboard and don't also surface as shell commands; it
+/// un-mutes when the terminal (or nothing) is focused.
+pub const TAG_TTY_MUTE: u64 = 0x4554554D; // "MUTE"

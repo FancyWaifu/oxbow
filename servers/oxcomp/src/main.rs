@@ -36,6 +36,18 @@ pub extern "C" fn ox_now_ms() -> u32 {
     rt::sys_uptime_ms() as u32
 }
 
+/// §92: mute/unmute the kbd→tty character path. The compositor calls this on focus
+/// changes — muting (on != 0) when a non-terminal window is focused so keystrokes
+/// reach only that window's wl_keyboard, not the shell. Send-only on BOOT_TTY.
+#[no_mangle]
+pub extern "C" fn comp_tty_mute(on: i32) {
+    use oxbow_abi::{BOOT_TTY, TAG_TTY_MUTE};
+    let mut m = MsgBuf::new(TAG_TTY_MUTE);
+    m.data[0] = if on != 0 { 1 } else { 0 };
+    m.data_len = 1;
+    let _ = rt::sys_send(BOOT_TTY, &m);
+}
+
 /// §91: launch an app at runtime when the user clicks it in the Activities
 /// overview. Spawns the image, handing it a fresh Wayland-socket channel; returns
 /// the compositor's end as an fd for `wl_client_create`, or -1 on failure.

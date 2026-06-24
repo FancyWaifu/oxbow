@@ -16,6 +16,9 @@ extern int memfd_create(const char *name, unsigned int flags);
 extern void ox_log(const char *p, unsigned long len);
 /* Milliseconds since boot — the frame-callback timestamp clients animate from. */
 extern unsigned int ox_now_ms(void);
+/* §92: mute/unmute the kbd->tty path (on != 0 = mute). Called on focus changes so
+ * keystrokes go only to a focused non-terminal window, not also to the shell. */
+extern void comp_tty_mute(int on);
 static void slog(const char *s)
 {
   unsigned long n = 0;
@@ -225,6 +228,28 @@ static struct seatc *seat_for(struct wl_client *c)
 }
 static struct surf *g_focus_view; /* topmost view = keyboard focus */
 static struct surf *g_ptr_view;   /* view currently under the pointer */
+
+/* The terminal (oxterm) is the only window that consumes shell input via the tty;
+ * every other window wants keystrokes routed only to itself. Identify it by the
+ * title oxui sets at window-create time. */
+static int surf_is_terminal(struct surf *s)
+{
+  return s && s->title[0] && strcmp(s->title, "oxterm") == 0;
+}
+
+/* §92: mute the kbd->tty path while a non-terminal window holds focus, so its
+ * keystrokes don't ALSO surface as shell commands; unmute when the terminal (or
+ * nothing) is focused. Called on every focus/title change; only sends on a real
+ * state change. */
+static int g_tty_muted = 0;
+static void update_tty_mute(void)
+{
+  int want = (g_focus_view && !surf_is_terminal(g_focus_view)) ? 1 : 0;
+  if (want != g_tty_muted) {
+    g_tty_muted = want;
+    comp_tty_mute(want);
+  }
+}
 
 /* §57 window management: a titlebar above each window, and a cursor-mode state
  * machine (tinywl) for interactive move. */
@@ -823,6 +848,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
     s->mapped = 1;
     views_raise(s);
     g_focus_view = s;
+    update_tty_mute(); /* a non-terminal window grabbing focus mutes shell input */
     struct seatc *sc = seat_for(c);
     if (sc && sc->kbd) {
       struct wl_array keys;
@@ -879,8 +905,10 @@ static void surface_resource_destroy(struct wl_resource *res)
   struct surf *s = wl_resource_get_user_data(res);
   if (s) {
     views_remove(s);
-    if (g_focus_view == s)
+    if (g_focus_view == s) {
       g_focus_view = NULL;
+      update_tty_mute(); /* focused window gone → restore shell input */
+    }
     if (g_ptr_view == s)
       g_ptr_view = NULL;
     free(s->backing);
@@ -930,6 +958,8 @@ static void tl_set_title(struct wl_client *c, struct wl_resource *r, const char 
   for (; t[i] && i < (int)sizeof(s->title) - 1; i++)
     s->title[i] = t[i];
   s->title[i] = 0;
+  if (s == g_focus_view)
+    update_tty_mute(); /* title can arrive after focus → re-evaluate the mute */
   composite_scene(); /* §91: redraw the bar with the new title */
 }
 static void tl_set_app_id(struct wl_client *c, struct wl_resource *r, const char *a)
@@ -1285,6 +1315,7 @@ static void focus_view(struct surf *s)
   }
   views_raise(s);
   g_focus_view = s;
+  update_tty_mute(); /* clicking to a non-terminal window mutes shell input */
   if (s->surface) {
     struct seatc *nsc = seat_for(wl_resource_get_client(s->surface));
     if (nsc && nsc->kbd) {

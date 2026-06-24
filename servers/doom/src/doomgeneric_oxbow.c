@@ -158,6 +158,13 @@ static unsigned char keysym_to_doom(uint32_t ks)
 	case 0xff54: return KEY_DOWNARROW; /* XKB_KEY_Down      */
 	case 0xff51: return KEY_LEFTARROW; /* XKB_KEY_Left      */
 	case 0xff53: return KEY_RIGHTARROW;/* XKB_KEY_Right     */
+	/* WASD movement (mapped onto the arrow keys so it's playable without the mouse). */
+	case 'w': case 'W': return KEY_UPARROW;    /* forward    */
+	case 's': case 'S': return KEY_DOWNARROW;  /* back       */
+	case 'a': case 'A': return KEY_LEFTARROW;  /* turn left  */
+	case 'd': case 'D': return KEY_RIGHTARROW; /* turn right */
+	case 'q': case 'Q': return KEY_STRAFE_L;   /* strafe left  */
+	case 'e': case 'E': return KEY_STRAFE_R;   /* strafe right */
 	case 0xff0d: return KEY_ENTER;     /* XKB_KEY_Return    */
 	case 0xff1b: return KEY_ESCAPE;    /* XKB_KEY_Escape    */
 	case 0xff08: return KEY_BACKSPACE; /* XKB_KEY_BackSpace */
@@ -173,17 +180,31 @@ static unsigned char keysym_to_doom(uint32_t ks)
 	}
 }
 
-static void on_key(oxui_window *w, uint32_t keysym, int pressed, void *u)
+/* Push a (pressed, doomkey) event onto the queue, dropping on overflow. */
+static void push_key(int pressed, unsigned char dk)
 {
-	(void)w; (void)u;
-	unsigned char dk = keysym_to_doom(keysym);
 	if (!dk)
 		return;
 	int n = (kq_w + 1) % KQ;
-	if (n != kq_r) { /* drop on overflow */
+	if (n != kq_r) {
 		kq[kq_w] = (unsigned short)((pressed ? 1 : 0) << 8 | dk);
 		kq_w = n;
 	}
+}
+
+static void on_key(oxui_window *w, uint32_t keysym, int pressed, void *u)
+{
+	(void)w; (void)u;
+	push_key(pressed, keysym_to_doom(keysym));
+}
+
+/* Left mouse button = fire (standard DOOM mouse control). */
+#define BTN_LEFT 0x110
+static void on_button(oxui_window *w, int button, int pressed, void *u)
+{
+	(void)w; (void)u;
+	if (button == BTN_LEFT)
+		push_key(pressed, KEY_FIRE);
 }
 
 /* oxui animate-mode paint: run one DOOM frame; DG_DrawFrame blits into this canvas. */
@@ -217,6 +238,7 @@ int main(int argc, char **argv)
 	oxui_handlers h = {0};
 	h.draw = draw;     /* each frame: doomgeneric_Tick() -> DG_DrawFrame blits the canvas */
 	h.key = on_key;    /* keyboard -> DOOM key queue */
+	h.button = on_button; /* left mouse click -> fire */
 	h.animate = 1;     /* run the game loop continuously */
 	oxui_run(g_win, &h, 0);
 	return 0;

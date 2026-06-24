@@ -38,6 +38,9 @@ typedef struct {
     void (*draw)(oxui_window *w, oxui_canvas c, void *user);
     /* A key was pressed/released (xkb keysym; pressed=1 on press). Optional. */
     void (*key)(oxui_window *w, uint32_t keysym, int pressed, void *user);
+    /* A pointer button changed while the pointer is over this window (Linux button
+     * code, e.g. 0x110 = left; pressed=1 on press). Optional. */
+    void (*button)(oxui_window *w, int button, int pressed, void *user);
     /* The window's close box was clicked. Optional; default quits the loop. */
     void (*closed)(oxui_window *w, void *user);
     /* An extra app fd to also wait on (e.g. a terminal's tty). -1 = none. When it

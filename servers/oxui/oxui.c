@@ -46,6 +46,7 @@ struct oxui_window {
     struct xdg_wm_base   *wm_base;
     struct wl_seat       *seat;
     struct wl_keyboard   *keyboard;
+    struct wl_pointer    *pointer;
     struct wl_surface    *surface;
     struct xdg_surface   *xdg_surface;
     struct xdg_toplevel  *xdg_toplevel;
@@ -251,12 +252,39 @@ static const struct wl_keyboard_listener keyboard_listener = {
     kb_keymap, kb_enter, kb_leave, kb_key, kb_mods,
 };
 
+/* Pointer: oxui only forwards button clicks to the app (DOOM maps left-click to fire);
+ * enter/leave/motion/axis are accepted but ignored. */
+static void pt_enter(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *sf,
+                     wl_fixed_t x, wl_fixed_t y)
+{ (void)d;(void)p;(void)s;(void)sf;(void)x;(void)y; }
+static void pt_leave(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *sf)
+{ (void)d;(void)p;(void)s;(void)sf; }
+static void pt_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t x, wl_fixed_t y)
+{ (void)d;(void)p;(void)t;(void)x;(void)y; }
+static void pt_button(void *data, struct wl_pointer *p, uint32_t serial, uint32_t time,
+                      uint32_t button, uint32_t state)
+{
+    (void)p; (void)serial; (void)time;
+    struct oxui_window *w = data;
+    if (w->h && w->h->button)
+        w->h->button(w, (int)button, state ? 1 : 0, w->user);
+}
+static void pt_axis(void *d, struct wl_pointer *p, uint32_t t, uint32_t axis, wl_fixed_t value)
+{ (void)d;(void)p;(void)t;(void)axis;(void)value; }
+static const struct wl_pointer_listener pointer_listener = {
+    pt_enter, pt_leave, pt_motion, pt_button, pt_axis,
+};
+
 static void seat_caps(void *data, struct wl_seat *seat, uint32_t caps)
 {
     struct oxui_window *w = data;
     if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !w->keyboard) {
         w->keyboard = wl_seat_get_keyboard(seat);
         wl_keyboard_add_listener(w->keyboard, &keyboard_listener, w);
+    }
+    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !w->pointer) {
+        w->pointer = wl_seat_get_pointer(seat);
+        wl_pointer_add_listener(w->pointer, &pointer_listener, w);
     }
 }
 static void seat_name(void *d, struct wl_seat *s, const char *n) { (void)d;(void)s;(void)n; }

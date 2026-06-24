@@ -17,7 +17,7 @@
 
 use oxbow_abi::{
     Handle, MsgBuf, BOOT_CONSOLE, BOOT_TERM_CHAN, BOOT_TTY, HANDLE_NULL, TAG_TTY_CHAR,
-    TAG_TTY_FLUSH, TAG_TTY_LINE, TAG_TTY_MODE, TAG_TTY_READ, TAG_TTY_WRITE,
+    TAG_TTY_FLUSH, TAG_TTY_LINE, TAG_TTY_MODE, TAG_TTY_MUTE, TAG_TTY_READ, TAG_TTY_WRITE,
 };
 use oxbow_rt as rt;
 
@@ -112,6 +112,11 @@ pub extern "C" fn oxbow_main() -> ! {
     let mut raw = false;
     let mut rawbuf = [0u8; 256];
     let mut rawlen = 0usize;
+    // §92 focus gating: while `muted`, drop kbd keystrokes (TAG_TTY_CHAR) so they go
+    // only to the focused graphical window. The compositor toggles this on focus
+    // changes (muted when a non-terminal window is focused). Shell READ/WRITE and
+    // control messages are unaffected — only live keyboard input is suppressed.
+    let mut muted = false;
 
     loop {
         let mut m = MsgBuf::new(0);
@@ -121,6 +126,13 @@ pub extern "C" fn oxbow_main() -> ! {
         };
 
         match m.tag {
+            // §92: toggle focus gating. data[0] != 0 -> mute (drop keystrokes).
+            TAG_TTY_MUTE if m.data_len >= 1 => {
+                muted = m.data[0] != 0;
+            }
+            // Focus is on a non-terminal window: swallow the keystroke (it reached the
+            // focused app via wl_keyboard already). Drop silently — no echo, no buffer.
+            TAG_TTY_CHAR if muted => {}
             // Phase 7: raw-mode keystroke — deliver byte-for-byte, no echo/editing/
             // signals. Ctrl-C/Ctrl-D are just bytes here (the app's ISIG is off).
             TAG_TTY_CHAR if raw && m.data_len >= 1 => {
