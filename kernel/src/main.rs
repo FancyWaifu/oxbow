@@ -375,7 +375,7 @@ fn kmain_stage2() -> ! {
         // what gives a clean boot straight to the prompt (no demo spam).
         if matches!(
             cmd,
-            b"pong" | b"beta" | b"hello" | b"badge" | b"cat" | b"ls" | b"mkdir" | b"touch" | b"rm" | b"mv" | b"cp" | b"drift" | b"cc-hello" | b"tcc" | b"lua" | b"micropython" | b"qjs" | b"curl" | b"cares-test" | b"ffi-test" | b"wl-test" | b"xkb-test" | b"vterm-test" | b"ft-test" | b"wlclient" | b"oxterm" | b"sysmon" | b"jail" | b"fstest"
+            b"pong" | b"beta" | b"hello" | b"badge" | b"cat" | b"ls" | b"mkdir" | b"touch" | b"rm" | b"mv" | b"cp" | b"drift" | b"cc-hello" | b"tcc" | b"lua" | b"micropython" | b"qjs" | b"curl" | b"cares-test" | b"ffi-test" | b"wl-test" | b"xkb-test" | b"vterm-test" | b"ft-test" | b"wlclient" | b"oxterm" | b"sysmon" | b"doom" | b"jail" | b"fstest"
         ) {
             image::register(cmd, bytes);
             println!("[mod] image '{}' registered ({} bytes)", name, bytes.len());
@@ -614,6 +614,7 @@ fn kmain_stage2() -> ! {
                 (b"wlclient".as_slice(), oxbow_abi::BOOT_IMG_WLCLIENT),
                 (b"oxterm".as_slice(), oxbow_abi::BOOT_IMG_OXTERM),
                 (b"sysmon".as_slice(), oxbow_abi::BOOT_IMG_SYSMON),
+                (b"doom".as_slice(), oxbow_abi::BOOT_IMG_DOOM),
             ] {
                 if let Some(idx) = image::find(name) {
                     proc::with_proc_mut(pid, |p| {
@@ -632,6 +633,20 @@ fn kmain_stage2() -> ! {
                     println!("[boot] WARN: client image not found for oxcomp");
                 }
             }
+            // §93: the compositor also holds the fs-root cap so it can FORWARD it to a
+            // graphical app that needs to read files (DOOM reads its WAD via stdio). The
+            // compositor doesn't use it itself; it just hands it to the spawned app on
+            // the BOOT_EP slot. Same badged fs endpoint the shell gets.
+            proc::with_proc_mut(pid, |p| {
+                p.install(
+                    oxbow_abi::BOOT_FS_ROOT,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Endpoint(ipc::EP2),
+                        rights: oxbow_abi::R_SEND | oxbow_abi::R_GRANT,
+                        badge: oxbow_abi::FS_ROOT,
+                    },
+                );
+            });
         }
         // The tty is the sole receiver on the TTY endpoint.
         if cmd == b"tty" {

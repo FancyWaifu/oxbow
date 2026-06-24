@@ -86,6 +86,7 @@ members = [
     "servers/dash-musl",
     "servers/darkhttpd-musl",
     "servers/netcat-musl",
+    "servers/doom",
     "servers/ps",
     "servers/kill",
     "servers/spin",

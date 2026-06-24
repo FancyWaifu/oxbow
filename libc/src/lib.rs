@@ -168,7 +168,10 @@ unsafe fn fs_read(cap: Handle, off: u64, out: &mut [u8]) -> usize {
     if rt::sys_call(cap, &mut m).is_err() {
         return 0;
     }
-    let count = (m.data[0] as usize).min(out.len()).min(56);
+    // The FS_READ reply packs the data inline after the count word, so up to 504 bytes
+    // ride one call (the shell's loader uses the same bound). The old 56-byte cap meant
+    // ~9x more syscalls per read — a 4 MB WAD (DOOM) crawled. 504 makes file reads fast.
+    let count = (m.data[0] as usize).min(out.len()).min(504);
     core::ptr::copy_nonoverlapping((m.data.as_ptr() as *const u8).add(8), out.as_mut_ptr(), count);
     count
 }
@@ -241,12 +244,22 @@ pub unsafe extern "C" fn read(fd: i32, buf: *mut u8, len: usize) -> isize {
         let out = core::slice::from_raw_parts_mut(buf, len);
         return rt::tcp::recv(slot.handle, out) as isize;
     }
-    let mut tmp = [0u8; 56];
-    let want = len.min(tmp.len());
-    let got = fs_read(slot.handle, slot.off, &mut tmp[..want]);
-    core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf, got);
-    slot.off += got as u64;
-    got as isize
+    // Read straight into the caller's buffer, looping fs_read (up to 504 B/call) until
+    // `len` bytes or a short reply (a per-call reply only returns up to the end of the
+    // backing block, so a multi-block read needs several calls). The old code copied
+    // through a 56-byte temp and returned after ONE call — so a single `read` of a big
+    // lump came back short, and DOOM's W_ReadLump bailed ("only read X of Y").
+    let out = core::slice::from_raw_parts_mut(buf, len);
+    let mut done = 0usize;
+    while done < len {
+        let got = fs_read(slot.handle, slot.off, &mut out[done..]);
+        if got == 0 {
+            break; // EOF
+        }
+        slot.off += got as u64;
+        done += got;
+    }
+    done as isize
 }
 
 #[no_mangle]
@@ -2211,6 +2224,31 @@ unsafe fn emit_field(
     width
 }
 
+/// Apply printf integer precision: zero-pad the rendered digits in `body` (after any
+/// leading sign) up to at least `prec` digits. Per C, `%.3d` of 33 → "033". An explicit
+/// precision also suppresses the '0' flag (handled at the call site). No-op if prec < 0.
+unsafe fn apply_int_prec(body: &mut TmpBuf, prec: i32) {
+    if prec < 0 {
+        return;
+    }
+    let prec = prec as usize;
+    let sign = usize::from(body.len > 0 && (body.buf[0] == b'-' || body.buf[0] == b'+'));
+    let digits = body.len - sign;
+    if digits >= prec || body.len + (prec - digits) > body.buf.len() {
+        return;
+    }
+    let add = prec - digits;
+    let mut k = body.len;
+    while k > sign {
+        k -= 1;
+        body.buf[k + add] = body.buf[k];
+    }
+    for z in body.buf.iter_mut().skip(sign).take(add) {
+        *z = b'0';
+    }
+    body.len += add;
+}
+
 /// Format `x` in fixed notation with exactly `prec` fractional digits. Returns
 /// the byte count. Integer part uses u64 (fine for an interpreter's range).
 unsafe fn fmt_fixed(emit: &mut dyn FnMut(&[u8]), x: f64, prec: usize) -> i32 {
@@ -2448,27 +2486,31 @@ unsafe fn vfmt(emit: &mut dyn FnMut(&[u8]), fmt: *const u8, ap: &mut VaList) -> 
                 b'd' | b'i' => {
                     let v = if lng { ap.next_arg::<i64>() } else { ap.next_arg::<i32>() as i64 };
                     print_int(&mut |s| body.push(s), v);
-                    w += emit_field(emit, &body.buf[..body.len], width, left, zero);
+                    apply_int_prec(&mut body, prec);
+                    w += emit_field(emit, &body.buf[..body.len], width, left, zero && prec < 0);
                 }
                 b'u' => {
                     let v = if lng { ap.next_arg::<u64>() } else { ap.next_arg::<u32>() as u64 };
                     print_uint(&mut |s| body.push(s), v, 10);
-                    w += emit_field(emit, &body.buf[..body.len], width, left, zero);
+                    apply_int_prec(&mut body, prec);
+                    w += emit_field(emit, &body.buf[..body.len], width, left, zero && prec < 0);
                 }
                 b'o' => {
                     let v = if lng { ap.next_arg::<u64>() } else { ap.next_arg::<u32>() as u64 };
                     print_uint(&mut |s| body.push(s), v, 8);
-                    w += emit_field(emit, &body.buf[..body.len], width, left, zero);
+                    apply_int_prec(&mut body, prec);
+                    w += emit_field(emit, &body.buf[..body.len], width, left, zero && prec < 0);
                 }
                 b'x' | b'X' => {
                     let v = if lng { ap.next_arg::<u64>() } else { ap.next_arg::<u32>() as u64 };
                     print_uint(&mut |s| body.push(s), v, 16);
+                    apply_int_prec(&mut body, prec);
                     if spec == b'X' {
                         for k in 0..body.len {
                             body.buf[k] = body.buf[k].to_ascii_uppercase();
                         }
                     }
-                    w += emit_field(emit, &body.buf[..body.len], width, left, zero);
+                    w += emit_field(emit, &body.buf[..body.len], width, left, zero && prec < 0);
                 }
                 b'p' => {
                     body.push(b"0x");

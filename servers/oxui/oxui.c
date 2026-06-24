@@ -5,6 +5,12 @@
 #include "config.h"
 extern int ox_chan_fd(unsigned int);      /* oxbow: inherited Wayland socket (slot 1) */
 
+/* Which inherited capability slot carries the Wayland socket. Default 1 (the usual
+ * compositor-spawned-app convention). An app that needs slot 1 for something else — DOOM
+ * keeps its filesystem cap there so the WAD opens via stdio — sets this to a free slot
+ * BEFORE calling oxui_window_create. */
+int oxui_wl_slot = 1;
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -291,7 +297,7 @@ oxui_window *oxui_window_create(const char *title, int width, int height)
     w->running = 1;
     wl_list_init(&w->buffer_list);
 
-    w->display = wl_display_connect_to_fd(ox_chan_fd(1)); /* inherited fd */
+    w->display = wl_display_connect_to_fd(ox_chan_fd((unsigned)oxui_wl_slot)); /* inherited fd */
     if (!w->display) { free(w); return NULL; }
     w->registry = wl_display_get_registry(w->display);
     wl_registry_add_listener(w->registry, &registry_listener, w);

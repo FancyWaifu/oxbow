@@ -42,11 +42,15 @@ pub extern "C" fn ox_now_ms() -> u32 {
 /// app id: 0 = Terminal (oxterm), 1 = Monitor (sysmon), 2 = Rings (wlclient).
 #[no_mangle]
 pub extern "C" fn comp_server_launch_app(app_id: i32) -> i32 {
-    use oxbow_abi::{BOOT_IMG_OXTERM, BOOT_IMG_SYSMON, BOOT_IMG_WLCLIENT, BOOT_TERM_CHAN};
+    use oxbow_abi::{
+        BOOT_FS_ROOT, BOOT_IMG_DOOM, BOOT_IMG_OXTERM, BOOT_IMG_SYSMON, BOOT_IMG_WLCLIENT,
+        BOOT_TERM_CHAN,
+    };
     let (img, budget): (Handle, u64) = match app_id {
         0 => (BOOT_IMG_OXTERM, 36 * 1024 * 1024),
         1 => (BOOT_IMG_SYSMON, 24 * 1024 * 1024),
         2 => (BOOT_IMG_WLCLIENT, 16 * 1024 * 1024),
+        3 => (BOOT_IMG_DOOM, 24 * 1024 * 1024), // TEMP: test sysmon's working budget
         _ => return -1,
     };
     let Some((srv, cli)) = rt::channel::pair() else {
@@ -56,10 +60,21 @@ pub extern "C" fn comp_server_launch_app(app_id: i32) -> i32 {
     m.data[0] = budget;
     m.data_len = 3;
     m.handle_count = 4;
-    m.handles[0] = cli; // slot 1: Wayland socket
-    m.handles[1] = HANDLE_NULL; // slot 2: stdout (unused)
-    m.handles[2] = BOOT_CONSOLE; // slot 4: debug console
-    m.handles[3] = if app_id == 0 { BOOT_TERM_CHAN } else { HANDLE_NULL }; // slot 20: tty mirror
+    if app_id == 3 {
+        // DOOM: filesystem cap on slot 1 (BOOT_EP, so doomgeneric opens /doom1.wad via
+        // stdio), console on slot 2 (BOOT_CONSOLE — oxbow-libc's stdout, routed to the
+        // console by rt::stdout_write's mode-3 fallback), and the Wayland socket on slot
+        // 4 (oxui's `oxui_wl_slot` is set to 4 to match).
+        m.handles[0] = BOOT_FS_ROOT; // slot 1: filesystem (BOOT_EP)
+        m.handles[1] = BOOT_CONSOLE; // slot 2: console (stdout)
+        m.handles[2] = cli; // slot 4: Wayland socket
+        m.handles[3] = HANDLE_NULL; // slot 20: unused
+    } else {
+        m.handles[0] = cli; // slot 1: Wayland socket
+        m.handles[1] = HANDLE_NULL; // slot 2: stdout (unused)
+        m.handles[2] = BOOT_CONSOLE; // slot 4: debug console
+        m.handles[3] = if app_id == 0 { BOOT_TERM_CHAN } else { HANDLE_NULL }; // slot 20: tty mirror
+    }
     if rt::sys_spawn(img, BOOT_MEM, &m, HANDLE_NULL).is_ok() {
         w(b"[oxcomp] launched app from Activities\n");
         unsafe { ox_chan_fd(srv as u32) }

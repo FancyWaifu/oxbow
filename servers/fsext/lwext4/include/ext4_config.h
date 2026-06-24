@@ -130,7 +130,7 @@ extern "C" {
  * evicting — lwext4's write-back-mode eviction corrupts the LRU red-black tree
  * (ext4_buf_lru_RB_REMOVE null-deref) and truncates files. 1024 blocks = 4 MiB gives
  * headroom; fsd's budget is 16 MiB. */
-#define CONFIG_BLOCK_DEV_CACHE_SIZE 1024
+#define CONFIG_BLOCK_DEV_CACHE_SIZE 1536
 #endif
 
 

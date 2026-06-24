@@ -229,9 +229,22 @@ fn pipe_write_all(pipe: Handle, bytes: &[u8]) {
 /// pipe — so a program's print path "just works" whether piped or not.
 pub fn stdout_write(bytes: &[u8]) {
     use core::sync::atomic::Ordering;
-    if STDOUT_MODE.load(Ordering::Relaxed) == 2 {
-        pipe_write_all(SPAWN_STDOUT, bytes);
-        return;
+    match STDOUT_MODE.load(Ordering::Relaxed) {
+        2 => {
+            pipe_write_all(SPAWN_STDOUT, bytes);
+            return;
+        }
+        // 3 = stdout is a raw Console capability (e.g. a compositor-spawned graphical
+        // app handed BOOT_CONSOLE as its stdout): write straight to the console. Without
+        // this, TAG_TTY_WRITE and pipe_write both fail on a Console cap, and a printf-
+        // heavy app (DOOM) would thrash on failing write syscalls forever.
+        3 => {
+            let _ = sys_console_write(SPAWN_STDOUT, bytes.as_ptr(), bytes.len());
+            return;
+        }
+        // 4 = stdout is unusable (no valid sink) — drop output cheaply, no syscalls.
+        4 => return,
+        _ => {}
     }
     let mut off = 0;
     while off < bytes.len() {
@@ -246,9 +259,16 @@ pub fn stdout_write(bytes: &[u8]) {
         match sys_send(SPAWN_STDOUT, &m) {
             Ok(()) => STDOUT_MODE.store(1, Ordering::Relaxed),
             Err(SysError::BadType) if STDOUT_MODE.load(Ordering::Relaxed) == 0 => {
-                // stdout is a pipe, not a tty endpoint — write the rest as bytes.
-                STDOUT_MODE.store(2, Ordering::Relaxed);
-                pipe_write_all(SPAWN_STDOUT, &bytes[off..]);
+                // Not a tty endpoint. Try a Console cap (3), then a pipe (2); if neither
+                // accepts the bytes, mark stdout unusable (4) so we stop wasting syscalls.
+                if sys_console_write(SPAWN_STDOUT, bytes[off..].as_ptr(), bytes.len() - off)
+                    .is_ok()
+                {
+                    STDOUT_MODE.store(3, Ordering::Relaxed);
+                } else {
+                    STDOUT_MODE.store(2, Ordering::Relaxed);
+                    pipe_write_all(SPAWN_STDOUT, &bytes[off..]);
+                }
                 return;
             }
             Err(_) => return,

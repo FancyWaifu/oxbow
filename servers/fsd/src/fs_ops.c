@@ -39,8 +39,18 @@ int oxfs_pread(const char *path, uint64_t off, void *buf, size_t len, size_t *rd
 	if (r != EOK)
 		return r;
 	r = ext4_fseek(&f, (int64_t)off, SEEK_SET);
-	if (r == EOK)
-		r = ext4_fread(&f, buf, len, rd);
+	/* Loop: lwext4's ext4_fread can return a SHORT count for a multi-block (or even a
+	 * single-block, across an indirect boundary) request without being at EOF. The
+	 * block read cache stores the returned length per 4 KiB block and returns 0 for
+	 * offsets past it, so a short read here truncated reads of files like DOOM's WAD
+	 * mid-lump. Keep reading until `len` is satisfied or a genuine EOF (chunk == 0). */
+	while (r == EOK && *rd < len) {
+		size_t chunk = 0;
+		r = ext4_fread(&f, (char *)buf + *rd, len - *rd, &chunk);
+		if (r != EOK || chunk == 0)
+			break;
+		*rd += chunk;
+	}
 	ext4_fclose(&f);
 	return r;
 }

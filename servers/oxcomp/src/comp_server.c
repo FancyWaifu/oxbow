@@ -250,9 +250,9 @@ static void *g_display;            /* the wl_display, for launching apps at runt
 extern int comp_server_launch_app(int app_id);
 
 /* The launcher's apps (icon color + label). app id == index. */
-#define NAPPS 3
-static const unsigned int app_icon[NAPPS] = {0x00264f78u, 0x00367a4au, 0x00803050u};
-static const char *const  app_label[NAPPS] = {"TERMINAL", "MONITOR", "RINGS"};
+#define NAPPS 4
+static const unsigned int app_icon[NAPPS] = {0x00264f78u, 0x00367a4au, 0x00803050u, 0x00a01818u};
+static const char *const  app_label[NAPPS] = {"TERMINAL", "MONITOR", "RINGS", "DOOM"};
 
 /* Geometry of overview card `i` (centered row). */
 static void app_card_rect(int i, int *cx, int *cy, int *cw, int *ch)
