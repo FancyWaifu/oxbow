@@ -245,14 +245,14 @@ run-isolation: build build-server-isolation _iso
 
 # Boot WITH a graphical window so you can log in on screen. The oxterm terminal
 # (FreeType + libvterm) shows the shell; click the QEMU window to give it keyboard
-# focus, then log in (bryson/bryson or root/root). Kernel output + a serial mirror
+# focus, then log in (bryson/bryson or root/root2). Kernel output + a serial mirror
 # stream to this terminal. 512M for the graphics stack. (Quit: close the window,
 # or Ctrl-A X in this terminal.)
 run-tty: iso
     qemu-system-x86_64 -M q35 -m 512M -smp 4 -cdrom {{ISO}} -boot d -serial stdio -display cocoa -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive file=oxbow-disk.img,if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0
 
 # `just play` — hop into oxbow for hands-on use: a graphical window, your PERSISTENT
-# disk (files survive reboots), and networking. Log in ON SCREEN as root/root (Tab
+# disk (files survive reboots), and networking. Log in ON SCREEN as root/root2 (Tab
 # between the username/password fields, Enter submits); CLICK the window first to give
 # it keyboard/mouse focus (Ctrl-Alt-G releases). Kernel + serial logs stream to this
 # terminal — and you also get an interactive serial shell here once it boots.
