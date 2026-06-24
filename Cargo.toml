@@ -15,6 +15,7 @@ members = [
     "servers/serial",
     "servers/hello",
     "servers/thrtest",
+    "servers/bench",
     "servers/badge",
     "servers/fs",
     "servers/cat",

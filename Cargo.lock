@@ -37,6 +37,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bench"
+version = "0.0.0"
+dependencies = [
+ "oxbow-abi",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "beta"
 version = "0.0.0"
 dependencies = [
