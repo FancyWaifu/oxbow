@@ -80,6 +80,8 @@ pub struct Image<'a> {
     bytes: &'a [u8],
     phdrs: [Elf64Phdr; MAX_PHDRS],
     nphdr: usize,
+    phoff: u64,    // §96: e_phoff — needed to give the dynamic linker AT_PHDR
+    phentsize: u16,
 }
 
 impl<'a> Image<'a> {
@@ -131,7 +133,29 @@ impl<'a> Image<'a> {
             bytes,
             phdrs,
             nphdr: phnum,
+            phoff: eh.e_phoff,
+            phentsize: eh.e_phentsize,
         })
+    }
+
+    /// §96: the number of program headers and one header's size (for AT_PHNUM/PHENT).
+    pub fn phnum(&self) -> u64 {
+        self.nphdr as u64
+    }
+    pub fn phentsize(&self) -> u64 {
+        self.phentsize as u64
+    }
+    /// §96: the VADDR at which the program-header table is MAPPED — the dynamic
+    /// linker's AT_PHDR. The phdr table is at file offset `phoff`; find the PT_LOAD
+    /// whose file range covers it and translate to its vaddr. The dynamic linker
+    /// script keeps the ehdr+phdrs in the first PT_LOAD, so this resolves.
+    pub fn phdr_vaddr(&self) -> Option<u64> {
+        for ph in self.loads() {
+            if self.phoff >= ph.p_offset && self.phoff < ph.p_offset + ph.p_filesz {
+                return Some(ph.p_vaddr + (self.phoff - ph.p_offset));
+            }
+        }
+        None
     }
 
     /// Iterate the PT_LOAD program headers (from the frozen snapshot).

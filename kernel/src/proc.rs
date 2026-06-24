@@ -553,10 +553,31 @@ struct LoadResult {
 /// Returns `None` on PMM exhaustion partway through (some frames may already be mapped
 /// into `pml4_phys`; the caller reclaims the partial address space with `free_user_pml4`
 /// and fails the spawn with E_NOMEM — never a kernel panic).
-fn load_into(img: &Image, pml4_phys: u64) -> Option<LoadResult> {
+/// §96: the embedded dynamic linker (ld-oxbow) ELF bytes, set at boot from the
+/// Limine module. `load_into` maps it alongside any dynamically-linked image.
+static INTERP_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static INTERP_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub fn set_interp(bytes: &'static [u8]) {
+    use core::sync::atomic::Ordering;
+    INTERP_PTR.store(bytes.as_ptr() as usize, Ordering::Relaxed);
+    INTERP_LEN.store(bytes.len(), Ordering::Relaxed);
+}
+fn interp_image() -> Option<Image<'static>> {
+    use core::sync::atomic::Ordering;
+    let p = INTERP_PTR.load(Ordering::Relaxed);
+    let l = INTERP_LEN.load(Ordering::Relaxed);
+    if p == 0 || l == 0 {
+        return None;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(p as *const u8, l) };
+    Image::try_validate(bytes).ok()
+}
+
+/// Map an image's PT_LOAD segments into `pml4_phys`; returns the segment count.
+/// Shared by the executable and (for a dynamic image) the interpreter.
+fn map_loads(img: &Image, pml4_phys: u64) -> Option<u32> {
     let bytes = img.bytes();
     let mut segments = 0u32;
-
     for ph in img.loads() {
         let writable = ph.p_flags & PF_W != 0;
         let executable = ph.p_flags & PF_X != 0;
@@ -598,6 +619,41 @@ fn load_into(img: &Image, pml4_phys: u64) -> Option<LoadResult> {
             page += FRAME;
         }
         segments += 1;
+    }
+    Some(segments)
+}
+
+fn load_into(img: &Image, pml4_phys: u64) -> Option<LoadResult> {
+    let segments = map_loads(img, pml4_phys)?;
+
+    // §96: a dynamically-linked image (has PT_INTERP) → also map the interpreter
+    // (ld-oxbow) into this address space plus a read-only DynInfo page, and enter
+    // the interpreter instead of the executable. ld-oxbow links the shared objects,
+    // then jumps to the executable's real entry (DynInfo.exe_entry).
+    let mut entry = img.entry;
+    if img.interp().is_some() {
+        let interp = interp_image()?;
+        map_loads(&interp, pml4_phys)?;
+        entry = interp.entry;
+        let exe_phdr = img.phdr_vaddr()?;
+        let info = oxbow_abi::DynInfo {
+            magic: oxbow_abi::DYN_INFO_MAGIC,
+            exe_entry: img.entry,
+            exe_phdr,
+            exe_phnum: img.phnum(),
+            exe_phent: img.phentsize(),
+            exe_base: 0,
+        };
+        let frame = pmm::alloc_frame()?;
+        unsafe {
+            let dst = mm::phys_to_virt(frame) as *mut u8;
+            core::ptr::write_bytes(dst, 0, FRAME as usize);
+            core::ptr::write(dst as *mut oxbow_abi::DynInfo, info);
+        }
+        mm::vm::map_user_4k_in(pml4_phys, oxbow_abi::DYN_INFO, frame, false, false);
+        if crate::verbose() {
+            println!("[elf] dynamic: interp entry {:#x}, exe entry {:#x}", entry, img.entry);
+        }
     }
 
     // Stack-base ASLR: slide the stack top down by a random, page-aligned offset
@@ -646,7 +702,7 @@ fn load_into(img: &Image, pml4_phys: u64) -> Option<LoadResult> {
             );
         }
     }
-    Some(LoadResult { entry: img.entry, user_rsp: stack_top, fs_base, tls, tls_next })
+    Some(LoadResult { entry, user_rsp: stack_top, fs_base, tls, tls_next })
 }
 
 /// Create a process: claim a pool slot (reusing a `Dead` one), map the image

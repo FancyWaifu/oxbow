@@ -370,6 +370,15 @@ fn kmain_stage2() -> ! {
             continue;
         }
 
+        // §96: the dynamic linker (ld-oxbow) is not a program to spawn — it's the
+        // PT_INTERP the loader maps alongside any dynamically-linked image. Stash
+        // its bytes for proc::load_into.
+        if cmd == b"ld-oxbow" {
+            proc::set_interp(bytes);
+            println!("[mod] dynamic linker 'ld-oxbow' registered ({} bytes)", bytes.len());
+            continue;
+        }
+
         // Demo / on-demand programs are NOT boot-spawned: they are registered as
         // spawnable Image capabilities and launched later from the shell. This is
         // what gives a clean boot straight to the prompt (no demo spam).
