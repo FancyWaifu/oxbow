@@ -28,6 +28,7 @@ build-server:
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p shell
     RUSTFLAGS="-C relocation-model=static" cargo build -p serial
     RUSTFLAGS="-C relocation-model=static" cargo build -p hello
+    RUSTFLAGS="-C relocation-model=static" cargo build -p ld-oxbow
     RUSTFLAGS="-C relocation-model=static" cargo build -p thrtest
     RUSTFLAGS="-C relocation-model=static" cargo build -p bench
     RUSTFLAGS="-C relocation-model=static" cargo build -p badge
@@ -108,6 +109,7 @@ _iso:
     cp target/x86_64-unknown-none/debug/shell iso_root/boot/shell.elf
     cp target/x86_64-unknown-none/debug/serial iso_root/boot/serial.elf
     cp target/x86_64-unknown-none/debug/hello iso_root/boot/hello.elf
+    cp target/x86_64-unknown-none/debug/ld-oxbow iso_root/boot/ld-oxbow.elf
     cp target/x86_64-unknown-none/debug/badge iso_root/boot/badge.elf
     # §95: the Rust `std` demo as a boot module (kernel spawns it → output to the
     # serial console), if prebuilt. Proves real Rust std runs on oxbow.
