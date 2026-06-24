@@ -89,7 +89,17 @@ struct Dev {
     qv: usize,     // queue page vaddr (desc/avail/used rings)
     rv: usize,     // request page vaddr (header @0, data @512, status @1024)
     rp: u64,       // request page phys
+    // §perf multi-sector + read-ahead: a separate contiguous DMA buffer that holds up
+    // to RA_SECTORS sectors, so one virtio request transfers many sectors (the old code
+    // issued ONE request per 512-byte sector — ~8 device round-trips per 4 KiB read).
+    dv: usize, // data buffer vaddr
+    dp: u64,   // data buffer phys
 }
+
+// Read-ahead window: read this many sectors per device request (64 KiB) and serve
+// subsequent sequential READN requests from the buffer without touching the device.
+const RA_SECTORS: u64 = 128;
+const RA_PAGES: u64 = RA_SECTORS * SECTOR as u64 / 0x1000;
 
 impl Dev {
     /// The 512-byte sector data buffer (DMA), used as the write-back cache.
@@ -150,6 +160,58 @@ impl Dev {
         fence(Ordering::SeqCst);
         r8(stat)
     }
+
+    /// Read (write=false) or write `n` contiguous sectors starting at `sector` in ONE
+    /// virtio request, via the multi-sector DMA buffer (`dv`/`dp`). One device
+    /// round-trip for up to RA_SECTORS sectors instead of `op`'s one-per-sector.
+    unsafe fn op_n(&self, sector: u64, n: u64, write: bool) -> u8 {
+        let hdr = self.rv;
+        let stat = self.rv + 1024;
+        let hdr_p = self.rp;
+        let stat_p = self.rp + 1024;
+        let len = (n as usize) * SECTOR;
+
+        w32(hdr, if write { 1 } else { 0 });
+        w32(hdr + 4, 0);
+        w64(hdr + 8, sector);
+
+        // Descriptor chain: header (RO) -> multi-sector data -> status (device-write).
+        w64(self.qv, hdr_p);
+        w32(self.qv + 8, 16);
+        w16(self.qv + 12, F_NEXT);
+        w16(self.qv + 14, 1);
+
+        let dflags = F_NEXT | if write { 0 } else { F_WRITE };
+        w64(self.qv + 16, self.dp);
+        w32(self.qv + 24, len as u32);
+        w16(self.qv + 28, dflags);
+        w16(self.qv + 30, 2);
+
+        w64(self.qv + 32, stat_p);
+        w32(self.qv + 40, 1);
+        w16(self.qv + 44, F_WRITE);
+        w16(self.qv + 46, 0);
+
+        let avail = self.qv + AVAIL_OFF;
+        let aidx = r16(avail + 2);
+        w16(avail + 4 + (aidx % Q) as usize * 2, 0);
+        fence(Ordering::SeqCst);
+        w16(avail + 2, aidx.wrapping_add(1));
+        fence(Ordering::SeqCst);
+
+        w16(self.notify, 0);
+        let used = self.qv + USED_OFF;
+        let start = r16(used + 2);
+        let mut spins: u64 = 0;
+        while r16(used + 2) == start {
+            spins += 1;
+            if spins > 1_000_000_000 {
+                return 0xff;
+            }
+        }
+        fence(Ordering::SeqCst);
+        r8(stat)
+    }
 }
 
 /// One-sector write-back cache over the device.
@@ -157,6 +219,10 @@ struct Cache {
     dev: Dev,
     cached: u64, // sector currently in the buffer, or NO_SECTOR
     dirty: bool,
+    // §perf read-ahead window currently in dev.dv: sectors [ra_base, ra_base+ra_len).
+    // ra_len == 0 means invalid. Invalidated on every write so it can never go stale.
+    ra_base: u64,
+    ra_len: u64,
 }
 
 impl Cache {
@@ -167,8 +233,11 @@ impl Cache {
         if self.cached == sector {
             return true;
         }
-        if self.dirty && self.cached != NO_SECTOR && self.dev.op(self.cached, true) != 0 {
-            return false;
+        if self.dirty && self.cached != NO_SECTOR {
+            self.ra_len = 0; // committing a write — the RA window may now be stale
+            if self.dev.op(self.cached, true) != 0 {
+                return false;
+            }
         }
         self.dirty = false;
         if self.dev.op(sector, false) != 0 {
@@ -182,6 +251,7 @@ impl Cache {
     /// Commit the cached sector if dirty.
     unsafe fn flush(&mut self) -> bool {
         if self.dirty && self.cached != NO_SECTOR {
+            self.ra_len = 0; // committing a write — the RA window may now be stale
             if self.dev.op(self.cached, true) != 0 {
                 return false;
             }
@@ -258,7 +328,10 @@ pub extern "C" fn oxbow_main() -> ! {
                 w16(cc + QUEUE_SIZE, q);
                 let qp = rt::sys_dma_alloc(BOOT_MEM, BLK_DMA).unwrap_or(0);
                 let rp = rt::sys_dma_alloc(BOOT_MEM, BLK_DMA + 0x1000).unwrap_or(0);
-                if qp != 0 && rp != 0 {
+                // §perf: a contiguous RA_SECTORS-sector DMA buffer for multi-sector +
+                // read-ahead transfers, mapped at BLK_DMA + 0x2000 (room to BLK_SHARED).
+                let dp = rt::sys_dma_alloc_contig(BOOT_MEM, BLK_DMA + 0x2000, RA_PAGES).unwrap_or(0);
+                if qp != 0 && rp != 0 && dp != 0 {
                     w64(cc + QUEUE_DESC, qp);
                     w64(cc + QUEUE_DRIVER, qp + AVAIL_OFF as u64);
                     w64(cc + QUEUE_DEVICE, qp + USED_OFF as u64);
@@ -269,9 +342,18 @@ pub extern "C" fn oxbow_main() -> ! {
                         + notify_off as usize
                         + qnoff as usize * notify_mult as usize;
                     cache = Some(Cache {
-                        dev: Dev { notify, qv: BLK_DMA as usize, rv: (BLK_DMA + 0x1000) as usize, rp },
+                        dev: Dev {
+                            notify,
+                            qv: BLK_DMA as usize,
+                            rv: (BLK_DMA + 0x1000) as usize,
+                            rp,
+                            dv: (BLK_DMA + 0x2000) as usize,
+                            dp,
+                        },
                         cached: NO_SECTOR,
                         dirty: false,
+                        ra_base: 0,
+                        ra_len: 0,
                     });
                 }
             }
@@ -315,21 +397,35 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut status = 1u64;
                 if let (Some(sh), Some(c)) = (shared, cache.as_mut()) {
                     let _ = unsafe { c.flush() }; // coherency vs the byte-stream cache
-                    status = 0;
-                    for i in 0..n {
-                        if unsafe { c.dev.op(sector + i, false) } != 0 {
-                            status = 1;
-                            break;
+                    // §perf read-ahead: serve [sector, sector+n) from the RA window if it
+                    // covers them; otherwise refill the window with ONE multi-sector device
+                    // request (RA_SECTORS), so the next ~16 sequential READNs hit the buffer
+                    // with no device round-trip. If RA_SECTORS would overrun the device end
+                    // (op_n errors), fall back to reading just the n requested sectors.
+                    let covered = c.ra_len != 0
+                        && sector >= c.ra_base
+                        && sector + n <= c.ra_base + c.ra_len;
+                    if !covered {
+                        c.ra_len = 0;
+                        if unsafe { c.dev.op_n(sector, RA_SECTORS, false) } == 0 {
+                            c.ra_base = sector;
+                            c.ra_len = RA_SECTORS;
+                        } else if unsafe { c.dev.op_n(sector, n, false) } == 0 {
+                            c.ra_base = sector;
+                            c.ra_len = n;
                         }
+                    }
+                    if c.ra_len != 0 && sector >= c.ra_base && sector + n <= c.ra_base + c.ra_len {
+                        status = 0;
+                        let off = (sector - c.ra_base) as usize * SECTOR;
                         unsafe {
                             core::ptr::copy_nonoverlapping(
-                                c.dev.data_ptr(),
-                                (sh + i as usize * SECTOR) as *mut u8,
-                                SECTOR,
+                                (c.dev.dv + off) as *const u8,
+                                sh as *mut u8,
+                                n as usize * SECTOR,
                             );
                         }
                     }
-                    c.cached = NO_SECTOR; // dev.op clobbered the cache buffer
                 }
                 r.data[0] = status;
                 r.data_len = 1;
@@ -341,20 +437,16 @@ pub extern "C" fn oxbow_main() -> ! {
                 let mut status = 1u64;
                 if let (Some(sh), Some(c)) = (shared, cache.as_mut()) {
                     let _ = unsafe { c.flush() };
-                    status = 0;
-                    for i in 0..n {
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                (sh + i as usize * SECTOR) as *const u8,
-                                c.dev.data_ptr(),
-                                SECTOR,
-                            );
-                        }
-                        if unsafe { c.dev.op(sector + i, true) } != 0 {
-                            status = 1;
-                            break;
-                        }
+                    c.ra_len = 0; // a write invalidates the read-ahead window
+                    // One multi-sector device write instead of n single-sector ops.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            sh as *const u8,
+                            c.dev.dv as *mut u8,
+                            n as usize * SECTOR,
+                        );
                     }
+                    status = if unsafe { c.dev.op_n(sector, n, true) } == 0 { 0 } else { 1 };
                     c.cached = NO_SECTOR;
                 }
                 r.data[0] = status;
