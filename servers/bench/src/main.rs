@@ -185,6 +185,45 @@ fn bench_ctxsw() {
     );
 }
 
+// ---------------- Phase 2c: file-open latency (drives fsd's intern() path) ----------------
+// Open + close a file by name in a tight loop. Each open is a TAG_FS_OPEN round trip to
+// fsd, which interns the path → node id (a linear scan of the 512-slot path table). This
+// measures open latency AND exercises the intern() scan we want to profile. We open +
+// close (never accumulating handles) so the 64-slot handle table can't fill.
+fn bench_fs_open() {
+    use oxbow_abi::BOOT_EP;
+    let path = b"bin/cat"; // a file that always exists, reachable from the shell's cwd
+    let Some(n0) = rt::fs::open(BOOT_EP, path) else {
+        rt::println!("[bench] fs open : SKIP (cannot open bin/cat from cwd)");
+        return;
+    };
+    let _ = rt::sys_close(n0.cap);
+    const N: u64 = 50_000;
+    for _ in 0..1000 {
+        if let Some(n) = rt::fs::open(BOOT_EP, path) {
+            let _ = rt::sys_close(n.cap);
+        }
+    }
+    let w0 = rt::sys_uptime_ms();
+    let t0 = tsc();
+    let mut ok = 0u64;
+    for _ in 0..N {
+        if let Some(n) = rt::fs::open(BOOT_EP, path) {
+            let _ = rt::sys_close(n.cap);
+            ok += 1;
+        }
+    }
+    let dt = tsc().wrapping_sub(t0);
+    let wall = rt::sys_uptime_ms().wrapping_sub(w0).max(1);
+    rt::println!(
+        "[bench] fs open : {} cyc/open ({} opens in {} ms = {}k/s) [TAG_FS_OPEN -> fsd intern]",
+        dt / ok.max(1),
+        ok,
+        wall,
+        ok / wall
+    );
+}
+
 // ---------------- Phase 3: memory-map throughput + graceful exhaustion ----------------
 // Map fresh 4 KiB RW pages until the budget/PMM is exhausted. Measures map throughput
 // AND that exhaustion returns E_NOMEM (loop ends) rather than panicking the kernel.
@@ -271,6 +310,7 @@ pub extern "C" fn oxbow_main() -> ! {
     bench_syscall();
     bench_ipc();
     bench_ctxsw(); // isolates scheduler+context-switch from IPC message logic
+    bench_fs_open(); // file-open latency (fsd intern() path)
     bench_thread_spawn();
     bench_mmap(); // LAST: it deliberately exhausts the whole budget (terminal phase)
     rt::println!("[bench] DONE — kernel survived all phases");

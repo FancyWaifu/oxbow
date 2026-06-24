@@ -9,6 +9,7 @@
 #include "ext4_errno.h"
 #include "ext4_oflags.h"
 #include "ext4_types.h"
+#include "ext4_inode.h" /* ext4_inode_get_mode/size/time accessors (single-walk statx2) */
 
 /* Stat: is_dir = 1 for a directory, 0 for a regular file; size in bytes. */
 int oxfs_stat(const char *path, int *is_dir, uint64_t *size)
@@ -211,40 +212,38 @@ int oxfs_set_times(const char *path, uint32_t mtime, uint32_t atime, int set_m, 
  * ext4_mode_get for existence+type so a symlink is detected without following it. */
 int oxfs_statx2(const char *path, int *kind, uint64_t *size, uint32_t *mtime, uint32_t *atime)
 {
-	/* Dir-first: ext4_mode_get opens the path O_RDONLY as a file, which FAILS on a
-	 * directory, so detect dirs the same way oxfs_stat does. ext4_mode_get does work
-	 * on regular files and symlinks (it opens the inode and returns its mode). */
-	ext4_dir d;
-	if (ext4_dir_open(&d, path) == EOK) {
-		ext4_dir_close(&d);
-		*kind = 1; /* dir */
-		*size = 0;
-	} else {
-		uint32_t mode = 0;
-		if (ext4_mode_get(path, &mode) != EOK)
-			return -1; /* not found */
-		if ((mode & 0xF000) == 0xA000) { /* S_IFLNK */
-			*kind = 3;
-			char buf[256];
-			size_t rc = 0;
-			ext4_readlink(path, buf, sizeof(buf), &rc);
-			*size = rc;
-		} else { /* regular file */
-			*kind = 2;
-			ext4_file f;
-			if (ext4_fopen(&f, path, "rb") == EOK) {
-				*size = ext4_fsize(&f);
-				ext4_fclose(&f);
-			} else {
-				*size = 0;
-			}
-		}
+	/* ONE path walk. ext4_raw_inode_fill resolves path -> inode and reads it; the
+	 * kind, size, and times then come straight from the in-memory inode struct (no
+	 * further path resolution). This replaces FIVE separate path-based lwext4 calls
+	 * the old version made for a regular file (ext4_dir_open + ext4_mode_get +
+	 * ext4_fopen-for-size + ext4_mtime_get + ext4_atime_get), each of which re-walked
+	 * the ext2 directory tree — that redundant walking was the dominant fs-open cost
+	 * (TAG_FS_OPEN calls this on every open). The mount's superblock (needed by the
+	 * mode/size accessors) is constant, so it's fetched once. */
+	uint32_t ino;
+	struct ext4_inode inode;
+	if (ext4_raw_inode_fill(path, &ino, &inode) != EOK)
+		return -1; /* not found */
+	static struct ext4_sblock *sb;
+	if (!sb)
+		ext4_get_sblock("/mp/", &sb);
+	uint32_t mode = sb ? ext4_inode_get_mode(sb, &inode) : 0;
+	switch (mode & 0xF000) {
+	case 0x4000: /* S_IFDIR */
+		*kind = 1;
+		*size = 0; /* dir size is irrelevant to the protocol (readdir uses a cursor) */
+		break;
+	case 0xA000: /* S_IFLNK — inode size is the link-target length, like the old readlink */
+		*kind = 3;
+		*size = sb ? ext4_inode_get_size(sb, &inode) : 0;
+		break;
+	default: /* regular file */
+		*kind = 2;
+		*size = sb ? ext4_inode_get_size(sb, &inode) : 0;
+		break;
 	}
-	uint32_t m = 0, a = 0;
-	ext4_mtime_get(path, &m);
-	ext4_atime_get(path, &a);
-	*mtime = m;
-	*atime = a;
+	*mtime = ext4_inode_get_modif_time(&inode);
+	*atime = ext4_inode_get_access_time(&inode);
 	return 0;
 }
 
