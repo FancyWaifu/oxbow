@@ -189,6 +189,12 @@ fn reply_caller(idx: usize) -> usize {
     REPLIES.lock()[idx].caller_tid
 }
 
+/// The thread that minted reply pool slot `idx` (the blocked caller awaiting it). Pub
+/// so `sys_reply_bulk` can find the caller's address space to copy a bulk result into.
+pub fn reply_caller_of(idx: usize) -> usize {
+    reply_caller(idx)
+}
+
 // --- Message copy ---------------------------------------------------------
 
 /// Write the valid prefix of `m` into the user MsgBuf at `uptr` (§5: trailing

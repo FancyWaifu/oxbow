@@ -14,7 +14,7 @@ use oxbow_abi::{
     SYS_CAP_TYPE, SYS_CAP_DUP, SYS_CHAN_WAIT, SYS_CHANNEL_CLOSE, SYS_CHANNEL_PAIR, SYS_CHANNEL_POLL, SYS_CHANNEL_RECV,
     SYS_CHANNEL_SEND, SYS_DMA_ALLOC, SYS_DMA_ALLOC_CONTIG, SYS_SHM_CREATE, SYS_SHM_MAP, SYS_SHM_PHYS, CAP_CHANNEL, CAP_OTHER, CAP_SHM,
     SYS_FB_INFO, SYS_FB_MAP, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE,
-    SYS_PROTECT, SYS_RECV, SYS_RECV_NOTIF, SYS_REPLY,
+    SYS_PROTECT, SYS_RECV, SYS_RECV_NOTIF, SYS_REPLY, SYS_REPLY_BULK,
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_MEMINFO, SYS_UPTIME_MS,
     SYS_WALLTIME, SYS_THREAD_SPAWN, SYS_THREAD_EXIT, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE,
     SYS_THREAD_ID, SYS_YIELD, SYS_PROC_KILL, SYS_PROC_LIST, SYS_KILL, SYS_SET_FSBASE, SYS_FORK,
@@ -151,6 +151,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_RECV_NOTIF => sys_recv_notif(a1, a2, a3, a4),
         SYS_CALL => sys_ipc(a1, a2, true),
         SYS_REPLY => sys_reply(a1, a2),
+        SYS_REPLY_BULK => sys_reply_bulk(a1, a2, a3, a4, a5),
         SYS_MAP => sys_map(a1, a2, a3, a4),
         SYS_FRAME_ALLOC => sys_frame_alloc(a1),
         SYS_FRAME_MAP => sys_frame_map(a1, a2, a3),
@@ -1149,6 +1150,90 @@ fn sys_reply(reply: u64, msg_ptr: u64) -> SyscallRet {
     }
 }
 
+/// `sys_reply_bulk(reply, msg_ptr, src, dst, len)` — deliver the count+status MsgBuf
+/// like `sys_reply`, but FIRST copy `len` bytes (<=4096) from the replier's `src` into
+/// the blocked caller's `dst`. `dst` is translated + validated against the CALLER's
+/// address space (a present, USER, WRITABLE page), so a server can only ever fill the
+/// buffer the caller asked it to. No CR3 switch: the caller's page is reached via the
+/// HHDM. The whole thing runs in one non-preemptible syscall window, before the caller
+/// is woken, so its mapping is stable. Lets fsd return a whole page per round trip.
+/// Copy `len` bytes from `src` (current AS) to `dst` in the address space `pml4`,
+/// page by page through the HHDM. `dst` must be a present, USER, WRITABLE, lower-half
+/// page in `pml4` (else returns false and copies nothing past the bad page). Used by
+/// sys_reply_bulk to fill the caller's buffer without switching CR3.
+fn copy_into_as(pml4: u64, src: u64, dst: u64, len: usize) -> bool {
+    let mut done = 0usize;
+    while done < len {
+        let d = dst + done as u64;
+        if d >= LOWER_HALF_END {
+            return false;
+        }
+        let page_off = (d & 0xfff) as usize;
+        let chunk = core::cmp::min(0x1000 - page_off, len - done);
+        let Some((phys, user, writable)) = mm::vm::translate_in(pml4, d & !0xfff) else {
+            return false;
+        };
+        if !user || !writable {
+            return false;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (src + done as u64) as *const u8,
+                (mm::phys_to_virt(phys) + page_off as u64) as *mut u8,
+                chunk,
+            );
+        }
+        done += chunk;
+    }
+    true
+}
+
+fn sys_reply_bulk(reply: u64, msg_ptr: u64, src: u64, dst: u64, len: u64) -> SyscallRet {
+    // Phase 1 — validate with NO side effects: the reply is a Reply cap, the count
+    // MsgBuf is readable + sane, and the bulk src (in the replier's AS) is valid.
+    let prepared = (|| -> SysResult<MsgBuf> {
+        let entry = proc::with_current(|p| p.lookup(reply as Handle, ObjType::Reply, 0))?;
+        if !matches!(entry.obj, ObjectRef::Reply(_)) {
+            return Err(SysError::BadType);
+        }
+        if msg_ptr & 7 != 0 {
+            return Err(SysError::Fault);
+        }
+        usermem::check_user(msg_ptr, size_of::<MsgBuf>(), false)?;
+        let mut m: MsgBuf = unsafe { core::ptr::read(msg_ptr as *const MsgBuf) };
+        if m.data_len as usize > MSG_DATA_WORDS || m.handle_count as usize > MSG_HANDLES {
+            return Err(SysError::Msg);
+        }
+        if len as usize > 4096 {
+            return Err(SysError::Msg); // one page per bulk reply (v0)
+        }
+        usermem::check_user(src, len as usize, false)?;
+        m.badge = 0; // a reply always delivers badge 0 (§14)
+        Ok(m)
+    })();
+    let mut m = match prepared {
+        Ok(m) => m,
+        Err(e) => return SyscallRet::err(e),
+    };
+    // Phase 2 — CLAIM the reply first (gen-checked: this fails if the caller already
+    // died and its reply slot was reclaimed), THEN copy into the caller's AS. Claiming
+    // first means the caller is provably still the live owner of `ridx`, so resolving
+    // its pml4 + writing its buffer can't race a teardown. The caller stays Blocked
+    // until do_reply below, all within this one non-preemptible syscall.
+    match proc::take_reply(reply as Handle) {
+        Ok(ridx) => {
+            let caller_pml4 =
+                proc::pml4_of(crate::thread::process_of(ipc::reply_caller_of(ridx as usize)));
+            if !copy_into_as(caller_pml4, src, dst, len as usize) {
+                m.data[0] = 0; // bad dst — unblock the caller with a 0-byte (EOF) reply
+            }
+            ipc::do_reply(ridx as usize, &m);
+            SyscallRet::ok()
+        }
+        Err(e) => SyscallRet::err(e),
+    }
+}
+
 /// `sys_console_write(con, buf, len)` — write user bytes through a Console cap.
 fn sys_console_write(con: u64, buf: u64, len: u64) -> SyscallRet {
     let result = (|| -> SysResult {
@@ -1587,7 +1672,8 @@ fn pledge_class(nr: u64) -> u64 {
         SYS_CONSOLE_WRITE | SYS_GETENTROPY | SYS_UPTIME_MS | SYS_WALLTIME | SYS_MEMINFO => PLEDGE_STDIO,
         SYS_THREAD_SPAWN | SYS_THREAD_EXIT | SYS_FUTEX_WAIT | SYS_FUTEX_WAKE => PLEDGE_STDIO,
         SYS_THREAD_ID | SYS_YIELD | SYS_SET_FSBASE => PLEDGE_STDIO,
-        SYS_SEND | SYS_RECV | SYS_RECV_NOTIF | SYS_CALL | SYS_REPLY | SYS_EP_CREATE | SYS_MINT | SYS_PIPE
+        SYS_SEND | SYS_RECV | SYS_RECV_NOTIF | SYS_CALL | SYS_REPLY | SYS_REPLY_BULK | SYS_EP_CREATE
+        | SYS_MINT | SYS_PIPE
         | SYS_PIPE_READ | SYS_PIPE_WRITE | SYS_PIPE_EOF | SYS_CHANNEL_PAIR | SYS_CHANNEL_SEND
         | SYS_CHANNEL_RECV | SYS_CHANNEL_CLOSE | SYS_CHANNEL_POLL | SYS_CHAN_WAIT => PLEDGE_IPC,
         SYS_MAP | SYS_PROTECT | SYS_IMMUTABLE | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC

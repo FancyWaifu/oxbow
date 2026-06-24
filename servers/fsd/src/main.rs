@@ -26,7 +26,7 @@ use oxbow_abi::{
     FS_RIGHT_NODELETE, FS_RIGHT_RW, FS_ROOT, FS_SYMLINK,
     MSG_DATA_WORDS, PROT_READ, PROT_WRITE, R_GRANT, R_SEND, TAG_BLK_ATTACH,
     TAG_BLK_FLUSH, TAG_BLK_READ, TAG_BLK_READN, TAG_BLK_WRITE, TAG_BLK_WRITEN, TAG_FS_CREATE,
-    TAG_FS_LINK, TAG_FS_MKDIR, TAG_FS_NAMESPACE, TAG_FS_NS_MOUNT, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR, TAG_FS_READLINK,
+    TAG_FS_LINK, TAG_FS_MKDIR, TAG_FS_NAMESPACE, TAG_FS_NS_MOUNT, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READ_BULK, TAG_FS_READDIR, TAG_FS_READLINK,
     TAG_FS_RELEASE, TAG_FS_RENAME, TAG_FS_SETTIMES, TAG_FS_SYMLINK, TAG_FS_SYNC, TAG_FS_TRUNCATE,
     TAG_FS_UNLINK, TAG_FS_WRITE,
 };
@@ -54,6 +54,10 @@ static mut C_BLK: [u64; CWAYS] = [u64::MAX; CWAYS]; // block idx per way (MAX = 
 static mut C_LEN: [usize; CWAYS] = [0; CWAYS]; // valid bytes per way
 static mut C_NEXT: usize = 0; // round-robin eviction cursor
 static mut C_BUF: [[u8; CBLK]; CWAYS] = [[0; CBLK]; CWAYS];
+// §perf bulk read: fsd reads up to one page into here, then SYS_REPLY_BULK copies it
+// straight into the caller's buffer (one round trip per page vs ~8 inline 504-B reads).
+// +512 slack: cached_read writes in <=504-B chunks and may overshoot the page tail.
+static mut BULKBUF: [u8; 4096 + 512] = [0; 4096 + 512];
 
 fn cache_invalidate() {
     unsafe {
@@ -1165,6 +1169,44 @@ pub extern "C" fn oxbow_main() -> ! {
                 r.data[0] = count as u64;
                 r.data_len = 64; // all MSG_DATA_WORDS valid (count + up to 504 payload bytes)
                 let _ = rt::sys_reply(reply, &r);
+            }
+            TAG_FS_READ_BULK => {
+                // §perf: read up to one PAGE at `off` into BULKBUF, then deliver it
+                // straight into the caller's `dst` buffer via SYS_REPLY_BULK — one round
+                // trip per 4 KiB instead of ~8 inline 504-B TAG_FS_READ round trips.
+                sync_writes();
+                let off = m.data[0];
+                let want = (m.data[1] as usize).min(4096);
+                let dst = m.data[2]; // the caller's destination buffer vaddr
+                let mut full = [0u8; 256];
+                let mut total = 0usize;
+                let mut served = false;
+                if valid && allows_read(cap_right) && full_path(id, &mut full).is_some() {
+                    unsafe {
+                        let buf = core::ptr::addr_of_mut!(BULKBUF) as *mut u8;
+                        while total < want {
+                            let got = cached_read(&full, off + total as u64, buf.add(total));
+                            if got == 0 {
+                                break; // EOF
+                            }
+                            total += got;
+                        }
+                        let n = total.min(want);
+                        let mut r = MsgBuf::new(0);
+                        r.data[0] = n as u64;
+                        r.data_len = 1;
+                        if rt::sys_reply_bulk(reply, &r, buf as *const u8, dst, n as u64).is_ok() {
+                            served = true;
+                        }
+                    }
+                }
+                if !served {
+                    // bad cap/dst, or the bulk copy failed — unblock the caller with count 0.
+                    let mut r = MsgBuf::new(0);
+                    r.data[0] = 0;
+                    r.data_len = 1;
+                    let _ = rt::sys_reply(reply, &r);
+                }
             }
             TAG_FS_READDIR => {
                 let cursor = m.data[0] as u32;

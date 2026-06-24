@@ -243,11 +243,11 @@ fn bench_fs_read() {
     let got = data.len() as u64;
     core::hint::black_box(&data);
     rt::println!(
-        "[bench] fs read : {} KiB in {} ms = {} MiB/s, ~{} read IPCs (504 B each)",
+        "[bench] fs read : {} KiB in {} ms = {} MiB/s, ~{} read IPCs (4 KiB bulk each)",
         got / 1024,
         wall,
         got * 1000 / (1024 * 1024) / wall,
-        got / 504
+        got / 4096
     );
 }
 

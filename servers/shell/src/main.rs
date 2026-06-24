@@ -719,23 +719,24 @@ static mut ELF_BUF: [u8; ELF_BUF_CAP] = [0; ELF_BUF_CAP];
 /// Slurp an entire file capability into `buf` via the 56-byte FS_READ protocol,
 /// looping on the read offset until EOF. Returns the byte count read.
 unsafe fn read_all(cap: Handle, buf: &mut [u8]) -> usize {
+    // §perf: BULK reads — fsd writes a whole page straight into `buf` via SYS_REPLY_BULK,
+    // so loading a /bin ELF takes ~8x fewer cross-process IPCs (4 KiB/round-trip vs the
+    // 504-B inline TAG_FS_READ). This is the program-launch read path.
     let mut off = 0usize;
-    loop {
-        let mut m = MsgBuf::new(oxbow_abi::TAG_FS_READ);
+    while off < buf.len() {
+        let want = core::cmp::min(buf.len() - off, 4096);
+        let mut m = MsgBuf::new(oxbow_abi::TAG_FS_READ_BULK);
         m.data[0] = off as u64;
-        m.data_len = 1;
+        m.data[1] = want as u64;
+        m.data[2] = buf.as_mut_ptr().add(off) as u64; // dst: the kernel copies straight here
+        m.data_len = 3;
         if rt::sys_call(cap, &mut m).is_err() {
             break;
         }
-        let count = core::cmp::min(m.data[0] as usize, 504);
+        let count = m.data[0] as usize;
         if count == 0 || off + count > buf.len() {
             break;
         }
-        core::ptr::copy_nonoverlapping(
-            (m.data.as_ptr() as *const u8).add(8),
-            buf.as_mut_ptr().add(off),
-            count,
-        );
         off += count;
     }
     off

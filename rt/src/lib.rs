@@ -320,7 +320,7 @@ macro_rules! println {
 pub mod fs {
     use crate::{sys_call, Handle};
     use alloc::vec::Vec;
-    use oxbow_abi::{MsgBuf, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READDIR};
+    use oxbow_abi::{MsgBuf, TAG_FS_OPEN, TAG_FS_READ, TAG_FS_READ_BULK, TAG_FS_READDIR};
 
     /// A node returned by `open`: its capability, kind (`FS_FILE`/`FS_DIR`), size.
     pub struct Node {
@@ -395,21 +395,25 @@ pub mod fs {
     /// Read an entire file capability into a `Vec`.
     pub fn read_all(file: Handle) -> Vec<u8> {
         let mut out = Vec::new();
+        // §perf: BULK reads — fsd writes a whole page straight into `buf` via
+        // SYS_REPLY_BULK, so one round trip carries 4 KiB instead of 504 B inline (~8x
+        // fewer cross-process IPCs, each of which costs a CR3 switch both ways).
+        let mut buf = [0u8; 4096];
         let mut off = 0u64;
         loop {
-            let mut m = MsgBuf::new(TAG_FS_READ);
+            let mut m = MsgBuf::new(TAG_FS_READ_BULK);
             m.data[0] = off;
-            m.data_len = 1;
+            m.data[1] = buf.len() as u64; // want one page
+            m.data[2] = buf.as_mut_ptr() as u64; // dst: the kernel copies the page here
+            m.data_len = 3;
             if sys_call(file, &mut m).is_err() {
                 break;
             }
             let count = m.data[0] as usize;
-            if count == 0 {
+            if count == 0 || count > buf.len() {
                 break;
             }
-            let bytes =
-                unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), count) };
-            out.extend_from_slice(bytes);
+            out.extend_from_slice(&buf[..count]);
             off += count as u64;
         }
         out
@@ -1727,6 +1731,23 @@ pub fn sys_yield() {
 
 pub fn sys_reply(reply: Handle, msg: *const MsgBuf) -> SysResult {
     let (rax, _) = unsafe { syscall2(SYS_REPLY, reply as u64, msg as u64) };
+    SysError::from_raw(rax)
+}
+
+/// Like `sys_reply`, but first copies `len` bytes (<=4096) from `src` (this process's
+/// memory) straight into the caller's `dst` buffer (validated in the caller's AS). For
+/// a server returning a bulk result (a whole page) without the 504-B inline MsgBuf.
+pub fn sys_reply_bulk(reply: Handle, msg: *const MsgBuf, src: *const u8, dst: u64, len: u64) -> SysResult {
+    let (rax, _) = unsafe {
+        syscall5(
+            oxbow_abi::SYS_REPLY_BULK,
+            reply as u64,
+            msg as u64,
+            src as u64,
+            dst,
+            len,
+        )
+    };
     SysError::from_raw(rax)
 }
 

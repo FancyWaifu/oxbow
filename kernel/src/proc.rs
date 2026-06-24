@@ -719,6 +719,12 @@ pub fn create(
     Ok((id, lr.entry, lr.user_rsp, lr.fs_base))
 }
 
+/// The address-space root (CR3 value) of process `id` — for a cross-AS copy (a bulk
+/// reply writes into the blocked caller's AS without switching CR3).
+pub fn pml4_of(id: usize) -> u64 {
+    PROCESSES.lock()[id].pml4_phys
+}
+
 /// Reclaim a process slot that was `create`d but never started (no thread has run on
 /// its address space yet) — frees its address space (frames + page tables) and returns
 /// the slot to `Free`. Used when a spawn fails AFTER `create` succeeds (e.g. the budget

@@ -240,6 +240,13 @@ pub const SYS_SIGDISPATCH: u64 = 67;
 /// (ctx_ptr) -> never returns normally. Restore the interrupted context saved at
 /// `ctx_ptr` ([rip, rflags, rsp, rax]) — the tail of a signal handler. Phase 9 step 2.
 pub const SYS_SIGRETURN: u64 = 68;
+/// (reply, msg_ptr, src_vaddr, dst_vaddr, len) -> 0 ok. Like SYS_REPLY (delivers the
+/// count+status MsgBuf), but FIRST copies `len` bytes (<=4096) from the replier's
+/// `src_vaddr` straight into the blocked caller's `dst_vaddr` — a bulk result that skips
+/// the 504-B inline MsgBuf, so a server (fsd) can return a whole page per round trip.
+/// `dst` is validated against the CALLER's address space (a writable user page), so the
+/// replier can only ever write into the buffer the caller asked it to fill.
+pub const SYS_REPLY_BULK: u64 = 69;
 pub const PROC_NAME_LEN: usize = 16;
 pub const PROC_STATE_ALIVE: u32 = 1;
 pub const PROC_STATE_DEAD: u32 = 2; // exited, slot not yet reused (zombie)
@@ -548,6 +555,11 @@ pub const FS_O_TRUNC: u64 = 4;
 /// READ(file): `data[0]` = byte offset. Reply: `data[0]` = count (0 = EOF),
 /// `data[1..]` = up to 56 bytes of content.
 pub const TAG_FS_READ: u64 = u32::from_le_bytes(*b"FSRD") as u64;
+/// Bulk read: data[0]=off, data[1]=len (<=4096), data[2]=caller dst buffer vaddr. fsd
+/// reads into a local buffer then SYS_REPLY_BULK copies it straight into the caller's
+/// dst — a whole page per round trip instead of 504 B, ~8x fewer IPCs for file/program
+/// loads. Reply: data[0]=count. (Falls back to TAG_FS_READ if the server is older.)
+pub const TAG_FS_READ_BULK: u64 = u32::from_le_bytes(*b"FRDB") as u64;
 /// READDIR(dir): `data[0]` = cursor index. Reply: `data[0]` = 1 if an entry is
 /// present (else 0 = end), `data[1]` = kind, `data[2..]` = the entry name.
 pub const TAG_FS_READDIR: u64 = u32::from_le_bytes(*b"FSDR") as u64;

@@ -251,6 +251,43 @@ pub fn clone_user_as(src_pml4: u64) -> u64 {
 /// MUST NOT run while this address space is the live CR3 — call it only after the
 /// owning thread has switched away (we free on slot reuse, never on the dying
 /// thread itself).
+/// Walk a (user) address space `pml4_phys` to translate `vaddr` → (page phys, leaf
+/// flags), or `None` if it isn't mapped. Used to copy INTO another process's AS (the
+/// blocked caller of a bulk reply) without switching CR3: translate the caller's page,
+/// reach it through the HHDM, copy. Assumes 4 KiB leaves — user mappings always go
+/// through `map_user_4k_in`, so a HUGE_PAGE here means "not a normal user page" → None.
+pub fn translate_in(pml4_phys: u64, vaddr: u64) -> Option<(u64, bool, bool)> {
+    let idx = |lvl: u64| ((vaddr >> (12 + 9 * lvl)) & 0x1ff) as usize;
+    unsafe {
+        let l4 = &*(super::phys_to_virt(pml4_phys) as *const PageTable);
+        let e4 = &l4[idx(3)];
+        if !e4.flags().contains(Flags::PRESENT) {
+            return None;
+        }
+        let l3 = &*(super::phys_to_virt(e4.addr().as_u64()) as *const PageTable);
+        let e3 = &l3[idx(2)];
+        if !e3.flags().contains(Flags::PRESENT) || e3.flags().contains(Flags::HUGE_PAGE) {
+            return None;
+        }
+        let l2 = &*(super::phys_to_virt(e3.addr().as_u64()) as *const PageTable);
+        let e2 = &l2[idx(1)];
+        if !e2.flags().contains(Flags::PRESENT) || e2.flags().contains(Flags::HUGE_PAGE) {
+            return None;
+        }
+        let l1 = &*(super::phys_to_virt(e2.addr().as_u64()) as *const PageTable);
+        let e1 = &l1[idx(0)];
+        let fl = e1.flags();
+        if !fl.contains(Flags::PRESENT) {
+            return None;
+        }
+        Some((
+            e1.addr().as_u64(),
+            fl.contains(Flags::USER_ACCESSIBLE),
+            fl.contains(Flags::WRITABLE),
+        ))
+    }
+}
+
 pub fn free_user_pml4(pml4_phys: u64) {
     unsafe {
         let l4 = &*(super::phys_to_virt(pml4_phys) as *const PageTable);
