@@ -17,7 +17,7 @@ void _start(void) {
     int r = add(3, 4);
     static char msg[] = "ld-oxbow OK: 3+4=_\n";
     msg[17] = (char)('0' + r); /* '_' -> '7' if linking worked */
-    sc(6, 2, (long)msg, sizeof(msg) - 1);
-    sc(7, 0, 0, 0);
+    sc(6, 2, (long)msg, sizeof(msg) - 1); /* best-effort console (serial routing varies) */
+    sc(7, r, 0, 0); /* EXIT CODE = r: 7 proves add() was resolved from libadd.so */
     for (;;) { }
 }
