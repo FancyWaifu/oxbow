@@ -182,15 +182,37 @@ static void blit_scaled(const unsigned int *src, int bw, int bh, int dx0, int dy
   if (cy0 < 0) cy0 = 0;
   if (cx1 > g_w) cx1 = g_w;
   if (cy1 > g_h) cy1 = g_h;
+  if (cx0 >= cx1 || cy0 >= cy1)
+    return;
+  /* §perf: 1:1 (no scaling — a window rendered at its display size, e.g. a
+   * reflowed terminal) → straight row copies, no per-pixel work at all. */
+  if (bw == dw && bh == dh) {
+    for (int y = cy0; y < cy1; y++) {
+      const unsigned int *srow = src + (long)(y - dy0) * bw + (cx0 - dx0);
+      memcpy(&g_back[(long)y * g_pitch_words + cx0], srow, (size_t)(cx1 - cx0) * 4);
+    }
+    return;
+  }
+  /* §perf: scaling path — precompute the source column for each dest x ONCE
+   * (it's identical for every row), turning a multiply+divide PER PIXEL into one
+   * table build + a lookup per pixel. A full-screen scaled window was doing
+   * millions of divides per composite; this is the choppiness lever for scaled
+   * (maximized, fixed-content) windows like a fullscreen game. */
+  static int xmap[4096];
+  if (cx1 - cx0 > 4096)
+    cx1 = cx0 + 4096;
+  int n = cx1 - cx0;
+  for (int i = 0; i < n; i++) {
+    int sx = (cx0 + i - dx0) * bw / dw;
+    xmap[i] = sx >= bw ? bw - 1 : sx;
+  }
   for (int y = cy0; y < cy1; y++) {
     int sy = (y - dy0) * bh / dh;
     if (sy >= bh) sy = bh - 1;
     const unsigned int *srow = src + (long)sy * bw;
-    for (int x = cx0; x < cx1; x++) {
-      int sx = (x - dx0) * bw / dw;
-      if (sx >= bw) sx = bw - 1;
-      g_back[(long)y * g_pitch_words + x] = srow[sx];
-    }
+    unsigned int *drow = &g_back[(long)y * g_pitch_words + cx0];
+    for (int i = 0; i < n; i++)
+      drow[i] = srow[xmap[i]];
   }
 }
 
