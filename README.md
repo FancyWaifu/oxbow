@@ -1,273 +1,192 @@
 # oxbow
 
-A secure-minimal **capability microkernel** written in Rust — an OpenBSD-shaped
-security ethos expressed through an seL4-leaned capability ABI. Targets
-`x86_64` under QEMU first; the arch-specific code is walled behind
-`kernel/src/arch/` so an `aarch64` port stays possible later.
+A from-scratch, secure-minimal **capability microkernel** written in Rust — an
+OpenBSD-shaped security ethos expressed through an seL4-leaned capability ABI,
+with a full Unix-flavored userland built *on top of* the capabilities (the Redox
+model: the kernel stays capability-pure, the POSIX feel lives in user space).
 
-> One line: *an OpenBSD-shaped secure microkernel with an seL4-grade capability
-> ABI underneath it, in Rust.*
+It boots on `x86_64` under QEMU **and on real hardware** (a Proxmox KVM VM gets a
+real LAN IP and does real TCP to the internet). Arch-specific code is walled
+behind `kernel/src/arch/`, so an `aarch64` port stays possible.
+
+> *An OpenBSD-shaped secure microkernel with an seL4-grade capability ABI
+> underneath it — and a graphical Unix on top.*
 
 ## Design at a glance
 
 | Axis | Choice |
 |---|---|
-| Kernel | Microkernel — user-mode drivers/servers, IPC-first |
+| Kernel | Microkernel — user-mode drivers/servers, IPC-first, SMP |
 | IPC | Synchronous call/reply **endpoints** + a flat per-process **handle table** |
-| Security | **Zero ambient authority**, W^X always, one attenuation primitive |
-| Userland | Rust-only `no_std`; shared `oxbow-abi` + `oxbow-rt` crates |
+| Security | **Zero ambient authority**, W^X always, one attenuation primitive, `pledge`/`mimmutable` |
+| Userland | Capability-native; a POSIX/musl personality runs unmodified Unix apps |
+| Graphics | Own virtio-gpu driver + a from-scratch Wayland compositor + a GNOME-style shell |
 | Boot | Limine (server binaries ride in as modules) |
 | License | BSD-2-Clause |
 
 The kernel ABI is specified — normatively — in [`docs/abi-v0.md`](docs/abi-v0.md).
-Read that first; everything in a microkernel is downstream of the IPC/capability ABI.
+Read that first; in a microkernel, everything is downstream of the IPC/capability ABI.
 
-## Status
+## What works today
 
-### What works today
+oxbow is a small kernel with a surprisingly large userland on top of it. All of
+the following runs:
 
-oxbow boots (QEMU **and real hardware** — a Proxmox KVM VM gets a real LAN IP)
-to an interactive shell, and the userland on top of the capability kernel is now
-substantial — POSIX/Unix feel built *over* the capabilities, the kernel staying
-capability-pure (the Redox model):
+- **Capability microkernel core** — zero ambient authority (every syscall takes a
+  handle), synchronous IPC endpoints with badged capabilities, a per-process
+  handle table, user-funded memory (seL4-style "untyped" budgets), W^X
+  everywhere, a kernel CSPRNG (RDSEED/RDRAND → ChaCha20), `pledge`, and
+  `mimmutable`. **SMP** — real user threads run across multiple cores.
 
-- **Filesystem** — a real **ext2** on a `virtio-blk` disk (vendored lwext4),
-  persistent across reboots, with `ls`/`cat`/`cp`/`mv`/`rm`/`mkdir` as separate
-  capability-confined programs (each gets only a directory/file cap, never a name).
-- **Network stack, from scratch** — an `e1000` driver, Ethernet/ARP/IPv4/ICMP/
-  UDP/TCP (smoltcp for TCP), DHCP, a socket **capability** API, and **validated
-  HTTPS**: `curl https://…` works (BearSSL + the kernel CSPRNG). DNS is a full
+- **A persistent filesystem** — a real **ext2** on a `virtio-blk` disk (vendored
+  lwext4), surviving reboots. The coreutils (`ls`/`cat`/`cp`/`mv`/`rm`/`mkdir`/…)
+  are separate, **capability-confined** programs living as files in `/bin` — each
+  is handed only the directory/file capability it needs, never a global namespace.
+
+- **A network stack, from scratch** — an `e1000` driver, Ethernet/ARP/IPv4/ICMP/
+  UDP/TCP, DHCP, and a socket **capability** API. **HTTPS is validated**:
+  `curl https://…` works (BearSSL + the kernel CSPRNG), with DNS via a full
   **c-ares** port backing `getaddrinfo` system-wide.
-- **Real programs** — an oxbow libc + a C-port harness run **TinyCC, Lua,
-  MicroPython, QuickJS, and curl** on the kernel; TinyCC even runs *on* oxbow.
-- **Graphics → a Wayland compositor** — a linear framebuffer owned as a
-  capability, a byte+capability **channel** transport (socketpair + `SCM_RIGHTS`),
-  ports of **libffi** and **libwayland** (wire + server + client + an epoll event
-  loop), **shm/memfd/mmap** shared buffers — and `oxcomp`, a tiny **Wayland
-  compositor**: a real Wayland client draws a window into an shm buffer, the buffer
-  fd is passed to the compositor over the channel, and its pixels are composited
-  onto the screen.
-- **OpenBSD-style hardening** — a kernel CSPRNG (RDSEED/RDRAND→ChaCha20),
-  `pledge`, `mimmutable`, W^X everywhere, and the `jail` confinement showcase.
 
-It remains a from-scratch **Rust** capability microkernel; the large C trees in
-the tree are *vendored* upstream sources (lwext4, BearSSL, c-ares, libffi,
-libwayland, the language runtimes) ported to run on it — see `.gitattributes`.
+- **Real software** — a **POSIX/musl personality** (a userland Linux-syscall
+  translation layer) runs **unmodified upstream Unix programs**: `dash` (a real
+  `/bin/sh`), `awk`, the **kilo** editor, **darkhttpd**, and **GNU netcat**. On
+  top of an oxbow libc it also runs **Lua, MicroPython, QuickJS, and curl**, plus
+  cross-compiled **Rust `std`**. And **TinyCC runs *on* oxbow** — `cc src.c -o
+  /bin/prog` compiles a C program on the machine itself.
 
-The verified milestone-by-milestone history follows.
+- **A graphical desktop** — oxbow's **own virtio-gpu driver** (2D scanout, runtime
+  modeset, a hardware cursor), a **from-scratch Wayland compositor** (`oxcomp`,
+  built on a port of libwayland), and a **GNOME-style shell**: a top bar with a
+  live clock, an Activities launcher, draggable/resizable/closable windows, and a
+  graphical login greeter. Apps draw real pixels through Wayland. And yes — **it
+  runs DOOM.**
 
-**v0 — PONG: complete and verified booting in QEMU.** The kernel boots via
-Limine, manages physical and virtual memory under W^X, sets up GDT/TSS/IDT and
-the `syscall` fast path, hand-builds one user-mode server (`pong`) from a Limine
-module, and runs it in ring 3. The server does one capability-mediated IPC
-roundtrip — `sys_call(PING)` → kernel echo → `PONG` printed through a Console
-capability — with zero ambient authority. See §7 of the ABI for the normative
-acceptance trace. `just run-selftest` additionally exercises every documented
-error path (`E_BAD_HANDLE`, `E_RIGHTS`, `E_FAULT`, `E_MSG`, `E_NOSYS`) from ring 3.
+- **Security-tested** — a `jail` confinement showcase, an executable
+  capability-law spec with a crafted-ELF fuzzer, SMP race proof-of-concepts, and
+  a multi-round internal pentest (all findings fixed).
 
-Built in nine verified phases (physical memory → CPU tables → paging → ring-3
-syscall → module plumbing → ELF loader → capabilities → IPC → hardening).
+The large C trees in the repo are *vendored* upstream sources (lwext4, BearSSL,
+c-ares, libffi, libwayland, FreeType, the language runtimes, the ported Unix
+apps) compiled to run on oxbow — see `.gitattributes`. The kernel itself is
+from-scratch Rust.
 
-**v1 arc 1 — threads + preemptive scheduler: complete.** A PIT timer (IRQ0 via
-the remapped 8259 PIC) drives a round-robin scheduler over a fixed pool of
-kernel threads. The kernel is non-preemptible (IF=0 in all kernel code);
-preemption lands only in ring 3 (IF=1) and at idle `sti; hlt` points. The user
-process runs as a schedulable thread — preempted mid-userspace, concurrent with
-kernel threads — and `sys_exit` kills the thread, not the machine.
-
-**v1 arc 2 — per-process address spaces + isolation: complete.** Each process
-gets its own PML4 (sharing the kernel upper half), and the scheduler reloads CR3
-when dispatching a thread in a different address space. Two user processes,
-both linked at `0x200000`, run concurrently in *separate* address spaces. A
-ring-3 fault kills the offending process while everything else continues.
-
-**v1 arc 3 — blocking user-to-user IPC: complete.** The kernel echo is gone:
-`pong` (pinger) and `beta` (ponger) do a real PING→PONG rendezvous across two
-address spaces. A sender that arrives first BLOCKS on the endpoint's send queue;
-a receiver that arrives first blocks as its `recv_waiter`; whoever completes the
-rendezvous wakes the other. Messages cross address spaces via per-thread kernel
-STAGING (each thread only ever touches its own user memory, under its own CR3).
-Reply is a real pooled kernel object handed to the receiver as a handle;
-`sys_reply` consumes it; a replier that dies mid-call wakes the caller `E_GONE`.
-Capabilities transfer across the rendezvous (`pong` grants an attenuated console
-to `beta`, which writes through it). Both arrival orderings, `E_GONE`, and the
-selftest 7/7 all verified.
-
-**v1 arc 4 — user-driven memory: complete.** Each process is born holding a
-`Memory` capability — a byte budget (a degenerate seL4 "untyped"). `sys_map`
-takes that handle and debits it to map anonymous pages into the caller's own
-address space, charging intermediate page-tables too; exhaustion is `E_NOMEM`.
-**Law L6 is now literally enforced** — the kernel never allocates a user frame
-without an authorizing capability, and a process can only consume what it was
-granted. `Frame` objects name a physical frame; because handles transfer over
-IPC, a frame can be **shared zero-copy** between two isolated address spaces,
-with read-only sharing falling out of capability attenuation (a writable map
-through a read-only handle is `E_RIGHTS`). See `docs/abi-v0.md` §9.
-
-**v1 arc 5 — IRQ capabilities + a user-mode keyboard driver: complete.** A user
-process (`servers/kbd`) is a real device driver: it holds the keyboard IRQ line
-and the i8042 I/O ports as **capabilities**, binds the IRQ to a **Notification**
-(an async signal the kernel's handler can fire without blocking), waits on it,
-reads scancodes via `sys_io_in`, translates them, and forwards each keystroke to
-the TTY. The kernel never touches the keyboard. See `docs/abi-v0.md` §10.
-(Headless test: `just`-style boot + QEMU monitor `sendkey`.)
-
-**v1 arc 6 — a TTY + an interactive shell: complete.** Three userspace processes
-form a terminal over one tag-multiplexed endpoint (no new syscalls). `kbd` posts
-keystrokes; **`tty`** (`servers/tty`) is the sole receiver and the sole Console
-writer — it runs the line discipline (echo, backspace rub-out, buffer-to-Enter)
-and answers `READ` requests, stashing the caller's Reply until a line completes;
-**`shell`** (`servers/shell`) prints the `oxbow$ ` prompt, reads a line, and runs
-builtins (`echo`, `help`, unknown → *command not found*). The shell's Console
-grant is **revoked at boot**, so it holds zero direct hardware authority and all
-output flows through the tty — least privilege enforced by not minting the cap.
-The headline works end-to-end at the keyboard: **`oxbow$ echo hi` → `hi`**. See
-`docs/abi-v0.md` §11.
-
-**v1 arc 7 — a serial console: complete.** A sixth userspace process
-(`servers/serial`) makes COM1 a real *input* device, so you can type at the
-shell directly over the serial line — `just run` is fully interactive in your
-terminal, BSD-serial-console style, no graphical window needed. It is the §10
-IRQ/driver pattern applied to the 16550 UART, with a twist: the device is
-**shared with the kernel** (which owns config + the TX path), split by direction
-and enforced by capabilities — the driver is granted RBR/LSR as **`R_IN`-only**
-I/O-port caps, so it can physically only *read* the UART; a write faults
-`E_RIGHTS`. Each received byte is forwarded to the tty as `TAG_TTY_CHAR`, joining
-keyboard input in the one line discipline (DEL and 0x08 both rub out). See
-`docs/abi-v0.md` §12. (Headless test: COM1 on a TCP socket, driven by
-`tools/serial_expect.py`.)
-
-**v1 arc 8 — userspace process spawning: complete.** The boot now drops straight
-into a clean `oxbow$ ` prompt (no demo spam); the pong/beta demo is registered as
-**spawnable Image capabilities** and launched on demand. `sys_spawn` loads an
-Image into a fresh address space and grants it a starter capability set named in
-a spawn message — the parent's Memory budget *pays* for the child (the seL4-honest
-model), and a Notification is signalled when the child exits (lifecycle without
-leaks; process/thread slots are reused). The shell gains `run`: **`run hello`**
-spawns a one-line program, **`run pong`** wires an endpoint between two freshly
-spawned children (the full PONG regression — IPC, zero-copy shmem, E_GONE, tick,
-sys_map — on demand). A program can only launch images it was *granted* (zero
-ambient authority; spawn-by-handle). See `docs/abi-v0.md` §13.
-
-**v1 arc 9 — cooked-mode line discipline: complete.** The tty now synchronizes
-echo with the reader: keystrokes echo live while the shell waits in `READ`, but
-buffer **un-echoed** while the shell is busy (running a command, emitting its
-output + prompt) and flush at the next `READ`, after the prompt. So pasting a
-whole command — or typing the next one before the previous finishes — no longer
-tangles the echo with output; each command's echo lands grouped with its own
-prompt, and type-ahead edits (backspace) are invisible. A pure `servers/tty`
-change (no ABI/shell/driver change). See `docs/abi-v0.md` §12.5.
-
-**v1 arc 10 — badged endpoints: complete.** The seL4 badge mechanism: a holder
-of an endpoint capability can `sys_mint` additional capabilities to the *same*
-endpoint, each stamped with a server-chosen **badge** that the kernel delivers —
-**unforgeably** — to the receiver (it overwrites whatever the sender wrote). So a
-single-endpoint server can hand out many distinct, unforgeable per-object
-capabilities and tell them apart on one receive loop — no per-object endpoint
-objects, no wait-on-many primitive. Badges are immutable once set (no re-badging,
-preserved by attenuation + transfer), forward-only (replies deliver 0). This is
-the foundation for the filesystem: each open file becomes a badged capability to
-the one FS endpoint. See `docs/abi-v0.md` §14.
-
-**v1 arc 11 — a userspace filesystem (ramfs): complete.** `ls` and `cat` from the
-shell, served by `servers/fs` — reached *entirely* through capabilities, no
-kernel-resident namespace. **Directories are capabilities**: you open a file
-relative to a directory cap you hold (the shell gets the root dir cap at boot;
-`/` and `..` are rejected — confinement). **Each open file is a badged
-capability** (§14) whose badge is the node id, so the server is *stateless* —
-every request indexes `nodes[badge]`. OPEN mints a fresh file cap and returns it
-in the reply (this arc taught the kernel's reply path to **carry capabilities**).
-The tree is seeded from a **USTAR tar initrd** mapped read-only into the fs
-address space at boot; file content points straight into the mapped archive
-(zero-copy). See `docs/abi-v0.md` §15.
-
-**v1 arc 12 — a read-write filesystem: complete.** `echo TEXT > file`, `mkdir`,
-and `cd` from the shell. File bytes live in an arena the fs server `sys_map`s from
-its *own Memory budget* (even the filesystem funds its storage from a capability —
-law L6); seed files are copied in so every file is writable. New ops `CREATE`,
-`WRITE`, `MKDIR`. The shell tracks a **current-directory capability**: `cd <dir>`
-opens a subdir cap, `cd /` returns to root — and there is no `cd ..` (you can't
-walk above a directory cap you hold; the capability tree *is* the access boundary,
-so a subdir's files are invisible from its parent). See `docs/abi-v0.md` §15.7.
-
-**v1 arc 13 — spawned coreutils: complete.** `ls` and `cat` are real programs
-the shell launches (`servers/{ls,cat}`), not builtins — the first capability
-transfer between *unrelated* processes. For `cat foo`, the shell (holding the dir
-cap) resolves the name, opens the file, and grants the resulting **file
-capability** to a freshly-spawned `cat`, which reads exactly that one file and
-nothing else — it never sees a name, holds no directory. A spawned coreutil
-can't take a *name* (no argv yet), which is exactly why `cat`/`ls` spawn (they
-take a cap) while `mkdir`/`cd`/`echo >` stay builtins. Least privilege, enforced
-by the kernel. See `docs/abi-v0.md` §15.8.
-
-**v1 arc 14 — spawn arguments (argv): complete.** A spawned program can take a
-string argument: the parent packs it into the spawn message, the kernel maps it
-read-only at a fixed vaddr in the child, and `rt::argv()` reads it. This is what
-lets a coreutil take a *name* — `mkdir`/`touch` are now spawned programs granted
-the current-directory capability plus the new name as argv. The split is
-deliberate: read commands (`cat`/`ls`) take a *capability* the shell pre-resolves
-(maximally confined); name-creating commands (`mkdir`/`touch`) take a *name* via
-argv plus the directory cap. argv names a target *within* authority already
-granted — it never widens it. See `docs/abi-v0.md` §13.7.
-
-**v1 arc 15 — rm and mv: complete.** The first *destructive* filesystem
-operations. `rm <name>` (UNLINK) removes a file or an empty directory; `mv <old>
-<new>` (RENAME) renames a child within the current directory. Both are spawned
-coreutils holding the cwd capability + a name via argv, so confinement applies to
-destruction too — `rm`/`mv` can only affect children of the directory they were
-handed, never anything above it. See `docs/abi-v0.md` §15.9.
-
-**v1 arc 16 — memory reclamation: complete.** Every allocation layer now frees.
-The frame allocator gains an intrusive free list; a dead process's address space
-is walked and its frames + page tables returned to the allocator (skipping
-shared shmem frames so peers aren't double-freed); the spawner's budget is
-refunded the cost of a child when it dies; and the fs storage arena reclaims
-removed files. Before this, a session was capped at ~20 spawned commands (each
-permanently consumed budget) — now a shell can spawn and reap commands
-indefinitely (verified by 70 back-to-back cycles with no exhaustion). See
-`docs/abi-v0.md` §16.
-
-**v1 arc 19 — a userland runtime ("libc"): complete.** `oxbow-rt` grew from raw
-syscall stubs into a small libc, so programs read like ordinary Rust. A bump
-**heap** backed by the program's Memory budget (mapped lazily, no-op `dealloc`
-since the address space is reclaimed on exit) makes `alloc` work — `Vec`,
-`String`, `format!`. `print!`/`println!` write to the program's stdout. A file
-API (`rt::fs::open`/`read_all`/`readdir`) wraps the fs protocol. The coreutils
-were rewritten against it — `cat` is `read_all` + `stdout_write`, `ls` a
-`readdir` loop with `println!`, `hello` uses `Vec`/`format!`. See §17.
-
-### Next — frontier
-
-On the graphics track: **cross-process** Wayland (the compositor spawns the
-client with an inherited `WAYLAND_SOCKET` fd), **input routing** (keyboard →
-focused surface), `xdg_shell` toplevels, and multiple windows. Underneath:
-turning the epoll busy-poll into a block-on-channel-wake, **SMP** + a user-thread
-syscall, frame reclamation + budget refund, `sys_unmap`, and an `aarch64` port.
-POSIX and the Unix feel keep growing in *userspace* over the capability kernel
-(the Redox model) — the kernel stays capability-pure.
-
-## Building & running
-
-Requires: a nightly Rust toolchain (pinned via `rust-toolchain.toml`),
-`qemu-system-x86_64`, `xorriso`, `just`, and the Limine bootloader binaries.
-The Limine path is configured in the `justfile` (`LIMINE_DIR`).
+## Quick start
 
 ```sh
-just run           # build kernel -> assemble ISO -> boot in QEMU (serial on stdio)
-just run-selftest  # same, but run the ABI negative-path selftests first
-just build         # just compile the kernel
-just iso           # build the bootable ISO
+git clone https://github.com/FancyWaifu/oxbow.git
+cd oxbow
+just disk     # create the persistent disk image (once)
+just play     # build everything, boot a graphical window, log in on screen
+```
+
+`just play` opens a window; log in as **`root` / `root`** (the first login asks
+you to set a new password). From there you have a shell, a desktop (click
+**Activities** to launch apps), networking, and a disk whose files survive
+reboots. Prefer a headless terminal-only boot? Use `just run` (kernel + serial
+console on your terminal, no window).
+
+> First boot formats and seeds the ext2 disk from the initrd, which takes a few
+> tens of seconds — wait for `[fsd] ready` before logging in.
+
+See [Prerequisites](#prerequisites) below to install the toolchain first.
+
+## Prerequisites
+
+You need: a Rust toolchain (via `rustup` — the pinned nightly installs
+automatically from `rust-toolchain.toml`), `just`, `qemu-system-x86_64`,
+`xorriso`, a `clang`/LLVM toolchain (the vendored C ports compile with it),
+`make`, and the **Limine** bootloader (v11).
+
+### Linux (Debian / Ubuntu)
+
+```sh
+# 1. Rust (rustup auto-installs the pinned nightly + rust-src/llvm-tools on first build)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+
+# 2. Build tools
+sudo apt update
+sudo apt install -y qemu-system-x86 xorriso clang llvm make git
+cargo install just            # or: sudo apt install just  (on 24.04+)
+
+# 3. Limine v11 (prebuilt binaries + the host install tool)
+git clone https://github.com/limine-bootloader/limine.git \
+  --branch=v11.x-binary --depth=1 ~/oxbow-limine-src
+make -C ~/oxbow-limine-src
+```
+
+Fedora: `sudo dnf install qemu-system-x86 xorriso clang llvm make git`.
+Arch: `sudo pacman -S qemu-base xorriso clang llvm make git just`.
+
+### macOS (Apple Silicon or Intel)
+
+```sh
+# 1. Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+
+# 2. Command-line clang/make/git, then the rest via Homebrew
+xcode-select --install
+brew install just qemu xorriso llvm
+
+# 3. Limine v11
+git clone https://github.com/limine-bootloader/limine.git \
+  --branch=v11.x-binary --depth=1 ~/oxbow-limine-src
+make -C ~/oxbow-limine-src
+```
+
+The build uses `llvm-strip` (shipped by Rust's `llvm-tools` component, found
+automatically), so Apple's `strip` being ELF-blind is a non-issue. If a vendored
+C port fails to assemble an archive, put Homebrew LLVM ahead of Apple clang for
+that build: `export PATH="$(brew --prefix llvm)/bin:$PATH"`.
+
+### Windows (WSL2)
+
+The build is driven by a Unix shell and tools (`dd`, `tar`, `find`, `xorriso`,
+…), so build oxbow inside **WSL2**, not native Windows:
+
+```powershell
+wsl --install -d Ubuntu        # in an elevated PowerShell, then reboot
+```
+
+Open the Ubuntu shell and follow the **Linux (Debian / Ubuntu)** steps above.
+`just run` (headless serial) works as-is. For the graphical `just play` you need
+the WSLg GUI support that ships with Windows 11 / recent Windows 10; on older
+setups, use `just run` or point `qemu` at a Windows X server.
+
+## Running
+
+```sh
+just play          # graphical window + persistent disk + networking (log in root/root)
+just run           # headless: kernel + an interactive serial shell on your terminal
+just disk          # create the persistent disk image (oxbow-disk.img); run once
+just build         # compile just the kernel
+just iso           # build the bootable ISO without running it
 just gdb           # boot under QEMU stopped, waiting for gdb on :1234
 just clean
 ```
 
-## Layout
+If Limine lives somewhere other than `~/oxbow-limine-src`, point the build at it:
+`LIMINE_DIR=/path/to/limine just play`.
+
+The produced `oxbow.iso` is a real hybrid BIOS+UEFI bootable image — it also runs
+on a physical machine or a KVM/Proxmox VM (where oxbow brings up a real network).
+
+## Repository layout
 
 ```
-kernel/   the microkernel (no_std, no_main; boots via Limine)
-abi/      oxbow-abi — syscall numbers, rights, errors, MsgBuf (shared kernel+user)
-rt/       oxbow-rt  — userland runtime: _start, syscall stubs, panic handler
-servers/  user-mode servers (the pong server is the first; added with v0)
-tools/    build-time helpers (initrd packer, etc.)
-docs/     abi-v0.md — the normative capability/IPC ABI
+kernel/    the microkernel (no_std, no_main; boots via Limine), arch/ for x86_64
+abi/       oxbow-abi — syscall numbers, rights, errors, MsgBuf (shared kernel+user)
+rt/        oxbow-rt  — userland runtime: _start, syscall stubs, libc-ish helpers
+libc/      oxbow-libc — a small C library for the native (non-musl) programs
+servers/   user-mode servers + apps: drivers (kbd, net, blk, gpu), fs, tty, shell,
+           the Wayland compositor (oxcomp) + toolkit (oxui), coreutils, doom, …
+userland/  the musl/POSIX personality (the Linux-syscall translation layer)
+docs/      abi-v0.md — the normative capability/IPC ABI (read this first)
+tools/     build-time helpers (initrd packer, serial test harness, …)
 ```
+
+## License
+
+BSD-2-Clause. The vendored upstream C sources retain their own licenses.
