@@ -7,6 +7,7 @@
 const ET_EXEC: u16 = 2;
 const EM_X86_64: u16 = 62;
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3; // §96: dynamic linker path (a dynamically-linked image)
 const PT_TLS: u32 = 7;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
@@ -158,6 +159,23 @@ impl<'a> Image<'a> {
         self.bytes
     }
 
+    /// §96: the PT_INTERP path (the dynamic linker, e.g. `/lib/ld-oxbow`) if this is
+    /// a dynamically-linked image, else None. The returned slice is the NUL-terminated
+    /// path from the file. Bounds-checked here (so it's safe even for a trusted boot
+    /// module that never went through `segments_in_bounds`).
+    pub fn interp(&self) -> Option<&'a [u8]> {
+        let ph = self.phdrs[..self.nphdr]
+            .iter()
+            .copied()
+            .find(|ph| ph.p_type == PT_INTERP)?;
+        let start = ph.p_offset as usize;
+        let end = start.checked_add(ph.p_filesz as usize)?;
+        if ph.p_filesz == 0 || end > self.bytes.len() {
+            return None;
+        }
+        Some(&self.bytes[start..end])
+    }
+
     /// Validate that the program-header table and every PT_LOAD segment's file
     /// range lie within the byte buffer, and that p_filesz ≤ p_memsz. Boot
     /// modules are trusted (the loader asserts), but an ELF handed to
@@ -216,6 +234,22 @@ impl<'a> Image<'a> {
             };
             if rounded + 16 > 4096 || t.p_filesz > rounded {
                 return false;
+            }
+        }
+        // §96: PT_INTERP (dynamic linker path) — validate its file range. A path
+        // longer than 256 B or out of bounds is rejected.
+        if let Some(ph) = self
+            .phdrs[..self.nphdr]
+            .iter()
+            .copied()
+            .find(|p| p.p_type == PT_INTERP)
+        {
+            if ph.p_filesz == 0 || ph.p_filesz > 256 {
+                return false;
+            }
+            match ph.p_offset.checked_add(ph.p_filesz) {
+                Some(e) if e as usize <= self.bytes.len() => {}
+                _ => return false,
             }
         }
         true
