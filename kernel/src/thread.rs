@@ -556,7 +556,16 @@ fn switch_to(next: usize) {
     // §101 native ELF TLS: load the incoming thread's %fs base (its TLS thread
     // pointer). Per-thread MSR state, not saved on the kernel stack — set it on
     // every switch-in from the Tcb. 0 for kernel/TLS-less threads (harmless).
-    crate::arch::set_fs_base(fs_base_of(next));
+    // The fs-base MSR already holds the OUTGOING thread's value (it was set when prev
+    // was switched in, and SYS_SET_FSBASE keeps the TCB in sync), so skip the costly
+    // serializing WRMSR whenever the incoming thread shares that base — every switch
+    // to/from a TLS-less kernel/idle thread (base 0), and any two threads with equal
+    // bases. (Profiled at ~257 cyc/switch; this elides it on idle-heavy workloads. It
+    // does NOT help two distinct-TLS user threads ping-ponging — they differ every
+    // switch — so the all-user IPC bench is unchanged by it.)
+    if fs_base_of(next) != fs_base_of(prev) {
+        crate::arch::set_fs_base(fs_base_of(next));
+    }
     // Load the incoming process's address space (skip for kernel threads, cr3=0,
     // and when unchanged). Safe to reload CR3 here: the executing code, this
     // kernel stack (in .bss), and the next thread's saved context all live in
