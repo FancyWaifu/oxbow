@@ -120,6 +120,22 @@ on_draw(oxui_window *w, oxui_canvas c, void *user)
     render_grid(c.pixels, c.width, c.height);
 }
 
+/* §93b: the compositor resized the window (maximize/tile/drag) → reflow the vterm
+ * grid to the new pixel size so the terminal gains/loses rows+cols and renders
+ * sharp at the new resolution (instead of the compositor up-scaling a fixed grid).
+ * render_grid uses the same cols=bw/cell_w math, so they stay in lock-step. */
+static void
+on_resize(oxui_window *w, int width, int height, void *user)
+{
+    (void)w; (void)user;
+    if (!vt || cell_w < 1 || cell_h < 1)
+        return;
+    int cols = width / cell_w, rows = height / cell_h;
+    if (cols < 1) cols = 1;
+    if (rows < 1) rows = 1;
+    vterm_set_size(vt, rows, cols);
+}
+
 /* oxui fd_ready callback: new shell output on the tty mirror → feed libvterm and
  * ask oxui to repaint. ONLCR: the console stream uses bare '\n'; libvterm needs
  * '\r\n' or the cursor staircases. */
@@ -157,6 +173,7 @@ main(void)
 
     oxui_handlers h = {
         .draw     = on_draw,
+        .resize   = on_resize, /* §93b: reflow the grid on maximize/tile/resize */
         .extra_fd = g_tty_fd, /* also wait on the shell-output mirror */
         .fd_ready = on_tty,
         .animate  = 0,        /* a terminal is event-driven, not animated */

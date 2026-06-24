@@ -54,6 +54,10 @@ typedef struct {
      * the kernel between repaints — no busy-poll, no per-frame CPU — and still
      * wakes immediately for input. 0 = off. Ignored when `animate` is set. */
     int  redraw_interval_ms;
+    /* §93b: the window was resized by the compositor (xdg configure) to (w,h). The
+     * next draw uses the new size; this lets a client reflow content (e.g. a
+     * terminal's row/col grid). Optional. Fires before the repaint. */
+    void (*resize)(oxui_window *w, int width, int height, void *user);
 } oxui_handlers;
 
 /* Create a window (title shown to the WM; w×h content area). NULL on failure. */

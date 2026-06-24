@@ -196,6 +196,10 @@ static void tl_configure(void *data, struct xdg_toplevel *tl, int32_t width,
         w->width = width;
         w->height = height;
         w->dirty = 1; /* resized → repaint at the new size */
+        /* §93b: let the app reflow its content (e.g. a terminal's grid) before the
+         * repaint that runs at the new dimensions. */
+        if (w->h && w->h->resize)
+            w->h->resize(w, width, height, w->user);
     }
 }
 static void tl_close(void *data, struct xdg_toplevel *tl)

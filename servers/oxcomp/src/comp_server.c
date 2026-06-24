@@ -1378,6 +1378,7 @@ static void toggle_maximize(struct surf *s);
 static void minimize_view(struct surf *s);
 static void unminimize_focus(struct surf *s);
 static void snap_view(struct surf *s, int zone);
+static void send_configure(struct surf *s);
 /* §91: launch app `id`, attach its Wayland socket to the display, close the
  * overview. */
 static void launch_and_attach(int id)
@@ -1482,6 +1483,10 @@ static void pointer_button(int left)
         else if (g_cx <= SNAP_ZONE)             snap_view(g_grab, 1); /* left half */
         else if (g_cx >= g_w - SNAP_ZONE)       snap_view(g_grab, 2); /* right half */
       }
+      /* §93b: interactive resize scales live during the drag; on release, tell the
+       * client its final size so it re-renders sharp at that resolution. */
+      if (g_cursor_mode == MODE_RESIZE && g_grab)
+        send_configure(g_grab);
       g_cursor_mode = MODE_PASSTHROUGH;
       g_grab = NULL;
       return;
@@ -1524,9 +1529,27 @@ static void focus_view(struct surf *s)
   wake_unoccluded(); /* §62: raising `s` to the top uncovers whatever it hid */
 }
 
+/* §93b: tell the client its new on-screen size via xdg configure, so it re-renders
+ * its buffer at that resolution (sharp) instead of the compositor up-scaling a
+ * fixed buffer (blocky). oxui honors this — tl_configure resizes + repaints; until
+ * the new buffer arrives the old one keeps scaling, so there's no flash. */
+static void send_configure(struct surf *s)
+{
+  if (!s->xdg_toplevel || !s->xdg_surface)
+    return;
+  struct wl_array states;
+  wl_array_init(&states);
+  if (s->maximized) {
+    uint32_t *st = wl_array_add(&states, sizeof(uint32_t));
+    if (st) *st = XDG_TOPLEVEL_STATE_MAXIMIZED;
+  }
+  xdg_toplevel_send_configure(s->xdg_toplevel, s->w, s->h, &states);
+  wl_array_release(&states);
+  xdg_surface_send_configure(s->xdg_surface, ++g_serial);
+}
 /* §93: maximize to the work area (below the panel) or restore the saved geometry.
  * The titlebar lives in rows [y-TBH, y), so y=PANEL_H+TBH puts it flush under the
- * panel. Content scales (clients don't reflow) — same as drag-resize. */
+ * panel. §93b: a configure is sent so the client re-renders sharp at the new size. */
 static void toggle_maximize(struct surf *s)
 {
   if (!s->maximized) {
@@ -1540,6 +1563,7 @@ static void toggle_maximize(struct surf *s)
     s->x = s->sx; s->y = s->sy; s->w = s->sw; s->h = s->sh;
     s->maximized = 0;
   }
+  send_configure(s);
   composite_scene();
 }
 /* §93: tile a dragged window — zone 0=top(maximize), 1=left half, 2=right half.
@@ -1557,6 +1581,7 @@ static void snap_view(struct surf *s, int zone)
   if (zone == 1) { s->x = 0; s->w = g_w / 2; }
   else if (zone == 2) { s->x = g_w / 2; s->w = g_w - g_w / 2; }
   else { s->x = 0; s->w = g_w; } /* top → maximize */
+  send_configure(s); /* §93b: re-render sharp at the tiled size */
   composite_scene();
 }
 /* The topmost mapped, non-minimized view other than `except` (for focus handoff). */
