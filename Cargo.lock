@@ -590,6 +590,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "netcat-musl"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "nl"
 version = "0.0.0"
 dependencies = [

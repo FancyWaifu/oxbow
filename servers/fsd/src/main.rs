@@ -752,7 +752,8 @@ fn flush() {
 
 fn seed_from_initrd() {
     w(b"[fsd] seeding ext2 from the initrd...\n");
-    unsafe { oxfs_writeback(1) }; // batch write-back for speed during seeding
+    // Write-back is toggled PER FILE in the loop below (batch a file, then drain), not
+    // once for the whole seed — see the per-file rationale there.
     let base = FS_INITRD as *const u8;
     let mut off = 0usize;
     let mut files = 0u32;
@@ -803,10 +804,16 @@ fn seed_from_initrd() {
                 unsafe { oxfs_mkdir(full.as_ptr()) };
             } else if is_file {
                 if unsafe { oxfs_create(full.as_ptr()) } == 0 {
-                    // stream the file body into ext2
+                    // Batch THIS file's blocks in write-back mode, then drain with the
+                    // clean writeback toggle. Per-file (not whole-seed) batching keeps the
+                    // dirty set ≤ one file's blocks, so with the bumped cache (1024 blocks)
+                    // lwext4 never has to evict mid-write — avoiding both the silent
+                    // truncation AND the LRU-tree corruption (ext4_buf_lru_RB_REMOVE
+                    // null-deref) that an unbounded write-back accumulation + ext4_cache_flush
+                    // triggered. writeback(0) flushes cleanly (same call used at seed end).
+                    unsafe { oxfs_writeback(1) };
                     let data = unsafe { hdr.add(512) };
                     let mut done = 0usize;
-                    let mut since_flush = 0usize;
                     while done < size {
                         let chunk = core::cmp::min(size - done, 4096);
                         let mut wr = 0usize;
@@ -823,19 +830,8 @@ fn seed_from_initrd() {
                             break;
                         }
                         done += wr;
-                        // Seeding runs in batch write-back mode (no per-write flush), so
-                        // dirty lwext4 cache blocks accumulate across the whole ~11 MB
-                        // initrd. Left unbounded the cache exhausts and ext4_fwrite starts
-                        // returning 0 mid-file — silently TRUNCATING files written late in
-                        // the seed (a >150 KB /bin program would fail to spawn). Flush every
-                        // 64 KiB to bound the dirty set while keeping the batch-mode speed.
-                        since_flush += wr;
-                        if since_flush >= 64 * 1024 {
-                            unsafe { oxfs_flush() };
-                            since_flush = 0;
-                        }
                     }
-                    unsafe { oxfs_flush() }; // flush each file before starting the next
+                    unsafe { oxfs_writeback(0) }; // flush this file cleanly before the next
                     files += 1;
                 }
             }
