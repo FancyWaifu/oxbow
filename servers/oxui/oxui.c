@@ -103,6 +103,14 @@ static int create_shm(struct oxui_window *w, struct oxui_buffer *b)
         close(fd);
         return -1;
     }
+    /* §93b-fix: the new allocation succeeded — only NOW drop any old buffer in this
+     * slot. Allocating first means an OOM above (e.g. a full-screen buffer that
+     * doesn't fit the client's memory budget) leaves the old buffer intact to fall
+     * back on, instead of destroying it and wedging the client with nothing to draw. */
+    if (b->buffer)
+        wl_buffer_destroy(b->buffer);
+    if (b->pixels)
+        munmap(b->pixels, b->size);
     struct wl_shm_pool *pool = wl_shm_create_pool(w->shm, fd, size);
     b->buffer = wl_shm_pool_create_buffer(pool, 0, w->width, w->height, stride,
                                           WL_SHM_FORMAT_XRGB8888);
@@ -122,15 +130,19 @@ static struct oxui_buffer *next_buffer(struct oxui_window *w)
     struct oxui_buffer *b = pick_free_buffer(w);
     if (!b)
         return NULL;
-    if (b->buffer && (b->width != w->width || b->height != w->height)) {
-        /* size changed: drop the old shm so we recreate at the new size */
-        munmap(b->pixels, b->size);
-        wl_buffer_destroy(b->buffer);
-        b->buffer = NULL;
-    }
-    if (!b->buffer && create_shm(w, b) < 0)
-        return NULL;
-    return b;
+    if (b->buffer && b->width == w->width && b->height == w->height)
+        return b; /* already the right size — reuse */
+    /* (Re)create at the requested size. create_shm frees the old buffer only after
+     * the new alloc succeeds (non-destructive on OOM). */
+    if (create_shm(w, b) == 0)
+        return b;
+    /* §93b-fix: couldn't allocate the (larger) buffer — DON'T wedge. Fall back to
+     * the existing buffer; present() draws at ITS size and the compositor scales it
+     * up to the window's display size (blocky, but the app keeps running + animating
+     * instead of freezing on a full-screen buffer that won't fit the budget). */
+    if (b->buffer)
+        return b;
+    return NULL; /* nothing to fall back to (first-ever paint OOM) */
 }
 
 /* ---- present: call the app's draw into a free buffer and commit (or defer) ---- */
@@ -145,12 +157,15 @@ static void present(struct oxui_window *w)
     if (!b)
         return; /* §63: both buffers busy — stay dirty, retry on release */
 
-    oxui_canvas c = { .width = w->width, .height = w->height,
+    /* §93b-fix: draw at the BUFFER's size, not w->width/height. They match in the
+     * common case; on an OOM fallback the buffer is the old (smaller) size and the
+     * compositor scales it — drawing at w->width into a smaller buffer would overflow. */
+    oxui_canvas c = { .width = b->width, .height = b->height,
                       .pixels = b->pixels, .time_ms = w->time_ms };
     w->h->draw(w, c, w->user);
 
     wl_surface_attach(w->surface, b->buffer, 0, 0);
-    wl_surface_damage(w->surface, 0, 0, w->width, w->height);
+    wl_surface_damage(w->surface, 0, 0, b->width, b->height);
 
     /* animate mode: ask for a frame callback so the compositor paces us and wakes
      * us for the next frame. event-driven mode: no callback — we sleep until the
