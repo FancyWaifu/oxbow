@@ -224,6 +224,33 @@ fn bench_fs_open() {
     );
 }
 
+// ---------------- Phase 2d: file-read throughput (TAG_FS_READ path) ----------------
+// Read a whole file via rt::fs::read_all, which loops TAG_FS_READ at ~504 bytes per
+// IPC round trip. Program loads ride this exact path (the shell slurps a /bin ELF this
+// way), so its MiB/s + implied round-trip count tells us whether per-IPC overhead (vs
+// a bulk shared-frame transfer) is the bottleneck for reads.
+fn bench_fs_read() {
+    use oxbow_abi::BOOT_EP;
+    let path = b"doom1.wad"; // a big seeded file (~4 MiB) for a clear throughput number
+    let Some(n) = rt::fs::open(BOOT_EP, path) else {
+        rt::println!("[bench] fs read : SKIP (cannot open doom1.wad)");
+        return;
+    };
+    let w0 = rt::sys_uptime_ms();
+    let data = rt::fs::read_all(n.cap);
+    let wall = rt::sys_uptime_ms().wrapping_sub(w0).max(1);
+    let _ = rt::sys_close(n.cap);
+    let got = data.len() as u64;
+    core::hint::black_box(&data);
+    rt::println!(
+        "[bench] fs read : {} KiB in {} ms = {} MiB/s, ~{} read IPCs (504 B each)",
+        got / 1024,
+        wall,
+        got * 1000 / (1024 * 1024) / wall,
+        got / 504
+    );
+}
+
 // ---------------- Phase 3: memory-map throughput + graceful exhaustion ----------------
 // Map fresh 4 KiB RW pages until the budget/PMM is exhausted. Measures map throughput
 // AND that exhaustion returns E_NOMEM (loop ends) rather than panicking the kernel.
@@ -311,6 +338,7 @@ pub extern "C" fn oxbow_main() -> ! {
     bench_ipc();
     bench_ctxsw(); // isolates scheduler+context-switch from IPC message logic
     bench_fs_open(); // file-open latency (fsd intern() path)
+    bench_fs_read(); // file-read throughput (TAG_FS_READ path)
     bench_thread_spawn();
     bench_mmap(); // LAST: it deliberately exhausts the whole budget (terminal phase)
     rt::println!("[bench] DONE — kernel survived all phases");

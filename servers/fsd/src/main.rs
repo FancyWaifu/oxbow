@@ -59,6 +59,7 @@ fn cache_invalidate() {
     unsafe {
         C_BLK = [u64::MAX; CWAYS];
         C_PLEN = 0;
+        oxfs_read_close(); // §perf: drop the held read handle too (it may now be stale)
     }
 }
 
@@ -84,7 +85,7 @@ unsafe fn cached_read(full: &[u8], off: u64, dst: *mut u8) -> usize {
             let i = C_NEXT;
             C_NEXT = (C_NEXT + 1) % CWAYS;
             let mut rd = 0usize;
-            oxfs_pread(
+            oxfs_pread2(
                 full.as_ptr(),
                 blk * CBLK as u64,
                 core::ptr::addr_of_mut!(C_BUF[i]) as *mut c_void,
@@ -384,6 +385,11 @@ extern "C" {
     fn oxfs_mkfs_ext2(bd: *mut c_void) -> c_int;
     fn oxfs_stat(path: *const u8, is_dir: *mut c_int, size: *mut u64) -> c_int;
     fn oxfs_pread(path: *const u8, off: u64, buf: *mut c_void, len: usize, rd: *mut usize) -> c_int;
+    // §perf: like oxfs_pread but holds the file open across calls (sequential block reads
+    // skip the per-block path walk); oxfs_read_close drops the held handle on mutation.
+    fn oxfs_pread2(path: *const u8, off: u64, buf: *mut c_void, len: usize, rd: *mut usize)
+        -> c_int;
+    fn oxfs_read_close();
     fn oxfs_pwrite(path: *const u8, off: u64, buf: *const c_void, len: usize, wr: *mut usize)
         -> c_int;
     fn oxfs_create(path: *const u8) -> c_int;

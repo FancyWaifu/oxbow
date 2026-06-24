@@ -56,6 +56,51 @@ int oxfs_pread(const char *path, uint64_t off, void *buf, size_t len, size_t *rd
 	return r;
 }
 
+/* §perf read-handle cache: hold ONE file open across a sequential read. cached_read()
+ * calls oxfs_pread2 on each 4 KiB block miss; without this, every block re-walked the
+ * path via ext4_fopen/fclose (e.g. ~1024 redundant walks to read a 4 MiB file). The
+ * held handle is dropped by oxfs_read_close(), wired into cache_invalidate() so it is
+ * closed at every mutation point the block cache already invalidates at. */
+static ext4_file g_rf;
+static char g_rf_path[256];
+static int g_rf_valid;
+
+void oxfs_read_close(void)
+{
+	if (g_rf_valid) {
+		ext4_fclose(&g_rf);
+		g_rf_valid = 0;
+	}
+}
+
+int oxfs_pread2(const char *path, uint64_t off, void *buf, size_t len, size_t *rd)
+{
+	*rd = 0;
+	if (!g_rf_valid || strcmp(g_rf_path, path) != 0) {
+		oxfs_read_close();
+		int r = ext4_fopen(&g_rf, path, "rb");
+		if (r != EOK)
+			return r;
+		size_t n = 0;
+		while (path[n] && n < sizeof(g_rf_path) - 1) {
+			g_rf_path[n] = path[n];
+			n++;
+		}
+		g_rf_path[n] = 0;
+		g_rf_valid = 1;
+	}
+	int r = ext4_fseek(&g_rf, (int64_t)off, SEEK_SET);
+	/* Same short-read loop as oxfs_pread (lwext4 can return short without EOF). */
+	while (r == EOK && *rd < len) {
+		size_t chunk = 0;
+		r = ext4_fread(&g_rf, (char *)buf + *rd, len - *rd, &chunk);
+		if (r != EOK || chunk == 0)
+			break;
+		*rd += chunk;
+	}
+	return r; /* file stays OPEN for the next block read */
+}
+
 /* Write len bytes at offset off (no truncate); *wr gets the count written. */
 int oxfs_pwrite(const char *path, uint64_t off, const void *buf, size_t len, size_t *wr)
 {
