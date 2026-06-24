@@ -182,11 +182,35 @@ fn drain(mods: &mut Mods, mouse: &mut Mouse) {
             continue;
         }
         if sc == 0xE0 {
-            ext = true; // extended-key prefix — swallow the next code
+            ext = true; // extended-key prefix — the next byte is an extended key
             continue;
         }
         if ext {
             ext = false;
+            // §48b: 0xE0-extended keys (arrows, right-side modifiers, the nav cluster)
+            // were previously dropped — so e.g. DOOM got no arrow keys and couldn't move.
+            // Their set-1 extended codes differ from evdev, so translate to the evdev
+            // keycode the compositor/xkb expect; preserve the break bit (0x80 = release).
+            let evdev: u8 = match sc & 0x7f {
+                0x48 => 103, // Up
+                0x50 => 108, // Down
+                0x4b => 105, // Left
+                0x4d => 106, // Right
+                0x1d => 97,  // Right Ctrl
+                0x38 => 100, // Right Alt
+                0x47 => 102, // Home
+                0x4f => 107, // End
+                0x49 => 104, // Page Up
+                0x51 => 109, // Page Down
+                0x52 => 110, // Insert
+                0x53 => 111, // Delete
+                0x1c => 96,  // Keypad Enter
+                0x35 => 98,  // Keypad /
+                _ => 0,
+            };
+            if evdev != 0 {
+                rt::channel::send(BOOT_INPUT_CHAN, &[evdev | (sc & 0x80)], &[]);
+            }
             continue;
         }
         // §48: forward the raw set-1 scancode (make AND break) to the compositor
