@@ -4,7 +4,10 @@
 // ~/musl-oxbow/doomgeneric (cloned from ozkl/doomgeneric); the platform layer + entry
 // shim are in this crate. The engine file list mirrors Makefile.soso (the no-SDL,
 // null-sound hobby-OS target), minus its doomgeneric_soso.c platform.
+// §96 Phase 4: oxui + libwayland + libffi link dynamically from /lib/liboxui.so (shared
+// helper); doom statically links only libxkbcommon + FreeType + the doomgeneric engine.
 use std::process::Command;
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../oxui/dynlink.rs"));
 
 fn harness(llvm_ar: &str, res_inc: &str) -> cc::Build {
     let mut b = cc::Build::new();
@@ -30,8 +33,7 @@ fn main() {
         std::path::Path::new(&dg).exists(),
         "doomgeneric not found at {dg} — clone ozkl/doomgeneric first"
     );
-    println!("cargo:rustc-link-arg=-T{dir}/user.ld");
-    println!("cargo:rerun-if-changed=user.ld");
+    emit_oxui_dynlink(dir); // §96 Phase 4: link /lib/liboxui.so dynamically
     println!("cargo:rerun-if-changed=src/doomgeneric_oxbow.c");
     println!("cargo:rerun-if-changed={dg}");
 
@@ -88,17 +90,7 @@ fn main() {
         .include("../oxwl")
         .include(&dg) // doomgeneric.h, doomkeys.h, config.h, engine headers
         .define("HAVE_CONFIG_H", None);
-    for f in ["wayland-util","connection","wayland-os","wayland-protocol",
-              "xdg-shell-protocol","wayland-client"] {
-        b.file(format!("../oxwl/wl-src/{f}.c"));
-    }
-    for f in ["prep_cif","types","raw_api","x86/ffi64","x86/ffiw64"] {
-        b.file(format!("../oxffi/ffi-src/{f}.c"));
-    }
-    b.file("../oxffi/ffi-src/x86/unix64.S");
-    b.file("../oxffi/ffi-src/x86/win64.S");
-    b.file("../oxui/oxui.c");
-    b.file("../oxui/oxui_text.c");
+    // §96 Phase 4: wayland + ffi + oxui.c + oxui_text.c are in /lib/liboxui.so now.
     // doomgeneric engine (Makefile.soso list, minus its platform file).
     for f in ["am_map","d_event","d_items","d_iwad","d_loop","d_main","d_mode","d_net",
               "doomdef","doomgeneric","doomstat","dstrings","dummy","f_finale","f_wipe",

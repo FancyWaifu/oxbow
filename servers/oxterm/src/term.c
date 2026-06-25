@@ -163,9 +163,14 @@ on_tty(oxui_window *w, void *user)
         oxui_request_redraw(w);
 }
 
+extern void oxui_set_wl_slot(int); /* from liboxui.so (§96 Phase 4) */
+
 int
 main(void)
 {
+    /* §96 Phase 4: dynamically linked, so oxcomp hands BOOT_FS_ROOT at slot 1
+     * (ld-oxbow's /lib) and the Wayland socket at slot 4; the tty mirror stays slot 20. */
+    oxui_set_wl_slot(4);
     oxui_window *w = oxui_window_create("oxterm", 720, 400);
     if (!w)
         return 1;

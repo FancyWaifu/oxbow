@@ -229,8 +229,10 @@ int main(int argc, char **argv)
 	/* The compositor hands DOOM its filesystem cap on slot 1 (BOOT_EP, so doomgeneric
 	 * opens /doom1.wad via stdio), the console on slot 2 (BOOT_CONSOLE — oxbow-libc's
 	 * stdout), and the Wayland socket on slot 4; point oxui at slot 4. */
-	extern int oxui_wl_slot;
-	oxui_wl_slot = 4;
+	/* §96 Phase 4: oxui is in /lib/liboxui.so now — use the setter (a JUMP_SLOT call),
+	 * not a direct write to the .so's data global (which would emit an R_X86_64_COPY). */
+	extern void oxui_set_wl_slot(int);
+	oxui_set_wl_slot(4);
 	doomgeneric_Create(argc, argv); /* load the WAD + init the engine */
 	g_win = oxui_window_create("DOOM", DOOMGENERIC_RESX, DOOMGENERIC_RESY);
 	if (!g_win)

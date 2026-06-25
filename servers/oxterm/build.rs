@@ -2,8 +2,11 @@
 // (client) + libffi + libxkbcommon (keys) + libvterm (screen model) + FreeType
 // (glyphs). xkb/vterm/freetype are each compiled as their OWN archive so their
 // private headers + config.h don't collide; the main unit (wayland + ffi +
-// term.c) sees only their PUBLIC headers.
+// term.c) sees only their PUBLIC headers. §96 Phase 4: oxui + libwayland + libffi link
+// dynamically from /lib/liboxui.so (shared helper); oxterm statically links only
+// libxkbcommon + libvterm + FreeType + term.c.
 use std::process::Command;
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../oxui/dynlink.rs"));
 
 fn harness(llvm_ar: &str, res_inc: &str) -> cc::Build {
     let mut b = cc::Build::new();
@@ -23,8 +26,7 @@ fn harness(llvm_ar: &str, res_inc: &str) -> cc::Build {
 
 fn main() {
     let dir = env!("CARGO_MANIFEST_DIR");
-    println!("cargo:rustc-link-arg=-T{dir}/user.ld");
-    println!("cargo:rerun-if-changed=user.ld");
+    emit_oxui_dynlink(dir); // §96 Phase 4: link /lib/liboxui.so dynamically
     println!("cargo:rerun-if-changed=src/term.c");
 
     let sysroot = String::from_utf8(
@@ -89,16 +91,7 @@ fn main() {
         .include("font")
         .include("../oxwl")
         .define("HAVE_CONFIG_H", None);
-    for f in ["wayland-util","connection","wayland-os","wayland-protocol",
-              "xdg-shell-protocol","wayland-client"] {
-        b.file(format!("../oxwl/wl-src/{f}.c"));
-    }
-    for f in ["prep_cif","types","raw_api","x86/ffi64","x86/ffiw64"] {
-        b.file(format!("../oxffi/ffi-src/{f}.c"));
-    }
-    b.file("../oxffi/ffi-src/x86/unix64.S");
-    b.file("../oxffi/ffi-src/x86/win64.S");
-    b.file("../oxui/oxui.c"); // §64: window/buffer/loop plumbing
+    // §96 Phase 4: wayland + ffi + oxui.c are in /lib/liboxui.so now.
     b.file("src/term.c");
     b.compile("oxterm");
 }

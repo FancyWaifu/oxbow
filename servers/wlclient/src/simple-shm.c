@@ -49,9 +49,14 @@ paint_rings(oxui_window *w, oxui_canvas c, void *user)
     }
 }
 
+extern void oxui_set_wl_slot(int); /* from liboxui.so (§96 Phase 4) */
+
 int
 main(void)
 {
+    /* §96 Phase 4: dynamically linked, so oxcomp hands BOOT_FS_ROOT at slot 1
+     * (ld-oxbow's /lib) and the Wayland socket at slot 4. */
+    oxui_set_wl_slot(4);
     oxui_window *w = oxui_window_create("rings", 256, 256);
     if (!w)
         return 1;

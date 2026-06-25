@@ -1,6 +1,8 @@
-// sysmon — a system-monitor oxui app. Links the client stack: libwayland + libffi
-// + libxkbcommon (oxui needs it for keys) + FreeType (oxui_text) + oxui + the app.
+// sysmon — a system-monitor oxui app. §96 Phase 3/4: oxui + libwayland + libffi live in
+// /lib/liboxui.so (linked dynamically via the shared helper below); sysmon statically
+// links only libxkbcommon + FreeType + the app, and imports oxui_* at runtime.
 use std::process::Command;
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../oxui/dynlink.rs"));
 
 fn harness(llvm_ar: &str, res_inc: &str) -> cc::Build {
     let mut b = cc::Build::new();
@@ -30,57 +32,10 @@ fn main() {
     .unwrap();
     let host = std::env::var("HOST").unwrap();
     let llvm_ar = format!("{}/lib/rustlib/{}/bin/llvm-ar", sysroot.trim(), host);
-    let llvm_nm = format!("{}/lib/rustlib/{}/bin/llvm-nm", sysroot.trim(), host);
 
-    // §96 Phase 3: sysmon links oxui DYNAMICALLY from /lib/liboxui.so instead of
-    // baking oxui.c + oxui_text.c into its own binary. Build the .so first so the
-    // linker can resolve sysmon.c's oxui_* calls against it (DT_NEEDED liboxui.so).
-    let oxui_out = format!("{dir}/../oxui/out");
-    let st = Command::new("bash").arg(format!("{dir}/../oxui/build-so.sh")).status().unwrap();
-    assert!(st.success(), "build-so.sh failed");
-
-    // Dynamic link: PT_INTERP=/lib/ld-oxbow, eager binding, sysv hash (ld-oxbow reads
-    // DT_HASH nchain).
-    println!("cargo:rustc-link-arg=-T{dir}/user-dyn.ld");
-    println!("cargo:rustc-link-arg=-dynamic-linker");
-    println!("cargo:rustc-link-arg=/lib/ld-oxbow");
-    println!("cargo:rustc-link-arg=-z");
-    println!("cargo:rustc-link-arg=now");
-    println!("cargo:rustc-link-arg=--hash-style=sysv");
-    println!("cargo:rustc-link-arg=-L{oxui_out}");
-    println!("cargo:rustc-link-arg=-loxui");
-
-    // sysmon.c doesn't directly reference the libc/wayland/ffi/xkb/freetype symbols
-    // that liboxui.so imports (oxui did, and it's now in the .so) — so the linker won't
-    // pull those archive members on its own (a shared lib's UNDEFs are runtime, not
-    // link-time), and they wouldn't be in sysmon's .dynsym for ld-oxbow to resolve the
-    // .so against. Two link args, both driven by the .so's undefined-symbol set (auto-
-    // extracted with llvm-nm so it never goes stale when oxui adds an import):
-    //   --undefined=SYM    force the archive member defining SYM to be pulled in.
-    //   --dynamic-list F   export EXACTLY these symbols into .dynsym. (NOT --export-
-    //     dynamic: that exports/retains ALL globals, which drags in unreferenced
-    //     server-side wayland code — wl_display_connect->unsetenv, wl_os_accept_cloexec
-    //     ->accept — that oxbow-libc doesn't have. --dynamic-list lets --gc-sections
-    //     still drop those, while exporting the symbols the .so actually needs.)
-    let nm = Command::new(&llvm_nm)
-        .args(["--undefined-only", "--no-sort", &format!("{oxui_out}/liboxui.so")])
-        .output()
-        .unwrap();
-    let mut retained = 0;
-    for line in String::from_utf8_lossy(&nm.stdout).lines() {
-        if let Some(sym) = line.split_whitespace().last() {
-            if !sym.is_empty() && sym != "U" {
-                println!("cargo:rustc-link-arg=--undefined={sym}");
-                println!("cargo:rustc-link-arg=--export-dynamic-symbol={sym}");
-                retained += 1;
-            }
-        }
-    }
-    assert!(retained > 0, "no undefined symbols extracted from liboxui.so");
-    println!("cargo:rerun-if-changed=user-dyn.ld");
+    // §96 Phase 3/4: link oxui dynamically from /lib/liboxui.so (shared helper).
+    emit_oxui_dynlink(dir);
     println!("cargo:rerun-if-changed=src/sysmon.c");
-    println!("cargo:rerun-if-changed=../oxui/oxui.c");
-    println!("cargo:rerun-if-changed=../oxui/oxui_text.c");
     let res = String::from_utf8(
         Command::new("clang").args(["-print-resource-dir"]).output().unwrap().stdout,
     )

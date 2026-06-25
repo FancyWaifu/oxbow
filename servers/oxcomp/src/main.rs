@@ -72,21 +72,15 @@ pub extern "C" fn comp_server_launch_app(app_id: i32) -> i32 {
     m.data[0] = budget;
     m.data_len = 3;
     m.handle_count = 4;
-    if app_id == 3 || app_id == 1 {
-        // DOOM (3) AND §96 Phase 3 sysmon (1): filesystem cap on slot 1, console on slot
-        // 2, Wayland socket on slot 4 (oxui's `oxui_wl_slot` is set to 4 to match). DOOM
-        // keeps slot 1 for the WAD; dynamically-linked sysmon needs slot 1 = BOOT_FS_ROOT
-        // so ld-oxbow opens /lib/liboxui.so there (it has no other fs cap). Same layout.
-        m.handles[0] = BOOT_FS_ROOT; // slot 1: filesystem (BOOT_EP / ld-oxbow's /lib)
-        m.handles[1] = BOOT_CONSOLE; // slot 2: console (stdout)
-        m.handles[2] = cli; // slot 4: Wayland socket
-        m.handles[3] = HANDLE_NULL; // slot 20: unused
-    } else {
-        m.handles[0] = cli; // slot 1: Wayland socket
-        m.handles[1] = HANDLE_NULL; // slot 2: stdout (unused)
-        m.handles[2] = BOOT_CONSOLE; // slot 4: debug console
-        m.handles[3] = if app_id == 0 { BOOT_TERM_CHAN } else { HANDLE_NULL }; // slot 20: tty mirror
-    }
+    // §96 Phase 4: ALL oxui apps (oxterm 0, sysmon 1, wlclient 2, doom 3) are dynamically
+    // linked now, so every one needs BOOT_FS_ROOT at slot 1 (ld-oxbow opens /lib/liboxui.so
+    // there — they have no other fs cap; doom also opens its WAD via it), the console at
+    // slot 2, and the Wayland socket at slot 4 (each app calls oxui_set_wl_slot(4)). Only
+    // oxterm keeps the tty-output mirror (BOOT_TERM_CHAN) at slot 20; the rest get NULL.
+    m.handles[0] = BOOT_FS_ROOT; // slot 1: filesystem (BOOT_EP / ld-oxbow's /lib + doom WAD)
+    m.handles[1] = BOOT_CONSOLE; // slot 2: console (stdout)
+    m.handles[2] = cli; // slot 4: Wayland socket
+    m.handles[3] = if app_id == 0 { BOOT_TERM_CHAN } else { HANDLE_NULL }; // slot 20: tty mirror (oxterm)
     if rt::sys_spawn(img, BOOT_MEM, &m, HANDLE_NULL).is_ok() {
         w(b"[oxcomp] launched app from Activities\n");
         unsafe { ox_chan_fd(srv as u32) }
@@ -158,10 +152,13 @@ pub extern "C" fn oxbow_main() -> ! {
                                   // TWO 1.15 MB shm buffers for double-buffering; §63)
     m.data_len = 3; // data[1]/data[2] = empty argv
     m.handle_count = 4;
-    m.handles[0] = cli_end; // -> child slot 1 (the Wayland socket)
-    m.handles[1] = HANDLE_NULL; // slot 2 (stdout) — unused
-    m.handles[2] = BOOT_CONSOLE; // -> child slot 4: a console for debug logging
-    m.handles[3] = BOOT_TERM_CHAN; // -> child slot 20: the tty-output mirror channel (§53)
+    // §96 Phase 4: oxterm is dynamically linked now (oxui in /lib/liboxui.so), so it
+    // needs BOOT_FS_ROOT at slot 1 for ld-oxbow to open /lib, the Wayland socket moves
+    // to slot 4 (term.c calls oxui_set_wl_slot(4)), and the tty mirror stays at slot 20.
+    m.handles[0] = oxbow_abi::BOOT_FS_ROOT; // -> slot 1: filesystem (ld-oxbow's /lib)
+    m.handles[1] = BOOT_CONSOLE; // -> slot 2: console (stdout / debug)
+    m.handles[2] = cli_end; // -> slot 4: the Wayland socket
+    m.handles[3] = BOOT_TERM_CHAN; // -> slot 20: the tty-output mirror channel (§53)
     if rt::sys_spawn(BOOT_IMG_OXTERM, BOOT_MEM, &m, exit).is_err() {
         w(b"[oxcomp] failed to spawn the terminal\n");
         park();
