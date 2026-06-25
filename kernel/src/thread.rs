@@ -32,7 +32,17 @@ fn announce_first_cr3(proc: usize) {
 // §104: bumped 32 -> 256 so a thread-heavy std program (e.g. a libtest run, or an
 // mpsc stress test spawning ~100 senders) doesn't exhaust the pool. ~4 MiB of BSS.
 pub const MAX_THREADS: usize = 256;
-const KSTACK_SIZE: usize = 16 * 1024;
+// 32 KiB per-thread kernel stack. 16 KiB was too small: a dual-load spawn (§96 —
+// `proc::load_into` maps the interpreter's image AND the executable's, holding two
+// ~1.8 KiB `Image` snapshots plus the page-mapping loop) overflowed past the bottom
+// of the spawning thread's kstack into the ADJACENT thread's kstack, silently
+// corrupting its saved switch context → a later `switch_to` `ret`'d into a clobbered
+// (zeroed) return slot → kernel #PF at rip=0. The canary below catches a recurrence.
+const KSTACK_SIZE: usize = 32 * 1024;
+/// Sentinel written at the BOTTOM word of every kernel stack; `switch_to` checks the
+/// outgoing thread's word still holds it. A mismatch = that thread overflowed its
+/// kstack (and likely corrupted a neighbour) — fail loud instead of a silent rip=0.
+const KSTACK_CANARY: u64 = 0x5341_4645_4b53_544b; // "KTSKEFAS" — recognisable in a dump
 /// The boot thread becomes the idle thread; it is never in the Ready set.
 const IDLE: usize = 0;
 
@@ -262,7 +272,11 @@ pub fn init() {
 /// Build a fake initial stack frame so the first switch into this thread
 /// "returns" into the trampoline with entry in r12 and args in r13/r14.
 fn init_stack(slot: usize, entry: u64, arg1: u64, arg2: u64) -> (u64, u64) {
-    let top = unsafe { addr_of!(KSTACKS[slot]) as u64 } + KSTACK_SIZE as u64;
+    let bottom = unsafe { addr_of!(KSTACKS[slot]) as u64 };
+    // Stamp the overflow canary at the lowest word — an overflow grows down toward
+    // it (and then into the neighbouring slot), so clobbering it is the first sign.
+    unsafe { *(bottom as *mut u64) = KSTACK_CANARY };
+    let top = bottom + KSTACK_SIZE as u64;
     let mut sp = top;
     let mut push = |v: u64| {
         sp -= 8;
@@ -526,6 +540,16 @@ fn switch_to(next: usize) {
     if prev == next {
         sched_unlock(); // nothing to switch to; release the lock the caller took
         return;
+    }
+    // Kstack-overflow tripwire: the outgoing thread is about to have its context
+    // saved on its kstack — if it overflowed, its bottom canary is gone (and it has
+    // likely already corrupted a neighbour's saved frame). Fail loud, not a silent
+    // rip=0 ten switches later. NO_PROC/idle threads run on dedicated stacks, skip.
+    if prev != crate::percpu::idle_tid() {
+        let bot = unsafe { *(addr_of!(KSTACKS[prev]) as *const u64) };
+        if bot != KSTACK_CANARY {
+            panic!("kstack overflow: tcb {} clobbered its canary (got {:#x})", prev, bot);
+        }
     }
     // §74 on_cpu maintenance (under SCHED_LOCK): prev leaves this CPU, next arrives.
     // Clearing prev here — before `context_switch` saves its context — is safe because
