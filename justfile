@@ -217,6 +217,10 @@ _iso:
     # and both share one runtime state (the mechanism a shared liboxui needs in Phase 3).
     [ -f servers/dyntest/out/libacc.so ] && cp servers/dyntest/out/libacc.so build/initrd/lib/libacc.so || true
     [ -f servers/dyntest/out/dyntwo ] && cp servers/dyntest/out/dyntwo build/initrd/bin/dyntwo || true
+    # §96 Phase 3: oxui as a shared library. /lib/liboxui.so (built by
+    # servers/oxui/build-so.sh) — its consumers (sysmon etc., dynamically linked) get
+    # the .so resolved by ld-oxbow at runtime, so an oxui change rebuilds only the .so.
+    [ -f servers/oxui/out/liboxui.so ] && cp servers/oxui/out/liboxui.so build/initrd/lib/liboxui.so || true
     # /usr/include (§36): oxbow-libc headers (stdio.h, string.h, …) at
     # /usr/include + tcc's own builtin headers (stdarg.h, stddef.h, …) at
     # /usr/lib/tcc/include. tcc's default sysinclude path is "{B}/include:

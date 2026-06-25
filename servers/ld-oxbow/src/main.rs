@@ -45,9 +45,13 @@ const R_X86_64_RELATIVE: u32 = 8;
 
 const PAGE: u64 = 4096;
 const SCRATCH: u64 = 0x5000_0000; // where we read a .so file before mapping its segments
-// Sized to fit the default 256 KiB program budget (a small .so + its mapping). Phase
-// 3's liboxui.so will need a larger spawn budget; bump both then.
-const SCRATCH_LEN: u64 = 128 * 1024;
+// ld-oxbow reads a whole .so file into this scratch before mapping its segments, so
+// SCRATCH_LEN must exceed the largest .so. §96 Phase 3: liboxui.so is ~350 KiB (the
+// embedded DejaVu font in oxui_text dominates), so 1 MiB with headroom. The spawning
+// program's Memory budget must cover this scratch + the .so's mapped segments: the
+// tiny dyntest libs run under the shell's 64 MiB foreground budget, sysmon under its
+// 24 MiB. A /bin program on the 256 KiB default budget can only load a SMALL .so.
+const SCRATCH_LEN: u64 = 1024 * 1024;
 const SO_BASE_START: u64 = 0x3000_0000; // shared objects bump from here
 
 const MAX_OBJS: usize = 8;
