@@ -3205,6 +3205,19 @@ const ext4_direntry *ext4_dir_entry_next(ext4_dir *dir)
 		goto Finish;
 	}
 
+	/* A successful seek can still land with no current entry (it.curr == NULL):
+	 * e.g. next_off at a block boundary, or offset 0 of a directory whose first
+	 * block is a hole. Dereferencing it.curr below (ext4_dir_en_get_name_len etc.)
+	 * would then fault on a NULL pointer — and in fsd that fault kills the whole
+	 * filesystem server (a confined user's `ls` of such a directory took it down).
+	 * Treat it as end-of-directory instead. */
+	if (!it.curr) {
+		dir->next_off = EXT4_DIR_ENTRY_OFFSET_TERM;
+		ext4_dir_iterator_fini(&it);
+		ext4_fs_put_inode_ref(&dir_inode);
+		goto Finish;
+	}
+
 	memset(&dir->de.name, 0, sizeof(dir->de.name));
 	name_length = ext4_dir_en_get_name_len(&dir->f.mp->fs.sb,
 					       it.curr);
