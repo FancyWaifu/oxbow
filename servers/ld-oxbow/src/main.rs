@@ -44,7 +44,13 @@ const R_X86_64_JUMP_SLOT: u32 = 7;
 const R_X86_64_RELATIVE: u32 = 8;
 
 const PAGE: u64 = 4096;
-const SCRATCH: u64 = 0x5000_0000; // where we read a .so file before mapping its segments
+// §96 Phase 3: ld-oxbow's working regions MUST avoid the consuming program's oxbow-rt
+// vaddr layout, because ld-oxbow's mappings persist after it jmps to the exe. rt's heap
+// is [0x3000_0000, 0x3400_0000) and rt's shm/mmap window is [0x4000_0000, 0x6000_0000)
+// (rt/src/lib.rs). The .so (whose code the exe RUNS) and the scratch both live ABOVE
+// that, clear of the stack at 0x7fff_*. (dynhello/dyntwo used raw C with no rt heap/shm,
+// so the old 0x3000_0000/0x5000_0000 never collided — sysmon's first Vec alloc did.)
+const SCRATCH: u64 = 0x7000_0000; // where we read a .so file before mapping its segments
 // ld-oxbow reads a whole .so file into this scratch before mapping its segments, so
 // SCRATCH_LEN must exceed the largest .so. §96 Phase 3: liboxui.so is ~350 KiB (the
 // embedded DejaVu font in oxui_text dominates), so 1 MiB with headroom. The spawning
@@ -52,7 +58,7 @@ const SCRATCH: u64 = 0x5000_0000; // where we read a .so file before mapping its
 // tiny dyntest libs run under the shell's 64 MiB foreground budget, sysmon under its
 // 24 MiB. A /bin program on the 256 KiB default budget can only load a SMALL .so.
 const SCRATCH_LEN: u64 = 1024 * 1024;
-const SO_BASE_START: u64 = 0x3000_0000; // shared objects bump from here
+const SO_BASE_START: u64 = 0x6800_0000; // shared objects bump from here (clear of rt heap+shm)
 
 const MAX_OBJS: usize = 8;
 

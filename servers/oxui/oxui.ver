@@ -1,0 +1,11 @@
+/* §96 Phase 3: export ONLY oxui's public API from liboxui.so; hide the bundled
+ * wayland/ffi internals (local: *). Combined with --gc-sections this lets the linker
+ * DROP the wayland code that oxui never reaches (e.g. the by-name wl_display_connect
+ * networking path: socket/connect/accept/getenv/...) instead of a -shared lib's default
+ * "retain every global", which dragged in a pile of libc deps oxbow-libc lacks. */
+OXUI_1.0 {
+    global:
+        oxui_*;
+    local:
+        *;
+};

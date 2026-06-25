@@ -3,7 +3,11 @@
 #include <stddef_shim.h>
 #include <stdarg.h>
 typedef struct FILE FILE;
-extern FILE *stdin, *stdout, *stderr;
+extern FILE *stdin, *stdout;
+/* §96 Phase 3: stderr via a function (same non-PIE-exe-can't-export-DATA reason as
+ * errno). dynamically-linked code reaches it through __stderrp() (a JUMP_SLOT import). */
+FILE *__stderrp(void);
+#define stderr (__stderrp())
 #define EOF (-1)
 #define SEEK_SET 0
 #define SEEK_CUR 1

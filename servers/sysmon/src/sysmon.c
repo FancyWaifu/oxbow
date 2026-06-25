@@ -76,9 +76,14 @@ draw(oxui_window *w, oxui_canvas c, void *user)
     }
 }
 
+extern void oxui_set_wl_slot(int); /* from liboxui.so (§96 Phase 3) */
+
 int
 main(void)
 {
+    /* §96 Phase 3: sysmon is dynamically linked, so oxcomp hands it BOOT_FS_ROOT at
+     * slot 1 (ld-oxbow opens /lib/liboxui.so there) and the Wayland socket at slot 4. */
+    oxui_set_wl_slot(4);
     oxui_window *w = oxui_window_create("system monitor", 360, 200);
     if (!w)
         return 1;

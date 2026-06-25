@@ -72,12 +72,12 @@ pub extern "C" fn comp_server_launch_app(app_id: i32) -> i32 {
     m.data[0] = budget;
     m.data_len = 3;
     m.handle_count = 4;
-    if app_id == 3 {
-        // DOOM: filesystem cap on slot 1 (BOOT_EP, so doomgeneric opens /doom1.wad via
-        // stdio), console on slot 2 (BOOT_CONSOLE — oxbow-libc's stdout, routed to the
-        // console by rt::stdout_write's mode-3 fallback), and the Wayland socket on slot
-        // 4 (oxui's `oxui_wl_slot` is set to 4 to match).
-        m.handles[0] = BOOT_FS_ROOT; // slot 1: filesystem (BOOT_EP)
+    if app_id == 3 || app_id == 1 {
+        // DOOM (3) AND §96 Phase 3 sysmon (1): filesystem cap on slot 1, console on slot
+        // 2, Wayland socket on slot 4 (oxui's `oxui_wl_slot` is set to 4 to match). DOOM
+        // keeps slot 1 for the WAD; dynamically-linked sysmon needs slot 1 = BOOT_FS_ROOT
+        // so ld-oxbow opens /lib/liboxui.so there (it has no other fs cap). Same layout.
+        m.handles[0] = BOOT_FS_ROOT; // slot 1: filesystem (BOOT_EP / ld-oxbow's /lib)
         m.handles[1] = BOOT_CONSOLE; // slot 2: console (stdout)
         m.handles[2] = cli; // slot 4: Wayland socket
         m.handles[3] = HANDLE_NULL; // slot 20: unused

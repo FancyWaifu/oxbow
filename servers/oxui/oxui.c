@@ -11,6 +11,13 @@ extern int ox_chan_fd(unsigned int);      /* oxbow: inherited Wayland socket (sl
  * BEFORE calling oxui_window_create. */
 int oxui_wl_slot = 1;
 
+/* §96 Phase 3: a setter for the Wayland slot. A STATICALLY-linked app (DOOM) can write
+ * oxui_wl_slot directly, but a DYNAMICALLY-linked app (oxui in liboxui.so) must not —
+ * a non-PIE exe writing this .so data global would emit an R_X86_64_COPY relocation,
+ * which ld-oxbow doesn't implement (and which would split the variable into two copies).
+ * A setter CALL is an ordinary JUMP_SLOT import, so it stays COPY-free. */
+void oxui_set_wl_slot(int slot) { oxui_wl_slot = slot; }
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>

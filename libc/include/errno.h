@@ -1,6 +1,11 @@
 #ifndef _ERRNO_H
 #define _ERRNO_H
-extern int errno;
+/* §96 Phase 3: errno via a function, not a bare data symbol. A non-PIE oxbow exe can't
+ * export DATA to a .so, so dynamically-linked code (oxui/wayland in liboxui.so) reaches
+ * errno through __errno_location() (a JUMP_SLOT import). Static code resolves it locally.
+ * Transparent: `errno = x`, `if (errno)`, `&errno` all still work through the macro. */
+int *__errno_location(void);
+#define errno (*__errno_location())
 #define ENOENT 2
 #define EINTR 4
 #define EIO 5

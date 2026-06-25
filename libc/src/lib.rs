@@ -3257,6 +3257,24 @@ pub static mut errno: i32 = 0;
 #[no_mangle]
 pub static mut environ: *const *const u8 = core::ptr::null();
 
+// §96 Phase 3: accessor for errno. A DATA symbol can't cross the exe<->.so boundary
+// on oxbow (non-PIE exes can't export data to a DSO), so dynamically-linked C code
+// (oxui/wayland in liboxui.so) reaches errno through this FUNCTION (errno.h #defines
+// `errno` to `(*__errno_location())`). Statically-linked code uses the same path,
+// resolved locally. Single-threaded today, so one global suffices.
+#[no_mangle]
+pub extern "C" fn __errno_location() -> *mut i32 {
+    core::ptr::addr_of_mut!(errno)
+}
+
+// §96 Phase 3: accessor for `stderr` (same DATA-across-the-.so-boundary reason).
+// stdio.h #defines `stderr` to `__stderrp()`; returns the live pointer (set to
+// &F_STDERR at libc init) so the .so shares the exe's one FILE.
+#[no_mangle]
+pub unsafe extern "C" fn __stderrp() -> *mut FILE {
+    stderr
+}
+
 // --- stubs (features that won't run on oxbow but must link) ---
 #[no_mangle]
 pub extern "C" fn getenv(_name: *const u8) -> *const u8 {
