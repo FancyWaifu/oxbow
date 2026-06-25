@@ -54,6 +54,60 @@ blit_glyph(uint32_t *buf, int bw, int bh, FT_Bitmap *bmp, int px, int py,
     }
 }
 
+/* §perf: glyph rasterization cache. render_grid used to call FT_Load_Char
+ * (FreeType rasterization — hinting + rendering) for EVERY non-space cell on
+ * EVERY frame. A maximized/full-screen terminal has thousands of cells, so that
+ * was thousands of re-rasterizations per frame — the dominant cost that made
+ * maximized terminals crawl, and under continuous output let the tty pipe back up
+ * into an apparent freeze. Cache the rasterized bitmap + metrics keyed by
+ * codepoint so a repeat glyph (almost all of them) is just a blit. The font size
+ * is fixed (16px set once in term_init), so cached entries never invalidate. */
+struct glyph_cache_entry {
+    int       valid;
+    int       left, top; /* FT_GlyphSlot bitmap_left / bitmap_top */
+    FT_Bitmap bmp;       /* metrics + a malloc'd copy of the coverage buffer */
+};
+#define GLYPH_CACHE_N 128 /* ASCII covers the overwhelming bulk of terminal text */
+static struct glyph_cache_entry g_glyphs[GLYPH_CACHE_N];
+
+/* A rasterized glyph for `ch`, from cache when possible. ASCII codepoints are
+ * cached (rasterized once, then reused); rarer codepoints rasterize into a scratch
+ * entry that borrows FreeType's own slot buffer (valid until the next FT_Load_Char,
+ * which is fine — the caller blits it immediately). NULL if it can't be loaded. */
+static struct glyph_cache_entry *
+glyph_for(uint32_t ch)
+{
+    if (ch < GLYPH_CACHE_N) {
+        struct glyph_cache_entry *g = &g_glyphs[ch];
+        if (g->valid)
+            return g;
+        if (FT_Load_Char(ft_face, ch, FT_LOAD_RENDER))
+            return NULL;
+        FT_GlyphSlot s = ft_face->glyph;
+        int pitch = s->bitmap.pitch < 0 ? -s->bitmap.pitch : s->bitmap.pitch;
+        int sz = pitch * (int)s->bitmap.rows;
+        g->bmp = s->bitmap;
+        g->bmp.buffer = NULL;
+        if (sz > 0) {
+            g->bmp.buffer = malloc(sz);
+            if (!g->bmp.buffer)
+                return NULL; /* OOM: leave uncached, retry next frame */
+            memcpy(g->bmp.buffer, s->bitmap.buffer, sz);
+        }
+        g->left = s->bitmap_left;
+        g->top = s->bitmap_top;
+        g->valid = 1;
+        return g;
+    }
+    static struct glyph_cache_entry scratch;
+    if (FT_Load_Char(ft_face, ch, FT_LOAD_RENDER))
+        return NULL;
+    scratch.bmp = ft_face->glyph->bitmap; /* borrows FT's slot buffer (used now) */
+    scratch.left = ft_face->glyph->bitmap_left;
+    scratch.top = ft_face->glyph->bitmap_top;
+    return &scratch;
+}
+
 /* Render the libvterm screen grid into the oxui canvas with FreeType. */
 static void
 render_grid(uint32_t *buf, int bw, int bh)
@@ -73,12 +127,12 @@ render_grid(uint32_t *buf, int bw, int bh)
             uint32_t ch = cell.chars[0];
             if (ch == 0 || ch == ' ')
                 continue;
-            if (FT_Load_Char(ft_face, ch, FT_LOAD_RENDER))
+            struct glyph_cache_entry *g = glyph_for(ch);
+            if (!g)
                 continue;
-            FT_GlyphSlot g = ft_face->glyph;
-            int px = c * cell_w + g->bitmap_left;
-            int py = r * cell_h + baseline - g->bitmap_top;
-            blit_glyph(buf, bw, bh, &g->bitmap, px, py, fg, bg);
+            int px = c * cell_w + g->left;
+            int py = r * cell_h + baseline - g->top;
+            blit_glyph(buf, bw, bh, &g->bmp, px, py, fg, bg);
         }
     }
 }
