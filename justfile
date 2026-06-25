@@ -211,6 +211,12 @@ _iso:
     # ld-oxbow, which links libadd.so and prints "ld-oxbow OK: 3+4=7".
     [ -f servers/dyntest/out/libadd.so ] && cp servers/dyntest/out/libadd.so build/initrd/lib/libadd.so || true
     [ -f servers/dyntest/out/dynhello ] && cp servers/dyntest/out/dynhello build/initrd/bin/dynhello || true
+    # §96 Phase 2: single-runtime symbol scope. /lib/libacc.so + /bin/dyntwo. dyntwo
+    # imports accumulate() from libacc.so; libacc.so calls BACK into dyntwo's exported
+    # exe_add() (--dynamic-list). exit 15 proves the .so->exe callback resolves exe-first
+    # and both share one runtime state (the mechanism a shared liboxui needs in Phase 3).
+    [ -f servers/dyntest/out/libacc.so ] && cp servers/dyntest/out/libacc.so build/initrd/lib/libacc.so || true
+    [ -f servers/dyntest/out/dyntwo ] && cp servers/dyntest/out/dyntwo build/initrd/bin/dyntwo || true
     # /usr/include (§36): oxbow-libc headers (stdio.h, string.h, …) at
     # /usr/include + tcc's own builtin headers (stdarg.h, stddef.h, …) at
     # /usr/lib/tcc/include. tcc's default sysinclude path is "{B}/include:

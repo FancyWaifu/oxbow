@@ -1,0 +1,7 @@
+/* §96 Phase 2: symbols the EXE exports into its .dynsym so a .so can import them.
+ * This is the curated export list the real libc set will use in Phase 3 (malloc,
+ * free, memcpy, ...). Here, just the one callback the .so needs. Functions only —
+ * no data symbols, so no R_X86_64_COPY relocations. */
+{
+    exe_add;
+};
