@@ -59,10 +59,14 @@ pub extern "C" fn comp_server_launch_app(app_id: i32) -> i32 {
         BOOT_TERM_CHAN,
     };
     let (img, budget): (Handle, u64) = match app_id {
-        0 => (BOOT_IMG_OXTERM, 36 * 1024 * 1024),
-        1 => (BOOT_IMG_SYSMON, 24 * 1024 * 1024),
-        2 => (BOOT_IMG_WLCLIENT, 16 * 1024 * 1024),
-        3 => (BOOT_IMG_DOOM, 24 * 1024 * 1024), // TEMP: test sysmon's working budget
+        // §maximize: a window can be maximized to the full screen, so every app that
+        // renders NATIVELY at the new size needs budget for a full-screen DOUBLE buffer
+        // (2 x 1280x800x4 = ~8 MB) on top of its working set — else create_shm OOMs and
+        // oxui falls back to the small buffer + the compositor upscales (blurry/slow).
+        0 => (BOOT_IMG_OXTERM, 40 * 1024 * 1024),
+        1 => (BOOT_IMG_SYSMON, 32 * 1024 * 1024),
+        2 => (BOOT_IMG_WLCLIENT, 32 * 1024 * 1024),
+        3 => (BOOT_IMG_DOOM, 24 * 1024 * 1024), // DOOM scales (fixed 320x200), no big buffer
         _ => return -1,
     };
     let Some((srv, cli)) = rt::channel::pair() else {
@@ -148,8 +152,8 @@ pub extern "C" fn oxbow_main() -> ! {
     // we can tell when it dies).
     let exit = rt::sys_notif_create().unwrap_or(HANDLE_NULL);
     let mut m = MsgBuf::new(0);
-    m.data[0] = 36 * 1024 * 1024; // child Memory budget (FreeType + vterm + font +
-                                  // TWO 1.15 MB shm buffers for double-buffering; §63)
+    m.data[0] = 40 * 1024 * 1024; // child Memory budget (FreeType + vterm + font +
+                                  // a full-screen DOUBLE buffer for maximize; §63/§maximize)
     m.data_len = 3; // data[1]/data[2] = empty argv
     m.handle_count = 4;
     // §96 Phase 4: oxterm is dynamically linked now (oxui in /lib/liboxui.so), so it
