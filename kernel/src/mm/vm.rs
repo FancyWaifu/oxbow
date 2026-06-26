@@ -430,6 +430,34 @@ pub fn map_mmio_4k_in(pml4_phys: u64, virt: u64, phys: u64) {
     }
 }
 
+/// Map one 4 KiB framebuffer page WRITE-COMBINING into a user address space (§perf).
+/// PWT set + PCD clear selects IA32_PAT slot 1, which `arch::program_pat()` set to WC.
+/// WC coalesces the compositor's sequential pixel writes into burst transfers — UC
+/// (`map_mmio_4k_in`) made every write a separate uncached transaction, so a
+/// full-screen 1080p flush (8 MiB) stalled the CPU (the "fullscreen is slow/choppy"
+/// cause). NX + writable like the MMIO path; the phys range is the linear framebuffer
+/// (device VRAM under Limine/QEMU std-VGA), not RAM, so no frame is consumed.
+pub fn map_fb_wc_4k_in(pml4_phys: u64, virt: u64, phys: u64) {
+    assert!(virt < 0x0000_8000_0000_0000, "fb vaddr must be lower half");
+    let flags = Flags::PRESENT
+        | Flags::USER_ACCESSIBLE
+        | Flags::WRITABLE
+        | Flags::NO_EXECUTE
+        | Flags::WRITE_THROUGH; // PWT=1, PCD=0 → PAT slot 1 = Write-Combining
+    let hhdm = VirtAddr::new(super::hhdm_offset());
+    let l4: &mut PageTable = unsafe { &mut *(super::phys_to_virt(pml4_phys) as *mut PageTable) };
+    let mut mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
+    let mut falloc = PmmAlloc;
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+    let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys));
+    unsafe {
+        mapper
+            .map_to(page, frame, flags, &mut falloc)
+            .expect("vm: map_fb_wc_4k_in")
+            .ignore();
+    }
+}
+
 /// Like `map_mmio_4k_in` but into the KERNEL higher half (no USER bit) — for
 /// per-CPU device registers (the LAPIC, later the IOAPIC). The HHDM does not cover
 /// MMIO holes, and the higher-half PML4 entries are shared by every address space

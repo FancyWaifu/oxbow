@@ -993,19 +993,44 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
   /* §56: copy the frame into this view's backing store so the whole scene can be
    * recomposited in z-order (windows may overlap). */
   long need = (long)bw * bh * 4;
+  int old_bw = s->bw, old_bh = s->bh; /* §perf: previous frame's backing dims */
+  int realloced = 0;
   if (s->backing_cap < need) {
     free(s->backing);
     s->backing = malloc(need);
     s->backing_cap = s->backing ? need : 0;
+    realloced = 1;
   }
   s->bw = bw; /* §91: backing size; display w/h is set once (below) then resizable */
   s->bh = bh;
+  /* §perf damage-diff: compare each incoming row against the previous frame still in
+   * `backing` and record the changed buffer-row span [dy0,dy1). Only those rows get
+   * flushed to the framebuffer below — which on QEMU/TCG (and uncached real hw) is the
+   * dominant cost — so typing one character flushes ~1 row, not the whole 8 MiB screen
+   * (the "fullscreen typing is slow/choppy" cause). Valid only when this frame matches
+   * the previous in size (else `backing` holds a different layout / fresh garbage), so a
+   * resize / first map flushes the full window. */
+  int can_diff = s->mapped && !realloced && s->backing && old_bw == bw && old_bh == bh;
+  int dy0 = bh, dy1 = 0;
   wl_shm_buffer_begin_access(shm);
   unsigned char *data = wl_shm_buffer_get_data(shm);
-  if (s->backing)
-    for (int y = 0; y < bh; y++)
-      memcpy(s->backing + (long)y * bw, data + (long)y * stride, (size_t)bw * 4);
+  if (s->backing) {
+    for (int y = 0; y < bh; y++) {
+      unsigned int  *brow = s->backing + (long)y * bw;
+      unsigned char *srow = data + (long)y * stride;
+      if (can_diff) {
+        if (memcmp(brow, srow, (size_t)bw * 4) != 0) {
+          memcpy(brow, srow, (size_t)bw * 4);
+          if (y < dy0) dy0 = y;
+          dy1 = y + 1;
+        }
+      } else {
+        memcpy(brow, srow, (size_t)bw * 4);
+      }
+    }
+  }
   wl_shm_buffer_end_access(shm);
+  if (!can_diff) { dy0 = 0; dy1 = bh; } /* resize/first-map → flush the whole window */
   if (!s->mapped) {
     s->w = bw; /* first frame: display 1:1 with the buffer */
     s->h = bh;
@@ -1043,12 +1068,22 @@ static void surface_commit(struct wl_client *c, struct wl_resource *res)
     }
     composite_scene(); /* new window: place + focus → full recomposite */
   } else if (!s->minimized) {
-    /* §59: an animation frame only changed THIS window — damage just its area.
-     * §61: and skip the parts hidden behind windows above, so a window animating
-     * behind an opaque one costs only its VISIBLE area, not its full size.
-     * §93: a minimized window draws nothing (but still releases its buffer below
-     * and has its frame callback withheld, so the client pauses). */
-    composite_occluded(s, s->x, s->y - TBH, s->x + s->w, s->y + s->h);
+    /* §59/§61: an animation frame only changed THIS window — damage just its area,
+     * skipping parts hidden behind windows above. §perf: and within that, only the
+     * buffer ROWS that actually changed this frame (mapped to screen Y). dy0>=dy1 ⇒
+     * the new frame is byte-identical to the last → skip the framebuffer flush entirely
+     * (an animate app that didn't really change costs nothing). A full / resized frame
+     * (dy0==0,dy1==bh) flushes the whole window incl. the titlebar chrome.
+     * §93: a minimized window draws nothing (but still releases its buffer below). */
+    if (dy0 < dy1) {
+      if (dy0 == 0 && dy1 == bh) {
+        composite_occluded(s, s->x, s->y - TBH, s->x + s->w, s->y + s->h);
+      } else {
+        int sy0 = s->y + (int)((long)dy0 * s->h / bh);
+        int sy1 = s->y + (int)(((long)dy1 * s->h + bh - 1) / bh);
+        composite_occluded(s, s->x, sy0, s->x + s->w, sy1);
+      }
+    }
   }
   g_composited = 1;
   wl_buffer_send_release(s->buffer); /* client may reuse the buffer */

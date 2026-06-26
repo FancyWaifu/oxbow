@@ -1380,7 +1380,7 @@ fn sys_fb_info(fb: u64) -> SyscallRet {
 }
 
 /// `sys_fb_map(fb, vaddr) -> 0` — map the linear framebuffer's physical region
-/// into the caller's AS at `vaddr` (writable, uncacheable), one page at a time.
+/// into the caller's AS at `vaddr` (writable, WRITE-COMBINING), one page at a time.
 /// Needs a Framebuffer handle with R_MAP. The region is large but bounded by the
 /// mode (e.g. 1280x800x4 ≈ 4 MiB).
 fn sys_fb_map(fb: u64, vaddr: u64) -> SyscallRet {
@@ -1401,7 +1401,10 @@ fn sys_fb_map(fb: u64, vaddr: u64) -> SyscallRet {
         let _vm = mm::vm::lock_mut(); // §SMP: serialize the mapping in this AS
         let pml4 = mm::vm::current_pml4();
         for i in 0..pages {
-            mm::vm::map_mmio_4k_in(pml4, vaddr + i * 0x1000, info.phys + i * 0x1000);
+            // §perf: WRITE-COMBINING, not uncacheable — the compositor flushes the
+            // whole framebuffer per frame; UC made every pixel write a separate
+            // uncached transaction (choppy/slow at 1080p). WC bursts them.
+            mm::vm::map_fb_wc_4k_in(pml4, vaddr + i * 0x1000, info.phys + i * 0x1000);
         }
         Ok(())
     })())
