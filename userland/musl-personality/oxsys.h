@@ -35,6 +35,11 @@
 #define OX_SYS_SHM_MAP       43  /* (shm, vaddr) -> rdx = bytes mapped */
 #define OX_BOOT_MEM          3   /* the Memory cap handle granted at spawn */
 #define OX_CHAN_NONBLOCK     1   /* CHANNEL_RECV flag: don't block when empty */
+/* §102 pseudo-terminals — the kernel runs the line discipline (kernel/src/pty.rs). */
+#define OX_SYS_PTY_CREATE    70  /* () -> rdx = master | slave<<32 */
+#define OX_SYS_PTY_READ      71  /* (h, buf, len) -> rdx count (0=EOF) */
+#define OX_SYS_PTY_WRITE     72  /* (h, buf, len) -> rdx count */
+#define OX_SYS_PTY_IOCTL     73  /* (h, op, arg) -> rdx (op 0x100 = poll readiness) */
 
 /* CRITICAL: oxbow syscalls return TWO values (rax + RDX), unlike Linux (rax only).
  * So RDX is ALWAYS clobbered by the syscall — it must be an asm output, never left
@@ -168,6 +173,50 @@ static __inline long ox_shm_map(unsigned int h, unsigned long vaddr)
 	                     : "a"((long)OX_SYS_SHM_MAP), "D"((long)h), "S"(vaddr)
 	                     : "rcx", "r11", "memory");
 	return rax == 0 ? (long)rdx : 0;
+}
+
+/* §pty: create a pty; returns the master cap (>=0), writes the slave cap to *slave. */
+static __inline long ox_pty_create(unsigned int *slave)
+{
+	unsigned long rax, rdx;
+	__asm__ __volatile__("syscall"
+	                     : "=a"(rax), "=d"(rdx)
+	                     : "a"((long)OX_SYS_PTY_CREATE)
+	                     : "rcx", "r11", "memory");
+	if (rax != 0)
+		return -1;
+	if (slave)
+		*slave = (unsigned int)(rdx >> 32);
+	return (long)(rdx & 0xffffffffUL);
+}
+static __inline long ox_pty_read(unsigned int h, void *buf, unsigned long len)
+{
+	unsigned long rax, rdx = len;
+	__asm__ __volatile__("syscall"
+	                     : "=a"(rax), "+d"(rdx)
+	                     : "a"((long)OX_SYS_PTY_READ), "D"((long)h), "S"((long)buf)
+	                     : "rcx", "r11", "memory");
+	return rax == 0 ? (long)rdx : -1;
+}
+static __inline long ox_pty_write(unsigned int h, const void *buf, unsigned long len)
+{
+	unsigned long rax, rdx = len;
+	__asm__ __volatile__("syscall"
+	                     : "=a"(rax), "+d"(rdx)
+	                     : "a"((long)OX_SYS_PTY_WRITE), "D"((long)h), "S"((long)buf)
+	                     : "rcx", "r11", "memory");
+	return rax == 0 ? (long)rdx : -1;
+}
+/* op 0x100 = poll readiness (returns 1 if readable); else TCGETS/TCSETS/TIOC* with the
+ * user struct at `arg`. Returns rdx (or -1 on error). */
+static __inline long ox_pty_ioctl(unsigned int h, unsigned long op, unsigned long arg)
+{
+	unsigned long rax, rdx = arg;
+	__asm__ __volatile__("syscall"
+	                     : "=a"(rax), "+d"(rdx)
+	                     : "a"((long)OX_SYS_PTY_IOCTL), "D"((long)h), "S"(op)
+	                     : "rcx", "r11", "memory");
+	return rax == 0 ? (long)rdx : -1;
 }
 
 /* IPC-backed primitives provided by oxbow-rt (feature = "hosted"): stdout/stderr

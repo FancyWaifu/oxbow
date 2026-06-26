@@ -247,6 +247,12 @@ pub const SYS_SIGRETURN: u64 = 68;
 /// `dst` is validated against the CALLER's address space (a writable user page), so the
 /// replier can only ever write into the buffer the caller asked it to fill.
 pub const SYS_REPLY_BULK: u64 = 69;
+// §102 pseudo-terminals: a Pty object both a terminal (master) and shell (slave) hold
+// caps to; the kernel runs the line discipline (see kernel/src/pty.rs).
+pub const SYS_PTY_CREATE: u64 = 70; // () -> rdx = master_handle | slave_handle<<32
+pub const SYS_PTY_READ: u64 = 71; // (handle, buf, len) -> rdx count (0 = EOF). master or slave by cap.
+pub const SYS_PTY_WRITE: u64 = 72; // (handle, buf, len) -> rdx count. master = input (line discipline), slave = output.
+pub const SYS_PTY_IOCTL: u64 = 73; // (handle, op, arg) -> termios/winsize/ptn (TCGETS/TCSETS/TIOC*).
 pub const PROC_NAME_LEN: usize = 16;
 pub const PROC_STATE_ALIVE: u32 = 1;
 pub const PROC_STATE_DEAD: u32 = 2; // exited, slot not yet reused (zombie)

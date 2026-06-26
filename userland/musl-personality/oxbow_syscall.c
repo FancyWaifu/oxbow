@@ -70,6 +70,8 @@ static long do_clock_gettime(long id, struct ox_timespec *ts)
 #define K_LISTEN 7  /* a TCP listener; .handle = listener cap (accept mints K_SOCK fds) */
 #define K_CHAN   8  /* §wayland: a channel cap (the Wayland display socket); .handle = chan cap */
 #define K_SHM    9  /* §wayland: an shm/memfd region; .handle = shm cap (-1 until ftruncate), .size = bytes */
+#define K_PTYM   10 /* §pty: pty MASTER (.handle = master cap, .off = pts number) */
+#define K_PTYS   11 /* §pty: pty SLAVE  (.handle = slave cap) — the shell's controlling tty */
 struct oxfd {
 	int used;
 	int kind;
@@ -110,6 +112,12 @@ static int fd_alloc(long handle, unsigned long size)
 /* §wayland: vaddr bump for shm maps. Sits ABOVE oxbow-rt's anon mmap window
  * [0x4000_0000, 0x6000_0000) so the two never collide. */
 static unsigned long g_shm_next = 0x60000000UL;
+
+/* §pty: bridge open("/dev/ptmx") → open("/dev/pts/N"). When ptmx is opened we create
+ * the pty (master+slave caps) and stash (pts number → slave cap) here; the matching
+ * /dev/pts/N open consumes it. Small table covers a few concurrent openpty()s. */
+static struct { int n; long slave; } g_pts[4] = { { -1, -1 }, { -1, -1 }, { -1, -1 }, { -1, -1 } };
+static int g_pts_counter = 0;
 
 /* §wayland: wrap an inherited capability slot (the Wayland display channel oxcomp
  * hands the client at spawn) as a stream fd. A spawn-slot handle IS the small integer
@@ -154,10 +162,66 @@ static void fd_release(int fd)
 	fds[fd].used = 0;
 }
 
+/* Tiny strcmp/atoi (no <string.h> in this freestanding dispatcher). */
+static int peq(const char *a, const char *b)
+{
+	while (*a && *a == *b) { a++; b++; }
+	return *a == *b;
+}
+
 static long do_open(const char *path, long flags)
 {
 	if (!path)
 		return -E_FAULT;
+
+	/* §pty: open("/dev/ptmx") allocates a pty — the master fd here, the slave stashed
+	 * for the matching open("/dev/pts/N"). Makes musl's openpty()/forkpty() work. */
+	if (peq(path, "/dev/ptmx")) {
+		unsigned int slave = 0;
+		long master = ox_pty_create(&slave);
+		if (master < 0)
+			return -12; /* ENOMEM */
+		int slot = -1;
+		for (int i = 0; i < 4; i++)
+			if (g_pts[i].n < 0) { slot = i; break; }
+		if (slot < 0)
+			return -E_MFILE;
+		int n = g_pts_counter++;
+		g_pts[slot].n = n;
+		g_pts[slot].slave = (long)slave;
+		int fd = fd_alloc_kind(master, 0, K_PTYM);
+		if (fd < 0)
+			return -E_MFILE;
+		fds[fd].off = (unsigned long)n; /* the pts number, for TIOCGPTN */
+		return fd;
+	}
+	/* §shm: POSIX shared memory — musl's shm_open(name) opens "/dev/shm/name". Back it
+	 * with an oxbow shm region, exactly like memfd_create (ftruncate allocates it, mmap
+	 * maps it, and wl_shm_create_pool passes the fd to the compositor via SCM_RIGHTS).
+	 * havoc allocates its wl_shm pixel buffers this way. */
+	if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' &&
+	    path[4] == '/' && path[5] == 's' && path[6] == 'h' && path[7] == 'm' &&
+	    path[8] == '/') {
+		int fd = fd_alloc_kind(-1, 0, K_SHM);
+		return fd < 0 ? -E_MFILE : fd;
+	}
+	if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' &&
+	    path[3] == 'v' && path[4] == '/' && path[5] == 'p' && path[6] == 't' &&
+	    path[7] == 's' && path[8] == '/') {
+		/* open("/dev/pts/N") — hand back the slave stashed by the ptmx open. */
+		int n = 0;
+		for (const char *p = path + 9; *p >= '0' && *p <= '9'; p++)
+			n = n * 10 + (*p - '0');
+		for (int i = 0; i < 4; i++)
+			if (g_pts[i].n == n && g_pts[i].slave >= 0) {
+				long s = g_pts[i].slave;
+				g_pts[i].n = -1;
+				g_pts[i].slave = -1;
+				int fd = fd_alloc_kind(s, 0, K_PTYS);
+				return fd < 0 ? -E_MFILE : fd;
+			}
+		return -E_NOENT;
+	}
 	unsigned int ox = 0;
 	if (flags & LO_CREAT)
 		ox |= 1; /* FS_O_CREATE */
@@ -200,6 +264,8 @@ static long do_read(long fd, void *buf, unsigned long len)
 		if (fds[fd].kind == K_SOCK)
 			return fds[fd].handle < 0 ? -E_INVAL
 			                          : __oxbow_sock_recv(fds[fd].handle, buf, len);
+		if (fds[fd].kind == K_PTYM || fds[fd].kind == K_PTYS)
+			return ox_pty_read((unsigned int)fds[fd].handle, buf, len);
 		return -E_BADF; /* read on a write-only pipe end */
 	}
 	if (fd < 3) {
@@ -232,6 +298,8 @@ static long do_write(long fd, const void *buf, unsigned long len)
 		if (fds[fd].kind == K_SOCK)
 			return fds[fd].handle < 0 ? -E_INVAL
 			                          : __oxbow_sock_send(fds[fd].handle, buf, len);
+		if (fds[fd].kind == K_PTYM || fds[fd].kind == K_PTYS)
+			return ox_pty_write((unsigned int)fds[fd].handle, buf, len);
 		return -E_BADF; /* write on a read-only pipe end */
 	}
 	if (fd == 1 || fd == 2)
@@ -448,12 +516,13 @@ static long do_exec_spawn(const char *path, char *const argv[])
 	 * `awk | cmd` idiom: pipe()+fork()+dup2(we,1)+exec), hand the exec'd child that
 	 * pipe as its stdout instead of our tty. Otherwise inherit our SPAWN_STDOUT(=2). */
 	unsigned int stdout_cap = 2;
-	if (fds[1].used && fds[1].kind == K_PIPE_W)
+	if (fds[1].used && (fds[1].kind == K_PIPE_W || fds[1].kind == K_PTYS))
 		stdout_cap = (unsigned int)fds[1].handle;
 	/* Honor a dup2'd stdin too: popen("w") / a pipeline does dup2(pipe_r, 0) +
-	 * exec, so the child reads its stdin from the pipe. 0 = inherit ours. */
+	 * exec, so the child reads its stdin from the pipe. A forkpty child dup2's the
+	 * pty SLAVE onto 0/1/2 (login_tty), so it inherits the pty as its tty. 0 = ours. */
 	unsigned int stdin_cap = 0;
-	if (fds[0].used && fds[0].kind == K_PIPE_R)
+	if (fds[0].used && (fds[0].kind == K_PIPE_R || fds[0].kind == K_PTYS))
 		stdin_cap = (unsigned int)fds[0].handle;
 
 	unsigned int pid = 0;
@@ -1135,6 +1204,24 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		long fd = a1;
 		unsigned long req = (unsigned long)a2;
 		void *arg = (void *)a3;
+		/* §pty: ioctls on a pty master/slave fd (these are real ttys). */
+		if (fd >= 3 && fd < MAXFD && fds[fd].used &&
+		    (fds[fd].kind == K_PTYM || fds[fd].kind == K_PTYS)) {
+			unsigned int h = (unsigned int)fds[fd].handle;
+			if (fds[fd].kind == K_PTYM) {
+				if (req == TIOCGPTN) {
+					if (arg)
+						*(int *)arg = (int)fds[fd].off;
+					return 0;
+				}
+				if (req == TIOCSPTLCK)
+					return 0; /* unlock: noop */
+			}
+			if (req == TCGETS || req == TCSETS || req == TCSETSW || req == TCSETSF ||
+			    req == TIOCGWINSZ || req == TIOCSWINSZ)
+				return ox_pty_ioctl(h, req, (unsigned long)arg) < 0 ? -E_INVAL : 0;
+			return 0; /* other tty ioctls on a pty: benign success */
+		}
 		if (fd < 0 || fd > 2) /* only stdin/out/err are ttys for now */
 			return -E_NOTTY;
 		switch (req) {
@@ -1265,6 +1352,12 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 			 * message buffered, so wl_display_dispatch doesn't block on an empty fd. */
 			if (fd >= 0 && fd < MAXFD && fds[fd].used && fds[fd].kind == K_CHAN &&
 			    (re & 0x1) && !(ox_chan_poll((unsigned int)fds[fd].handle) & 1))
+				re &= ~0x1;
+			/* §pty: a pty fd reports POLLIN only when the kernel line discipline has a
+			 * line/byte ready (op 0x100 = readiness), so the terminal's poll loop sleeps. */
+			if (fd >= 0 && fd < MAXFD && fds[fd].used &&
+			    (fds[fd].kind == K_PTYM || fds[fd].kind == K_PTYS) &&
+			    (re & 0x1) && ox_pty_ioctl((unsigned int)fds[fd].handle, 0x100, 0) != 1)
 				re &= ~0x1;
 			pf[i].revents = re;
 			if (re)

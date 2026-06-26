@@ -468,6 +468,14 @@ pub unsafe extern "C" fn __oxbow_write(_fd: i32, buf: *const u8, len: usize) -> 
     // endpoint or a pipe, NOT a kernel Console cap, so the old
     // sys_console_write(BOOT_CONSOLE) silently dropped output (and std's stdout layer
     // then wedged). stdout/stderr both route here.
+    // §102: a forkpty child's stdout is a pty SLAVE — write through the pty (OPOST).
+    // SYS_PTY_WRITE on a non-pty cap returns BadType, so this is a no-op otherwise.
+    let (ptr, _) = unsafe {
+        syscall3(oxbow_abi::SYS_PTY_WRITE, SPAWN_STDOUT as u64, buf as u64, len as u64)
+    };
+    if SysError::from_raw(ptr).is_ok() {
+        return len as isize;
+    }
     let slice = unsafe { core::slice::from_raw_parts(buf, len) };
     stdout_write(slice);
     len as isize
@@ -493,6 +501,15 @@ pub const OXBOW_READ_EINTR: isize = -4;
 pub unsafe extern "C" fn __oxbow_read(_fd: i32, buf: *mut u8, len: usize) -> isize {
     if len == 0 {
         return 0;
+    }
+    // §102: a forkpty child's stdin is a pty SLAVE — read a cooked line through the
+    // kernel line discipline. SYS_PTY_READ on a non-pty cap returns BadType, so this
+    // probe is a no-op for ordinary (pipe / interactive-tty) stdin.
+    let (ptr, ptd) = unsafe {
+        syscall3(oxbow_abi::SYS_PTY_READ, SPAWN_STDIN as u64, buf as u64, len as u64)
+    };
+    if SysError::from_raw(ptr).is_ok() {
+        return ptd as isize;
     }
     // 1. Pipeline stdin: if SPAWN_STDIN is a real pipe, read from it. A genuine pipe
     //    returns rax=ok with rdx=count (0 = EOF, write side closed); a NULL/non-pipe

@@ -20,7 +20,9 @@ use oxbow_abi::{
     SYS_THREAD_ID, SYS_YIELD, SYS_PROC_KILL, SYS_PROC_LIST, SYS_KILL, SYS_SET_FSBASE, SYS_FORK,
     SYS_SET_FOREGROUND, SYS_TTY_INTR, SYS_SIGDISPATCH, SYS_SIGRETURN,
     ProcInfo,
-    SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_PIPE_EOF, CHAN_NONBLOCK, PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT,
+    SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_PIPE_EOF,
+    SYS_PTY_CREATE, SYS_PTY_READ, SYS_PTY_WRITE, SYS_PTY_IOCTL,
+    CHAN_NONBLOCK, PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT,
     R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM, PLEDGE_SPAWN, PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
     PLEDGE_PROC,
 };
@@ -173,6 +175,10 @@ pub extern "C" fn syscall_dispatch(
         SYS_PIPE_READ => sys_pipe_read(a1, a2, a3),
         SYS_PIPE_WRITE => sys_pipe_write(a1, a2, a3),
         SYS_PIPE_EOF => sys_pipe_eof(a1),
+        SYS_PTY_CREATE => sys_pty_create(),
+        SYS_PTY_READ => sys_pty_read(a1, a2, a3),
+        SYS_PTY_WRITE => sys_pty_write(a1, a2, a3),
+        SYS_PTY_IOCTL => sys_pty_ioctl(a1, a2, a3),
         SYS_EP_CREATE => sys_ep_create(),
         SYS_MINT => sys_mint(a1, a2, a3),
         SYS_PCI_READ => sys_pci_read(a1, a2),
@@ -1675,7 +1681,8 @@ fn pledge_class(nr: u64) -> u64 {
         SYS_SEND | SYS_RECV | SYS_RECV_NOTIF | SYS_CALL | SYS_REPLY | SYS_REPLY_BULK | SYS_EP_CREATE
         | SYS_MINT | SYS_PIPE
         | SYS_PIPE_READ | SYS_PIPE_WRITE | SYS_PIPE_EOF | SYS_CHANNEL_PAIR | SYS_CHANNEL_SEND
-        | SYS_CHANNEL_RECV | SYS_CHANNEL_CLOSE | SYS_CHANNEL_POLL | SYS_CHAN_WAIT => PLEDGE_IPC,
+        | SYS_CHANNEL_RECV | SYS_CHANNEL_CLOSE | SYS_CHANNEL_POLL | SYS_CHAN_WAIT
+        | SYS_PTY_CREATE | SYS_PTY_READ | SYS_PTY_WRITE | SYS_PTY_IOCTL => PLEDGE_IPC,
         SYS_MAP | SYS_PROTECT | SYS_IMMUTABLE | SYS_FRAME_ALLOC | SYS_FRAME_MAP | SYS_DMA_ALLOC
         | SYS_DMA_ALLOC_CONTIG | SYS_SHM_CREATE | SYS_SHM_MAP | SYS_SHM_PHYS => PLEDGE_MEM,
         SYS_CAP_TYPE | SYS_CAP_DUP => PLEDGE_IPC,
@@ -1836,6 +1843,214 @@ fn sys_pipe_eof(h: u64) -> SyscallRet {
         crate::thread::wake(t);
     }
     SyscallRet { rax: 0, rdx: 0 }
+}
+
+// ---- §102 pseudo-terminals ----
+
+/// `sys_pty_create()` — allocate a pty; returns master|slave<<32 in rdx (two caps in
+/// the caller, like SYS_CHANNEL_PAIR). The caller (openpty) keeps the master and hands
+/// the slave to the shell.
+fn sys_pty_create() -> SyscallRet {
+    let idx = match crate::pty::create() {
+        Some(i) => i,
+        None => return SyscallRet::err(SysError::NoMem),
+    };
+    let m = proc::with_current_mut(|p| {
+        p.alloc_slot(HandleEntry { obj: ObjectRef::PtyMaster(idx), rights: R_IN | R_OUT | R_GRANT, badge: 0 })
+    });
+    let s = proc::with_current_mut(|p| {
+        p.alloc_slot(HandleEntry { obj: ObjectRef::PtySlave(idx), rights: R_IN | R_OUT | R_GRANT, badge: 0 })
+    });
+    match (m, s) {
+        (Ok(mh), Ok(sh)) => SyscallRet { rax: 0, rdx: (mh as u64) | ((sh as u64) << 32) },
+        _ => SyscallRet::err(SysError::NoMem),
+    }
+}
+
+/// Resolve a Pty handle (requiring `right`) to (pool index, is_master).
+fn pty_of(h: u64, right: u32) -> SysResult<(u8, bool)> {
+    let e = proc::with_current(|p| p.lookup(h as Handle, ObjType::Pty, right))?;
+    match e.obj {
+        ObjectRef::PtyMaster(i) => Ok((i, true)),
+        ObjectRef::PtySlave(i) => Ok((i, false)),
+        _ => Err(SysError::BadType),
+    }
+}
+
+/// `sys_pty_read(handle, buf, len)` — read from the master (shell output) or slave
+/// (cooked input); blocks while empty, 0 at EOF. Count in rdx. (§70 sleep protocol.)
+fn sys_pty_read(h: u64, buf: u64, len: u64) -> SyscallRet {
+    let (idx, master) = match pty_of(h, R_IN) {
+        Ok(v) => v,
+        Err(e) => return SyscallRet::err(e),
+    };
+    let want = (len as usize).min(1024);
+    if want == 0 {
+        return SyscallRet { rax: 0, rdx: 0 };
+    }
+    let me = crate::thread::current();
+    loop {
+        if master {
+            crate::pty::park_master_reader(idx, me);
+        } else {
+            crate::pty::park_slave_reader(idx, me);
+        }
+        crate::thread::prepare_block();
+        let mut kbuf = [0u8; 1024];
+        let res = if master {
+            crate::pty::master_read(idx, &mut kbuf[..want])
+        } else {
+            crate::pty::slave_read(idx, &mut kbuf[..want])
+        };
+        let unpark = |idx, me| {
+            if master {
+                crate::pty::unpark_master_reader(idx, me)
+            } else {
+                crate::pty::unpark_slave_reader(idx, me)
+            }
+        };
+        match res {
+            crate::pty::ReadOut::Data(n) => {
+                crate::thread::cancel_block();
+                unpark(idx, me);
+                if usermem::check_user(buf, n, true).is_err() {
+                    return SyscallRet::err(SysError::Fault);
+                }
+                unsafe { core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf as *mut u8, n) };
+                return SyscallRet { rax: 0, rdx: n as u64 };
+            }
+            crate::pty::ReadOut::Eof => {
+                crate::thread::cancel_block();
+                unpark(idx, me);
+                return SyscallRet { rax: 0, rdx: 0 };
+            }
+            crate::pty::ReadOut::WouldBlock => {
+                crate::thread::block_current();
+            }
+        }
+    }
+}
+
+/// `sys_pty_write(handle, buf, len)` — master write = terminal input (runs the line
+/// discipline: echo + canonical/raw + signals); slave write = shell output (OPOST).
+/// Never blocks (a tty drops on overflow). Count consumed in rdx.
+fn sys_pty_write(h: u64, buf: u64, len: u64) -> SyscallRet {
+    let (idx, master) = match pty_of(h, R_OUT) {
+        Ok(v) => v,
+        Err(e) => return SyscallRet::err(e),
+    };
+    let total = (len as usize).min(1024);
+    if total == 0 {
+        return SyscallRet { rax: 0, rdx: 0 };
+    }
+    if usermem::check_user(buf, total, false).is_err() {
+        return SyscallRet::err(SysError::Fault);
+    }
+    let mut kbuf = [0u8; 1024];
+    unsafe { core::ptr::copy_nonoverlapping(buf as *const u8, kbuf.as_mut_ptr(), total) };
+    if master {
+        let ld = crate::pty::master_write(idx, &kbuf[..total]);
+        for &t in &ld.wake_master[..ld.nwake_master] {
+            crate::thread::wake(t);
+        }
+        for &t in &ld.wake_slave[..ld.nwake_slave] {
+            crate::thread::wake(t);
+        }
+        // ld.sig (Ctrl-C/\\) is recognized; async delivery to the fg process is a
+        // separate step (the personality notes async signals aren't wired yet).
+    } else {
+        let mut wake = [0usize; 8];
+        let nwake = crate::pty::slave_write(idx, &kbuf[..total], &mut wake);
+        for &t in &wake[..nwake] {
+            crate::thread::wake(t);
+        }
+    }
+    SyscallRet { rax: 0, rdx: total as u64 }
+}
+
+/// `sys_pty_ioctl(handle, op, arg)` — TCGETS/TCSETS (the 44-byte musl termios at
+/// `arg`), TIOCGWINSZ/TIOCSWINSZ (struct winsize). The /dev/ptmx indirection
+/// (TIOCGPTN/TIOCSPTLCK) is handled personality-side; here `_` is a benign no-op.
+fn sys_pty_ioctl(h: u64, op: u64, arg: u64) -> SyscallRet {
+    let (idx, master) = match pty_of(h, R_IN) {
+        Ok(v) => v,
+        Err(e) => return SyscallRet::err(e),
+    };
+    match op as u32 {
+        0x100 => {
+            // OXPTY_POLL (oxbow-internal): non-blocking readiness for poll(). 1=readable.
+            let readable = if master {
+                crate::pty::master_can_read(idx)
+            } else {
+                crate::pty::slave_can_read(idx)
+            };
+            SyscallRet { rax: 0, rdx: readable as u64 }
+        }
+        0x5401 => {
+            // TCGETS: build the cooked termios from the pty.
+            if usermem::check_user(arg, 44, true).is_err() {
+                return SyscallRet::err(SysError::Fault);
+            }
+            let (iflag, oflag, lflag, cc) = crate::pty::get_termios(idx);
+            let t = arg as *mut u8;
+            unsafe {
+                core::ptr::write_bytes(t, 0, 44);
+                core::ptr::write_unaligned(t as *mut u32, iflag);
+                core::ptr::write_unaligned(t.add(4) as *mut u32, oflag);
+                core::ptr::write_unaligned(t.add(8) as *mut u32, 0xbf); // c_cflag: CS8|CREAD
+                core::ptr::write_unaligned(t.add(12) as *mut u32, lflag);
+                for (i, &b) in cc.iter().enumerate() {
+                    *t.add(17 + i) = b;
+                }
+            }
+            SyscallRet { rax: 0, rdx: 0 }
+        }
+        0x5402 | 0x5403 | 0x5404 => {
+            // TCSETS/W/F: apply the termios (we ignore c_cflag).
+            if usermem::check_user(arg, 44, false).is_err() {
+                return SyscallRet::err(SysError::Fault);
+            }
+            let t = arg as *const u8;
+            let mut cc = [0u8; 19];
+            let (iflag, oflag, lflag);
+            unsafe {
+                iflag = core::ptr::read_unaligned(t as *const u32);
+                oflag = core::ptr::read_unaligned(t.add(4) as *const u32);
+                lflag = core::ptr::read_unaligned(t.add(12) as *const u32);
+                for (i, b) in cc.iter_mut().enumerate() {
+                    *b = *t.add(17 + i);
+                }
+            }
+            crate::pty::set_termios(idx, iflag, oflag, lflag, cc);
+            SyscallRet { rax: 0, rdx: 0 }
+        }
+        0x5413 => {
+            // TIOCGWINSZ
+            if usermem::check_user(arg, 8, true).is_err() {
+                return SyscallRet::err(SysError::Fault);
+            }
+            let (rows, cols) = crate::pty::get_winsize(idx);
+            let w = arg as *mut u16;
+            unsafe {
+                *w = rows;
+                *w.add(1) = cols;
+                *w.add(2) = 0;
+                *w.add(3) = 0;
+            }
+            SyscallRet { rax: 0, rdx: 0 }
+        }
+        0x5414 => {
+            // TIOCSWINSZ
+            if usermem::check_user(arg, 8, false).is_err() {
+                return SyscallRet::err(SysError::Fault);
+            }
+            let w = arg as *const u16;
+            let (rows, cols) = unsafe { (*w, *w.add(1)) };
+            crate::pty::set_winsize(idx, rows, cols);
+            SyscallRet { rax: 0, rdx: 0 }
+        }
+        _ => SyscallRet { rax: 0, rdx: 0 }, // benign: unsupported tty ioctls
+    }
 }
 
 /// Resolve a Channel handle to (conn, side), checking `right`.

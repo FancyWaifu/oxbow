@@ -20,6 +20,7 @@ pub enum ObjType {
     Framebuffer,
     Channel,
     Shm,
+    Pty,
 }
 
 /// What a handle points at: a pool index for Endpoint/Reply/Memory/Frame, or the
@@ -49,6 +50,11 @@ pub enum ObjectRef {
     /// A shared multi-page memory region (see shm.rs), by pool index — backs
     /// memfd/mmap + Wayland's wl_shm pixel buffers.
     Shm(u8),
+    /// One end of a pseudo-terminal (see pty.rs), by pool index. The MASTER is the
+    /// terminal emulator's side, the SLAVE is the shell's tty; the kernel runs the
+    /// line discipline between them.
+    PtyMaster(u8),
+    PtySlave(u8),
 }
 
 impl ObjectRef {
@@ -68,6 +74,7 @@ impl ObjectRef {
             ObjectRef::Framebuffer => ObjType::Framebuffer,
             ObjectRef::Channel { .. } => ObjType::Channel,
             ObjectRef::Shm(_) => ObjType::Shm,
+            ObjectRef::PtyMaster(_) | ObjectRef::PtySlave(_) => ObjType::Pty,
         }
     }
 }

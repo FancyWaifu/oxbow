@@ -95,6 +95,9 @@
 #define TCSETSW     0x5403
 #define TCSETSF     0x5404
 #define TIOCGWINSZ  0x5413
+#define TIOCSWINSZ  0x5414
+#define TIOCGPTN    0x80045430UL /* §pty: get the pts number */
+#define TIOCSPTLCK  0x40045431UL /* §pty: (un)lock the pts (noop here) */
 /* termios c_lflag bits / c_cc indices used in the cooked default */
 #define T_ISIG   0x0001
 #define T_ICANON 0x0002
