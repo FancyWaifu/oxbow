@@ -69,25 +69,6 @@ pub fn init() {
     idt::init();
     syscall::init();
     enable_sse();
-    program_pat();
-}
-
-/// §perf: reprogram IA32_PAT slot 1 to Write-Combining so the linear framebuffer
-/// can be mapped WC instead of UC. The default PAT is `0x0007_0406_0007_0406`, in
-/// which PA1 = Write-Through — a type the kernel never uses (no PTE sets PWT without
-/// PCD). We rewrite PA1 to `0x01` (WC), giving `0x0007_0406_0007_0401`; a PTE with
-/// PWT=1, PCD=0 then selects WC (`map_fb_wc_4k_in`). WC batches the compositor's
-/// sequential pixel writes into burst transactions, so a full-screen 1080p flush
-/// (~8 MiB) no longer stalls on per-write uncached round-trips (the "fullscreen is
-/// choppy/slow" cause). MUST be identical on every CPU — the page tables are shared
-/// but IA32_PAT is per-core — so this runs next to `enable_sse()` on the BSP AND each
-/// AP. Safe to write directly (no CR0.CD/WBINVD dance): it runs at boot before any WC
-/// mapping exists, and the slot it changes (WT) had no live mappings.
-pub fn program_pat() {
-    use x86_64::registers::model_specific::Msr;
-    const IA32_PAT: u32 = 0x277;
-    const PAT_WC_SLOT1: u64 = 0x0007_0406_0007_0401;
-    unsafe { Msr::new(IA32_PAT).write(PAT_WC_SLOT1) };
 }
 
 /// Enable SSE so userland may run SIMD code (the crypto in the DRIFT client
@@ -153,7 +134,6 @@ pub fn load_descriptor_tables_ap(cpu: usize) {
 pub fn init_ap_cpu() {
     syscall::init();
     enable_sse();
-    program_pat(); // §perf: same WC PAT on every CPU (page tables are shared, PAT is per-core)
 }
 
 /// §75 panic path: write to the console bypassing the `SERIAL1` lock (the other
