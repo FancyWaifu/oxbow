@@ -19,6 +19,27 @@ use oxbow_abi::{
 };
 use oxbow_rt as rt;
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// §maximize: the ACTUAL framebuffer resolution, published by `oxbow_main` once the
+/// display is up so the per-app spawn budgets can be sized from it (both the boot
+/// terminal and runtime Activities launches). Defaults to 1280x800 until set.
+static FB_W: AtomicU32 = AtomicU32::new(1280);
+static FB_H: AtomicU32 = AtomicU32::new(800);
+
+/// §maximize: memory budget for an app that re-renders NATIVELY on maximize — its
+/// working set PLUS a full-screen DOUBLE buffer at the REAL screen resolution, with
+/// headroom for oxui's non-destructive realloc (it keeps the old buffer mapped until
+/// the new, larger one is allocated, so the peak is ~3 full-screen buffers). Sizing
+/// this from the live framebuffer makes it correct at 1280x800, 1920x1080, 4K, … — a
+/// hardcoded 1280x800 assumption OOMed at 1080p, so create_shm fell back to the small
+/// buffer and the compositor UPSCALED the window (the "maximize blows up the text +
+/// goes slow" bug). `just play` runs at 1920x1080 (no virtio-gpu → Limine fb).
+fn app_budget(working_set_mb: u64) -> u64 {
+    let fb_bytes = FB_W.load(Ordering::Relaxed) as u64 * FB_H.load(Ordering::Relaxed) as u64 * 4;
+    working_set_mb * 1024 * 1024 + 4 * fb_bytes
+}
+
 fn w(s: &[u8]) {
     let _ = rt::sys_console_write(BOOT_CONSOLE, s.as_ptr(), s.len());
 }
@@ -63,9 +84,9 @@ pub extern "C" fn comp_server_launch_app(app_id: i32) -> i32 {
         // renders NATIVELY at the new size needs budget for a full-screen DOUBLE buffer
         // (2 x 1280x800x4 = ~8 MB) on top of its working set — else create_shm OOMs and
         // oxui falls back to the small buffer + the compositor upscales (blurry/slow).
-        0 => (BOOT_IMG_OXTERM, 40 * 1024 * 1024),
-        1 => (BOOT_IMG_SYSMON, 32 * 1024 * 1024),
-        2 => (BOOT_IMG_WLCLIENT, 32 * 1024 * 1024),
+        0 => (BOOT_IMG_OXTERM, app_budget(24)),
+        1 => (BOOT_IMG_SYSMON, app_budget(20)),
+        2 => (BOOT_IMG_WLCLIENT, app_budget(16)),
         3 => (BOOT_IMG_DOOM, 24 * 1024 * 1024), // DOOM scales (fixed 320x200), no big buffer
         _ => return -1,
     };
@@ -142,6 +163,11 @@ pub extern "C" fn oxbow_main() -> ! {
             (width, height, pitch)
         };
 
+    // §maximize: publish the real resolution so per-app spawn budgets fit a full-screen
+    // double buffer at THIS screen size (not a hardcoded 1280x800 that OOMs at 1080p).
+    FB_W.store(width, Ordering::Relaxed);
+    FB_H.store(height, Ordering::Relaxed);
+
     // A channel pair: one end becomes the client's Wayland socket, we keep the other.
     let Some((srv_end, cli_end)) = rt::channel::pair() else {
         w(b"[oxcomp] channel pair failed\n");
@@ -152,8 +178,10 @@ pub extern "C" fn oxbow_main() -> ! {
     // we can tell when it dies).
     let exit = rt::sys_notif_create().unwrap_or(HANDLE_NULL);
     let mut m = MsgBuf::new(0);
-    m.data[0] = 40 * 1024 * 1024; // child Memory budget (FreeType + vterm + font +
-                                  // a full-screen DOUBLE buffer for maximize; §63/§maximize)
+    m.data[0] = app_budget(24); // child Memory budget: FreeType + vterm + font + glyph
+                                // cache PLUS a full-screen DOUBLE buffer for maximize, sized
+                                // to the REAL resolution (§63/§maximize). 1280x800-hardcoded
+                                // before → OOM at 1080p → upscaled (blurry/slow) terminal.
     m.data_len = 3; // data[1]/data[2] = empty argv
     m.handle_count = 4;
     // §96 Phase 4: oxterm is dynamically linked now (oxui in /lib/liboxui.so), so it

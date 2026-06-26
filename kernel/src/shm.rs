@@ -16,10 +16,15 @@ use crate::sync::DiagMutex;
 // 16 covers 8 double-buffered windows with headroom. (Each region is ~4 KiB of
 // static frame-table, so 16 is 64 KiB.)
 const NREGIONS: usize = 16;
-/// Max pages per region: 1024 * 4 KiB = 4 MiB — enough for a 1280x800x4 shared
-/// framebuffer (1000 pages), the gpu/oxcomp scanout buffer, as well as client
-/// wl_shm buffers.
-const MAX_PAGES: usize = 1024;
+/// Max pages per region: 4096 * 4 KiB = 16 MiB. MUST cover a FULL-SCREEN client
+/// wl_shm buffer at the real display resolution, because a window maximizes to the
+/// whole screen and re-renders NATIVELY at that size (text stays the same size, the
+/// window just gains room). 1920x1080x4 = 2025 pages, 2560x1440x4 = 3600 pages — so
+/// 1024 (4 MiB, only a 1280x800 buffer) made every maximize on a 1080p display fail
+/// to allocate, fall back to the small buffer, and get UPSCALED (blurry + slow). The
+/// gpu/oxcomp scanout buffers live here too. (16 regions x 16 MiB frame-table = 512
+/// KiB static; frames are only allocated on demand by `create`.)
+const MAX_PAGES: usize = 4096;
 
 #[derive(Clone, Copy)]
 struct Region {
