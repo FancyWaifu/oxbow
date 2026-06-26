@@ -20,6 +20,8 @@ mod object;
 mod percpu;
 mod pci;
 mod pipe;
+#[allow(dead_code)] // §102: the pty object + line discipline; syscall wiring lands next
+mod pty;
 mod proc;
 mod shm;
 mod rng;
