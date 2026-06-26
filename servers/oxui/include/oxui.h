@@ -58,6 +58,15 @@ typedef struct {
      * next draw uses the new size; this lets a client reflow content (e.g. a
      * terminal's row/col grid). Optional. Fires before the repaint. */
     void (*resize)(oxui_window *w, int width, int height, void *user);
+    /* §perf: maximize/resize behaviour. DEFAULT (0): re-render the content at the
+     * new NATIVE size — sharp, and the compositor composites it 1:1, the way a
+     * traditional window manager maximizes (an adaptive `draw` that uses
+     * c.width/c.height just fills the bigger canvas; .resize lets stateful apps
+     * reflow). Set to 1 to instead KEEP the window's original buffer and let the
+     * compositor SCALE it to the new size — only for fixed-resolution content like
+     * a 320x200 game (DOOM) where rendering natively into a full-screen buffer
+     * isn't meaningful and an upscaled image is what you want. */
+    int  scale_when_resized;
 } oxui_handlers;
 
 /* Create a window (title shown to the WM; w×h content area). NULL on failure. */

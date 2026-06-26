@@ -242,6 +242,9 @@ int main(int argc, char **argv)
 	h.key = on_key;    /* keyboard -> DOOM key queue */
 	h.button = on_button; /* left mouse click -> fire */
 	h.animate = 1;     /* run the game loop continuously */
+	h.scale_when_resized = 1; /* §perf: DOOM has a fixed 320x200 framebuffer — keep it
+	                           * and let the compositor upscale on maximize (fullscreen
+	                           * game), rather than render natively into a huge canvas. */
 	oxui_run(g_win, &h, 0);
 	return 0;
 }

@@ -215,17 +215,20 @@ static void tl_configure(void *data, struct xdg_toplevel *tl, int32_t width,
     struct oxui_window *w = data;
     (void)tl; (void)states;
     if (width > 0 && height > 0 && (width != w->width || height != w->height)) {
-        /* §93b: ONLY re-render at the new size if the app can reflow its content
-         * (it provides a resize handler, e.g. a terminal that gains rows/cols).
-         * Apps with fixed content (a 320x200 game, a fixed animation) keep their
-         * small buffer and the compositor scales it — clean (no partial-canvas
-         * double-image) AND cheap (no full-resolution render every frame). */
-        if (w->h && w->h->resize) {
-            w->width = width;
-            w->height = height;
-            w->dirty = 1;
+        /* §perf: maximize like a traditional WM — re-render the content at the new
+         * NATIVE size (sharp, and the compositor composites it 1:1, no per-pixel
+         * upscale). An adaptive `draw` (uses c.width/c.height) just fills the bigger
+         * canvas; a `.resize` handler additionally lets a stateful app reflow (e.g.
+         * a terminal gaining rows/cols). Fixed-resolution apps (a 320x200 game)
+         * opt OUT via .scale_when_resized — they keep their small buffer and the
+         * compositor upscales it, which is what you want for a fullscreen game. */
+        if (w->h && w->h->scale_when_resized)
+            return; /* keep the buffer at its current size; compositor scales it */
+        w->width = width;
+        w->height = height;
+        w->dirty = 1;
+        if (w->h && w->h->resize)
             w->h->resize(w, width, height, w->user);
-        }
     }
 }
 static void tl_close(void *data, struct xdg_toplevel *tl)
