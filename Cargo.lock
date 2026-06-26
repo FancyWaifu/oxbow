@@ -462,6 +462,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "havoc-musl"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "head"
 version = "0.0.0"
 dependencies = [

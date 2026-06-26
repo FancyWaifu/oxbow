@@ -196,11 +196,29 @@ pub extern "C" fn oxbow_main() -> ! {
         park();
     }
 
-    // §91: a GNOME-clean start — only the terminal opens at boot; the rest of the
-    // apps (Monitor, Rings, more terminals) are launched on demand from the
-    // Activities overview. That keeps the desktop uncluttered and leaves the
-    // compositor's Memory budget free to fund runtime launches.
-    let srv2 = HANDLE_NULL;
+    // §havoc: also boot havoc — the first real upstream Wayland terminal (musl) — as a
+    // second window, so it renders alongside oxterm (which still handles the greeter
+    // login). Fresh channel pair: havoc gets `hcli` as its Wayland socket at slot 4;
+    // we keep `hsrv` and register it as a second client (srv2) below.
+    let srv2 = match rt::channel::pair() {
+        Some((hsrv, hcli)) => {
+            let mut hm = MsgBuf::new(0);
+            hm.data[0] = app_budget(24);
+            hm.data_len = 3;
+            hm.handle_count = 4;
+            hm.handles[0] = oxbow_abi::BOOT_FS_ROOT; // slot 1: fs (musl personality + /bin/sh)
+            hm.handles[1] = BOOT_CONSOLE; // slot 2: console
+            hm.handles[2] = hcli; // slot 4: Wayland socket
+            hm.handles[3] = HANDLE_NULL; // slot 20: havoc has no tty mirror
+            if rt::sys_spawn(oxbow_abi::BOOT_IMG_HAVOC, BOOT_MEM, &hm, HANDLE_NULL).is_ok() {
+                hsrv
+            } else {
+                w(b"[oxcomp] havoc spawn failed\n");
+                HANDLE_NULL
+            }
+        }
+        None => HANDLE_NULL,
+    };
     let srv3 = HANDLE_NULL;
     w(b"[oxcomp] compositor up; terminal spawned (launch more from Activities)\n");
 

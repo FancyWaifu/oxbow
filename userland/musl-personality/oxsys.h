@@ -25,6 +25,16 @@
 #define OX_SYS_FORK          64
 #define OX_SYS_SIGDISPATCH   67
 #define OX_SYS_SIGRETURN     68
+/* §wayland: the channel + shm primitives the Wayland transport rides on. A channel
+ * cap carries BOTH bytes and capability handles (SCM_RIGHTS); shm regions back the
+ * wl_shm pixel buffers. Numbers track abi/src/lib.rs. */
+#define OX_SYS_CHANNEL_SEND  38  /* (h, buf, len, caps_ptr, ncaps) -> rdx = nbytes */
+#define OX_SYS_CHANNEL_RECV  39  /* (h, buf, len, caps_out, ncaps_max|flags<<32) -> rdx = nbytes|ncaps<<32 */
+#define OX_SYS_CHANNEL_POLL  41  /* (h) -> rdx readiness: 1=readable 2=eof 4=writable */
+#define OX_SYS_SHM_CREATE    42  /* (mem, pages) -> rdx = Shm handle */
+#define OX_SYS_SHM_MAP       43  /* (shm, vaddr) -> rdx = bytes mapped */
+#define OX_BOOT_MEM          3   /* the Memory cap handle granted at spawn */
+#define OX_CHAN_NONBLOCK     1   /* CHANNEL_RECV flag: don't block when empty */
 
 /* CRITICAL: oxbow syscalls return TWO values (rax + RDX), unlike Linux (rax only).
  * So RDX is ALWAYS clobbered by the syscall — it must be an asm output, never left
@@ -86,6 +96,78 @@ static __inline long ox_syscall4(long n, long a1, long a2, long a3, long a4)
 	                     : "rcx", "r11", "memory");
 	(void)d;
 	return r;
+}
+
+/* §wayland channel/shm primitives. These take 5 args and/or read RDX as a real
+ * return value, so they're hand-rolled (the generic ox_syscallN discard RDX). */
+
+/* Send `len` bytes + `ncaps` capability handles over channel `h`. Returns bytes sent
+ * (0 if the peer is gone). The caps are the SCM_RIGHTS fd-passing of shm buffers. */
+static __inline long ox_chan_send(unsigned int h, const void *buf, unsigned long len,
+                                  const unsigned int *caps, unsigned long ncaps)
+{
+	unsigned long rax, rdx = len;
+	register long r10 __asm__("r10") = (long)caps;
+	register long r8 __asm__("r8") = (long)ncaps;
+	__asm__ __volatile__("syscall"
+	                     : "=a"(rax), "+d"(rdx)
+	                     : "a"((long)OX_SYS_CHANNEL_SEND), "D"((long)h), "S"((long)buf),
+	                       "r"(r10), "r"(r8)
+	                     : "rcx", "r11", "memory");
+	return rax == 0 ? (long)rdx : 0;
+}
+
+/* Receive up to `len` bytes + up to `ncaps_max` caps over channel `h`. With nonblock,
+ * returns -1 if nothing is buffered. On success returns nbytes|ncaps<<32 (split by the
+ * caller). The Wayland display fd is always O_NONBLOCK + poll-driven. */
+static __inline long ox_chan_recv(unsigned int h, void *buf, unsigned long len,
+                                  unsigned int *caps, unsigned long ncaps_max, int nonblock)
+{
+	unsigned long rax, rdx = len;
+	unsigned long packed = ncaps_max |
+	    ((unsigned long)(nonblock ? OX_CHAN_NONBLOCK : 0) << 32);
+	register long r10 __asm__("r10") = (long)caps;
+	register long r8 __asm__("r8") = (long)packed;
+	__asm__ __volatile__("syscall"
+	                     : "=a"(rax), "+d"(rdx)
+	                     : "a"((long)OX_SYS_CHANNEL_RECV), "D"((long)h), "S"((long)buf),
+	                       "r"(r10), "r"(r8)
+	                     : "rcx", "r11", "memory");
+	return rax == 0 ? (long)rdx : -1;
+}
+
+/* Channel readiness bits (1=readable 2=eof 4=writable) — for poll() on the display fd. */
+static __inline long ox_chan_poll(unsigned int h)
+{
+	unsigned long rax, rdx;
+	__asm__ __volatile__("syscall"
+	                     : "=a"(rax), "=d"(rdx)
+	                     : "a"((long)OX_SYS_CHANNEL_POLL), "D"((long)h)
+	                     : "rcx", "r11", "memory");
+	return rax == 0 ? (long)rdx : 0;
+}
+
+/* Allocate an shm region of `pages` 4 KiB frames from BOOT_MEM; returns its cap handle
+ * (>=0) or -1. Backs memfd_create + ftruncate for wl_shm pools. */
+static __inline long ox_shm_create(unsigned long pages)
+{
+	unsigned long rax, rdx = pages;
+	__asm__ __volatile__("syscall"
+	                     : "=a"(rax), "+d"(rdx)
+	                     : "a"((long)OX_SYS_SHM_CREATE), "D"((long)OX_BOOT_MEM), "S"(pages)
+	                     : "rcx", "r11", "memory");
+	return rax == 0 ? (long)rdx : -1;
+}
+
+/* Map shm region `h` at `vaddr` (RW); returns bytes mapped, or 0 on failure. */
+static __inline long ox_shm_map(unsigned int h, unsigned long vaddr)
+{
+	unsigned long rax, rdx = vaddr;
+	__asm__ __volatile__("syscall"
+	                     : "=a"(rax), "+d"(rdx)
+	                     : "a"((long)OX_SYS_SHM_MAP), "D"((long)h), "S"(vaddr)
+	                     : "rcx", "r11", "memory");
+	return rax == 0 ? (long)rdx : 0;
 }
 
 /* IPC-backed primitives provided by oxbow-rt (feature = "hosted"): stdout/stderr

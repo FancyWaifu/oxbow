@@ -13,6 +13,10 @@
 #include "oxsys.h"
 #include "linux_nr.h"
 
+/* memcpy is provided by musl libc.a at link; declared here since this freestanding
+ * dispatcher doesn't pull <string.h>. Used by the §wayland send/recvmsg iov copies. */
+extern void *memcpy(void *, const void *, unsigned long);
+
 #include <stdarg.h>
 #include <stdint.h>
 #include <setjmp.h>
@@ -64,6 +68,8 @@ static long do_clock_gettime(long id, struct ox_timespec *ts)
 #define K_SOCK   5  /* a TCP socket; .handle = socket cap (-1 until connect succeeds) */
 #define K_UDP    6  /* a UDP socket; .handle = socket cap (-1 until bind/first send) */
 #define K_LISTEN 7  /* a TCP listener; .handle = listener cap (accept mints K_SOCK fds) */
+#define K_CHAN   8  /* §wayland: a channel cap (the Wayland display socket); .handle = chan cap */
+#define K_SHM    9  /* §wayland: an shm/memfd region; .handle = shm cap (-1 until ftruncate), .size = bytes */
 struct oxfd {
 	int used;
 	int kind;
@@ -99,6 +105,18 @@ static int fd_alloc_kind(long handle, unsigned long size, int kind)
 static int fd_alloc(long handle, unsigned long size)
 {
 	return fd_alloc_kind(handle, size, K_FILE);
+}
+
+/* §wayland: vaddr bump for shm maps. Sits ABOVE oxbow-rt's anon mmap window
+ * [0x4000_0000, 0x6000_0000) so the two never collide. */
+static unsigned long g_shm_next = 0x60000000UL;
+
+/* §wayland: wrap an inherited capability slot (the Wayland display channel oxcomp
+ * hands the client at spawn) as a stream fd. A spawn-slot handle IS the small integer
+ * `slot`. The (patched) havoc calls wl_display_connect_to_fd(ox_chan_fd(SLOT)). */
+int ox_chan_fd(int slot)
+{
+	return fd_alloc_kind(slot, 0, K_CHAN);
 }
 
 /* Close whatever an fd backs (pipe endpoints need an explicit pipe close). */
@@ -796,11 +814,45 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 			unsigned long msg_controllen;
 			int msg_flags;
 		} *mh = (struct msghdr_x *)a2;
-		if (fd < 0 || fd >= MAXFD || !fds[fd].used || fds[fd].kind != K_UDP)
+		if (fd < 0 || fd >= MAXFD || !fds[fd].used)
 			return -E_INVAL;
 		if (!mh || !mh->msg_iov || mh->msg_iovlen < 1)
 			return -E_INVAL;
-		if (fds[fd].handle < 0)
+		if (fds[fd].kind == K_CHAN) {
+			/* §wayland: receive wire bytes (scattered into the iovs) + any passed
+			 * capabilities, adopting each as a fresh shm fd reported via an SCM_RIGHTS
+			 * cmsg. The display fd is O_NONBLOCK + poll-driven, so recv non-blocking. */
+			char tmp[4096];
+			unsigned int caps[8];
+			long r = ox_chan_recv((unsigned int)fds[fd].handle, tmp, sizeof tmp, caps, 8, 1);
+			if (r < 0)
+				return -11; /* EAGAIN: nothing buffered */
+			unsigned long nbytes = (unsigned long)r & 0xffffffffUL;
+			unsigned long ncaps = ((unsigned long)r >> 32) & 0xffffffffUL;
+			unsigned long copied = 0;
+			for (unsigned long i = 0; i < mh->msg_iovlen && copied < nbytes; i++) {
+				unsigned long take = mh->msg_iov[i].len;
+				if (take > nbytes - copied)
+					take = nbytes - copied;
+				memcpy(mh->msg_iov[i].base, tmp + copied, take);
+				copied += take;
+			}
+			if (ncaps && mh->msg_control && mh->msg_controllen >= 16 + ncaps * 4) {
+				struct cmsg_x { unsigned long len; int level; int type; } *c = mh->msg_control;
+				c->len = 16 + ncaps * 4;
+				c->level = 1; /* SOL_SOCKET */
+				c->type = 1;  /* SCM_RIGHTS */
+				int *fp = (int *)((char *)mh->msg_control + 16);
+				for (unsigned long i = 0; i < ncaps; i++)
+					fp[i] = fd_alloc_kind((long)caps[i], 0, K_SHM);
+				mh->msg_controllen = 16 + ncaps * 4;
+			} else {
+				mh->msg_controllen = 0;
+			}
+			mh->msg_flags = 0;
+			return (long)copied;
+		}
+		if (fds[fd].kind != K_UDP || fds[fd].handle < 0)
 			return -E_INVAL;
 		unsigned int sip = 0;
 		unsigned short sport = 0;
@@ -812,6 +864,50 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 			fill_sockaddr_in((unsigned char *)mh->msg_name, &mh->msg_namelen, sip, sport);
 		mh->msg_flags = 0; /* datagram fit (no MSG_TRUNC) — recvfrom caps at the iov len */
 		return n;
+	}
+	case NR_sendmsg: {
+		/* §wayland: the client sends wire requests + (for wl_shm) shm-pool fds via
+		 * SCM_RIGHTS — translated to capability-handle passing over the channel. (UDP
+		 * uses sendto(), not sendmsg, so K_CHAN is the only sendmsg shape we serve.) */
+		int fd = (int)a1;
+		struct msghdr_x {
+			void *msg_name; unsigned int msg_namelen; unsigned int _pad;
+			struct iovec_x { void *base; unsigned long len; } *msg_iov;
+			unsigned long msg_iovlen;
+			void *msg_control; unsigned long msg_controllen;
+			int msg_flags;
+		} *mh = (struct msghdr_x *)a2;
+		if (fd < 0 || fd >= MAXFD || !fds[fd].used || fds[fd].kind != K_CHAN)
+			return -E_INVAL;
+		if (!mh || !mh->msg_iov)
+			return -E_INVAL;
+		char tmp[4096];
+		unsigned long dlen = 0;
+		for (unsigned long i = 0; i < mh->msg_iovlen && dlen < sizeof tmp; i++) {
+			unsigned long take = mh->msg_iov[i].len;
+			if (take > sizeof tmp - dlen)
+				take = sizeof tmp - dlen;
+			memcpy(tmp + dlen, mh->msg_iov[i].base, take);
+			dlen += take;
+		}
+		unsigned int caps[8];
+		unsigned long ncaps = 0;
+		if (mh->msg_control && mh->msg_controllen >= 16) {
+			struct cmsg_x { unsigned long len; int level; int type; } *c = mh->msg_control;
+			if (c->level == 1 && c->type == 1) { /* SOL_SOCKET, SCM_RIGHTS */
+				unsigned long nfd = (c->len - 16) / 4;
+				int *fp = (int *)((char *)mh->msg_control + 16);
+				for (unsigned long i = 0; i < nfd && ncaps < 8; i++) {
+					int pfd = fp[i];
+					if (pfd >= 0 && pfd < MAXFD && fds[pfd].used && fds[pfd].handle >= 0)
+						caps[ncaps++] = (unsigned int)fds[pfd].handle;
+				}
+			}
+		}
+		long s = ox_chan_send((unsigned int)fds[fd].handle, tmp, dlen, caps, ncaps);
+		if (s == 0 && dlen > 0)
+			return -E_INVAL;
+		return (long)dlen;
 	}
 	case NR_getsockname: {
 		/* Report 0.0.0.0 + the socket's bound port (stashed in .off at bind). Enough for
@@ -831,11 +927,29 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 	case NR_setsockopt: /* accept option sets benignly (no real options yet) */
 	case NR_getsockopt:
 		return 0;
+	case NR_memfd_create:
+		/* §wayland: a wl_shm pool fd. Its shared backing region is allocated lazily by
+		 * the subsequent ftruncate (which carries the size). */
+		return fd_alloc_kind(-1, 0, K_SHM);
 	case NR_ftruncate: {
 		/* ftruncate(fd, len): set a file's length. Editors (kilo) rewrite a file as
 		 * ftruncate(len) + write(len); without this, the dirty flag never clears. */
 		long fd = a1;
-		if (fd < 0 || fd >= MAXFD || !fds[fd].used || fds[fd].kind != K_FILE)
+		if (fd < 0 || fd >= MAXFD || !fds[fd].used)
+			return -E_BADF;
+		if (fds[fd].kind == K_SHM) {
+			/* §wayland: sizing a wl_shm memfd allocates its backing shm region. */
+			if (fds[fd].handle < 0 && (long)a2 > 0) {
+				unsigned long pages = (((unsigned long)a2) + 4095) / 4096;
+				long h = ox_shm_create(pages);
+				if (h < 0)
+					return -12; /* ENOMEM */
+				fds[fd].handle = h;
+				fds[fd].size = (unsigned long)a2;
+			}
+			return 0;
+		}
+		if (fds[fd].kind != K_FILE)
 			return -E_BADF;
 		if (__oxbow_fs_truncate(fds[fd].handle, (unsigned long)a2) != 0)
 			return -E_INVAL;
@@ -953,10 +1067,24 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 	}
 
 	/* ---- memory ---- */
-	case NR_mmap:
+	case NR_mmap: {
+		/* §wayland: file-backed mmap of a wl_shm memfd maps the SHARED region's frames
+		 * (so the client and the compositor — both holding the Shm cap — see the same
+		 * pixels). a5 = fd, a2 = len. */
+		int mfd = (int)a5;
+		if (mfd >= 0 && mfd < MAXFD && fds[mfd].used && fds[mfd].kind == K_SHM &&
+		    fds[mfd].handle >= 0) {
+			unsigned long len = ((unsigned long)a2 + 4095) & ~4095UL;
+			unsigned long va = g_shm_next;
+			g_shm_next += len;
+			if (ox_shm_map((unsigned int)fds[mfd].handle, va) == 0)
+				return -12; /* ENOMEM */
+			return (long)va;
+		}
 		/* __oxbow_mmap_anon always maps RW (ignoring PROT_NONE); musl's mallocng
 		 * mmaps PROT_NONE then mprotects to RW, which we make a no-op below. */
 		return (long)__oxbow_mmap_anon((unsigned long)a2);
+	}
 	case NR_munmap:
 		return 0;
 	case NR_mprotect:
@@ -1132,6 +1260,11 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 			/* A listener reports POLLIN only when a connection is actually pending. */
 			if (fd >= 0 && fd < MAXFD && fds[fd].used && fds[fd].kind == K_LISTEN &&
 			    (re & 0x1) && !listener_pending(fd))
+				re &= ~0x1;
+			/* §wayland: the display channel reports POLLIN only when it actually has a
+			 * message buffered, so wl_display_dispatch doesn't block on an empty fd. */
+			if (fd >= 0 && fd < MAXFD && fds[fd].used && fds[fd].kind == K_CHAN &&
+			    (re & 0x1) && !(ox_chan_poll((unsigned int)fds[fd].handle) & 1))
 				re &= ~0x1;
 			pf[i].revents = re;
 			if (re)

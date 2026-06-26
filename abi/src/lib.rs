@@ -624,6 +624,7 @@ pub const BOOT_IMG_FT: Handle = 39; // ft-test — FreeType glyph rasterizer por
 pub const BOOT_IMG_OXTERM: Handle = 40; // oxterm — the Wayland terminal client
 pub const BOOT_IMG_SYSMON: Handle = 44; // sysmon — the system-monitor oxui app (§64)
 pub const BOOT_IMG_DOOM: Handle = 45; // doom — DOOM (doomgeneric) oxui app
+pub const BOOT_IMG_HAVOC: Handle = 46; // havoc — real upstream Wayland terminal (musl)
 
 /// The framebuffer capability, granted to the `fb` server at boot. Gates
 /// SYS_FB_INFO (geometry) + SYS_FB_MAP (map the pixels RW). §34 (graphics).

@@ -1,0 +1,15 @@
+[package]
+name = "havoc-musl"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "havoc"
+path = "src/main.rs"
+
+[dependencies]
+oxbow-rt = { path = "../../rt", features = ["hosted"] }
+
+[build-dependencies]
+cc = "1"
