@@ -1074,9 +1074,19 @@ pub unsafe extern "C" fn __oxbow_spawn(
     sm.handles[1] = stdout_cap as Handle; // stdout: 2 (inherit) or a pipe write-end
     // stdin: 4 (inherit the parent's) or a dup2'd pipe read-end (popen "w" / pipelines)
     sm.handles[2] = if stdin_cap != 0 { stdin_cap as Handle } else { 4 };
-    sm.handles[3] = oxbow_abi::BOOT_NET_EP; // net
+    sm.handles[3] = oxbow_abi::BOOT_NET_EP; // net (optional — see retry below)
     let elf_slice = unsafe { core::slice::from_raw_parts(elf, elf_len) };
-    match sys_spawn_bytes(elf_slice, BOOT_MEM, &sm, notif) {
+    // Net access is optional for exec. A spawner that does NOT hold BOOT_NET_EP
+    // (e.g. a Wayland app like havoc forking a shell) would have the whole spawn
+    // rejected because handle 20 is absent — spawn_common requires R_GRANT on every
+    // passed handle. spawn_common validates with no side effects before committing,
+    // so a failed attempt is clean and `notif` stays usable: retry without net.
+    let mut res = sys_spawn_bytes(elf_slice, BOOT_MEM, &sm, notif);
+    if res.is_err() {
+        sm.handles[3] = oxbow_abi::HANDLE_NULL;
+        res = sys_spawn_bytes(elf_slice, BOOT_MEM, &sm, notif);
+    }
+    match res {
         Ok(pid) => {
             unsafe { pid_out.write(pid as u32) };
             notif as i64
