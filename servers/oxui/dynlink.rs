@@ -52,4 +52,10 @@ fn emit_oxui_dynlink(dir: &str) {
     println!("cargo:rerun-if-changed={dir}/user-dyn.ld");
     println!("cargo:rerun-if-changed={dir}/../oxui/oxui.c");
     println!("cargo:rerun-if-changed={dir}/../oxui/oxui_text.c");
+    // CRITICAL: track the public header too. oxui_handlers' layout lives here; if a
+    // field is added (e.g. scale_when_resized) and this isn't tracked, the consumer's
+    // C isn't recompiled, so the app keeps the OLD struct while liboxui.so reads the
+    // new field off the end → garbage → wrong behavior (terminal scaled instead of
+    // reflowed). The `cc` crate does NOT auto-track header deps, so declare it.
+    println!("cargo:rerun-if-changed={dir}/../oxui/include/oxui.h");
 }
