@@ -760,8 +760,18 @@ fn flush() {
     }
 }
 
-fn seed_from_initrd() {
-    w(b"[fsd] seeding ext2 from the initrd...\n");
+// `system_only` = re-copy ONLY /bin/* and /lib/*.so from the initrd (NOT the whole
+// tree, NOT user data). Run on EVERY mount so the on-disk system programs + dynamic
+// libraries always match the booted ISO — without this, a disk seeded before a
+// liboxui.so / coreutil rebuild keeps the STALE binary (dynamically linked at runtime),
+// e.g. an old liboxui.so makes maximize upscale instead of render native. Cheap: a few
+// hundred KB. `false` = the full first-boot format+seed.
+fn seed_from_initrd(system_only: bool) {
+    if system_only {
+        w(b"[fsd] refreshing /lib/*.so from the initrd...\n");
+    } else {
+        w(b"[fsd] seeding ext2 from the initrd...\n");
+    }
     // Write-back is toggled PER FILE in the loop below (batch a file, then drain), not
     // once for the whole seed — see the per-file rationale there.
     let base = FS_INITRD as *const u8;
@@ -802,6 +812,18 @@ fn seed_from_initrd() {
         let typeflag = unsafe { *hdr.add(156) };
         let is_dir = typeflag == b'5' || trailing;
         let is_file = !is_dir && (typeflag == b'0' || typeflag == 0);
+        // §lib-refresh: in system_only mode, re-copy ONLY the /lib/*.so dynamic libraries
+        // (liboxui.so etc.) — the apps link these at RUNTIME, so a stale one is a real
+        // mismatch (old liboxui → maximize upscales). Skip /bin (static programs — stale =
+        // just old code, no link mismatch; rare, use `rm oxbow-disk.img`), /lib/c.a, and
+        // user data. This keeps the per-boot refresh tiny (~a few small files).
+        if system_only {
+            let keep = is_file && nm.starts_with(b"lib/") && nm.ends_with(b".so");
+            if !keep {
+                off += 512 + ((size + 511) & !511);
+                continue;
+            }
+        }
         // The full tree (incl. the megabyte source under /usr/src) is now seeded —
         // the shared-memory block transfer makes it fast enough.
         if !nm.is_empty() && nm.len() < PLEN {
@@ -850,13 +872,17 @@ fn seed_from_initrd() {
         // Report progress as each 10% boundary is crossed (skips multiple at once if
         // a big file jumps the offset). The "seeded files: N" line marks 100%.
         let pct = (off as u64 * 100 / total as u64) as i64;
-        while pct >= next_mark && next_mark <= 90 {
+        while !system_only && pct >= next_mark && next_mark <= 90 {
             wpct(next_mark);
             next_mark += 10;
         }
     }
     unsafe { oxfs_writeback(0) }; // flush + back to write-through
-    wn(b"[fsd] seeded files: ", files as i64);
+    if system_only {
+        wn(b"[fsd] refreshed system files: ", files as i64);
+    } else {
+        wn(b"[fsd] seeded files: ", files as i64);
+    }
 }
 
 fn reply_status(reply: Handle, status: u64) {
@@ -884,11 +910,15 @@ pub extern "C" fn oxbow_main() -> ! {
             if oxfs_mkfs_ext2(bd) == 0 {
                 r = ext4_mount(b"ox\0".as_ptr(), b"/mp/\0".as_ptr(), false);
                 if r == 0 {
-                    seed_from_initrd();
+                    seed_from_initrd(false); // full first-boot seed
                 }
             }
         } else {
             w(b"[fsd] mounted existing ext2 from disk\n");
+            // §lib-refresh: keep on-disk /bin + /lib/*.so in lockstep with the booted ISO
+            // (the apps dynamically link /lib/liboxui.so at runtime), so a rebuild's new
+            // binaries take effect WITHOUT a manual `rm oxbow-disk.img` reseed.
+            seed_from_initrd(true);
         }
         if r != 0 {
             w(b"[fsd] FATAL: could not mount ext2\n");
