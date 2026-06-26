@@ -215,20 +215,19 @@ static void tl_configure(void *data, struct xdg_toplevel *tl, int32_t width,
     struct oxui_window *w = data;
     (void)tl; (void)states;
     if (width > 0 && height > 0 && (width != w->width || height != w->height)) {
-        /* §perf: maximize like a traditional WM — re-render the content at the new
-         * NATIVE size (sharp, and the compositor composites it 1:1, no per-pixel
-         * upscale). An adaptive `draw` (uses c.width/c.height) just fills the bigger
-         * canvas; a `.resize` handler additionally lets a stateful app reflow (e.g.
-         * a terminal gaining rows/cols). Fixed-resolution apps (a 320x200 game)
-         * opt OUT via .scale_when_resized — they keep their small buffer and the
-         * compositor upscales it, which is what you want for a fullscreen game. */
-        if (w->h && w->h->scale_when_resized)
-            return; /* keep the buffer at its current size; compositor scales it */
-        w->width = width;
-        w->height = height;
-        w->dirty = 1;
-        if (w->h && w->h->resize)
+        /* §maximize: re-render at the new NATIVE size (text stays the same size — the
+         * window just gains room; the compositor composites it 1:1, no upscale) IFF the
+         * app provides a .resize handler. An app WITHOUT one (a fixed-resolution game
+         * like DOOM) keeps its small buffer and the compositor upscales it. Driving this
+         * off the .resize FUNCTION POINTER — not a struct flag — keeps the oxui_handlers
+         * ABI frozen, so a stale app + fresh liboxui.so can never disagree on the layout
+         * (which is what was making maximize upscale the terminal). */
+        if (w->h && w->h->resize) {
+            w->width = width;
+            w->height = height;
+            w->dirty = 1;
             w->h->resize(w, width, height, w->user);
+        }
     }
 }
 static void tl_close(void *data, struct xdg_toplevel *tl)

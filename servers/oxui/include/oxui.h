@@ -54,19 +54,14 @@ typedef struct {
      * the kernel between repaints — no busy-poll, no per-frame CPU — and still
      * wakes immediately for input. 0 = off. Ignored when `animate` is set. */
     int  redraw_interval_ms;
-    /* §93b: the window was resized by the compositor (xdg configure) to (w,h). The
-     * next draw uses the new size; this lets a client reflow content (e.g. a
-     * terminal's row/col grid). Optional. Fires before the repaint. */
+    /* §93b/§maximize: provide this and the window re-renders its content at the new
+     * NATIVE size on maximize/resize (text stays the same size; you just get more
+     * room — a terminal gains rows/cols, an adaptive `draw` fills the bigger canvas).
+     * OMIT it and the window keeps its original buffer and the compositor upscales it
+     * — only meaningful for FIXED-resolution content like a 320x200 game (DOOM).
+     * NOTE: deliberately the LAST field + just a function pointer, so this struct's
+     * layout never changes — apps and liboxui.so can't drift out of ABI sync. */
     void (*resize)(oxui_window *w, int width, int height, void *user);
-    /* §perf: maximize/resize behaviour. DEFAULT (0): re-render the content at the
-     * new NATIVE size — sharp, and the compositor composites it 1:1, the way a
-     * traditional window manager maximizes (an adaptive `draw` that uses
-     * c.width/c.height just fills the bigger canvas; .resize lets stateful apps
-     * reflow). Set to 1 to instead KEEP the window's original buffer and let the
-     * compositor SCALE it to the new size — only for fixed-resolution content like
-     * a 320x200 game (DOOM) where rendering natively into a full-screen buffer
-     * isn't meaningful and an upscaled image is what you want. */
-    int  scale_when_resized;
 } oxui_handlers;
 
 /* Create a window (title shown to the WM; w×h content area). NULL on failure. */

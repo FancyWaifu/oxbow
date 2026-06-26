@@ -51,6 +51,14 @@ paint_rings(oxui_window *w, oxui_canvas c, void *user)
 
 extern void oxui_set_wl_slot(int); /* from liboxui.so (§96 Phase 4) */
 
+/* §maximize: paint_rings already draws to c.width/c.height, so an empty .resize handler
+ * makes oxui re-render the rings natively at the new size instead of upscaling. */
+static void
+on_resize(oxui_window *w, int width, int height, void *user)
+{
+    (void)w; (void)width; (void)height; (void)user;
+}
+
 int
 main(void)
 {
@@ -60,7 +68,8 @@ main(void)
     oxui_window *w = oxui_window_create("rings", 256, 256);
     if (!w)
         return 1;
-    oxui_handlers h = { .draw = paint_rings, .animate = 1, .extra_fd = -1 };
+    oxui_handlers h = { .draw = paint_rings, .resize = on_resize, .animate = 1,
+                        .extra_fd = -1 };
     oxui_run(w, &h, NULL);
     oxui_window_destroy(w);
     return 0;

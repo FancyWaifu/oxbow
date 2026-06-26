@@ -78,6 +78,14 @@ draw(oxui_window *w, oxui_canvas c, void *user)
 
 extern void oxui_set_wl_slot(int); /* from liboxui.so (§96 Phase 3) */
 
+/* §maximize: no state to reflow — its presence just makes oxui re-render natively at
+ * the new size (draw() adapts via c.width/c.height) instead of upscaling a small buffer. */
+static void
+on_resize(oxui_window *w, int width, int height, void *user)
+{
+    (void)w; (void)width; (void)height; (void)user;
+}
+
 int
 main(void)
 {
@@ -89,7 +97,11 @@ main(void)
         return 1;
     /* §65: refresh ~4x/second so the clock ticks and the strip sweeps, but SLEEP in
      * the kernel between repaints (no busy-poll) — and still wake instantly for input. */
-    oxui_handlers h = { .draw = draw, .redraw_interval_ms = 250, .extra_fd = -1 };
+    /* §maximize: an empty .resize handler tells oxui to re-render at the new NATIVE
+     * size on maximize (the `draw` above already uses c.width/c.height, so it just
+     * fills the bigger canvas — text/bars stay the same size, more room). */
+    oxui_handlers h = { .draw = draw, .resize = on_resize, .redraw_interval_ms = 250,
+                        .extra_fd = -1 };
     oxui_run(w, &h, NULL);
     oxui_window_destroy(w);
     return 0;
