@@ -138,6 +138,42 @@ fn main() {
     cv.include(format!("{mo}/libxcvt/include")).file(format!("{mo}/libxcvt/lib/libxcvt.c"));
     cv.compile("oxxcvt");
 
+    // 4b. zlib (libXfont2 inflates the gzip'd builtin fonts)
+    let mut zl = cc::Build::new();
+    base(&mut zl);
+    zl.include(format!("{mo}/zlib")).define("Z_HAVE_UNISTD_H", None);
+    for f in ["adler32", "crc32", "inflate", "inftrees", "inffast", "zutil", "uncompr",
+        "compress", "deflate", "trees", "gzlib", "gzread", "gzwrite", "gzclose", "infback"] {
+        zl.file(format!("{mo}/zlib/{f}.c"));
+    }
+    zl.compile("oxxz");
+
+    // 4c. libXfont2 — REAL server fonts via the compiled-in builtin font path (cursor/fixed
+    //     are embedded gzip'd pcf in src/builtins/fonts.c). No font files, freetype, or
+    //     fontenc needed; just bitmap/pcf + zlib. Replaces the glue.c xfont2_* stubs.
+    let mut xf = cc::Build::new();
+    base(&mut xf);
+    let lxf = format!("{mo}/libXfont2");
+    xf.define("__linux__", "1").define("HAVE_CONFIG_H", None)
+        .include(&lxf).include(format!("{lxf}/include")).include(format!("{lxf}/src"))
+        .include(format!("{lxf}/src/builtins")).include(format!("{mo}/xorgproto/include"))
+        .include(format!("{mo}/zlib"));
+    for f in ["fontaccel", "fontnames", "fontutil", "fontxlfd", "format", "miscutil",
+        "patcache", "private", "reallocarray", "realpath", "strlcat", "strlcpy", "utilbitmap"] {
+        xf.file(format!("{lxf}/src/util/{f}.c"));
+    }
+    for f in ["atom", "libxfontstubs"] { xf.file(format!("{lxf}/src/stubs/{f}.c")); }
+    for f in ["bdfread", "bdfutils", "bitmap", "bitmapfunc", "bitmaputil", "bitscale",
+        "fontink", "pcfread", "pcfwrite", "snfread"] {
+        xf.file(format!("{lxf}/src/bitmap/{f}.c"));
+    }
+    for f in ["dir", "file", "fonts", "fpe", "render"] { xf.file(format!("{lxf}/src/builtins/{f}.c")); }
+    for f in ["bitsource", "bufio", "catalogue", "decompress", "defaults", "dirfile",
+        "fileio", "filewr", "fontdir", "fontfile", "fontscale", "gunzip", "register", "renderers"] {
+        xf.file(format!("{lxf}/src/fontfile/{f}.c"));
+    }
+    xf.compile("oxxfont");
+
     // 5. THE xserver — core components + DDX + generated protocols. Excludes = the
     //    disabled-feature files (no Xinerama/security/xace/xselinux; our own SHA1).
     // Exactly the files that don't compile in this software/feature-reduced build

@@ -70,17 +70,7 @@ int x_sha1_final(void *ctx, unsigned char out[20])
     return 1;
 }
 
-/* ---- libXfont2 stubs (no server-side core fonts) ---- */
-int xfont2_init(void *a) { (void)a; return 1; }
-int xfont2_init_glyph_caching(void) { return 1; }
-int xfont2_parse_glyph_caching_mode(char *s) { (void)s; return 0; }
-int xfont2_query_text_extents(void *a, unsigned long b, void *c, void *d) { (void)a;(void)b;(void)c;(void)d; return 0; }
-int xfont2_query_glyph_extents(void *a, void *b, unsigned long c, void *d) { (void)a;(void)b;(void)c;(void)d; return 0; }
-int xfont2_add_font_names_name(void *a, void *b) { (void)a;(void)b; return 0; }
-void xfont2_free_font_names(void *a) { (void)a; }
-void *xfont2_make_font_names_record(unsigned long a) { (void)a; return 0; }
-void xfont2_free_font_pattern_cache(void *a) { (void)a; }
-void *xfont2_make_font_pattern_cache(void) { return 0; }
+/* (server fonts now come from REAL libXfont2 with its compiled-in builtin fonts) */
 
 /* ---- libffi static-trampoline stubs (wayland uses ffi_call, not closures) ---- */
 int ffi_tramp_set_parms(void *a, void *b, void *c) { (void)a;(void)b;(void)c; return 0; }
