@@ -297,7 +297,3 @@ fn park() -> ! {
     }
     loop {}
 }
-
-// Keep these referenced so the handle type is used.
-#[allow(dead_code)]
-fn _t(_: Handle) {}

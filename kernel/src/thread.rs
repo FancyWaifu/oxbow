@@ -340,12 +340,6 @@ fn spawn(entry: u64, arg1: u64, arg2: u64, proc: usize, cr3: u64, fs_base: u64) 
     0 // pool exhausted — caller returns an error to userland (never a kernel panic)
 }
 
-/// Spawn a kernel thread (no owning process; runs under whatever CR3 is live).
-#[allow(dead_code)] // scheduler API; kernel-thread demos were retired in arc 3
-pub fn spawn_kernel(entry: extern "C" fn(u64), arg: u64) -> usize {
-    spawn(entry as *const () as u64, arg, 0, NO_PROC, 0, 0)
-}
-
 /// Register an idle thread for an AP that is ALREADY executing on `kstack_top` (its
 /// dedicated bringup stack), §69 SMP Phase 5. Unlike `spawn`, it builds NO initial
 /// stack frame — the AP is already running this context — it just claims a TCB slot
