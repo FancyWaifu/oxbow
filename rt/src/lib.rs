@@ -223,6 +223,33 @@ fn pipe_write_all(pipe: Handle, bytes: &[u8]) {
     }
 }
 
+/// Write all of `bytes` to a pty SLAVE handle via SYS_PTY_WRITE (OPOST output path).
+/// Returns true if `h` is a pty (the first write was accepted) — the caller uses that
+/// to latch STDOUT_MODE. A forkpty grandchild's stdout is a pty slave, not a tty
+/// endpoint / pipe / Console, so native programs (ls, cat, …) printing through
+/// `stdout_write` need this branch or their output is silently dropped.
+fn pty_write_all(h: Handle, bytes: &[u8]) -> bool {
+    let mut off = 0;
+    let mut is_pty = false;
+    while off < bytes.len() {
+        let (rax, rdx) = unsafe {
+            syscall3(oxbow_abi::SYS_PTY_WRITE, h as u64, bytes[off..].as_ptr() as u64, (bytes.len() - off) as u64)
+        };
+        if SysError::from_raw(rax).is_err() {
+            // BadType on the very first chunk ⇒ not a pty; report so the caller falls
+            // through to the pipe path. A later error just stops the write.
+            return is_pty;
+        }
+        is_pty = true;
+        let n = rdx as usize;
+        if n == 0 {
+            break;
+        }
+        off += n;
+    }
+    is_pty
+}
+
 /// Write raw bytes to stdout. Normally stdout is a tty endpoint and the bytes go
 /// out as <=63-byte TAG_TTY_WRITE messages; but when stdout is a pipe write end
 /// (a `cmd | …` stage), `sys_send` reports BadType and we switch to writing the
@@ -244,6 +271,12 @@ pub fn stdout_write(bytes: &[u8]) {
         }
         // 4 = stdout is unusable (no valid sink) — drop output cheaply, no syscalls.
         4 => return,
+        // 5 = stdout is a pty SLAVE (a forkpty grandchild — e.g. `ls` run from a shell
+        // inside havoc): write through the kernel line discipline's OPOST path.
+        5 => {
+            pty_write_all(SPAWN_STDOUT, bytes);
+            return;
+        }
         _ => {}
     }
     let mut off = 0;
@@ -265,6 +298,9 @@ pub fn stdout_write(bytes: &[u8]) {
                     .is_ok()
                 {
                     STDOUT_MODE.store(3, Ordering::Relaxed);
+                } else if pty_write_all(SPAWN_STDOUT, &bytes[off..]) {
+                    // A pty slave (forkpty grandchild stdout) — latch mode 5.
+                    STDOUT_MODE.store(5, Ordering::Relaxed);
                 } else {
                     STDOUT_MODE.store(2, Ordering::Relaxed);
                     pipe_write_all(SPAWN_STDOUT, &bytes[off..]);
