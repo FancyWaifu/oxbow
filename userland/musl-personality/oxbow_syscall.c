@@ -929,6 +929,23 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 			mh->msg_flags = 0;
 			return (long)copied;
 		}
+		if (fds[fd].kind == K_SOCK) {
+			/* TCP stream recv (the X server reads client sockets via recvmsg because
+			 * XTRANS_SEND_FDS is on). No fd passing on a TCP socket — just fill the iov.
+			 * Honor O_NONBLOCK so a poll-driven reader gets EAGAIN, not a block. */
+			if (fds[fd].handle < 0)
+				return -E_INVAL;
+			long n = fds[fd].nonblock
+			    ? __oxbow_sock_recv_nb(fds[fd].handle, mh->msg_iov[0].base, mh->msg_iov[0].len)
+			    : __oxbow_sock_recv(fds[fd].handle, mh->msg_iov[0].base, mh->msg_iov[0].len);
+			if (n == -11)
+				return -11; /* EAGAIN */
+			if (n < 0)
+				return n;
+			mh->msg_controllen = 0;
+			mh->msg_flags = 0;
+			return n;
+		}
 		if (fds[fd].kind != K_UDP || fds[fd].handle < 0)
 			return -E_INVAL;
 		unsigned int sip = 0;
@@ -954,9 +971,25 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 			void *msg_control; unsigned long msg_controllen;
 			int msg_flags;
 		} *mh = (struct msghdr_x *)a2;
-		if (fd < 0 || fd >= MAXFD || !fds[fd].used || fds[fd].kind != K_CHAN)
+		if (fd < 0 || fd >= MAXFD || !fds[fd].used || !mh || !mh->msg_iov)
 			return -E_INVAL;
-		if (!mh || !mh->msg_iov)
+		if (fds[fd].kind == K_SOCK) {
+			/* TCP stream send (the X server writes client sockets via sendmsg because
+			 * XTRANS_SEND_FDS is on). No fd passing on a TCP socket — send each iov. */
+			if (fds[fd].handle < 0)
+				return -E_INVAL;
+			long total = 0;
+			for (unsigned long i = 0; i < mh->msg_iovlen; i++) {
+				if (!mh->msg_iov[i].len)
+					continue;
+				long s = __oxbow_sock_send(fds[fd].handle, mh->msg_iov[i].base, mh->msg_iov[i].len);
+				if (s < 0)
+					return total > 0 ? total : s;
+				total += s;
+			}
+			return total;
+		}
+		if (fds[fd].kind != K_CHAN)
 			return -E_INVAL;
 		char tmp[4096];
 		unsigned long dlen = 0;
