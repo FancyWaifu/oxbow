@@ -48,6 +48,7 @@ fn main() {
     println!("cargo:rerun-if-changed={xs}/dix");
     println!("cargo:rerun-if-changed={xs}/xkb");
     println!("cargo:rerun-if-changed={xs}/include");
+    println!("cargo:rerun-if-changed={mo}/xtrans");
     println!("cargo:rerun-if-changed=us_keymap.c");
 
     println!("cargo:rustc-link-arg=-T{pers}/musl-user.ld");

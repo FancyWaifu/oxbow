@@ -8,7 +8,7 @@ use crate::Nic;
 use alloc::vec;
 use oxbow_rt as rt;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
+use smoltcp::phy::{self, Device, DeviceCapabilities, Loopback, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
@@ -91,6 +91,13 @@ impl phy::TxToken for PhyTx {
 pub struct TcpStack {
     device: PhyDevice,
     iface: Interface,
+    /// Loopback path: a separate smoltcp `Interface` over a `Loopback` device holding
+    /// 127.0.0.1/8, sharing the SocketSet. Local connects (X clients -> Xwayland) route
+    /// to 127/8 here and the handshake completes on the loopback device. Polled BEFORE
+    /// the e1000 each turn so a local SYN is delivered before e1000's retransmit timer
+    /// could leak it to the LAN.
+    lo_device: Loopback,
+    lo_iface: Interface,
     sockets: SocketSet<'static>,
     next_port: u16,
     /// Sockets currently in LISTEN state, with the port they listen on. A backlog of
@@ -149,9 +156,21 @@ impl TcpStack {
             sn[15] = a[15];
             let _ = iface.join_multicast_group(Ipv6Address::from(sn));
         }
+        // Loopback interface: IP medium (no MAC/ARP), 127.0.0.1/8 connected.
+        let mut lo_device = Loopback::new(Medium::Ip);
+        let mut lo_iface = Interface::new(
+            Config::new(HardwareAddress::Ip),
+            &mut lo_device,
+            now(),
+        );
+        lo_iface.update_ip_addrs(|a| {
+            let _ = a.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8));
+        });
         TcpStack {
             device,
             iface,
+            lo_device,
+            lo_iface,
             sockets: SocketSet::new(vec![]),
             next_port: 49152,
             listeners: vec![],
@@ -215,7 +234,11 @@ impl TcpStack {
     }
 
     fn poll(&mut self) {
-        let _ = self.iface.poll(now(), &mut self.device, &mut self.sockets);
+        // Loopback first: local handshakes settle on the loopback device before the
+        // e1000's retransmit timer could emit a 127/8 SYN onto the LAN.
+        let t = now();
+        let _ = self.lo_iface.poll(t, &mut self.lo_device, &mut self.sockets);
+        let _ = self.iface.poll(t, &mut self.device, &mut self.sockets);
     }
 
     /// Open a connection to an IPv4 `dst:port`. Handle once established, else None.
@@ -237,7 +260,13 @@ impl TcpStack {
         let mut sock = tcp::Socket::new(rx, tx);
         let local = self.next_port;
         self.next_port = if self.next_port >= 65000 { 49152 } else { self.next_port + 1 };
-        if sock.connect(self.iface.context(), remote, local).is_err() {
+        // smoltcp picks the local source address via cx.get_source_address(remote). For a
+        // loopback dest we MUST use the loopback iface's context so the source is 127.0.0.1
+        // (using e1000's context would pick 10.0.2.15 and the SYN-ACK would route out the LAN
+        // instead of back over loopback — the handshake would never complete).
+        let is_loopback = matches!(remote.addr, IpAddress::Ipv4(v4) if v4.octets()[0] == 127);
+        let cx = if is_loopback { self.lo_iface.context() } else { self.iface.context() };
+        if sock.connect(cx, remote, local).is_err() {
             return None;
         }
         let handle = self.sockets.add(sock);
@@ -304,6 +333,24 @@ impl TcpStack {
             if rt::sys_uptime_ms() - start > 8000 {
                 return 0;
             }
+        }
+    }
+
+    /// Non-blocking receive: poll once, then return `(bytes, would_block)`. `would_block`
+    /// = true means the socket is open but has no data buffered yet — the caller should
+    /// yield and retry rather than hog this single-threaded server. `(0, false)` = the
+    /// peer closed. This is what lets two LOCAL clients (e.g. an X client and Xwayland over
+    /// loopback) make progress: a blocking recv would pin the net server for 8s, starving
+    /// the very peer whose send would produce the awaited data.
+    pub fn recv_nb(&mut self, handle: SocketHandle, out: &mut [u8]) -> (usize, bool) {
+        self.poll();
+        let s = self.sockets.get_mut::<tcp::Socket>(handle);
+        if s.can_recv() {
+            (s.recv_slice(out).unwrap_or(0), false)
+        } else if !s.may_recv() {
+            (0, false) // peer closed, nothing buffered
+        } else {
+            (0, true) // open but empty — would block
         }
     }
 

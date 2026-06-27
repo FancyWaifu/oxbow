@@ -16,6 +16,7 @@ oxbow-abi = { path = "../../abi" }
 smoltcp = { version = "0.12", default-features = false, features = [
     "alloc",
     "medium-ethernet",
+    "medium-ip", # loopback iface (127.0.0.1) so local X clients reach Xwayland
     "multicast",
     "proto-ipv4",
     "proto-ipv6",

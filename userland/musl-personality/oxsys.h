@@ -269,6 +269,7 @@ extern void __oxbow_tty_mode(int raw);
 extern long __oxbow_sock_tcp_connect(unsigned int ip, unsigned short port);
 extern long __oxbow_sock_send(long sock, const void *buf, unsigned long len);
 extern long __oxbow_sock_recv(long sock, void *buf, unsigned long len);
+extern long __oxbow_sock_recv_nb(long sock, void *buf, unsigned long len);
 extern void __oxbow_sock_close(long sock);
 
 /* TCP server path: listen returns a listener cap; accept (non-blocking) returns a fresh

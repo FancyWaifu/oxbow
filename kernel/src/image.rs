@@ -13,7 +13,7 @@
 use crate::sync::DiagMutex;
 
 /// Max distinct spawnable images. Bump alongside the boot module list.
-pub const MAX_IMAGES: usize = 32;
+pub const MAX_IMAGES: usize = 40;
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // name/ptr/len read by the sys_spawn path (next phase)

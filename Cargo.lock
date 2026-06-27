@@ -1302,6 +1302,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "xclient-musl"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-rt",
+]
+
+[[package]]
+name = "xwayland-musl"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "yes"
 version = "0.0.0"
 dependencies = [

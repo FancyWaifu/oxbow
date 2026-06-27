@@ -386,7 +386,7 @@ fn kmain_stage2() -> ! {
         // what gives a clean boot straight to the prompt (no demo spam).
         if matches!(
             cmd,
-            b"pong" | b"beta" | b"hello" | b"badge" | b"cat" | b"ls" | b"mkdir" | b"touch" | b"rm" | b"mv" | b"cp" | b"drift" | b"cc-hello" | b"tcc" | b"lua" | b"micropython" | b"qjs" | b"curl" | b"cares-test" | b"ffi-test" | b"wl-test" | b"xkb-test" | b"vterm-test" | b"ft-test" | b"wlclient" | b"oxterm" | b"sysmon" | b"doom" | b"havoc" | b"xwayland" | b"jail" | b"fstest"
+            b"pong" | b"beta" | b"hello" | b"badge" | b"cat" | b"ls" | b"mkdir" | b"touch" | b"rm" | b"mv" | b"cp" | b"drift" | b"cc-hello" | b"tcc" | b"lua" | b"micropython" | b"qjs" | b"curl" | b"cares-test" | b"ffi-test" | b"wl-test" | b"xkb-test" | b"vterm-test" | b"ft-test" | b"wlclient" | b"oxterm" | b"sysmon" | b"doom" | b"havoc" | b"xwayland" | b"xclient" | b"jail" | b"fstest"
         ) {
             image::register(cmd, bytes);
             println!("[mod] image '{}' registered ({} bytes)", name, bytes.len());
@@ -639,6 +639,7 @@ fn kmain_stage2() -> ! {
                 (b"doom".as_slice(), oxbow_abi::BOOT_IMG_DOOM),
                 (b"havoc".as_slice(), oxbow_abi::BOOT_IMG_HAVOC),
                 (b"xwayland".as_slice(), oxbow_abi::BOOT_IMG_XWAYLAND),
+                (b"xclient".as_slice(), oxbow_abi::BOOT_IMG_XCLIENT),
             ] {
                 if let Some(idx) = image::find(name) {
                     proc::with_proc_mut(pid, |p| {

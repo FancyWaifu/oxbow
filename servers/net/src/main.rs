@@ -1270,8 +1270,27 @@ pub extern "C" fn oxbow_main() -> ! {
                 // smoltcp keeps the rest buffered for the next recv (byte-exact,
                 // which TLS requires).
                 let want = (m.data[0] as usize).clamp(1, 504);
+                // data[1] == 1 => non-blocking: one poll, and signal "would block" with the
+                // sentinel 0xFFFF_FFFF in data[0] (a real count is <= 504) so the caller can
+                // yield+retry instead of pinning this single-threaded server for 8s.
+                let nonblock = m.data[1] == 1;
                 if let Some(Sock::Tcp(handle)) = slot_of(&sockets, sid) {
                     let mut out = [0u8; 504];
+                    if nonblock {
+                        let (n, wb) = tcp_stack.recv_nb(handle, &mut out[..want]);
+                        if wb {
+                            r.data[0] = 0xFFFF_FFFF;
+                            r.data_len = 1;
+                            let _ = rt::sys_reply(reply, &r);
+                            continue;
+                        }
+                        r.data[0] = n as u64;
+                        let dst = r.data.as_mut_ptr() as *mut u8;
+                        unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), dst.add(8), n) };
+                        r.data_len = 64;
+                        let _ = rt::sys_reply(reply, &r);
+                        continue;
+                    }
                     let n = tcp_stack.recv(handle, &mut out[..want]);
                     r.data[0] = n as u64;
                     let dst = r.data.as_mut_ptr() as *mut u8;

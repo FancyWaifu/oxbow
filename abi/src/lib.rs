@@ -632,6 +632,7 @@ pub const BOOT_IMG_SYSMON: Handle = 44; // sysmon — the system-monitor oxui ap
 pub const BOOT_IMG_DOOM: Handle = 45; // doom — DOOM (doomgeneric) oxui app
 pub const BOOT_IMG_HAVOC: Handle = 46; // havoc — real upstream Wayland terminal (musl)
 pub const BOOT_IMG_XWAYLAND: Handle = 47; // Xwayland — real X server as an oxcomp Wayland client
+pub const BOOT_IMG_XCLIENT: Handle = 48; // xclient — minimal raw-X11 client (loopback TCP -> Xwayland)
 
 /// The framebuffer capability, granted to the `fb` server at boot. Gates
 /// SYS_FB_INFO (geometry) + SYS_FB_MAP (map the pixels RW). §34 (graphics).

@@ -78,6 +78,7 @@ struct oxfd {
 	long handle;         /* fsd file cap (FILE) or pipe handle (PIPE_*) */
 	unsigned long off;   /* current file offset (FILE only) */
 	unsigned long size;  /* known size, grows on write (FILE only) */
+	int nonblock;        /* O_NONBLOCK (K_SOCK): read() returns EAGAIN instead of blocking */
 };
 static struct oxfd fds[MAXFD];
 
@@ -98,6 +99,7 @@ static int fd_alloc_kind(long handle, unsigned long size, int kind)
 			fds[i].handle = handle;
 			fds[i].off = 0;
 			fds[i].size = size;
+			fds[i].nonblock = 0;
 			return i;
 		}
 	}
@@ -261,9 +263,15 @@ static long do_read(long fd, void *buf, unsigned long len)
 		}
 		if (fds[fd].kind == K_TTY)
 			return do_read(fds[fd].handle, buf, len); /* route to the std stream */
-		if (fds[fd].kind == K_SOCK)
-			return fds[fd].handle < 0 ? -E_INVAL
-			                          : __oxbow_sock_recv(fds[fd].handle, buf, len);
+		if (fds[fd].kind == K_SOCK) {
+			if (fds[fd].handle < 0)
+				return -E_INVAL;
+			if (fds[fd].nonblock) {
+				long n = __oxbow_sock_recv_nb(fds[fd].handle, buf, len);
+				return (n == -11) ? -11 : n; /* -11 = EAGAIN (socket open, no data yet) */
+			}
+			return __oxbow_sock_recv(fds[fd].handle, buf, len);
+		}
 		if (fds[fd].kind == K_PTYM || fds[fd].kind == K_PTYS)
 			return ox_pty_read((unsigned int)fds[fd].handle, buf, len);
 		return -E_BADF; /* read on a write-only pipe end */
@@ -992,6 +1000,22 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 			fill_sockaddr_in(sa, sl, 0, port);
 		return 0;
 	}
+	case NR_getpeername: {
+		/* Report the peer as 127.0.0.1 + the socket's port. Our only TCP-server peers are
+		 * local (X clients over loopback), and xtrans's SocketINETAccept aborts the
+		 * connection if getpeername() fails — so this must succeed and read as localhost
+		 * (which X access control allows). */
+		int fd = (int)a1;
+		unsigned char *sa = (unsigned char *)a2;
+		unsigned int *sl = (unsigned int *)a3;
+		unsigned short port = 0;
+		if (fd >= 0 && fd < MAXFD && fds[fd].used &&
+		    (fds[fd].kind == K_SOCK || fds[fd].kind == K_LISTEN))
+			port = (unsigned short)fds[fd].off;
+		if (sa && sl && *sl >= 16)
+			fill_sockaddr_in(sa, sl, 0x7f000001u, port); /* 127.0.0.1 */
+		return 0;
+	}
 	case NR_shutdown: /* half-close: treat as a no-op; close() does the teardown */
 	case NR_setsockopt: /* accept option sets benignly (no real options yet) */
 	case NR_getsockopt:
@@ -1472,7 +1496,12 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		case F_GETFL:
 			return 2; /* O_RDWR */
 		case F_SETFL:
-			return 0; /* accept O_NONBLOCK/etc. */
+			/* Track O_NONBLOCK for sockets — a poll-driven peer (X client, Xwayland)
+			 * needs read() to return EAGAIN, not block, so the single-threaded net
+			 * server stays free to serve the other end over loopback. */
+			if (fd >= 0 && fd < MAXFD && fds[fd].used)
+				fds[fd].nonblock = (arg & 04000) ? 1 : 0; /* O_NONBLOCK (x86_64) */
+			return 0;
 		default:
 			return 0; /* accept other fcntls benignly */
 		}

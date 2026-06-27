@@ -90,6 +90,7 @@ members = [
     "servers/netcat-musl",
     "servers/havoc-musl",
     "servers/xwayland-musl",
+    "servers/xclient-musl",
     "servers/doom",
     "servers/ps",
     "servers/kill",

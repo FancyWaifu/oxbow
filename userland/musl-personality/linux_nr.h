@@ -20,6 +20,7 @@
 #define NR_bind              49
 #define NR_listen            50
 #define NR_getsockname       51
+#define NR_getpeername       52
 #define NR_setsockopt        54
 #define NR_getsockopt        55
 #define NR_accept4           288

@@ -1531,6 +1531,20 @@ pub unsafe extern "C" fn __oxbow_sock_recv(sock: i64, buf: *mut u8, len: usize) 
     tcp::recv(sock as Handle, out) as isize
 }
 
+/// Non-blocking `recv` on a connected socket cap: returns the byte count (0 = peer
+/// closed) or -11 (EAGAIN) when the socket is open but has no data buffered yet. Backs
+/// the personality's read() on an O_NONBLOCK socket — essential for two LOCAL clients
+/// talking over loopback (a blocking recv would pin the single-threaded net server).
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __oxbow_sock_recv_nb(sock: i64, buf: *mut u8, len: usize) -> isize {
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    match tcp::recv_nb(sock as Handle, out) {
+        Some(n) => n as isize,
+        None => -11, // EAGAIN
+    }
+}
+
 /// `close`/`shutdown` on a socket cap: best-effort FIN, then drop the capability.
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
@@ -2848,6 +2862,26 @@ pub mod tcp {
         let src = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), n) };
         out[..n].copy_from_slice(src);
         n
+    }
+
+    /// Non-blocking `recv`: sets the request's non-block flag (data[1]=1). Returns
+    /// `Some(n)` (n=0 => peer closed) or `None` if the socket has no data yet (the server
+    /// replied with the 0xFFFF_FFFF would-block sentinel).
+    pub fn recv_nb(sock: Handle, out: &mut [u8]) -> Option<usize> {
+        let mut m = MsgBuf::new(TAG_TCP_RECV);
+        m.data[0] = out.len().min(504) as u64;
+        m.data[1] = 1; // non-blocking
+        m.data_len = 2;
+        if sys_call(sock, &mut m).is_err() {
+            return Some(0); // IPC error — treat as closed
+        }
+        if m.data[0] == 0xFFFF_FFFF {
+            return None; // would block
+        }
+        let n = (m.data[0] as usize).min(out.len()).min(504);
+        let src = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), n) };
+        out[..n].copy_from_slice(src);
+        Some(n)
     }
 
     /// Send the first `len` bytes (≤1472) of the socket's transfer frame on `sock`

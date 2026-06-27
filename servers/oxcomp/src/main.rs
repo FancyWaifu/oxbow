@@ -226,9 +226,13 @@ pub extern "C" fn oxbow_main() -> ! {
     let srv3 = match rt::channel::pair() {
         Some((xsrv, xcli)) => {
             // rootful default; -retro = visible root; -nolock skips the /tmp lock (hangs on oxbow
-            // fs); -listen tcp = the personality has no AF_UNIX named sockets, only TCP, so X
-            // clients connect via 127.0.0.1:0 instead of /tmp/.X11-unix/X0.
-            let args = b":0 -geometry 1280x800 -retro -nolock -listen tcp";
+            // fs); -listen inet = the personality has no AF_UNIX named sockets, only AF_INET TCP,
+            // so X clients connect via 127.0.0.1:6000 (loopback). NB: "inet" (not "tcp") — the
+            // xtrans "tcp" transport is AF_INET6, which the personality rejects; "inet" is AF_INET.
+            // -noreset: a failed/closed X client must NOT reset the whole server (which would
+            // tear down the rendered root + try to re-connect to wayland and fail). -ac: no
+            // xauth, so a local X client connects without a cookie.
+            let args = b":0 -geometry 1280x800 -retro -nolock -listen inet -ac -noreset";
             let mut xm = MsgBuf::new(0);
             xm.data[0] = app_budget(64); // a full X server needs a generous working set
             xm.data[1] = args.as_ptr() as u64;
@@ -249,6 +253,28 @@ pub extern "C" fn oxbow_main() -> ! {
         }
         None => HANDLE_NULL,
     };
+    // §xclient: a minimal raw-X11 client (no libX11) — connects to Xwayland over loopback
+    // TCP (127.0.0.1:6000) and maps a window, proving X clients render on oxbow. It retries
+    // connect() until Xwayland is listening, so spawn order doesn't matter. Demo wire (no
+    // wayland channel needed); slot 20 = net for its TCP socket.
+    {
+        let args = b"";
+        let mut cm = MsgBuf::new(0);
+        cm.data[0] = app_budget(8);
+        cm.data[1] = args.as_ptr() as u64;
+        cm.data[2] = args.len() as u64;
+        cm.data_len = 3;
+        cm.handle_count = 4;
+        cm.handles[0] = oxbow_abi::BOOT_FS_ROOT; // slot 1: fs
+        cm.handles[1] = BOOT_CONSOLE; // slot 2: console (logging)
+        cm.handles[2] = BOOT_CONSOLE; // slot 4: unused by xclient; fill with a harmless cap
+        cm.handles[3] = oxbow_abi::BOOT_NET_EP; // slot 20: net (loopback TCP to Xwayland)
+        if rt::sys_spawn(oxbow_abi::BOOT_IMG_XCLIENT, BOOT_MEM, &cm, HANDLE_NULL).is_ok() {
+            w(b"[oxcomp] xclient spawned (raw-X11 loopback demo)\n");
+        } else {
+            w(b"[oxcomp] xclient spawn failed\n");
+        }
+    }
     w(b"[oxcomp] compositor up; terminal spawned (launch more from Activities)\n");
 
     // Set up the display on our kept channel end and run the compositing loop.
