@@ -89,6 +89,7 @@ members = [
     "servers/darkhttpd-musl",
     "servers/netcat-musl",
     "servers/havoc-musl",
+    "servers/xwayland-musl",
     "servers/doom",
     "servers/ps",
     "servers/kill",
