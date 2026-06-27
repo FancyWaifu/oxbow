@@ -227,6 +227,8 @@ fn main() {
     gl.define("_GNU_SOURCE", None);
     gl.file("glue.c");
     gl.file("us_keymap.c"); // compiled-in US keymap for the no-data-files XKB fallback
+    gl.file("xkm_blob.c"); // precompiled US .xkm — bypasses popen(xkbcomp) at runtime
+    println!("cargo:rerun-if-changed=xkm_blob.c");
     gl.file(format!("{pers}/crt_glue.c")).file(format!("{pers}/oxbow_syscall.c")).include(&pers);
     // pixman arch get_implementations pass-throughs (we built generic-only)
     let stub = format!("{out}/pxsimd.c");
