@@ -46,7 +46,9 @@ fn main() {
     println!("cargo:rerun-if-changed={xs}/hw/xwayland");
     println!("cargo:rerun-if-changed={xs}/os");
     println!("cargo:rerun-if-changed={xs}/dix");
+    println!("cargo:rerun-if-changed={xs}/xkb");
     println!("cargo:rerun-if-changed={xs}/include");
+    println!("cargo:rerun-if-changed=us_keymap.c");
 
     println!("cargo:rustc-link-arg=-T{pers}/musl-user.ld");
     println!("cargo:rustc-link-arg=--start-group");
@@ -224,6 +226,7 @@ fn main() {
     base(&mut gl);
     gl.define("_GNU_SOURCE", None);
     gl.file("glue.c");
+    gl.file("us_keymap.c"); // compiled-in US keymap for the no-data-files XKB fallback
     gl.file(format!("{pers}/crt_glue.c")).file(format!("{pers}/oxbow_syscall.c")).include(&pers);
     // pixman arch get_implementations pass-throughs (we built generic-only)
     let stub = format!("{out}/pxsimd.c");
