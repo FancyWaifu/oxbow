@@ -44,6 +44,9 @@ fn main() {
     println!("cargo:rerun-if-changed=glue.c");
     println!("cargo:rerun-if-changed={pers}");
     println!("cargo:rerun-if-changed={xs}/hw/xwayland");
+    println!("cargo:rerun-if-changed={xs}/os");
+    println!("cargo:rerun-if-changed={xs}/dix");
+    println!("cargo:rerun-if-changed={xs}/include");
 
     println!("cargo:rustc-link-arg=-T{pers}/musl-user.ld");
     println!("cargo:rustc-link-arg=--start-group");

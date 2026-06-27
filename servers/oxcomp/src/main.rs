@@ -225,7 +225,10 @@ pub extern "C" fn oxbow_main() -> ! {
     // big X screen in a single oxcomp window; argv reaches its main() via SPAWN_ARGV.
     let srv3 = match rt::channel::pair() {
         Some((xsrv, xcli)) => {
-            let args = b":0 -geometry 1280x800 -retro"; // rootful is the default; -retro = visible root weave
+            // rootful default; -retro = visible root; -nolock skips the /tmp lock (hangs on oxbow
+            // fs); -listen tcp = the personality has no AF_UNIX named sockets, only TCP, so X
+            // clients connect via 127.0.0.1:0 instead of /tmp/.X11-unix/X0.
+            let args = b":0 -geometry 1280x800 -retro -nolock -listen tcp";
             let mut xm = MsgBuf::new(0);
             xm.data[0] = app_budget(64); // a full X server needs a generous working set
             xm.data[1] = args.as_ptr() as u64;
@@ -235,7 +238,7 @@ pub extern "C" fn oxbow_main() -> ! {
             xm.handles[0] = oxbow_abi::BOOT_FS_ROOT; // slot 1: fs
             xm.handles[1] = BOOT_CONSOLE; // slot 2: console (ErrorF → serial)
             xm.handles[2] = xcli; // slot 4: Wayland channel to us
-            xm.handles[3] = HANDLE_NULL;
+            xm.handles[3] = oxbow_abi::BOOT_NET_EP; // slot 20: net — Xwayland's X listen socket is TCP (needs oxcomp to hold net)
             if rt::sys_spawn(oxbow_abi::BOOT_IMG_XWAYLAND, BOOT_MEM, &xm, HANDLE_NULL).is_ok() {
                 w(b"[oxcomp] Xwayland spawned (:0 rootful)\n");
                 xsrv

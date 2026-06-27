@@ -589,6 +589,17 @@ fn kmain_stage2() -> ! {
                         },
                     );
                 }
+                // §xwayland: the network control endpoint (badged, like the init
+                // process gets) so oxcomp can grant net onward to Xwayland — whose X
+                // listen socket is TCP (the personality has no AF_UNIX named sockets).
+                p.install(
+                    oxbow_abi::BOOT_NET_EP,
+                    object::HandleEntry {
+                        obj: object::ObjectRef::Endpoint(ipc::EP3),
+                        rights: oxbow_abi::R_SEND | oxbow_abi::R_GRANT,
+                        badge: oxbow_abi::NET_CTL,
+                    },
+                );
                 // §54: the RECEIVE end of the mouse-packet channel — the compositor
                 // moves the cursor and emits wl_pointer from these.
                 if let Some(conn) = mouse_chan {
