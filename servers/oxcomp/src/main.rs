@@ -219,7 +219,33 @@ pub extern "C" fn oxbow_main() -> ! {
         }
         None => HANDLE_NULL,
     };
-    let srv3 = HANDLE_NULL;
+    // §xwayland: boot Xwayland (a real X server, the xorg-server Wayland DDX) as a THIRD
+    // compositor client, so X11 apps render beside the Wayland ones. It connects to us via
+    // its slot-4 channel (wl_display_connect_to_fd(ox_chan_fd(4)), patched in). Rootful: one
+    // big X screen in a single oxcomp window; argv reaches its main() via SPAWN_ARGV.
+    let srv3 = match rt::channel::pair() {
+        Some((xsrv, xcli)) => {
+            let args = b":0 -geometry 1280x800 -retro"; // rootful is the default; -retro = visible root weave
+            let mut xm = MsgBuf::new(0);
+            xm.data[0] = app_budget(64); // a full X server needs a generous working set
+            xm.data[1] = args.as_ptr() as u64;
+            xm.data[2] = args.len() as u64;
+            xm.data_len = 3;
+            xm.handle_count = 4;
+            xm.handles[0] = oxbow_abi::BOOT_FS_ROOT; // slot 1: fs
+            xm.handles[1] = BOOT_CONSOLE; // slot 2: console (ErrorF → serial)
+            xm.handles[2] = xcli; // slot 4: Wayland channel to us
+            xm.handles[3] = HANDLE_NULL;
+            if rt::sys_spawn(oxbow_abi::BOOT_IMG_XWAYLAND, BOOT_MEM, &xm, HANDLE_NULL).is_ok() {
+                w(b"[oxcomp] Xwayland spawned (:0 rootful)\n");
+                xsrv
+            } else {
+                w(b"[oxcomp] Xwayland spawn failed\n");
+                HANDLE_NULL
+            }
+        }
+        None => HANDLE_NULL,
+    };
     w(b"[oxcomp] compositor up; terminal spawned (launch more from Activities)\n");
 
     // Set up the display on our kept channel end and run the compositing loop.

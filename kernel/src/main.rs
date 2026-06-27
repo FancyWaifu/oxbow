@@ -386,7 +386,7 @@ fn kmain_stage2() -> ! {
         // what gives a clean boot straight to the prompt (no demo spam).
         if matches!(
             cmd,
-            b"pong" | b"beta" | b"hello" | b"badge" | b"cat" | b"ls" | b"mkdir" | b"touch" | b"rm" | b"mv" | b"cp" | b"drift" | b"cc-hello" | b"tcc" | b"lua" | b"micropython" | b"qjs" | b"curl" | b"cares-test" | b"ffi-test" | b"wl-test" | b"xkb-test" | b"vterm-test" | b"ft-test" | b"wlclient" | b"oxterm" | b"sysmon" | b"doom" | b"havoc" | b"jail" | b"fstest"
+            b"pong" | b"beta" | b"hello" | b"badge" | b"cat" | b"ls" | b"mkdir" | b"touch" | b"rm" | b"mv" | b"cp" | b"drift" | b"cc-hello" | b"tcc" | b"lua" | b"micropython" | b"qjs" | b"curl" | b"cares-test" | b"ffi-test" | b"wl-test" | b"xkb-test" | b"vterm-test" | b"ft-test" | b"wlclient" | b"oxterm" | b"sysmon" | b"doom" | b"havoc" | b"xwayland" | b"jail" | b"fstest"
         ) {
             image::register(cmd, bytes);
             println!("[mod] image '{}' registered ({} bytes)", name, bytes.len());
@@ -429,7 +429,7 @@ fn kmain_stage2() -> ! {
         } else if cmd == b"fs" {
             16 * 1024 * 1024
         } else if cmd == b"oxcomp" {
-            192 * 1024 * 1024 // libwayland + shm + funds children (oxterm + havoc both at boot)
+            384 * 1024 * 1024 // libwayland + shm + funds children (oxterm + havoc + Xwayland at boot)
         } else if cmd == b"gpu" {
             32 * 1024 * 1024 // virtqueue rings + a full-resolution scanout backing store
         } else if cmd == b"oxhello" || cmd == b"thrtest" {
@@ -627,6 +627,7 @@ fn kmain_stage2() -> ! {
                 (b"sysmon".as_slice(), oxbow_abi::BOOT_IMG_SYSMON),
                 (b"doom".as_slice(), oxbow_abi::BOOT_IMG_DOOM),
                 (b"havoc".as_slice(), oxbow_abi::BOOT_IMG_HAVOC),
+                (b"xwayland".as_slice(), oxbow_abi::BOOT_IMG_XWAYLAND),
             ] {
                 if let Some(idx) = image::find(name) {
                     proc::with_proc_mut(pid, |p| {

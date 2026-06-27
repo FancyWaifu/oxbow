@@ -42,6 +42,7 @@ build-server:
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p sysmon
     RUSTFLAGS='-C relocation-model=static -C target-feature=-soft-float,+sse,+sse2' cargo build -p doom
     cargo build -p havoc-musl  # real upstream Wayland terminal (musl); flags come from its build.rs
+    cargo build -p xwayland-musl  # real X server (xorg-server Wayland DDX) as an oxcomp client
     RUSTFLAGS="-C relocation-model=static" cargo build -p fsd
     RUSTFLAGS="-C relocation-model=static" cargo build -p cat
     RUSTFLAGS="-C relocation-model=static" cargo build -p ls
@@ -130,6 +131,8 @@ _iso:
     -strip -S iso_root/boot/doom.elf
     cp target/x86_64-unknown-none/debug/havoc iso_root/boot/havoc.elf
     -strip -S iso_root/boot/havoc.elf
+    cp target/x86_64-unknown-none/debug/Xwayland iso_root/boot/xwayland.elf
+    "$(find $(rustc --print sysroot) -name llvm-strip | head -1)" --strip-all iso_root/boot/xwayland.elf
     cp target/x86_64-unknown-none/debug/oxcomp iso_root/boot/oxcomp.elf
     -strip -S iso_root/boot/oxcomp.elf
     cp target/x86_64-unknown-none/debug/cat iso_root/boot/cat.elf
