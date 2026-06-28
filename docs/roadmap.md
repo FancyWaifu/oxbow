@@ -69,9 +69,14 @@ Goal: real X/Wayland apps → window manager → toolkit apps → a DE. Transpor
   owner (parent) keeps `owns=1` and does the real teardown. xterm now survives the fork and the
   shell runs end-to-end (`sh:` prompt) with no IO error. (Mirrors the existing pipe writer-refcount
   fix; full accept()+fork refcounting is still future, but no app needs it today.)
-  **Still remaining for the visible window:** xterm runs but doesn't yet map a composited window in
-  the Xwayland root (xeyes did, so the Xwayland→oxcomp path works) — likely the shell exiting on the
-  idle pty taking xterm with it, or an xterm window-map detail. Next.
+  **xterm RENDERS A WINDOW** (`docs/xterm-window-on-oxbow.png`): a stderr probe confirmed xterm
+  reaches `VTRun` → `set_vt_visibility` (maps its top window), and with twm temporarily disabled the
+  window appears in the Xwayland root. Two follow-ups for a *polished* interactive xterm:
+  (a) **twm hides it** — twm intercepts xterm's MapRequest and (unlike xeyes, whose geometry set
+  USPosition) does interactive placement, so the window never lands; needs a twm placement config
+  (RandomPlacement / UsePPosition) or USPosition hints. (b) The mapped window is **blank white** —
+  xterm cleared to background but isn't drawing the shell's output yet (the pty-master → VT-draw
+  path); the shell runs (havoc renders its prompt fine, so the pieces exist). Both tracked.
 - **A6. First real toolkit app** — a single **GTK3** app (Cairo + Pango + Fontconfig + GLib + D-Bus).
   GTK3 over GTK4 (no hard GL requirement for basic widgets). *Milestone:* a GTK window with widgets.
 - **A7. Lightweight DE** — **XFCE** (GTK, no mandatory GL) is the realistic DE target, NOT GNOME/KDE.
