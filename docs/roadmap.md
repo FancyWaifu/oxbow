@@ -81,10 +81,16 @@ Goal: real X/Wayland apps → window manager → toolkit apps → a DE. Transpor
   stayed on the **console** (its output went to serial, not xterm — hence "sh: can't access tty" on
   serial + a blank window). Patched the child to `dup2(ttyfd, i)` (explicit target fd, which the
   personality honors — same as login_tty). **Verified:** the shell's output now reaches xterm (a
-  pty-read probe fired; serial is clean of the shell message). REMAINING: xterm reads the pty data
-  but the window still shows no text — a VT text-draw / font-GC / color path issue (e.g. fg==bg),
-  the last step. (General note: oxbow's `dup()` returning only fds ≥ 3 breaks close+dup for any app;
-  a proper fix reuses closed low fds, which needs fd 0/1/2 tracking — deferred.)
+  pty-read probe fired; serial is clean of the shell message). A second probe in xterm's text-draw
+  (`xtermPartString`) confirmed xterm **draws the text 27× with distinct fg/bg colours** — so xterm
+  is correct end to end (reads shell I/O → parses → draws). REMAINING (isolated to the X server, not
+  xterm): the glyphs don't appear. The decisive tell is that **xeyes (graphics) rendered but xterm
+  (text via a font) shows only the white background** — so the gap is **Xwayland's server-side font
+  glyph rendering**: the builtin "fixed" font (libXfont2, gzip'd PCF) gives metrics (the window sized
+  to 80×24) but its glyph bitmaps aren't producing pixels. Next step is in the Xwayland font path
+  (verify the builtin PCF glyph decode/blit), a separate subsystem. (General note: oxbow's `dup()`
+  returning only fds ≥ 3 breaks close+dup for any app; a proper fix reuses closed low fds, which
+  needs fd 0/1/2 tracking — deferred.)
 - **A6. First real toolkit app** — a single **GTK3** app (Cairo + Pango + Fontconfig + GLib + D-Bus).
   GTK3 over GTK4 (no hard GL requirement for basic widgets). *Milestone:* a GTK window with widgets.
 - **A7. Lightweight DE** — **XFCE** (GTK, no mandatory GL) is the realistic DE target, NOT GNOME/KDE.
