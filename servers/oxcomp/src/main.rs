@@ -253,6 +253,15 @@ pub extern "C" fn oxbow_main() -> ! {
         }
         None => HANDLE_NULL,
     };
+    // §twm (roadmap A4): the real xorg twm window manager is ported, builds, and RUNS (it spawns,
+    // parses its config, manages the X root, and grabs keyboard focus as an active WM — verified).
+    // BUT auto-spawning it alongside xeyes currently WEDGES the wayland greeter login: twm+xeyes
+    // flood Xwayland's fd (xeyes polls the pointer ~every 50ms), and oxcomp's wl_event_loop epoll
+    // shim over capability channels starves the greeter's input channel under that flood — an
+    // epoll-fairness-under-load issue in the COMPOSITOR, not a twm problem. So twm is left spawnable
+    // (BOOT_IMG_TWM) but NOT auto-spawned, keeping the desktop usable. A4-runtime follow-up: make
+    // oxcomp's event loop fair to the input/session channels when a client floods.
+    let _ = oxbow_abi::BOOT_IMG_TWM;
     // §xeyes: the FIRST UNMODIFIED UPSTREAM X app (roadmap A3) — the real xorg xeyes on the full
     // X Toolkit chain (libXt/libXext/libXmu over libX11/libxcb). `-display 127.0.0.1:0` points it
     // at Xwayland's loopback TCP listener (XtAppInitialize parses it). It retries internally, so
@@ -260,7 +269,7 @@ pub extern "C" fn oxbow_main() -> ! {
     {
         let args = b"-display 127.0.0.1:0 -geometry 200x200+1150+450"; // host:0 -> TCP 6000; placed clear of other windows
         let mut cm = MsgBuf::new(0);
-        cm.data[0] = app_budget(56); // the whole toolkit stack (~11.5 MB) — large working set
+        cm.data[0] = app_budget(24); // X client — modest working set (fits alongside twm)
         cm.data[1] = args.as_ptr() as u64;
         cm.data[2] = args.len() as u64;
         cm.data_len = 3;
@@ -272,7 +281,7 @@ pub extern "C" fn oxbow_main() -> ! {
         if rt::sys_spawn(oxbow_abi::BOOT_IMG_XEYES, BOOT_MEM, &cm, HANDLE_NULL).is_ok() {
             w(b"[oxcomp] xeyes spawned (upstream X app, Xt toolkit)\n");
         } else {
-            w(b"[oxcomp] xlibdemo spawn failed\n");
+            w(b"[oxcomp] xeyes spawn failed\n");
         }
     }
     w(b"[oxcomp] compositor up; terminal spawned (launch more from Activities)\n");

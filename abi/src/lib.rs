@@ -636,6 +636,7 @@ pub const BOOT_IMG_XCLIENT: Handle = 48; // xclient — minimal raw-X11 client (
 pub const BOOT_IMG_XCBDEMO: Handle = 49; // xcbdemo — X client on real libxcb (loopback TCP -> Xwayland)
 pub const BOOT_IMG_XLIBDEMO: Handle = 50; // xlibdemo — X client on real libX11/Xlib (over libxcb)
 pub const BOOT_IMG_XEYES: Handle = 51; // xeyes — first unmodified upstream X app (Xt/Xext/Xmu toolkit)
+pub const BOOT_IMG_TWM: Handle = 52; // twm — the X window manager (decorates X clients in Xwayland)
 
 /// The framebuffer capability, granted to the `fb` server at boot. Gates
 /// SYS_FB_INFO (geometry) + SYS_FB_MAP (map the pixels RW). §34 (graphics).

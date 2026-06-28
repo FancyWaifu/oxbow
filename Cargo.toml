@@ -94,6 +94,7 @@ members = [
     "servers/xcbdemo-musl",
     "servers/xlibdemo-musl",
     "servers/xeyes-musl",
+    "servers/twm-musl",
     "servers/doom",
     "servers/ps",
     "servers/kill",
