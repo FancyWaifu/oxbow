@@ -37,14 +37,18 @@ Goal: real X/Wayland apps → window manager → toolkit apps → a DE. Transpor
 - **A3. libXt + libXext + libXmu** (toolkit intrinsics) — ✅ DONE. The whole chain (libXext +
   libICE + libSM + libXt + libXmu) builds against musl; `servers/xeyes-musl` runs the *unmodified
   upstream* xorg **xeyes** (`docs/xeyes-on-oxbow.png`). **← A3 COMPLETE: first real upstream X app**
-- **A4. A window manager** — `twm` — 🟡 PORTED + BUILDS + RUNS (`servers/twm-musl`). Two compositor
-  fixes landed toward the visual: (1) **event-driven login** — the greeter's verdict read was a
-  blocking `read()` that FROZE oxcomp's whole event loop (Xwayland + input) when the shell was slow
-  under load; now async via `on_session` (verified: Xwayland runs past InitOutput instead of wedging).
-  (2) **X session spawns post-login**, not at boot, so X-client traffic can't starve the greeter.
-  STILL BLOCKED on the visual by a deeper issue: **intermittent kbd input loss under wayland-server
-  load** (keystrokes — sometimes the whole burst, sometimes just Enter — don't reach the greeter).
-  **A4-runtime follow-up: kbd input reliability (kbd driver IRQ / oxcomp input fd) under load.**
+- **A4. A window manager** — `twm` — ✅ DONE. Graphical login works end-to-end and the post-login X
+  session renders: **xeyes draws inside the rootful Xwayland window with twm managing it**, next to
+  the native havoc + oxterm windows (`docs/twm-xeyes-on-oxbow.png`). Three fixes got here:
+  (1) **event-driven login** — the greeter's verdict read was a blocking `read()` that froze oxcomp's
+  whole event loop; now async via `on_session`. (2) **X session spawns post-login**, not at boot.
+  (3) **THE blocker — a handle collision**: `BOOT_IMG_TWM` was `52`, the same value as
+  `BOOT_SESSION_CHAN=52`. Both install into the shell, so the image handle overwrote the
+  session-channel side, closing it; oxcomp's `on_session` then spun on EOF/HUP forever and the shell
+  never received the greeter's credentials — login could never complete. (The earlier
+  "intermittent kbd input loss" was a misdiagnosis: input was always fine — `root` typed into the
+  greeter perfectly; the session channel was just dead.) Fixed by moving the X-demo image handles to
+  53–57, clear of the GPU/session data handles.
 - **A5. `xterm`** — a real terminal X client (needs the PTY subsystem too).
 - **A6. First real toolkit app** — a single **GTK3** app (Cairo + Pango + Fontconfig + GLib + D-Bus).
   GTK3 over GTK4 (no hard GL requirement for basic widgets). *Milestone:* a GTK window with widgets.
