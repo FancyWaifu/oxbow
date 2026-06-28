@@ -558,6 +558,7 @@ static int  g_passlen;
 static int  g_field;     /* 0 = username, 1 = password */
 static int  g_login_err; /* show "login incorrect" */
 static int  g_shift;     /* greeter modifier state */
+static int  g_awaiting_verdict; /* §A4: creds sent to the shell, awaiting its reply on the session fd */
 
 /* set-1 scancode (low 7 bits) -> US-ASCII for the greeter's own text input. The
  * compositor normally forwards raw scancodes to clients (xkb decodes them); the
@@ -661,20 +662,13 @@ static void greeter_submit(void)
   for (int i = 0; i < g_passlen && k < 99; i++)
     msg[k++] = g_pass[i];
   (void)!write(g_session_fd, msg, k);
-  char verdict = 0;
-  /* Block for the shell's reply (auth is instant); the event loop is paused. */
-  while (read(g_session_fd, &verdict, 1) != 1)
-    ;
   __builtin_memset(g_pass, 0, sizeof g_pass);
   g_passlen = 0;
-  if (verdict == '1') {
-    g_greeter = 0;
-    g_login_err = 0;
-    composite_rect(0, 0, g_w, g_h); /* reveal the desktop */
-  } else {
-    g_login_err = 1;
-    composite_rect(0, 0, g_w, g_h);
-  }
+  /* §A4: do NOT block for the verdict — the event loop must keep running (Xwayland and
+   * keyboard input depend on it; a slow shell reply under load would otherwise freeze the
+   * whole compositor). The shell's one-byte reply arrives asynchronously on the session fd
+   * and is handled by on_session(). */
+  g_awaiting_verdict = 1;
 }
 
 /* Feed one raw scancode to the greeter (press/release with the 0x80 break bit). */
@@ -728,9 +722,18 @@ static int on_session(int fd, uint32_t mask, void *data)
   (void)data;
   char b[16];
   long n = read(fd, b, sizeof b);
-  for (long i = 0; i < n; i++)
-    if (b[i] == 'L')
-      show_greeter();
+  for (long i = 0; i < n; i++) {
+    if (g_awaiting_verdict) {
+      /* §A4: the shell's reply to a login attempt: '1' = ok (reveal desktop), else error. */
+      g_awaiting_verdict = 0;
+      g_login_err = (b[i] != '1');
+      if (b[i] == '1')
+        g_greeter = 0;
+      composite_rect(0, 0, g_w, g_h);
+    } else if (b[i] == 'L') {
+      show_greeter(); /* logged in already: a byte means `logout` */
+    }
+  }
   return 0;
 }
 
@@ -1914,4 +1917,12 @@ void comp_server_pump(void *d)
 int comp_server_composited(void)
 {
   return g_composited;
+}
+
+/* §A4: 1 once the user has logged in (greeter dismissed). The Rust side spawns the X
+ * session apps (twm + xeyes) only AFTER this flips, so the wayland greeter login isn't
+ * starved by X-client traffic while the user is still typing credentials. */
+int comp_server_logged_in(void)
+{
+  return !g_greeter;
 }

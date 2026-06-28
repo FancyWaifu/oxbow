@@ -37,13 +37,14 @@ Goal: real X/Wayland apps → window manager → toolkit apps → a DE. Transpor
 - **A3. libXt + libXext + libXmu** (toolkit intrinsics) — ✅ DONE. The whole chain (libXext +
   libICE + libSM + libXt + libXmu) builds against musl; `servers/xeyes-musl` runs the *unmodified
   upstream* xorg **xeyes** (`docs/xeyes-on-oxbow.png`). **← A3 COMPLETE: first real upstream X app**
-- **A4. A window manager** — `twm` — 🟡 PORTED + BUILDS + RUNS (it spawns, parses its config, manages
-  the X root, grabs keyboard focus = an active WM; `servers/twm-musl`, deps all already ported, parser
-  pre-generated). BLOCKED on the VISUAL: a continuously-flooding X client (xeyes polls the pointer
-  ~20×/s) makes the **wayland greeter login intermittently miss keystrokes** — a compositor
-  input-reliability issue under X-client load (NOT epoll fairness — that's fine). Left spawnable but
-  not auto-spawned to keep the desktop usable. **A4-runtime follow-up: oxcomp input reliability under
-  a flooding wl client.**
+- **A4. A window manager** — `twm` — 🟡 PORTED + BUILDS + RUNS (`servers/twm-musl`). Two compositor
+  fixes landed toward the visual: (1) **event-driven login** — the greeter's verdict read was a
+  blocking `read()` that FROZE oxcomp's whole event loop (Xwayland + input) when the shell was slow
+  under load; now async via `on_session` (verified: Xwayland runs past InitOutput instead of wedging).
+  (2) **X session spawns post-login**, not at boot, so X-client traffic can't starve the greeter.
+  STILL BLOCKED on the visual by a deeper issue: **intermittent kbd input loss under wayland-server
+  load** (keystrokes — sometimes the whole burst, sometimes just Enter — don't reach the greeter).
+  **A4-runtime follow-up: kbd input reliability (kbd driver IRQ / oxcomp input fd) under load.**
 - **A5. `xterm`** — a real terminal X client (needs the PTY subsystem too).
 - **A6. First real toolkit app** — a single **GTK3** app (Cairo + Pango + Fontconfig + GLib + D-Bus).
   GTK3 over GTK4 (no hard GL requirement for basic widgets). *Milestone:* a GTK window with widgets.
