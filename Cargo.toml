@@ -92,6 +92,7 @@ members = [
     "servers/xwayland-musl",
     "servers/xclient-musl",
     "servers/xcbdemo-musl",
+    "servers/xlibdemo-musl",
     "servers/doom",
     "servers/ps",
     "servers/kill",

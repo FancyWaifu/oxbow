@@ -29,11 +29,13 @@ Everything in Track B converges here.
 ## Track A — Desktop & Apps (build the client side up)
 Goal: real X/Wayland apps → window manager → toolkit apps → a DE. Transport is proven.
 
-- **A1. libxcb** — the X11 client protocol library. Needs xcb-proto codegen (host Python)
-  + libXau (DONE, builds as a cc group) + pthreads (have). Connect via TCP (DISPLAY=127.0.0.1:0).
-  *Milestone:* a minimal xcb client draws a window via libxcb (not raw protocol). **← STARTING HERE**
-- **A2. libX11 (Xlib)** on top of libxcb (261 .c files present). *Milestone:* `xev`/a simple Xlib app.
-- **A3. libXt + libXext + libXmu/libXaw** (toolkit intrinsics). *Milestone:* `xclock`, `xeyes`.
+- **A1. libxcb** — ✅ DONE (commit e933307). xcb-proto codegen + libXau + the 11 core files build
+  against musl; `servers/xcbdemo-musl` connects via `xcb_connect("127.0.0.1:0")` and maps a window.
+- **A2. libX11 (Xlib)** — ✅ DONE. All 261 core + xcms/xkb/i18n + locale/om/im modules build against
+  musl over the libxcb transport; `servers/xlibdemo-musl` does `XOpenDisplay` + XCreateSimpleWindow +
+  XMapWindow (cyan window, `docs/libx11-on-oxbow.png`). **← A2 COMPLETE**
+- **A3. libXt + libXext + libXmu/libXaw** (toolkit intrinsics). *Milestone:* `xclock`, `xeyes`,
+  and the first *unmodified upstream* X apps. **← NEXT**
 - **A4. A window manager** — `twm` (tiny, Xlib-only) or `cwm`. *Milestone:* movable, decorated windows.
 - **A5. `xterm`** — a real terminal X client (needs the PTY subsystem too).
 - **A6. First real toolkit app** — a single **GTK3** app (Cairo + Pango + Fontconfig + GLib + D-Bus).
@@ -76,7 +78,7 @@ GNOME/KDE specifically are deliberately **not** near-term targets: they couple m
 a JS/QML engine + the full D-Bus service constellation at once. XFCE (Track A7) is the realistic DE.
 
 ## Immediate next step
-**A1: port libxcb.** Fetch xcb-proto + libxcb, run the protocol generator, build libxcb as a
-cc group against musl (mirroring the libXau group in `servers/xwayland-musl/build.rs`), and link a
-minimal xcb client that connects over loopback TCP and maps a window — replacing the raw-protocol
-`xclient` demo with the real client library every upstream X app uses.
+**A3: libXt + libXext (+ libXmu/libXaw).** With libxcb (A1) and libX11 (A2) proven, the next rung
+is the X Toolkit Intrinsics + extension library, which unlock the first *unmodified upstream* X
+apps — `xeyes`/`xclock` (libXt) and simple utilities. Port libXext + libXt as cc groups (mirroring
+the libX11 group in `servers/xlibdemo-musl/build.rs`), then build a real upstream app against them.

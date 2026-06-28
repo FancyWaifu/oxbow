@@ -253,14 +253,14 @@ pub extern "C" fn oxbow_main() -> ! {
         }
         None => HANDLE_NULL,
     };
-    // §xcbdemo: an X client built on REAL libxcb (roadmap A1) — connects to Xwayland over
-    // loopback TCP (127.0.0.1:6000) and maps a window, proving the actual client library every
-    // upstream X app uses works on oxbow. It retries connect() until Xwayland is listening, so
-    // spawn order doesn't matter. Demo wire; slot 20 = net for its TCP socket.
+    // §xlibdemo: an X client built on REAL libX11/Xlib (roadmap A2, over the libxcb transport
+    // from A1) — connects to Xwayland over loopback TCP (127.0.0.1:6000) and maps a window,
+    // proving the classic Xlib API that most upstream X apps + toolkits use works on oxbow. It
+    // retries connect() until Xwayland is listening, so spawn order doesn't matter. Demo wire.
     {
         let args = b"";
         let mut cm = MsgBuf::new(0);
-        cm.data[0] = app_budget(16); // libxcb needs a bigger working set than the raw client
+        cm.data[0] = app_budget(40); // libX11 is large (~8 MB) — generous working set
         cm.data[1] = args.as_ptr() as u64;
         cm.data[2] = args.len() as u64;
         cm.data_len = 3;
@@ -269,10 +269,10 @@ pub extern "C" fn oxbow_main() -> ! {
         cm.handles[1] = BOOT_CONSOLE; // slot 2: console (logging)
         cm.handles[2] = BOOT_CONSOLE; // slot 4: unused; fill with a harmless cap
         cm.handles[3] = oxbow_abi::BOOT_NET_EP; // slot 20: net (loopback TCP to Xwayland)
-        if rt::sys_spawn(oxbow_abi::BOOT_IMG_XCBDEMO, BOOT_MEM, &cm, HANDLE_NULL).is_ok() {
-            w(b"[oxcomp] xcbdemo spawned (libxcb loopback demo)\n");
+        if rt::sys_spawn(oxbow_abi::BOOT_IMG_XLIBDEMO, BOOT_MEM, &cm, HANDLE_NULL).is_ok() {
+            w(b"[oxcomp] xlibdemo spawned (libX11 loopback demo)\n");
         } else {
-            w(b"[oxcomp] xcbdemo spawn failed\n");
+            w(b"[oxcomp] xlibdemo spawn failed\n");
         }
     }
     w(b"[oxcomp] compositor up; terminal spawned (launch more from Activities)\n");
