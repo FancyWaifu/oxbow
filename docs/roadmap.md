@@ -10,6 +10,24 @@ desktop software, work toward a desktop environment, and eventually port Proton 
 3. **GPU acceleration** (Vulkan via virtio-gpu Venus) — the gate for everything below.
 4. **Wine → Proton** — run Windows games (DXVK/VKD3D → Vulkan). The summit.
 
+## Committed DE plan: XFCE first, then GNOME/KDE
+The explicit goal is a full desktop environment: **reach XFCE, then climb to GNOME and/or KDE.**
+XFCE is first because it's GTK-based with **no mandatory GPU GL** and only modest D-Bus — reachable
+on a software stack. GNOME/KDE come after because they additionally demand GPU Vulkan + a full D-Bus
+service constellation + a JS/QML engine all at once. The gate ladder (each rung is a real project,
+roughly in order):
+
+- **G0. Server-side font glyphs** (CURRENT BLOCKER, task #80) — text X clients render at all.
+- **G1. First real toolkit app: GTK3** — GLib + Cairo + Pango + Fontconfig + a D-Bus stub (roadmap A6).
+- **G2. Software OpenGL** — Mesa llvmpipe + LLVM (Track B1).
+- **G3. XFCE** — GTK, no mandatory GL, modest D-Bus. **← first DE target** (roadmap A7).
+- **G4. GPU-accelerated Vulkan** — virtio-gpu Venus (Track B4); the lever GTK4/Qt6/Mutter/KWin need.
+- **G5. Service constellation** — full D-Bus + a logind shim + PipeWire + PolicyKit + …
+- **G6. GNOME** (Mutter + Shell + GJS + GTK4) **and/or KDE** (KWin + Qt6/QML + KF6) — the summit DEs.
+
+Distance is honest: G3/XFCE is a year-plus of focused work but every gate is individually tractable;
+G6/GNOME-KDE is multi-year. The path is **wide** (many ports), not **deep** (no unsolved unknowns).
+
 ## Current position (verified rendering on screen)
 - Capability microkernel, SMP, virtio-gpu 2D driver, networking, **dynamic linking** (`ld-oxbow`).
 - **musl/Linux-syscall personality** runs real upstream apps unmodified.
