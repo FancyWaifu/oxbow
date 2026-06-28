@@ -100,6 +100,14 @@ fn main() {
                           "#if defined(__FreeBSD__) || defined(__DragonFly__)\n#include <libutil.h>		/* openpty() */\n#endif\n\n#if defined(__oxbow__)\n#include <pty.h>		/* openpty() */\n#endif");
             t = t.replace("\t    setpgrp(0, 0);", "\t    setpgrp();");
             t = t.replace("\t    setpgrp(0, pgrp);", "\t    setpgrp();");
+            // The child wires the pty slave onto 0/1/2 with `close(i); dup(ttyfd)`, relying on
+            // dup() returning the lowest free fd. oxbow's dup() only hands out fds >= 3, so the
+            // slave never lands on 0/1/2 and the shell's stdio stays on the console (its output
+            // never reaches xterm — blank window). Use dup2 with the explicit target fd, which
+            // the personality honors (this is what login_tty/forkpty already do).
+            t = t.replace(
+                "IGNORE_RC(close(i));\n\t\t\tIGNORE_RC(dup(ttyfd));",
+                "IGNORE_RC(dup2(ttyfd, i));");
             // Tolerate ENOSYS in the "no controlling terminal" check: oxbow has no /dev/tty and
             // returns ENXIO for it, but a following signal()/alarm() (unimplemented → ENOSYS)
             // can clobber errno before xterm inspects it. Treat ENOSYS like ENXIO (use defaults)

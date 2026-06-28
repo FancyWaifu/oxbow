@@ -74,9 +74,17 @@ Goal: real X/Wayland apps → window manager → toolkit apps → a DE. Transpor
   window appears in the Xwayland root. Two follow-ups for a *polished* interactive xterm:
   (a) **twm hides it** — twm intercepts xterm's MapRequest and (unlike xeyes, whose geometry set
   USPosition) does interactive placement, so the window never lands; needs a twm placement config
-  (RandomPlacement / UsePPosition) or USPosition hints. (b) The mapped window is **blank white** —
-  xterm cleared to background but isn't drawing the shell's output yet (the pty-master → VT-draw
-  path); the shell runs (havoc renders its prompt fine, so the pieces exist). Both tracked.
+  (RandomPlacement / UsePPosition) or USPosition hints. (b) The mapped window is **blank white**.
+  ROOT CAUSE of the no-output half FOUND + FIXED: xterm's child wires the pty slave onto fds 0/1/2
+  with the `close(i); dup(ttyfd)` idiom, which assumes `dup()` returns the lowest free fd — but
+  oxbow's `dup()` only hands out fds ≥ 3, so the slave never landed on 0/1/2 and the shell's stdio
+  stayed on the **console** (its output went to serial, not xterm — hence "sh: can't access tty" on
+  serial + a blank window). Patched the child to `dup2(ttyfd, i)` (explicit target fd, which the
+  personality honors — same as login_tty). **Verified:** the shell's output now reaches xterm (a
+  pty-read probe fired; serial is clean of the shell message). REMAINING: xterm reads the pty data
+  but the window still shows no text — a VT text-draw / font-GC / color path issue (e.g. fg==bg),
+  the last step. (General note: oxbow's `dup()` returning only fds ≥ 3 breaks close+dup for any app;
+  a proper fix reuses closed low fds, which needs fd 0/1/2 tracking — deferred.)
 - **A6. First real toolkit app** — a single **GTK3** app (Cairo + Pango + Fontconfig + GLib + D-Bus).
   GTK3 over GTK4 (no hard GL requirement for basic widgets). *Milestone:* a GTK window with widgets.
 - **A7. Lightweight DE** — **XFCE** (GTK, no mandatory GL) is the realistic DE target, NOT GNOME/KDE.
