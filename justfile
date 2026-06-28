@@ -44,6 +44,7 @@ build-server:
     cargo build -p havoc-musl  # real upstream Wayland terminal (musl); flags come from its build.rs
     cargo build -p xwayland-musl  # real X server (xorg-server Wayland DDX) as an oxcomp client
     cargo build -p xclient-musl  # minimal raw-X11 client (loopback TCP -> Xwayland)
+    cargo build -p xcbdemo-musl  # X client on real libxcb (loopback TCP -> Xwayland)
     RUSTFLAGS="-C relocation-model=static" cargo build -p fsd
     RUSTFLAGS="-C relocation-model=static" cargo build -p cat
     RUSTFLAGS="-C relocation-model=static" cargo build -p ls
@@ -136,6 +137,8 @@ _iso:
     "$(find $(rustc --print sysroot) -name llvm-strip | head -1)" --strip-all iso_root/boot/xwayland.elf
     cp target/x86_64-unknown-none/debug/xclient iso_root/boot/xclient.elf
     "$(find $(rustc --print sysroot) -name llvm-strip | head -1)" --strip-all iso_root/boot/xclient.elf
+    cp target/x86_64-unknown-none/debug/xcbdemo iso_root/boot/xcbdemo.elf
+    "$(find $(rustc --print sysroot) -name llvm-strip | head -1)" --strip-all iso_root/boot/xcbdemo.elf
     cp target/x86_64-unknown-none/debug/oxcomp iso_root/boot/oxcomp.elf
     -strip -S iso_root/boot/oxcomp.elf
     cp target/x86_64-unknown-none/debug/cat iso_root/boot/cat.elf

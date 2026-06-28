@@ -253,26 +253,26 @@ pub extern "C" fn oxbow_main() -> ! {
         }
         None => HANDLE_NULL,
     };
-    // §xclient: a minimal raw-X11 client (no libX11) — connects to Xwayland over loopback
-    // TCP (127.0.0.1:6000) and maps a window, proving X clients render on oxbow. It retries
-    // connect() until Xwayland is listening, so spawn order doesn't matter. Demo wire (no
-    // wayland channel needed); slot 20 = net for its TCP socket.
+    // §xcbdemo: an X client built on REAL libxcb (roadmap A1) — connects to Xwayland over
+    // loopback TCP (127.0.0.1:6000) and maps a window, proving the actual client library every
+    // upstream X app uses works on oxbow. It retries connect() until Xwayland is listening, so
+    // spawn order doesn't matter. Demo wire; slot 20 = net for its TCP socket.
     {
         let args = b"";
         let mut cm = MsgBuf::new(0);
-        cm.data[0] = app_budget(8);
+        cm.data[0] = app_budget(16); // libxcb needs a bigger working set than the raw client
         cm.data[1] = args.as_ptr() as u64;
         cm.data[2] = args.len() as u64;
         cm.data_len = 3;
         cm.handle_count = 4;
         cm.handles[0] = oxbow_abi::BOOT_FS_ROOT; // slot 1: fs
         cm.handles[1] = BOOT_CONSOLE; // slot 2: console (logging)
-        cm.handles[2] = BOOT_CONSOLE; // slot 4: unused by xclient; fill with a harmless cap
+        cm.handles[2] = BOOT_CONSOLE; // slot 4: unused; fill with a harmless cap
         cm.handles[3] = oxbow_abi::BOOT_NET_EP; // slot 20: net (loopback TCP to Xwayland)
-        if rt::sys_spawn(oxbow_abi::BOOT_IMG_XCLIENT, BOOT_MEM, &cm, HANDLE_NULL).is_ok() {
-            w(b"[oxcomp] xclient spawned (raw-X11 loopback demo)\n");
+        if rt::sys_spawn(oxbow_abi::BOOT_IMG_XCBDEMO, BOOT_MEM, &cm, HANDLE_NULL).is_ok() {
+            w(b"[oxcomp] xcbdemo spawned (libxcb loopback demo)\n");
         } else {
-            w(b"[oxcomp] xclient spawn failed\n");
+            w(b"[oxcomp] xcbdemo spawn failed\n");
         }
     }
     w(b"[oxcomp] compositor up; terminal spawned (launch more from Activities)\n");
