@@ -79,6 +79,8 @@ struct oxfd {
 	unsigned long off;   /* current file offset (FILE only) */
 	unsigned long size;  /* known size, grows on write (FILE only) */
 	int nonblock;        /* O_NONBLOCK (K_SOCK): read() returns EAGAIN instead of blocking */
+	int owns;            /* socket fds: 1 = close() destroys the net-server socket; 0 = a
+	                      * forked child's BORROWED copy (close drops the cap only). */
 };
 static struct oxfd fds[MAXFD];
 
@@ -100,6 +102,7 @@ static int fd_alloc_kind(long handle, unsigned long size, int kind)
 			fds[i].off = 0;
 			fds[i].size = size;
 			fds[i].nonblock = 0;
+			fds[i].owns = 1; /* a freshly created fd owns its handle (cleared in fork child) */
 			return i;
 		}
 	}
@@ -141,11 +144,19 @@ static void fd_release(int fd)
 		 * (which broke fork-based pipelines + command substitution). */
 		__oxbow_pipe_close((unsigned int)fds[fd].handle);
 	} else if (fds[fd].kind == K_SOCK || fds[fd].kind == K_LISTEN) {
-		if (fds[fd].handle >= 0)
-			__oxbow_sock_close(fds[fd].handle); /* FIN / drop the socket|listener cap */
+		if (fds[fd].handle >= 0) {
+			if (fds[fd].owns)
+				__oxbow_sock_close(fds[fd].handle); /* FIN / drop the socket|listener cap */
+			else
+				__oxbow_sock_release(fds[fd].handle); /* borrowed (fork child): cap only */
+		}
 	} else if (fds[fd].kind == K_UDP) {
-		if (fds[fd].handle >= 0)
-			__oxbow_sock_udp_close(fds[fd].handle);
+		if (fds[fd].handle >= 0) {
+			if (fds[fd].owns)
+				__oxbow_sock_udp_close(fds[fd].handle);
+			else
+				__oxbow_sock_release(fds[fd].handle);
+		}
 	} else if (fds[fd].kind == K_FILE || fds[fd].kind == K_DIR) {
 		/* dup2/F_DUPFD share the fsd handle, so only release it when NO other fd
 		 * still references it (shells dup a fd then close the original — closing the
@@ -655,8 +666,20 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		 * child resumes via the trampoline's longjmp in its own copied AS and setjmp
 		 * returns nonzero. The parent creates the child's exit-notif (so waitpid
 		 * works), forks, and remembers pid->notif. */
-		if (setjmp(fork_buf) != 0)
-			return 0; /* child: fork() returns 0, in its own AS */
+		if (setjmp(fork_buf) != 0) {
+			/* child: fork() returns 0, in its own AS. Its socket fds are BORROWED copies
+			 * of the parent's caps (the kernel cloned the handle table by value); closing
+			 * them must not tear the socket down for the still-running parent. The owner
+			 * (parent) keeps owns=1 and does the real teardown. (Fixes xterm: its child
+			 * close()s the X connection so the shell can't see it, which otherwise killed
+			 * the parent's X socket. A long-lived child that needs to OWN an inherited
+			 * socket — accept()+fork servers — would need real refcounting; none today.) */
+			for (int i = 0; i < MAXFD; i++)
+				if (fds[i].used &&
+				    (fds[i].kind == K_SOCK || fds[i].kind == K_LISTEN || fds[i].kind == K_UDP))
+					fds[i].owns = 0;
+			return 0;
+		}
 		long notif = ox_notif_create(); /* handle is in RDX, not RAX */
 		if (notif < 0)
 			return -E_NOSYS;

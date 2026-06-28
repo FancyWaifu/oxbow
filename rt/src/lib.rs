@@ -1555,6 +1555,17 @@ pub extern "C" fn __oxbow_sock_close(sock: i64) {
     let _ = sys_close(sock as Handle);
 }
 
+/// Release a BORROWED socket cap: drop the local handle WITHOUT the TAG_TCP_CLOSE that
+/// destroys the net-server socket. A forkpty/fork-exec child inherits the parent's socket
+/// caps (the kernel clones the handle table by value); when it closes its copy — e.g. xterm
+/// closing the X connection so the shell can't see it — it must not tear the socket down for
+/// the still-running parent. The owner's close (__oxbow_sock_close) does the real teardown.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_sock_release(sock: i64) {
+    let _ = sys_close(sock as Handle);
+}
+
 /// Listen on `port` and return a badged listener cap, or -1. Backs the personality's
 /// `listen()` — a musl program becomes a TCP server.
 #[cfg(feature = "hosted")]

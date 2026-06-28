@@ -62,8 +62,16 @@ Goal: real X/Wayland apps → window manager → toolkit apps → a DE. Transpor
   and reopen it by name in the child work. **Remaining blocker:** xterm's X connection is a TCP
   (smoltcp) socket; the forkpty child shares it (fork clones the handle table by value) and closes
   it, tearing down the parent's connection → `fatal IO error 11 (EAGAIN)`. havoc survives the same
-  fork because its Wayland link is an AF_UNIX channel, not a shared TCP socket. The fix is
-  **socket cap refcounting (or CLOEXEC) across fork** — a focused kernel change, tracked next.
+  fork because its Wayland link is an AF_UNIX channel, not a shared TCP socket. **FIXED** — a
+  forked child's inherited socket fds are now *borrowed*: the personality clears an `owns` flag
+  on socket fds in the fork child, so closing them (xterm closes the X fd so the shell can't see
+  it) drops the local cap WITHOUT the `TAG_TCP_CLOSE` that destroys the net-server socket; the
+  owner (parent) keeps `owns=1` and does the real teardown. xterm now survives the fork and the
+  shell runs end-to-end (`sh:` prompt) with no IO error. (Mirrors the existing pipe writer-refcount
+  fix; full accept()+fork refcounting is still future, but no app needs it today.)
+  **Still remaining for the visible window:** xterm runs but doesn't yet map a composited window in
+  the Xwayland root (xeyes did, so the Xwayland→oxcomp path works) — likely the shell exiting on the
+  idle pty taking xterm with it, or an xterm window-map detail. Next.
 - **A6. First real toolkit app** — a single **GTK3** app (Cairo + Pango + Fontconfig + GLib + D-Bus).
   GTK3 over GTK4 (no hard GL requirement for basic widgets). *Milestone:* a GTK window with widgets.
 - **A7. Lightweight DE** — **XFCE** (GTK, no mandatory GL) is the realistic DE target, NOT GNOME/KDE.

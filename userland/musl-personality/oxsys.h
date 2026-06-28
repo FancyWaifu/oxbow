@@ -283,6 +283,7 @@ extern long __oxbow_sock_send(long sock, const void *buf, unsigned long len);
 extern long __oxbow_sock_recv(long sock, void *buf, unsigned long len);
 extern long __oxbow_sock_recv_nb(long sock, void *buf, unsigned long len);
 extern void __oxbow_sock_close(long sock);
+extern void __oxbow_sock_release(long sock); /* drop a BORROWED socket cap (no teardown) */
 
 /* TCP server path: listen returns a listener cap; accept (non-blocking) returns a fresh
  * connected socket cap + the peer IPv4 (packed a<<24|… dotted order) + port, or -1 when
