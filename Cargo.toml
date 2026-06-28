@@ -93,6 +93,7 @@ members = [
     "servers/xclient-musl",
     "servers/xcbdemo-musl",
     "servers/xlibdemo-musl",
+    "servers/xeyes-musl",
     "servers/doom",
     "servers/ps",
     "servers/kill",

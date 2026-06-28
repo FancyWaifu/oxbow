@@ -34,8 +34,9 @@ Goal: real X/Wayland apps → window manager → toolkit apps → a DE. Transpor
 - **A2. libX11 (Xlib)** — ✅ DONE. All 261 core + xcms/xkb/i18n + locale/om/im modules build against
   musl over the libxcb transport; `servers/xlibdemo-musl` does `XOpenDisplay` + XCreateSimpleWindow +
   XMapWindow (cyan window, `docs/libx11-on-oxbow.png`). **← A2 COMPLETE**
-- **A3. libXt + libXext + libXmu/libXaw** (toolkit intrinsics). *Milestone:* `xclock`, `xeyes`,
-  and the first *unmodified upstream* X apps. **← NEXT**
+- **A3. libXt + libXext + libXmu** (toolkit intrinsics) — ✅ DONE. The whole chain (libXext +
+  libICE + libSM + libXt + libXmu) builds against musl; `servers/xeyes-musl` runs the *unmodified
+  upstream* xorg **xeyes** (`docs/xeyes-on-oxbow.png`). **← A3 COMPLETE: first real upstream X app**
 - **A4. A window manager** — `twm` (tiny, Xlib-only) or `cwm`. *Milestone:* movable, decorated windows.
 - **A5. `xterm`** — a real terminal X client (needs the PTY subsystem too).
 - **A6. First real toolkit app** — a single **GTK3** app (Cairo + Pango + Fontconfig + GLib + D-Bus).
@@ -78,7 +79,7 @@ GNOME/KDE specifically are deliberately **not** near-term targets: they couple m
 a JS/QML engine + the full D-Bus service constellation at once. XFCE (Track A7) is the realistic DE.
 
 ## Immediate next step
-**A3: libXt + libXext (+ libXmu/libXaw).** With libxcb (A1) and libX11 (A2) proven, the next rung
-is the X Toolkit Intrinsics + extension library, which unlock the first *unmodified upstream* X
-apps — `xeyes`/`xclock` (libXt) and simple utilities. Port libXext + libXt as cc groups (mirroring
-the libX11 group in `servers/xlibdemo-musl/build.rs`), then build a real upstream app against them.
+**A4: a window manager (`twm`).** With the toolkit chain proven through xeyes (A3), the next rung
+is a real WM so X windows get decorations/move/resize and the X session feels like a desktop. `twm`
+is libXt + libXmu + libXext (all ported) + libXrandr — minimal extra deps. Mirror the per-library
+cc::Build pattern in `servers/xeyes-musl/build.rs`. Then A5 = `xterm` (a real terminal X client).

@@ -253,14 +253,14 @@ pub extern "C" fn oxbow_main() -> ! {
         }
         None => HANDLE_NULL,
     };
-    // §xlibdemo: an X client built on REAL libX11/Xlib (roadmap A2, over the libxcb transport
-    // from A1) — connects to Xwayland over loopback TCP (127.0.0.1:6000) and maps a window,
-    // proving the classic Xlib API that most upstream X apps + toolkits use works on oxbow. It
-    // retries connect() until Xwayland is listening, so spawn order doesn't matter. Demo wire.
+    // §xeyes: the FIRST UNMODIFIED UPSTREAM X app (roadmap A3) — the real xorg xeyes on the full
+    // X Toolkit chain (libXt/libXext/libXmu over libX11/libxcb). `-display 127.0.0.1:0` points it
+    // at Xwayland's loopback TCP listener (XtAppInitialize parses it). It retries internally, so
+    // spawn order doesn't matter. Demo wire.
     {
-        let args = b"";
+        let args = b"-display 127.0.0.1:0 -geometry 200x200+1150+450"; // host:0 -> TCP 6000; placed clear of other windows
         let mut cm = MsgBuf::new(0);
-        cm.data[0] = app_budget(40); // libX11 is large (~8 MB) — generous working set
+        cm.data[0] = app_budget(56); // the whole toolkit stack (~11.5 MB) — large working set
         cm.data[1] = args.as_ptr() as u64;
         cm.data[2] = args.len() as u64;
         cm.data_len = 3;
@@ -269,8 +269,8 @@ pub extern "C" fn oxbow_main() -> ! {
         cm.handles[1] = BOOT_CONSOLE; // slot 2: console (logging)
         cm.handles[2] = BOOT_CONSOLE; // slot 4: unused; fill with a harmless cap
         cm.handles[3] = oxbow_abi::BOOT_NET_EP; // slot 20: net (loopback TCP to Xwayland)
-        if rt::sys_spawn(oxbow_abi::BOOT_IMG_XLIBDEMO, BOOT_MEM, &cm, HANDLE_NULL).is_ok() {
-            w(b"[oxcomp] xlibdemo spawned (libX11 loopback demo)\n");
+        if rt::sys_spawn(oxbow_abi::BOOT_IMG_XEYES, BOOT_MEM, &cm, HANDLE_NULL).is_ok() {
+            w(b"[oxcomp] xeyes spawned (upstream X app, Xt toolkit)\n");
         } else {
             w(b"[oxcomp] xlibdemo spawn failed\n");
         }
