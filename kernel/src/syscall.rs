@@ -21,7 +21,7 @@ use oxbow_abi::{
     SYS_SET_FOREGROUND, SYS_TTY_INTR, SYS_SIGDISPATCH, SYS_SIGRETURN,
     ProcInfo,
     SYS_PIPE, SYS_PIPE_READ, SYS_PIPE_WRITE, SYS_PIPE_EOF,
-    SYS_PTY_CREATE, SYS_PTY_READ, SYS_PTY_WRITE, SYS_PTY_IOCTL,
+    SYS_PTY_CREATE, SYS_PTY_READ, SYS_PTY_WRITE, SYS_PTY_IOCTL, SYS_PTY_OPEN_SLAVE,
     CHAN_NONBLOCK, PROT_EXEC, R_ACK, R_BIND, R_IN, R_OUT,
     R_SPAWN, PLEDGE_STDIO, PLEDGE_IPC, PLEDGE_MEM, PLEDGE_SPAWN, PLEDGE_CAP, PLEDGE_IO, PLEDGE_NOTIF,
     PLEDGE_PROC,
@@ -179,6 +179,7 @@ pub extern "C" fn syscall_dispatch(
         SYS_PTY_READ => sys_pty_read(a1, a2, a3),
         SYS_PTY_WRITE => sys_pty_write(a1, a2, a3),
         SYS_PTY_IOCTL => sys_pty_ioctl(a1, a2, a3),
+        SYS_PTY_OPEN_SLAVE => sys_pty_open_slave(a1),
         SYS_EP_CREATE => sys_ep_create(),
         SYS_MINT => sys_mint(a1, a2, a3),
         SYS_PCI_READ => sys_pci_read(a1, a2),
@@ -1864,6 +1865,23 @@ fn sys_pty_create() -> SyscallRet {
     match (m, s) {
         (Ok(mh), Ok(sh)) => SyscallRet { rax: 0, rdx: (mh as u64) | ((sh as u64) << 32) },
         _ => SyscallRet::err(SysError::NoMem),
+    }
+}
+
+/// `sys_pty_open_slave(pty_handle)` — mint a FRESH slave cap for the pty that `pty_handle`
+/// (master or slave) names. A slave cap is just a wrapper around the pool index, so reopening
+/// `/dev/pts/N` (as openpty-based apps like xterm do — they close the openpty slave and reopen
+/// it by name in the child) hands out another handle to the same pty. Returns the new cap in rdx.
+fn sys_pty_open_slave(h: u64) -> SyscallRet {
+    let idx = match pty_of(h, R_IN) {
+        Ok((i, _)) => i,
+        Err(e) => return SyscallRet::err(e),
+    };
+    match proc::with_current_mut(|p| {
+        p.alloc_slot(HandleEntry { obj: ObjectRef::PtySlave(idx), rights: R_IN | R_OUT | R_GRANT, badge: 0 })
+    }) {
+        Ok(sh) => SyscallRet { rax: 0, rdx: sh as u64 },
+        Err(_) => SyscallRet::err(SysError::NoMem),
     }
 }
 

@@ -176,6 +176,13 @@ static long do_open(const char *path, long flags)
 	if (!path)
 		return -E_FAULT;
 
+	/* §pty: open("/dev/tty") is the process's CONTROLLING terminal. A GUI app spawned by
+	 * the compositor (e.g. xterm) has none, so report ENXIO ("no controlling terminal") —
+	 * apps treat that as "use default tty modes / no job control" rather than a hard error
+	 * (xterm's ERROR_OPDEVTTY only fires on an unexpected errno). */
+	if (peq(path, "/dev/tty"))
+		return -6; /* ENXIO */
+
 	/* §pty: open("/dev/ptmx") allocates a pty — the master fd here, the slave stashed
 	 * for the matching open("/dev/pts/N"). Makes musl's openpty()/forkpty() work. */
 	if (peq(path, "/dev/ptmx")) {
@@ -210,15 +217,19 @@ static long do_open(const char *path, long flags)
 	if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' &&
 	    path[3] == 'v' && path[4] == '/' && path[5] == 'p' && path[6] == 't' &&
 	    path[7] == 's' && path[8] == '/') {
-		/* open("/dev/pts/N") — hand back the slave stashed by the ptmx open. */
+		/* open("/dev/pts/N") — mint a FRESH slave cap for pty N each time, so it is
+		 * REOPENABLE. openpty-based apps (xterm) open the slave once in the parent,
+		 * close it, then reopen it by name in the forked child; a one-shot stash would
+		 * fail that second open. The stash stays alive (the master fd holds the pty)
+		 * and fork clones the handle table, so the child can reopen too. */
 		int n = 0;
 		for (const char *p = path + 9; *p >= '0' && *p <= '9'; p++)
 			n = n * 10 + (*p - '0');
 		for (int i = 0; i < 4; i++)
 			if (g_pts[i].n == n && g_pts[i].slave >= 0) {
-				long s = g_pts[i].slave;
-				g_pts[i].n = -1;
-				g_pts[i].slave = -1;
+				long s = ox_pty_open_slave((unsigned int)g_pts[i].slave);
+				if (s < 0)
+					return -E_NOENT;
 				int fd = fd_alloc_kind(s, 0, K_PTYS);
 				return fd < 0 ? -E_MFILE : fd;
 			}
@@ -1241,6 +1252,11 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 	/* ---- scheduling / time / entropy ---- */
 	case NR_sched_yield:
 		return ox_syscall0(OX_SYS_YIELD);
+	/* No interval timers on oxbow. Report "no alarm was pending" (0) rather than ENOSYS:
+	 * apps like xterm call alarm(0) to cancel a watchdog and then inspect errno — an
+	 * ENOSYS here would clobber a prior call's errno and be misread as a real failure. */
+	case NR_alarm:
+		return 0;
 	case NR_clock_gettime:
 		return do_clock_gettime(a1, (void *)a2);
 	case NR_getrandom:
@@ -1379,6 +1395,19 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 	case NR_geteuid:
 	case NR_getgid:
 	case NR_getegid:
+		return 0;
+	/* oxbow is single-user with no uid/privilege model; setting the (effective) user/group
+	 * id or supplementary groups is a no-op SUCCESS. Apps like xterm drop privileges here and
+	 * treat ENOSYS as fatal (ERROR_SETUID), so we must report success, not "unimplemented". */
+	case NR_setuid:
+	case NR_setgid:
+	case NR_setreuid:
+	case NR_setregid:
+	case NR_setresuid:
+	case NR_setresgid:
+	case NR_setgroups:
+	case NR_setfsuid:
+	case NR_setfsgid:
 		return 0;
 
 	/* ---- exit ---- */

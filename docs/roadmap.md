@@ -49,7 +49,21 @@ Goal: real X/Wayland apps → window manager → toolkit apps → a DE. Transpor
   "intermittent kbd input loss" was a misdiagnosis: input was always fine — `root` typed into the
   greeter perfectly; the session channel was just dead.) Fixed by moving the X-demo image handles to
   53–57, clear of the GPU/session data handles.
-- **A5. `xterm`** — a real terminal X client (needs the PTY subsystem too).
+- **A5. `xterm`** — 🟡 PORTED + BUILDS + RUNS; the in-pty shell works; X-render blocked on one
+  fork/socket issue. `servers/xterm-musl` builds xterm-397 (core "fixed" font, **no Xft**) + a new
+  **libXaw** port (Athena widgets) on the existing Xt/Xmu/Xext chain. The **PTY subsystem already
+  existed** (kernel `pty.rs` + openpty/forkpty in the personality — havoc proves it); A5 added the
+  missing pieces around it. Verified working end-to-end: xterm spawns post-login, connects to
+  Xwayland over loopback TCP, loads locale, allocates a pty, **forks and execs `/bin/sh` which runs
+  in the pty** (`sh:` prompt on serial). Fixes landed (all general personality/kernel improvements):
+  (1) `/dev/tty` → ENXIO (no controlling terminal) instead of ENOSYS; (2) `alarm()` + `set*id()`
+  no-op success (were ENOSYS, which xterm treats as fatal); (3) **reopenable `/dev/pts/N`** — new
+  kernel `SYS_PTY_OPEN_SLAVE` mints a fresh slave cap per open, so openpty apps that close the slave
+  and reopen it by name in the child work. **Remaining blocker:** xterm's X connection is a TCP
+  (smoltcp) socket; the forkpty child shares it (fork clones the handle table by value) and closes
+  it, tearing down the parent's connection → `fatal IO error 11 (EAGAIN)`. havoc survives the same
+  fork because its Wayland link is an AF_UNIX channel, not a shared TCP socket. The fix is
+  **socket cap refcounting (or CLOEXEC) across fork** — a focused kernel change, tracked next.
 - **A6. First real toolkit app** — a single **GTK3** app (Cairo + Pango + Fontconfig + GLib + D-Bus).
   GTK3 over GTK4 (no hard GL requirement for basic widgets). *Milestone:* a GTK window with widgets.
 - **A7. Lightweight DE** — **XFCE** (GTK, no mandatory GL) is the realistic DE target, NOT GNOME/KDE.

@@ -48,6 +48,7 @@ build-server:
     cargo build -p xlibdemo-musl  # X client on real libX11/Xlib (over libxcb)
     cargo build -p xeyes-musl  # first unmodified upstream X app (Xt/Xext/Xmu toolkit chain)
     cargo build -p twm-musl  # the X window manager (decorates X clients in Xwayland)
+    cargo build -p xterm-musl  # real upstream terminal X client (core fonts, forkpty -> /bin/sh)
     RUSTFLAGS="-C relocation-model=static" cargo build -p fsd
     RUSTFLAGS="-C relocation-model=static" cargo build -p cat
     RUSTFLAGS="-C relocation-model=static" cargo build -p ls
@@ -148,6 +149,8 @@ _iso:
     "$(find $(rustc --print sysroot) -name llvm-strip | head -1)" --strip-all iso_root/boot/xeyes.elf
     cp target/x86_64-unknown-none/debug/twm iso_root/boot/twm.elf
     "$(find $(rustc --print sysroot) -name llvm-strip | head -1)" --strip-all iso_root/boot/twm.elf
+    cp target/x86_64-unknown-none/debug/xterm iso_root/boot/xterm.elf
+    "$(find $(rustc --print sysroot) -name llvm-strip | head -1)" --strip-all iso_root/boot/xterm.elf
     cp target/x86_64-unknown-none/debug/oxcomp iso_root/boot/oxcomp.elf
     -strip -S iso_root/boot/oxcomp.elf
     cp target/x86_64-unknown-none/debug/cat iso_root/boot/cat.elf

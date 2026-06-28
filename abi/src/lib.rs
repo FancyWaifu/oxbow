@@ -253,6 +253,7 @@ pub const SYS_PTY_CREATE: u64 = 70; // () -> rdx = master_handle | slave_handle<
 pub const SYS_PTY_READ: u64 = 71; // (handle, buf, len) -> rdx count (0 = EOF). master or slave by cap.
 pub const SYS_PTY_WRITE: u64 = 72; // (handle, buf, len) -> rdx count. master = input (line discipline), slave = output.
 pub const SYS_PTY_IOCTL: u64 = 73; // (handle, op, arg) -> termios/winsize/ptn (TCGETS/TCSETS/TIOC*).
+pub const SYS_PTY_OPEN_SLAVE: u64 = 74; // (pty_handle) -> rdx = a fresh slave cap for that pty (reopen /dev/pts/N).
 pub const PROC_NAME_LEN: usize = 16;
 pub const PROC_STATE_ALIVE: u32 = 1;
 pub const PROC_STATE_DEAD: u32 = 2; // exited, slot not yet reused (zombie)
@@ -641,6 +642,7 @@ pub const BOOT_IMG_XCBDEMO: Handle = 54; // xcbdemo — X client on real libxcb 
 pub const BOOT_IMG_XLIBDEMO: Handle = 55; // xlibdemo — X client on real libX11/Xlib (over libxcb)
 pub const BOOT_IMG_XEYES: Handle = 56; // xeyes — first unmodified upstream X app (Xt/Xext/Xmu toolkit)
 pub const BOOT_IMG_TWM: Handle = 57; // twm — the X window manager (decorates X clients in Xwayland)
+pub const BOOT_IMG_XTERM: Handle = 58; // xterm — real upstream terminal X client (core fonts, forkpty)
 
 /// The framebuffer capability, granted to the `fb` server at boot. Gates
 /// SYS_FB_INFO (geometry) + SYS_FB_MAP (map the pixels RW). §34 (graphics).

@@ -50,7 +50,17 @@
 #define NR_pipe2             293
 #define NR_dup3              292
 #define NR_nanosleep         35
+#define NR_alarm             37
 #define NR_ftruncate         77
+#define NR_setuid            105
+#define NR_setgid            106
+#define NR_setreuid          113
+#define NR_setregid          114
+#define NR_setgroups         116
+#define NR_setresuid         117
+#define NR_setresgid         119
+#define NR_setfsuid          122
+#define NR_setfsgid          123
 #define NR_memfd_create      319  /* §wayland: wl_shm pools are memfd-backed */
 #define NR_getdents64        217
 #define NR_getpid            39

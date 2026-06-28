@@ -40,6 +40,7 @@
 #define OX_SYS_PTY_READ      71  /* (h, buf, len) -> rdx count (0=EOF) */
 #define OX_SYS_PTY_WRITE     72  /* (h, buf, len) -> rdx count */
 #define OX_SYS_PTY_IOCTL     73  /* (h, op, arg) -> rdx (op 0x100 = poll readiness) */
+#define OX_SYS_PTY_OPEN_SLAVE 74 /* (pty_h) -> rdx = fresh slave cap (reopen /dev/pts/N) */
 
 /* CRITICAL: oxbow syscalls return TWO values (rax + RDX), unlike Linux (rax only).
  * So RDX is ALWAYS clobbered by the syscall — it must be an asm output, never left
@@ -188,6 +189,17 @@ static __inline long ox_pty_create(unsigned int *slave)
 	if (slave)
 		*slave = (unsigned int)(rdx >> 32);
 	return (long)(rdx & 0xffffffffUL);
+}
+/* Mint a fresh slave cap for the pty named by `h` (master or existing slave) — lets
+ * /dev/pts/N be reopened (openpty apps close the slave and reopen it by name). */
+static __inline long ox_pty_open_slave(unsigned int h)
+{
+	unsigned long rax, rdx;
+	__asm__ __volatile__("syscall"
+	                     : "=a"(rax), "=d"(rdx)
+	                     : "a"((long)OX_SYS_PTY_OPEN_SLAVE), "D"((long)h)
+	                     : "rcx", "r11", "memory");
+	return rax != 0 ? -1 : (long)(rdx & 0xffffffffUL);
 }
 static __inline long ox_pty_read(unsigned int h, void *buf, unsigned long len)
 {

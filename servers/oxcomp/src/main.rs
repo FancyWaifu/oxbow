@@ -310,9 +310,9 @@ pub extern "C" fn oxbow_main() -> ! {
     // first frame so animation settles before a screen capture.
     // §A3/A4: spawn an X client (twm/xeyes) — modest budget (X clients aren't framebuffer apps),
     // slot 20 = net for the loopback TCP to Xwayland's listener.
-    let spawn_x = |img: oxbow_abi::Handle, args: &[u8]| -> bool {
+    let spawn_x = |img: oxbow_abi::Handle, args: &[u8], budget_mb: u64| -> bool {
         let mut cm = MsgBuf::new(0);
-        cm.data[0] = app_budget(24);
+        cm.data[0] = app_budget(budget_mb);
         cm.data[1] = args.as_ptr() as u64;
         cm.data[2] = args.len() as u64;
         cm.data_len = 3;
@@ -328,16 +328,17 @@ pub extern "C" fn oxbow_main() -> ! {
     let mut x_started = false;
     loop {
         unsafe { comp_server_pump(display) };
-        // §A4: once the user has logged in, start the X session — twm (WM, grabs the root)
-        // then xeyes (a client it decorates). Deferred to here so X-client traffic never
-        // starves the pre-login greeter.
+        // §A5: once the user has logged in, start the X session — twm (WM, grabs the root)
+        // then xterm (a real terminal X client: core "fixed" font, forkpty → /bin/sh). Deferred
+        // to here so X-client traffic never starves the pre-login greeter.
         if !x_started && unsafe { comp_server_logged_in() } != 0 {
             x_started = true;
-            if spawn_x(oxbow_abi::BOOT_IMG_TWM, b"-display 127.0.0.1:0") {
+            if spawn_x(oxbow_abi::BOOT_IMG_TWM, b"-display 127.0.0.1:0", 24) {
                 w(b"[oxcomp] twm spawned (post-login X window manager)\n");
             }
-            if spawn_x(oxbow_abi::BOOT_IMG_XEYES, b"-display 127.0.0.1:0 -geometry 200x200+1150+450") {
-                w(b"[oxcomp] xeyes spawned (post-login upstream X app)\n");
+            if spawn_x(oxbow_abi::BOOT_IMG_XTERM,
+                       b"-display 127.0.0.1:0 -fn fixed -geometry 80x24+60+80", 48) {
+                w(b"[oxcomp] xterm spawned (post-login terminal X client)\n");
             }
         }
         if unsafe { comp_server_composited() } != 0 {
