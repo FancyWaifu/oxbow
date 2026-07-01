@@ -151,8 +151,20 @@ _iso:
     "$(find $(rustc --print sysroot) -name llvm-strip | head -1)" --strip-all iso_root/boot/twm.elf
     cp target/x86_64-unknown-none/debug/xterm iso_root/boot/xterm.elf
     "$(find $(rustc --print sysroot) -name llvm-strip | head -1)" --strip-all iso_root/boot/xterm.elf
-    cp target/x86_64-unknown-none/debug/oxcomp iso_root/boot/oxcomp.elf
-    -strip -S iso_root/boot/oxcomp.elf
+    cargo build -p weston-musl  # real upstream Weston — the DEFAULT compositor (P6)
+    # P6: Weston is now the default compositor. It's spawned as the "oxcomp" boot module so
+    # it inherits BOOT_GPU_FB + the input grants, and does window management via
+    # libweston-desktop. The old hand-written oxcomp is retired from the boot; set OXCOMP=1
+    # to roll back to it (it's still built for comparison/fallback).
+    if [ -n "${OXCOMP:-}" ]; then \
+      cp target/x86_64-unknown-none/debug/oxcomp iso_root/boot/oxcomp.elf; \
+      strip -S iso_root/boot/oxcomp.elf || true; \
+      echo "[iso] OXCOMP=1 -> booting the legacy oxcomp compositor"; \
+    else \
+      cp target/x86_64-unknown-none/debug/weston iso_root/boot/oxcomp.elf; \
+      "$(find $(rustc --print sysroot) -name llvm-strip | head -1)" --strip-all iso_root/boot/oxcomp.elf; \
+      echo "[iso] booting Weston as the compositor (default; OXCOMP=1 for the legacy one)"; \
+    fi
     cp target/x86_64-unknown-none/debug/cat iso_root/boot/cat.elf
     cp target/x86_64-unknown-none/debug/ls iso_root/boot/ls.elf
     cp target/x86_64-unknown-none/debug/mkdir iso_root/boot/mkdir.elf

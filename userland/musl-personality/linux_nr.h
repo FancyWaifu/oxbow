@@ -92,6 +92,28 @@
 #define NR_getrandom         318
 #define NR_statx             332
 
+/* epoll / timerfd / signalfd — libwayland's server event loop (weston) needs these */
+#define NR_epoll_create     213
+#define NR_epoll_wait       232
+#define NR_epoll_ctl        233
+#define NR_epoll_pwait      281
+#define NR_epoll_create1    291
+#define NR_timerfd_create   283
+#define NR_timerfd_settime  286
+#define NR_timerfd_gettime  287
+#define NR_signalfd         282
+#define NR_signalfd4        289
+#define NR_eventfd          284
+#define NR_eventfd2         290
+#define NR_fallocate        285
+
+/* epoll_ctl ops + event bits (subset) */
+#define LEPOLL_CTL_ADD 1
+#define LEPOLL_CTL_DEL 2
+#define LEPOLL_CTL_MOD 3
+#define LEPOLLIN  0x001
+#define LEPOLLOUT 0x004
+
 /* arch_prctl codes */
 #define ARCH_SET_FS 0x1002
 #define ARCH_GET_FS 0x1003

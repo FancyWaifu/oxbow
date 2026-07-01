@@ -354,6 +354,17 @@ impl TcpStack {
         }
     }
 
+    /// Poll once and report whether a recv would return immediately (data buffered, or
+    /// the peer closed so recv yields 0). NON-consuming — backs poll()/select() readiness
+    /// for loopback sockets, so a select-driven client (e.g. twm via libXt) blocks in
+    /// select's yield-loop instead of pinning this single-threaded server in a blocking
+    /// recv — which would starve the very peer (Xwayland) whose send produces the data.
+    pub fn recv_ready(&mut self, handle: SocketHandle) -> bool {
+        self.poll();
+        let s = self.sockets.get_mut::<tcp::Socket>(handle);
+        s.can_recv() || !s.may_recv()
+    }
+
     /// Close the connection (send FIN, pump briefly) and drop the socket.
     pub fn close(&mut self, handle: SocketHandle) {
         self.sockets.get_mut::<tcp::Socket>(handle).close();

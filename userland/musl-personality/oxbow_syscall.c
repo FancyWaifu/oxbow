@@ -44,7 +44,7 @@ static long do_clock_gettime(long id, struct ox_timespec *ts)
 	if (!ts)
 		return -E_FAULT;
 	if (id == CLOCK_MONOTONIC) {
-		unsigned long ms = (unsigned long)ox_syscall0(OX_SYS_UPTIME_MS);
+		unsigned long ms = ox_uptime_ms();
 		ts->tv_sec = ms / 1000;
 		ts->tv_nsec = (ms % 1000) * 1000000L;
 		return 0;
@@ -72,6 +72,10 @@ static long do_clock_gettime(long id, struct ox_timespec *ts)
 #define K_SHM    9  /* §wayland: an shm/memfd region; .handle = shm cap (-1 until ftruncate), .size = bytes */
 #define K_PTYM   10 /* §pty: pty MASTER (.handle = master cap, .off = pts number) */
 #define K_PTYS   11 /* §pty: pty SLAVE  (.handle = slave cap) — the shell's controlling tty */
+#define K_EPOLL  12 /* §weston: an epoll set; registrations live in g_epoll[] keyed by .handle */
+#define K_TIMERFD 13 /* §weston: a timerfd; .off = absolute deadline ms (0 = disarmed), .size = interval ms */
+#define K_SIGNALFD 14 /* §weston: a signalfd — stubbed (never readable; signals don't fire) */
+#define K_EVENTFD  15 /* §weston: an eventfd counter; .off = current count */
 struct oxfd {
 	int used;
 	int kind;
@@ -117,6 +121,45 @@ static int fd_alloc(long handle, unsigned long size)
 /* §wayland: vaddr bump for shm maps. Sits ABOVE oxbow-rt's anon mmap window
  * [0x4000_0000, 0x6000_0000) so the two never collide. */
 static unsigned long g_shm_next = 0x60000000UL;
+
+/* §41 shm lifetime: an mmap of a wl_shm region keeps that region alive as long as the
+ * MAPPING exists — which outlives the memfd fd (wl_shm closes the fd right after mmap,
+ * but keeps rendering into the mapping until the pixmap is destroyed). So we hold the
+ * shm cap here, keyed by the mapped vaddr, and drop it (SYS_CLOSE → kernel decref →
+ * free when the compositor also drops its granted copy) at munmap, NOT at close(fd).
+ * Without this every X pixmap leaked a kernel shm region → the 16-slot pool exhausted
+ * and Xwayland died. 64 covers plenty of concurrent wl_shm buffers. */
+static struct { unsigned long va; long handle; } g_shm_maps[64];
+static int shm_map_track(unsigned long va, long handle)
+{
+	for (int i = 0; i < 64; i++)
+		if (g_shm_maps[i].handle == 0 && g_shm_maps[i].va == 0) {
+			g_shm_maps[i].va = va;
+			g_shm_maps[i].handle = handle + 1; /* +1 so handle 0 isn't "empty" */
+			return 1;
+		}
+	return 0; /* table full: the region will leak, but we don't corrupt state */
+}
+/* Is `handle` still owned by a live mapping? (so close(fd) must NOT drop the cap) */
+static int shm_handle_mapped(long handle)
+{
+	for (int i = 0; i < 64; i++)
+		if (g_shm_maps[i].handle == handle + 1)
+			return 1;
+	return 0;
+}
+/* Drop the mapping tracked at `va`; returns the shm cap to close, or -1 if untracked. */
+static long shm_map_untrack(unsigned long va)
+{
+	for (int i = 0; i < 64; i++)
+		if (g_shm_maps[i].handle != 0 && g_shm_maps[i].va == va) {
+			long h = g_shm_maps[i].handle - 1;
+			g_shm_maps[i].va = 0;
+			g_shm_maps[i].handle = 0;
+			return h;
+		}
+	return -1;
+}
 
 /* §pty: bridge open("/dev/ptmx") → open("/dev/pts/N"). When ptmx is opened we create
  * the pty (master+slave caps) and stash (pts number → slave cap) here; the matching
@@ -171,6 +214,12 @@ static void fd_release(int fd)
 			}
 		if (!shared)
 			__oxbow_fs_close(fds[fd].handle);
+	} else if (fds[fd].kind == K_SHM) {
+		/* §41: a wl_shm memfd. If a live mapping still owns this region's cap, leave it
+		 * — munmap drops it. Otherwise (created/ftruncated but the mapping is already
+		 * gone, or never mapped) drop the cap now so the region can be reclaimed. */
+		if (fds[fd].handle >= 0 && !shm_handle_mapped(fds[fd].handle))
+			ox_syscall1(OX_SYS_CLOSE, fds[fd].handle);
 	}
 	fds[fd].used = 0;
 }
@@ -296,6 +345,46 @@ static long do_read(long fd, void *buf, unsigned long len)
 		}
 		if (fds[fd].kind == K_PTYM || fds[fd].kind == K_PTYS)
 			return ox_pty_read((unsigned int)fds[fd].handle, buf, len);
+		if (fds[fd].kind == K_CHAN) {
+			/* §weston: plain read() on a channel fd = raw channel bytes (non-blocking).
+			 * The oxbow input drivers push raw scancode/PS-2 byte streams over channels
+			 * with NO caps; weston's input handlers read() them directly. (libwayland's
+			 * display socket uses recvmsg instead, to also collect SCM_RIGHTS caps.) */
+			unsigned int caps[8];
+			long r = ox_chan_recv((unsigned int)fds[fd].handle, buf, len, caps, 8, 1);
+			if (r < 0)
+				return -11; /* EAGAIN: nothing buffered */
+			return (long)((unsigned long)r & 0xffffffffUL); /* byte count (caps ignored) */
+		}
+		if (fds[fd].kind == K_TIMERFD) {
+			/* §weston: return the u64 expiration count. One-shot: fire once when the
+			 * deadline is reached, then disarm (or re-arm for an interval timer). */
+			if (len < 8 || !buf)
+				return -E_INVAL;
+			unsigned long now = ox_uptime_ms();
+			unsigned long long count = 0;
+			if (fds[fd].off != 0 && now >= fds[fd].off) {
+				count = 1;
+				if (fds[fd].size)
+					fds[fd].off = now + fds[fd].size; /* interval: re-arm */
+				else
+					fds[fd].off = 0; /* one-shot: disarm */
+			}
+			if (count == 0)
+				return -11; /* EAGAIN: not expired yet */
+			*(unsigned long long *)buf = count;
+			return 8;
+		}
+		if (fds[fd].kind == K_EVENTFD) {
+			if (len < 8 || !buf)
+				return -E_INVAL;
+			unsigned long long v = fds[fd].off;
+			if (v == 0)
+				return -11; /* EAGAIN */
+			fds[fd].off = 0;
+			*(unsigned long long *)buf = v;
+			return 8;
+		}
 		return -E_BADF; /* read on a write-only pipe end */
 	}
 	if (fd < 3) {
@@ -454,6 +543,99 @@ static int listener_pending(int fd)
 	accept_stash.ip = ip;
 	accept_stash.port = port;
 	return 1;
+}
+
+/* §weston: poll-style readiness for ONE fd. Returns which of the requested events
+ * (bit0 IN, bit1 PRI, bit2 OUT) are ready. OUT is always ready (we never block on
+ * write); IN is gated per fd-kind exactly like NR_poll, plus timerfd expiry. Shared by
+ * NR_poll and epoll_wait so their readiness rules can't drift apart. */
+static short fd_revents(int fd, short want)
+{
+	if (fd < 0)
+		return 0;
+	short re = (short)(want & 0x7);
+	/* An untracked fd (std streams 0/1/2, or any fd not in our table) is treated as
+	 * ready — matching the pre-block poll(), which never blocked on them (a blocking
+	 * read()/write() on the std stream handles it). Only TRACKED fds get IN-gated. */
+	if (fd < MAXFD && fds[fd].used && (re & 0x1)) {
+		int kind = fds[fd].kind;
+		if (kind == K_LISTEN && !listener_pending(fd))
+			re &= ~0x1;
+		else if (kind == K_CHAN && !(ox_chan_poll((unsigned int)fds[fd].handle) & 1))
+			re &= ~0x1;
+		else if ((kind == K_PTYM || kind == K_PTYS) &&
+			 ox_pty_ioctl((unsigned int)fds[fd].handle, 0x100, 0) != 1)
+			re &= ~0x1;
+		else if (kind == K_SOCK && fds[fd].handle >= 0 &&
+			 !__oxbow_sock_recv_ready(fds[fd].handle))
+			re &= ~0x1;
+		else if (kind == K_TIMERFD) {
+			/* .off = absolute deadline ms (0 = disarmed); readable once reached. */
+			if (fds[fd].off == 0 ||
+			    ox_uptime_ms() < fds[fd].off)
+				re &= ~0x1;
+		} else if (kind == K_SIGNALFD)
+			re &= ~0x1; /* stub: signals never fire */
+		else if (kind == K_EVENTFD && fds[fd].off == 0)
+			re &= ~0x1; /* readable only when the counter is nonzero */
+	}
+	return re;
+}
+
+/* §weston: epoll registration table (one epoll set watches many fds). Keyed by the
+ * epoll fd's slot; a small fixed pool covers libwayland's event loop with headroom. */
+#define MAX_EPOLL_REGS 128
+static struct {
+	int used;
+	int epfd;                /* the epoll fd this registration belongs to */
+	int fd;                  /* the watched fd */
+	unsigned int events;     /* requested epoll events (EPOLLIN/EPOLLOUT/...) */
+	unsigned long long data; /* opaque user data returned on readiness */
+} g_epoll[MAX_EPOLL_REGS];
+
+/* §responsiveness: the sleeping replacement for the busy-yield in poll/select/epoll. Given
+ * the watched fds, gather their channel handles + the nearest timerfd deadline and block on
+ * `ox_chan_wait` until a channel is readable or the deadline passes — so weston and its
+ * clients stop spinning at 100% CPU (which starved fsd's seeding + everything else).
+ * `hard_ms` = the caller's own timeout budget (<0 = infinite). Falls back to a single YIELD
+ * when there are no channels to sleep on (e.g. a socket-only select), preserving old
+ * behavior for those; caps the wait to 8ms when sockets/ptys are present so they still get
+ * polled (ox_chan_wait can't wake on them). */
+static void block_wait_fds(const int *fdlist, int nfd, long hard_ms)
+{
+	unsigned int chans[16];
+	int nch = 0, has_other = 0, have_dl = 0;
+	unsigned long deadline = 0;
+	for (int i = 0; i < nfd; i++) {
+		int fd = fdlist[i];
+		if (fd < 0 || fd >= MAXFD || !fds[fd].used)
+			continue;
+		int k = fds[fd].kind;
+		if (k == K_CHAN && fds[fd].handle >= 0 && nch < 16)
+			chans[nch++] = (unsigned int)fds[fd].handle;
+		else if (k == K_TIMERFD && fds[fd].off != 0) {
+			if (!have_dl || fds[fd].off < deadline) {
+				deadline = fds[fd].off;
+				have_dl = 1;
+			}
+		} else if (k == K_SOCK || k == K_PTYM || k == K_PTYS || k == K_LISTEN)
+			has_other = 1;
+	}
+	if (nch == 0) {
+		ox_syscall0(OX_SYS_YIELD); /* nothing sleepable — keep old busy behavior */
+		return;
+	}
+	unsigned long now = ox_uptime_ms();
+	long wait_ms = -1; /* -1 = infinite */
+	if (have_dl)
+		wait_ms = (deadline > now) ? (long)(deadline - now) : 1;
+	if (hard_ms >= 0 && (wait_ms < 0 || hard_ms < wait_ms))
+		wait_ms = hard_ms;
+	if (has_other && (wait_ms < 0 || wait_ms > 8))
+		wait_ms = 8;
+	if (wait_ms < 0)
+		wait_ms = 0; /* 0 => ox_chan_wait blocks until a channel is readable */
+	ox_chan_wait(chans, (unsigned long)nch, (unsigned long)wait_ms);
 }
 
 /* stat a path into a kstat buffer (open-to-stat-then-close). */
@@ -744,6 +926,13 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 			if (w < 0)
 				return total ? total : w;
 			total += w;
+			/* POSIX writev: a short write ends the call. A socket send can accept
+			 * fewer bytes than asked (smoltcp TX buffer partly full); skipping to the
+			 * next iovec would drop this iovec's tail and corrupt the byte stream
+			 * (X protocol desync → lost events, e.g. twm never seeing a MapRequest).
+			 * Stop here and let the caller retry the unsent remainder. */
+			if ((unsigned long)w < iov[i].len)
+				break;
 		}
 		return total;
 	}
@@ -1091,6 +1280,28 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		/* §wayland: a wl_shm pool fd. Its shared backing region is allocated lazily by
 		 * the subsequent ftruncate (which carries the size). */
 		return fd_alloc_kind(-1, 0, K_SHM);
+	case NR_fallocate: {
+		/* fallocate(fd, mode, offset, len): posix_fallocate() sizes a memfd here.
+		 * weston's os_create_anonymous_file uses it (not ftruncate) to allocate the
+		 * keymap memfd — so a K_SHM fd must allocate its backing region, same as
+		 * ftruncate. New size = offset + len. Returns 0 (musl posix_fallocate wants 0). */
+		long fd = a1;
+		unsigned long need = (unsigned long)a3 + (unsigned long)a4; /* offset + len */
+		if (fd < 0 || fd >= MAXFD || !fds[fd].used)
+			return -E_BADF;
+		if (fds[fd].kind == K_SHM) {
+			if (fds[fd].handle < 0 && need > 0) {
+				unsigned long pages = (need + 4095) / 4096;
+				long h = ox_shm_create(pages);
+				if (h < 0)
+					return -12; /* ENOMEM */
+				fds[fd].handle = h;
+				fds[fd].size = need;
+			}
+			return 0;
+		}
+		return 0; /* non-shm: accept (best-effort; real allocation not needed) */
+	}
 	case NR_ftruncate: {
 		/* ftruncate(fd, len): set a file's length. Editors (kilo) rewrite a file as
 		 * ftruncate(len) + write(len); without this, the dirty flag never clears. */
@@ -1239,14 +1450,25 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 			g_shm_next += len;
 			if (ox_shm_map((unsigned int)fds[mfd].handle, va) == 0)
 				return -12; /* ENOMEM */
+			/* §41: the mapping now owns a reference to the shm region; hold the cap
+			 * (keyed by va) so close(fd) doesn't drop it — munmap will. */
+			shm_map_track(va, fds[mfd].handle);
 			return (long)va;
 		}
 		/* __oxbow_mmap_anon always maps RW (ignoring PROT_NONE); musl's mallocng
 		 * mmaps PROT_NONE then mprotects to RW, which we make a no-op below. */
 		return (long)__oxbow_mmap_anon((unsigned long)a2);
 	}
-	case NR_munmap:
+	case NR_munmap: {
+		/* §41: if this vaddr is a tracked wl_shm mapping, drop the region reference the
+		 * mapping held (SYS_CLOSE → kernel decref → frees once the compositor's granted
+		 * copy is also dropped). A non-shm anonymous mapping isn't tracked → no-op (our
+		 * anon allocator never reclaims address space, which is fine). */
+		long h = shm_map_untrack((unsigned long)a1);
+		if (h >= 0)
+			ox_syscall1(OX_SYS_CLOSE, h);
 		return 0;
+	}
 	case NR_mprotect:
 		/* Our anonymous mappings are already RW, so making them RW is a no-op
 		 * success. (W^X downgrades to NONE/RO are not yet enforced — Phase 4+.) */
@@ -1441,6 +1663,140 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 
 	/* ---- I/O multiplexing (pragmatic: report the requested fds ready, so a
 	 * poll/select-then-read works — reads block for real data) ---- */
+	/* ---- epoll / timerfd / signalfd / eventfd — libwayland's server event loop ---- */
+	case NR_epoll_create:
+	case NR_epoll_create1: /* flags (CLOEXEC) ignored */
+		return fd_alloc_kind(-1, 0, K_EPOLL);
+	case NR_epoll_ctl: {
+		int epfd = (int)a1, op = (int)a2, fd = (int)a3;
+		struct lepoll_event { unsigned int events; unsigned long long data; }
+			__attribute__((packed)) *ev = (struct lepoll_event *)a4;
+		if (epfd < 0 || epfd >= MAXFD || !fds[epfd].used || fds[epfd].kind != K_EPOLL)
+			return -E_BADF;
+		if (op == LEPOLL_CTL_ADD) {
+			int slot = -1;
+			for (int i = 0; i < MAX_EPOLL_REGS; i++) {
+				if (g_epoll[i].used && g_epoll[i].epfd == epfd && g_epoll[i].fd == fd) {
+					slot = i;
+					break;
+				}
+				if (slot < 0 && !g_epoll[i].used)
+					slot = i;
+			}
+			if (slot < 0)
+				return -12; /* ENOMEM */
+			g_epoll[slot].used = 1;
+			g_epoll[slot].epfd = epfd;
+			g_epoll[slot].fd = fd;
+			g_epoll[slot].events = ev ? ev->events : 0;
+			g_epoll[slot].data = ev ? ev->data : 0;
+			return 0;
+		} else if (op == LEPOLL_CTL_MOD) {
+			for (int i = 0; i < MAX_EPOLL_REGS; i++)
+				if (g_epoll[i].used && g_epoll[i].epfd == epfd && g_epoll[i].fd == fd) {
+					g_epoll[i].events = ev ? ev->events : 0;
+					g_epoll[i].data = ev ? ev->data : 0;
+					return 0;
+				}
+			return -E_INVAL; /* ENOENT */
+		} else if (op == LEPOLL_CTL_DEL) {
+			for (int i = 0; i < MAX_EPOLL_REGS; i++)
+				if (g_epoll[i].used && g_epoll[i].epfd == epfd && g_epoll[i].fd == fd)
+					g_epoll[i].used = 0;
+			return 0;
+		}
+		return -E_INVAL;
+	}
+	case NR_epoll_wait:
+	case NR_epoll_pwait: {
+		int epfd = (int)a1;
+		struct lepoll_event { unsigned int events; unsigned long long data; }
+			__attribute__((packed)) *out = (struct lepoll_event *)a2;
+		int maxevents = (int)a3;
+		int timeout = (int)a4; /* ms; -1 = forever, 0 = immediate */
+		if (epfd < 0 || epfd >= MAXFD || !fds[epfd].used || fds[epfd].kind != K_EPOLL)
+			return -E_BADF;
+		unsigned long start = ox_uptime_ms();
+		for (;;) {
+			int n = 0;
+			for (int i = 0; i < MAX_EPOLL_REGS && n < maxevents; i++) {
+				if (!g_epoll[i].used || g_epoll[i].epfd != epfd)
+					continue;
+				short want = 0;
+				if (g_epoll[i].events & LEPOLLIN)
+					want |= 0x1;
+				if (g_epoll[i].events & LEPOLLOUT)
+					want |= 0x4;
+				short re = fd_revents(g_epoll[i].fd, want);
+				if (re) {
+					unsigned int oe = 0;
+					if (re & 0x1)
+						oe |= LEPOLLIN;
+					if (re & 0x4)
+						oe |= LEPOLLOUT;
+					if (out) {
+						out[n].events = oe;
+						out[n].data = g_epoll[i].data;
+					}
+					n++;
+				}
+			}
+			if (n > 0)
+				return n;
+			if (timeout == 0)
+				return 0;
+			/* Sleep instead of spin: gather the watched fds and block until one is
+			 * readable or the nearest timer fires (was a busy-yield that pinned a core). */
+			int fdlist[MAX_EPOLL_REGS];
+			int nfd = 0;
+			for (int i = 0; i < MAX_EPOLL_REGS; i++)
+				if (g_epoll[i].used && g_epoll[i].epfd == epfd)
+					fdlist[nfd++] = g_epoll[i].fd;
+			long hard = -1;
+			if (timeout > 0) {
+				unsigned long el = ox_uptime_ms() - start;
+				hard = (timeout > (long)el) ? (timeout - (long)el) : 0;
+			}
+			block_wait_fds(fdlist, nfd, hard);
+			if (timeout > 0 && ox_uptime_ms() - start >=
+					    (unsigned long)timeout)
+				return 0;
+		}
+	}
+	case NR_timerfd_create:
+		return fd_alloc_kind(-1, 0, K_TIMERFD); /* .off = deadline ms, .size = interval ms */
+	case NR_timerfd_settime: {
+		int fd = (int)a1;
+		int flags = (int)a2; /* bit0 = TFD_TIMER_ABSTIME */
+		struct ltimespec { long sec; long nsec; };
+		struct litimerspec { struct ltimespec it_interval, it_value; } *nv =
+			(struct litimerspec *)a3;
+		if (fd < 0 || fd >= MAXFD || !fds[fd].used || fds[fd].kind != K_TIMERFD)
+			return -E_BADF;
+		if (!nv)
+			return -E_FAULT;
+		unsigned long now = ox_uptime_ms();
+		unsigned long value_ms = (unsigned long)nv->it_value.sec * 1000UL +
+					 (unsigned long)nv->it_value.nsec / 1000000UL;
+		unsigned long interval_ms = (unsigned long)nv->it_interval.sec * 1000UL +
+					    (unsigned long)nv->it_interval.nsec / 1000000UL;
+		if (nv->it_value.sec == 0 && nv->it_value.nsec == 0)
+			fds[fd].off = 0; /* disarm */
+		else
+			fds[fd].off = (flags & 1) ? value_ms : now + value_ms;
+		fds[fd].size = interval_ms;
+		return 0; /* old value (a4) not reported */
+	}
+	case NR_signalfd:
+	case NR_signalfd4:
+		return fd_alloc_kind(-1, 0, K_SIGNALFD); /* stub: never readable */
+	case NR_eventfd:
+	case NR_eventfd2: {
+		int fd = fd_alloc_kind(-1, 0, K_EVENTFD);
+		if (fd >= 0)
+			fds[fd].off = (unsigned long)a1; /* initval */
+		return fd;
+	}
 	case NR_poll:
 	case NR_ppoll: {
 		struct pfd {
@@ -1449,32 +1805,40 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 			short revents;
 		} *pf = (struct pfd *)a1;
 		unsigned long nfds = (unsigned long)a2;
-		int ready = 0;
-		for (unsigned long i = 0; i < nfds && pf; i++) {
-			int fd = pf[i].fd;
-			short re = (fd >= 0) ? (short)(pf[i].events & 0x7) : 0; /* IN|PRI|OUT */
-			/* A listener reports POLLIN only when a connection is actually pending. */
-			if (fd >= 0 && fd < MAXFD && fds[fd].used && fds[fd].kind == K_LISTEN &&
-			    (re & 0x1) && !listener_pending(fd))
-				re &= ~0x1;
-			/* §wayland: the display channel reports POLLIN only when it actually has a
-			 * message buffered, so wl_display_dispatch doesn't block on an empty fd. */
-			if (fd >= 0 && fd < MAXFD && fds[fd].used && fds[fd].kind == K_CHAN &&
-			    (re & 0x1) && !(ox_chan_poll((unsigned int)fds[fd].handle) & 1))
-				re &= ~0x1;
-			/* §pty: a pty fd reports POLLIN only when the kernel line discipline has a
-			 * line/byte ready (op 0x100 = readiness), so the terminal's poll loop sleeps. */
-			if (fd >= 0 && fd < MAXFD && fds[fd].used &&
-			    (fds[fd].kind == K_PTYM || fds[fd].kind == K_PTYS) &&
-			    (re & 0x1) && ox_pty_ioctl((unsigned int)fds[fd].handle, 0x100, 0) != 1)
-				re &= ~0x1;
-			pf[i].revents = re;
-			if (re)
-				ready++;
+		/* poll: a3 = int ms (-1 forever, 0 immediate). ppoll: a3 = struct timespec* (NULL
+		 * = forever). Previously ignored → single-shot busy-poll; now we actually block. */
+		long timeout_ms;
+		if (n == NR_poll) {
+			timeout_ms = (int)a3;
+		} else {
+			struct ltspec { long sec, nsec; } *ts = (struct ltspec *)a3;
+			timeout_ms = ts ? (ts->sec * 1000 + ts->nsec / 1000000) : -1;
 		}
-		if (ready == 0)
-			ox_syscall0(OX_SYS_YIELD); /* idle (e.g. awaiting a connection) — be polite */
-		return ready;
+		unsigned long start = ox_uptime_ms();
+		for (;;) {
+			int ready = 0, nfd = 0;
+			int fdlist[64];
+			for (unsigned long i = 0; i < nfds && pf; i++) {
+				short re = fd_revents(pf[i].fd, pf[i].events);
+				pf[i].revents = re;
+				if (re)
+					ready++;
+				if (pf[i].fd >= 0 && nfd < 64)
+					fdlist[nfd++] = pf[i].fd;
+			}
+			if (ready > 0)
+				return ready;
+			if (timeout_ms == 0)
+				return 0;
+			long hard = -1;
+			if (timeout_ms > 0) {
+				unsigned long el = ox_uptime_ms() - start;
+				hard = (timeout_ms > (long)el) ? (timeout_ms - (long)el) : 0;
+			}
+			block_wait_fds(fdlist, nfd, hard);
+			if (timeout_ms > 0 && ox_uptime_ms() - start >= (unsigned long)timeout_ms)
+				return 0;
+		}
 	}
 	case NR_select:
 	case NR_pselect6: {
@@ -1513,6 +1877,13 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 					if (fd < MAXFD && fds[fd].used && fds[fd].kind == K_LISTEN &&
 					    !listener_pending(fd))
 						rd[w] &= ~bit; /* listener, nothing pending -> not ready */
+					/* §sock: a connected TCP socket is readable only when a recv would
+					 * return immediately — so twm (libXt uses select, not poll) blocks in
+					 * this yield-loop instead of a blocking recv that pins the single-
+					 * threaded net server and starves the peer's (Xwayland) send. */
+					else if (fd < MAXFD && fds[fd].used && fds[fd].kind == K_SOCK &&
+						 fds[fd].handle >= 0 && !__oxbow_sock_recv_ready(fds[fd].handle))
+						rd[w] &= ~bit;
 					else
 						ready++;
 				}
@@ -1521,7 +1892,14 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 			}
 			if (ready > 0)
 				break;
-			ox_syscall0(OX_SYS_YIELD); /* nothing ready — yield */
+			/* Sleep instead of spin: block on the watched read fds' channels until one
+			 * is readable (NULL timeout) or ~10ms (finite), rather than busy-yielding. */
+			int fdlist[64];
+			int nfd = 0;
+			for (int fd = 0; fd < nfds && fd < 1024 && nfd < 64; fd++)
+				if (rd && (saved_rd[fd >> 6] & (1UL << (fd & 63))))
+					fdlist[nfd++] = fd;
+			block_wait_fds(fdlist, nfd, timeout ? 10 : -1);
 			if (timeout != 0)
 				break; /* a finite/zero timeout was requested: return 0 now */
 			/* else NULL timeout: keep blocking until a fd becomes ready */

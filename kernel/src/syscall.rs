@@ -16,7 +16,7 @@ use oxbow_abi::{
     SYS_FB_INFO, SYS_FB_MAP, SYS_PCI_BAR_MAP, SYS_PCI_READ, SYS_PCI_WRITE,
     SYS_PROTECT, SYS_RECV, SYS_RECV_NOTIF, SYS_REPLY, SYS_REPLY_BULK,
     SYS_SEND, SYS_SPAWN, SYS_SPAWN_BYTES, SYS_GETENTROPY, SYS_PLEDGE, SYS_IMMUTABLE, SYS_MEMINFO, SYS_UPTIME_MS,
-    SYS_WALLTIME, SYS_THREAD_SPAWN, SYS_THREAD_EXIT, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE,
+    SYS_WALLTIME, SYS_SLEEP, SYS_THREAD_SPAWN, SYS_THREAD_EXIT, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE,
     SYS_THREAD_ID, SYS_YIELD, SYS_PROC_KILL, SYS_PROC_LIST, SYS_KILL, SYS_SET_FSBASE, SYS_FORK,
     SYS_SET_FOREGROUND, SYS_TTY_INTR, SYS_SIGDISPATCH, SYS_SIGRETURN,
     ProcInfo,
@@ -206,6 +206,7 @@ pub extern "C" fn syscall_dispatch(
             let (secs, nanos) = crate::arch::walltime();
             SyscallRet { rax: secs, rdx: nanos }
         }
+        SYS_SLEEP => sys_sleep(a1),
         SYS_THREAD_SPAWN => {
             let tid = crate::thread::spawn_thread_in_current(a1, a2);
             SyscallRet { rax: tid as u64, rdx: 0 }
@@ -1496,13 +1497,26 @@ fn sys_shm_create(mem: u64, pages: u64) -> SyscallRet {
                 return Err(SysError::NoMem);
             }
         };
-        proc::with_current_mut(|p| {
+        // §41: remember the budget so the region's frames are refunded when its last
+        // handle drops (decref). Set before install so it's valid the instant the
+        // handle becomes grantable.
+        crate::shm::set_mem(idx, midx as u8);
+        match proc::with_current_mut(|p| {
             p.alloc_slot(HandleEntry {
                 obj: ObjectRef::Shm(idx),
                 rights: R_MAP | R_WRITE | R_GRANT | R_ATTENUATE,
                 badge: 0,
             })
-        })
+        }) {
+            Ok(h) => Ok(h), // alloc_slot increfs rc 0 -> 1
+            Err(e) => {
+                // No handle could be installed → region orphaned (rc still 0); free it
+                // and refund the budget ourselves (decref never runs for it).
+                crate::shm::free(idx);
+                mm::mem::credit(midx, bytes);
+                Err(e)
+            }
+        }
     })();
     match result {
         Ok(h) => SyscallRet::ok_handle(h),
@@ -1676,7 +1690,7 @@ fn sys_getentropy(buf: u64, len: u64) -> SyscallRet {
 fn pledge_class(nr: u64) -> u64 {
     match nr {
         SYS_EXIT | SYS_PLEDGE | SYS_CLOSE => 0,
-        SYS_CONSOLE_WRITE | SYS_GETENTROPY | SYS_UPTIME_MS | SYS_WALLTIME | SYS_MEMINFO => PLEDGE_STDIO,
+        SYS_CONSOLE_WRITE | SYS_GETENTROPY | SYS_UPTIME_MS | SYS_WALLTIME | SYS_MEMINFO | SYS_SLEEP => PLEDGE_STDIO,
         SYS_THREAD_SPAWN | SYS_THREAD_EXIT | SYS_FUTEX_WAIT | SYS_FUTEX_WAKE => PLEDGE_STDIO,
         SYS_THREAD_ID | SYS_YIELD | SYS_SET_FSBASE => PLEDGE_STDIO,
         SYS_SEND | SYS_RECV | SYS_RECV_NOTIF | SYS_CALL | SYS_REPLY | SYS_REPLY_BULK | SYS_EP_CREATE
@@ -2277,6 +2291,32 @@ fn sys_channel_poll(h: u64) -> SyscallRet {
 /// non-preemptible (IF=0, single core), so no sender can run between the park, the
 /// readiness check, and `block_current`. The deadline is armed BEFORE blocking, so
 /// a tick that lands between the check and the block still wakes us.
+/// `sys_sleep(ms)` — block the caller for `ms` milliseconds, woken by the timer IRQ
+/// (`wake_expired`). Lets pacing loops (e.g. the gpu present loop) sleep instead of
+/// busy-spinning a whole core — the "no sleep syscall yet" the gpu comment referenced.
+fn sys_sleep(ms: u64) -> SyscallRet {
+    if ms == 0 {
+        return SyscallRet::ok();
+    }
+    let me = crate::thread::current();
+    // ms -> 10ms ticks, round up, at least one tick.
+    let deadline = crate::arch::ticks() + ((ms + 9) / 10).max(1);
+    crate::thread::set_wake_at(me, deadline);
+    loop {
+        crate::thread::prepare_block();
+        if crate::thread::timed_out(me, crate::arch::ticks()) {
+            crate::thread::cancel_block();
+            break;
+        }
+        crate::thread::block_current(); // the timer IRQ wakes us at the deadline
+        if crate::thread::timed_out(me, crate::arch::ticks()) {
+            break;
+        }
+    }
+    crate::thread::set_wake_at(me, 0);
+    SyscallRet::ok()
+}
+
 fn sys_chan_wait(handles_ptr: u64, count: u64, timeout_ms: u64) -> SyscallRet {
     const MAXW: usize = 16;
     let n = (count as usize).min(MAXW);

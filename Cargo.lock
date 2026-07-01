@@ -1199,6 +1199,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "twm-musl"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1260,6 +1268,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "weston-musl"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-abi",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "wlclient"
 version = "0.0.0"
 dependencies = [
@@ -1302,7 +1319,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "xcbdemo-musl"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-rt",
+]
+
+[[package]]
 name = "xclient-musl"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-rt",
+]
+
+[[package]]
+name = "xeyes-musl"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-rt",
+]
+
+[[package]]
+name = "xlibdemo-musl"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "oxbow-rt",
+]
+
+[[package]]
+name = "xterm-musl"
 version = "0.0.0"
 dependencies = [
  "cc",

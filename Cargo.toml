@@ -41,6 +41,7 @@ members = [
     "servers/oxterm",
     "servers/oxwl",
     "servers/oxcomp",
+    "servers/weston-musl",
     "servers/wlclient",
     "servers/sysmon",
     "servers/drift",

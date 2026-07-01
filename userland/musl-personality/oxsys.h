@@ -9,6 +9,7 @@
 
 /* oxbow syscall numbers (must track abi/src/lib.rs). Only the ones the personality
  * issues directly are listed. */
+#define OX_SYS_CLOSE         5   /* (handle) -> drop a kernel cap (e.g. an shm region ref) */
 #define OX_SYS_CONSOLE_WRITE 6
 #define OX_SYS_EXIT          7
 #define OX_SYS_MAP           8
@@ -33,6 +34,7 @@
 #define OX_SYS_CHANNEL_POLL  41  /* (h) -> rdx readiness: 1=readable 2=eof 4=writable */
 #define OX_SYS_SHM_CREATE    42  /* (mem, pages) -> rdx = Shm handle */
 #define OX_SYS_SHM_MAP       43  /* (shm, vaddr) -> rdx = bytes mapped */
+#define OX_SYS_CHAN_WAIT     46  /* (handles, count, timeout_ms) -> block until a chan readable */
 #define OX_BOOT_MEM          3   /* the Memory cap handle granted at spawn */
 #define OX_CHAN_NONBLOCK     1   /* CHANNEL_RECV flag: don't block when empty */
 /* §102 pseudo-terminals — the kernel runs the line discipline (kernel/src/pty.rs). */
@@ -53,6 +55,32 @@ static __inline long ox_syscall0(long n)
 	__asm__ __volatile__("syscall" : "=a"(r), "=d"(d) : "a"(n) : "rcx", "r11", "memory");
 	(void)d;
 	return r;
+}
+
+/* §weston responsiveness: block the thread until one of `count` channel handles is
+ * readable OR `timeout_ms` elapses (0 = no timeout, block until a channel is readable).
+ * The kernel truly SLEEPS us (park/wake), so poll/select/epoll can stop busy-yielding —
+ * which was pinning a core and starving the other boot servers (fsd seeding, etc.). */
+static __inline void ox_chan_wait(const unsigned int *handles, unsigned long count,
+				  unsigned long timeout_ms)
+{
+	unsigned long rax, d = timeout_ms;
+	__asm__ __volatile__("syscall" : "=a"(rax), "+d"(d)
+			     : "a"((long)OX_SYS_CHAN_WAIT), "D"(handles), "S"(count)
+			     : "rcx", "r11", "memory");
+	(void)rax;
+}
+
+/* Milliseconds since boot. SYS_UPTIME_MS returns the value in RDX (RAX = 0 status), so
+ * ox_syscall0 — which returns RAX — always read 0. This reads RDX correctly. (That old
+ * bug made clock_gettime(MONOTONIC), the socket recv timeout, and timerfd all see 0.) */
+static __inline unsigned long ox_uptime_ms(void)
+{
+	unsigned long r, d;
+	__asm__ __volatile__("syscall" : "=a"(r), "=d"(d)
+			     : "a"((long)OX_SYS_UPTIME_MS) : "rcx", "r11", "memory");
+	(void)r;
+	return d;
 }
 /* sys_notif_create returns the handle in RDX (status in RAX, 0=ok). Create a
  * Notification and return its handle, or -1 on failure. */
@@ -282,6 +310,7 @@ extern long __oxbow_sock_tcp_connect(unsigned int ip, unsigned short port);
 extern long __oxbow_sock_send(long sock, const void *buf, unsigned long len);
 extern long __oxbow_sock_recv(long sock, void *buf, unsigned long len);
 extern long __oxbow_sock_recv_nb(long sock, void *buf, unsigned long len);
+extern int __oxbow_sock_recv_ready(long sock); /* non-consuming poll/select readiness peek */
 extern void __oxbow_sock_close(long sock);
 extern void __oxbow_sock_release(long sock); /* drop a BORROWED socket cap (no teardown) */
 

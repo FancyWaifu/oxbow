@@ -328,12 +328,17 @@ pub extern "C" fn oxbow_main() -> ! {
     let mut x_started = false;
     loop {
         unsafe { comp_server_pump(display) };
-        // §A5: once the user has logged in, start the X session — twm (WM, grabs the root)
-        // then xterm (a real terminal X client: core "fixed" font, forkpty → /bin/sh). Deferred
-        // to here so X-client traffic never starves the pre-login greeter.
+        // §A5: once the user has logged in, start the X session — xterm (a real terminal
+        // X client: core "fixed" font, forkpty → /bin/sh). Deferred to here so X-client
+        // traffic never starves the pre-login greeter.
+        //
+        // G0 = a visible, working xterm. G1 = a real window manager: twm now adopts, frames,
+        // and places xterm (the loopback select/poll readiness fix unblocked MapRequest
+        // delivery — see docs/HANDOFF-xterm-xfce.md). Remaining G1 polish: the framed client
+        // body is blank pending a nested-Expose fix in the xserver.
         if !x_started && unsafe { comp_server_logged_in() } != 0 {
             x_started = true;
-            if spawn_x(oxbow_abi::BOOT_IMG_TWM, b"-display 127.0.0.1:0", 24) {
+            if spawn_x(oxbow_abi::BOOT_IMG_TWM, b"-display 127.0.0.1:0", 24) { // G1: window manager
                 w(b"[oxcomp] twm spawned (post-login X window manager)\n");
             }
             if spawn_x(oxbow_abi::BOOT_IMG_XTERM,

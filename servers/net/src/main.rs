@@ -1274,8 +1274,17 @@ pub extern "C" fn oxbow_main() -> ! {
                 // sentinel 0xFFFF_FFFF in data[0] (a real count is <= 504) so the caller can
                 // yield+retry instead of pinning this single-threaded server for 8s.
                 let nonblock = m.data[1] == 1;
+                // data[1] == 2 => readiness peek (poll()/select()): reply data[0]=1 if a
+                // recv would return immediately, 0 otherwise. Does NOT consume bytes.
+                let peek = m.data[1] == 2;
                 if let Some(Sock::Tcp(handle)) = slot_of(&sockets, sid) {
                     let mut out = [0u8; 504];
+                    if peek {
+                        r.data[0] = if tcp_stack.recv_ready(handle) { 1 } else { 0 };
+                        r.data_len = 1;
+                        let _ = rt::sys_reply(reply, &r);
+                        continue;
+                    }
                     if nonblock {
                         let (n, wb) = tcp_stack.recv_nb(handle, &mut out[..want]);
                         if wb {

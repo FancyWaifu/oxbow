@@ -192,6 +192,7 @@ pub const SYS_DMA_ALLOC_CONTIG: u64 = 49; // (mem, vaddr, pages) -> contiguous p
 pub const SYS_SHM_PHYS: u64 = 50; // (shm) -> rdx = physical base of a CONTIGUOUS shm. needs R_MAP
 pub const SYS_NOTIF_POLL: u64 = 51; // (notif) -> rdx = drained count, NON-BLOCKING. needs R_WAIT
 pub const SYS_WALLTIME: u64 = 52; // () -> (epoch_secs in rax, nanoseconds in rdx). CMOS RTC. stdio
+pub const SYS_SLEEP: u64 = 53; // (ms) -> block the caller for ms via the timer. Replaces busy-waits.
 // §96 in-process threads + futex (back std::thread / Mutex / Condvar). A thread
 // shares the spawner's address space; the futex is per-process (keyed on vaddr).
 pub const SYS_THREAD_SPAWN: u64 = 53; // (entry, user_rsp) -> tid. New thread in caller's AS.

@@ -450,11 +450,11 @@ fn fill_rect(buf: *mut u32, w: u32, h: u32, x0: u32, y0: u32, rw: u32, rh: u32, 
     }
 }
 
-/// Crude busy-wait between animation frames (no sleep syscall yet).
+/// Pace the present loop to ~60 fps by SLEEPING on the timer (SYS_SLEEP) instead of
+/// busy-spinning — the old busy-wait pinned a whole core just to throttle, starving the
+/// compositor + clients and making the desktop feel laggy.
 fn frame_delay() {
-    for _ in 0..2_000_000u64 {
-        core::hint::spin_loop();
-    }
+    rt::sys_sleep(16);
 }
 
 /// The display loop (Phase 3): bounce a white sprite across the gradient, doing a

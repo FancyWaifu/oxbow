@@ -29,12 +29,21 @@ const MAX_PAGES: usize = 4096;
 #[derive(Clone, Copy)]
 struct Region {
     in_use: bool,
+    /// Handle-table references to this region across ALL processes (§41 refcount).
+    /// `create` starts at 0; each installed handle (`alloc_slot`/`install`) increfs,
+    /// each dropped handle (`close`/`close_all`) decrefs. Freed at 0 — so a wl_shm
+    /// buffer shared with the compositor (grant-by-copy = 2 handles) is reclaimed only
+    /// once BOTH Xwayland and oxcomp drop it. Without this, every X pixmap leaked a
+    /// region and the 16-slot pool exhausted → Xwayland died.
+    rc: u32,
+    /// The Memory budget that paid for the frames, refunded when the region frees.
+    mem_idx: u8,
     npages: usize,
     frames: [u64; MAX_PAGES],
 }
 impl Region {
     const fn new() -> Self {
-        Region { in_use: false, npages: 0, frames: [0; MAX_PAGES] }
+        Region { in_use: false, rc: 0, mem_idx: 0, npages: 0, frames: [0; MAX_PAGES] }
     }
 }
 
@@ -63,6 +72,8 @@ pub fn create(npages: usize) -> Option<u8> {
         }
     }
     r.in_use = true;
+    r.rc = 0; // the first installed handle increfs to 1
+    r.mem_idx = 0;
     r.npages = npages;
     Some(idx as u8)
 }
@@ -84,6 +95,8 @@ pub fn create_contig(npages: usize) -> Option<u8> {
         r.frames[i] = base + (i as u64) * 4096;
     }
     r.in_use = true;
+    r.rc = 0; // the first installed handle increfs to 1
+    r.mem_idx = 0;
     r.npages = npages;
     Some(idx as u8)
 }
@@ -130,8 +143,10 @@ pub fn map(idx: u8, pml4: u64, vaddr: u64, writable: bool) -> usize {
     r.npages
 }
 
-/// Free region `idx` (returns its frames to the PMM). Reset in place.
-#[allow(dead_code)]
+/// Free region `idx` (returns its frames to the PMM) WITHOUT refunding a budget.
+/// Only for the orphan path in `sys_shm_create` (region created but no handle could
+/// be installed) — the caller refunds the budget itself. Normal reclamation goes
+/// through `decref`.
 pub fn free(idx: u8) {
     let mut regs = REGIONS.lock();
     let r = &mut regs[idx as usize];
@@ -140,6 +155,56 @@ pub fn free(idx: u8) {
             crate::mm::pmm::free_frame(p);
         }
         r.in_use = false;
+        r.rc = 0;
         r.npages = 0;
+    }
+}
+
+/// Record the Memory budget that paid for region `idx`, so `decref` can refund it
+/// when the last handle drops. Set once, right after a successful handle install.
+pub fn set_mem(idx: u8, mem_idx: u8) {
+    let mut regs = REGIONS.lock();
+    let r = &mut regs[idx as usize];
+    if r.in_use {
+        r.mem_idx = mem_idx;
+    }
+}
+
+/// Add a handle reference (an `alloc_slot`/`install` of an `ObjectRef::Shm(idx)`).
+pub fn incref(idx: u8) {
+    let mut regs = REGIONS.lock();
+    let r = &mut regs[idx as usize];
+    if r.in_use {
+        r.rc = r.rc.saturating_add(1);
+    }
+}
+
+/// Drop a handle reference. When the count hits zero, return the frames to the PMM
+/// and refund the owning Memory budget. Safe to call for a not-in-use idx (no-op).
+pub fn decref(idx: u8) {
+    // Extract-then-release: don't hold REGIONS while touching the mem budget.
+    let (freed, mem_idx, bytes) = {
+        let mut regs = REGIONS.lock();
+        let r = &mut regs[idx as usize];
+        if !r.in_use {
+            return;
+        }
+        if r.rc > 0 {
+            r.rc -= 1;
+        }
+        if r.rc != 0 {
+            return;
+        }
+        let bytes = (r.npages as u64) * 4096;
+        let mem_idx = r.mem_idx;
+        for &p in &r.frames[..r.npages] {
+            crate::mm::pmm::free_frame(p);
+        }
+        r.in_use = false;
+        r.npages = 0;
+        (true, mem_idx, bytes)
+    };
+    if freed && bytes > 0 {
+        crate::mm::mem::credit(mem_idx, bytes);
     }
 }

@@ -357,6 +357,31 @@ pub extern "C" fn oxbow_main() -> ! {
         Ok(_) => report(b"[L6] map 64 MiB past my budget     ", false, b""),
     };
 
+    // §41 — shm region recycling. Create+close a 1-page region 32 times (twice the
+    // 16-slot pool). Each close must drop the last handle ref and free the region
+    // (refunding its frames), so every create succeeds. Before the refcount fix,
+    // close leaked the region and the 17th create failed E_NOMEM — the exact bug that
+    // exhausted the pool and killed Xwayland. One executable regression for §41.
+    total += 1;
+    let mut shm_ok = true;
+    for _ in 0..32 {
+        match rt::sys_shm_create(BOOT_MEM, 1) {
+            Ok(h) => {
+                let _ = rt::sys_close(h);
+            }
+            Err(_) => {
+                shm_ok = false;
+                break;
+            }
+        }
+    }
+    if shm_ok {
+        held += 1;
+        w(b"  [41] shm region recycles on close  -> 32/32 freed [ok]\n");
+    } else {
+        w(b"  [41] shm region recycles on close  -> pool exhausted [LEAK!]\n");
+    }
+
     // [FUZZ] crafted-ELF rejection: the kernel's untrusted-image validator must refuse
     // every malformed ELF (no panic, no load). One executable regression for the whole
     // ELF-loader hardening arc.

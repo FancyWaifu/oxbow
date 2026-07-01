@@ -1,0 +1,16 @@
+[package]
+name = "weston-musl"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "weston"
+path = "src/main.rs"
+
+[dependencies]
+oxbow-rt = { path = "../../rt", features = ["hosted"] }
+oxbow-abi = { path = "../../abi" }
+
+[build-dependencies]
+cc = "1"

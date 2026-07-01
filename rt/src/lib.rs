@@ -1545,6 +1545,18 @@ pub unsafe extern "C" fn __oxbow_sock_recv_nb(sock: i64, buf: *mut u8, len: usiz
     }
 }
 
+/// Non-consuming readiness peek for poll()/select(): 1 if a recv would return
+/// immediately (data buffered or peer closed), 0 if the socket is open but empty.
+#[cfg(feature = "hosted")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __oxbow_sock_recv_ready(sock: i64) -> i32 {
+    if tcp::recv_ready(sock as Handle) {
+        1
+    } else {
+        0
+    }
+}
+
 /// `close`/`shutdown` on a socket cap: best-effort FIN, then drop the capability.
 #[cfg(feature = "hosted")]
 #[unsafe(no_mangle)]
@@ -2056,6 +2068,13 @@ pub fn sys_protect(mem: Handle, vaddr: u64, len: u64, prot: u64) -> SysResult {
 pub fn sys_uptime_ms() -> u64 {
     let (_, rdx) = unsafe { syscall1(oxbow_abi::SYS_UPTIME_MS, 0) };
     rdx
+}
+
+/// Block this thread for `ms` milliseconds (timer-driven), instead of busy-spinning.
+pub fn sys_sleep(ms: u64) {
+    unsafe {
+        syscall1(oxbow_abi::SYS_SLEEP, ms);
+    }
 }
 
 /// Wall-clock time as `(epoch_seconds, nanoseconds)` from the CMOS RTC — ambient,
@@ -2893,6 +2912,21 @@ pub mod tcp {
         let src = unsafe { core::slice::from_raw_parts((m.data.as_ptr() as *const u8).add(8), n) };
         out[..n].copy_from_slice(src);
         Some(n)
+    }
+
+    /// Non-consuming readiness peek (data[1]=2): returns true if a recv would return
+    /// immediately (data buffered or peer closed). Backs poll()/select() so a loopback
+    /// client blocks in select's yield-loop instead of pinning the net server on a
+    /// blocking recv. An IPC error reports "ready" so the following read surfaces it.
+    pub fn recv_ready(sock: Handle) -> bool {
+        let mut m = MsgBuf::new(TAG_TCP_RECV);
+        m.data[0] = 1;
+        m.data[1] = 2; // readiness peek
+        m.data_len = 2;
+        if sys_call(sock, &mut m).is_err() {
+            return true;
+        }
+        m.data[0] == 1
     }
 
     /// Send the first `len` bytes (≤1472) of the socket's transfer frame on `sock`

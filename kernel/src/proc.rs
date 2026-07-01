@@ -128,6 +128,9 @@ impl Process {
     /// Install a well-known handle at a fixed slot (boot-time setup only).
     pub fn install(&mut self, slot: Handle, entry: HandleEntry) {
         self.handles[slot as usize] = Some(entry);
+        if let ObjectRef::Shm(idx) = entry.obj {
+            crate::shm::incref(idx); // §41: every Shm handle is a refcounted reference
+        }
     }
 
     /// Fetch an entry by handle with no type/rights check (for `attenuate`).
@@ -157,6 +160,9 @@ impl Process {
         for i in 1..HANDLE_TABLE_SIZE {
             if self.handles[i].is_none() {
                 self.handles[i] = Some(entry);
+                if let ObjectRef::Shm(idx) = entry.obj {
+                    crate::shm::incref(idx); // §41: every Shm handle is a refcounted reference
+                }
                 return Ok(i as Handle);
             }
         }
@@ -169,12 +175,20 @@ impl Process {
         if idx == 0 || idx >= HANDLE_TABLE_SIZE || self.handles[idx].is_none() {
             return Err(SysError::BadHandle);
         }
-        self.handles[idx] = None;
+        let entry = self.handles[idx].take().unwrap();
+        if let ObjectRef::Shm(sidx) = entry.obj {
+            crate::shm::decref(sidx); // §41: last Shm ref frees the region + refunds mem
+        }
         Ok(())
     }
 
     /// Close every handle.
     pub fn close_all(&mut self) {
+        for h in self.handles.iter().flatten() {
+            if let ObjectRef::Shm(idx) = h.obj {
+                crate::shm::decref(idx); // §41: drop each Shm ref (frees at rc 0)
+            }
+        }
         self.handles = [None; HANDLE_TABLE_SIZE];
     }
 
@@ -250,6 +264,9 @@ pub fn close_handle(h: Handle) -> Result<CloseAction, SysError> {
     }
     let entry = procs[id].handles[idx].unwrap();
     procs[id].handles[idx] = None;
+    if let ObjectRef::Shm(sidx) = entry.obj {
+        crate::shm::decref(sidx); // §41: last Shm ref frees the region + refunds mem
+    }
     if let ObjectRef::Pipe(pidx) = entry.obj {
         if (entry.rights & R_OUT) != 0 && !any_pipe_writer(&procs, pidx) {
             return Ok(CloseAction::PipeEof(pidx));
