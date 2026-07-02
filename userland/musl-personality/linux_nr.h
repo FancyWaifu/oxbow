@@ -129,6 +129,9 @@
 #define TCSETSF     0x5404
 #define TIOCGWINSZ  0x5413
 #define TIOCSWINSZ  0x5414
+#define TIOCSCTTY   0x540E /* §pty: make this pty the caller's controlling terminal */
+#define F_ADD_SEALS 1033   /* §wayland: memfd seals (weston keymap ro-anonymous-file) */
+#define F_GET_SEALS 1034
 #define TIOCGPTN    0x80045430UL /* §pty: get the pts number */
 #define TIOCSPTLCK  0x40045431UL /* §pty: (un)lock the pts (noop here) */
 /* termios c_lflag bits / c_cc indices used in the cooked default */

@@ -85,6 +85,9 @@ struct oxfd {
 	int nonblock;        /* O_NONBLOCK (K_SOCK): read() returns EAGAIN instead of blocking */
 	int owns;            /* socket fds: 1 = close() destroys the net-server socket; 0 = a
 	                      * forked child's BORROWED copy (close drops the cap only). */
+	unsigned int seals;  /* §wayland: memfd F_ADD_SEALS bits (F_GET_SEALS reports them). A
+	                      * read-only-sealed keymap memfd is NOT closed by weston's put_fd,
+	                      * so the fd survives until libwayland flushes it to the client. */
 };
 static struct oxfd fds[MAXFD];
 
@@ -106,6 +109,7 @@ static int fd_alloc_kind(long handle, unsigned long size, int kind)
 			fds[i].off = 0;
 			fds[i].size = size;
 			fds[i].nonblock = 0;
+			fds[i].seals = 0;
 			fds[i].owns = 1; /* a freshly created fd owns its handle (cleared in fork child) */
 			return i;
 		}
@@ -1460,13 +1464,24 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 		return (long)__oxbow_mmap_anon((unsigned long)a2);
 	}
 	case NR_munmap: {
-		/* §41: if this vaddr is a tracked wl_shm mapping, drop the region reference the
-		 * mapping held (SYS_CLOSE → kernel decref → frees once the compositor's granted
-		 * copy is also dropped). A non-shm anonymous mapping isn't tracked → no-op (our
-		 * anon allocator never reclaims address space, which is fine). */
+		/* §41: untrack this wl_shm mapping. Free the region ONLY if no open fd still
+		 * references it — POSIX munmap unmaps but does NOT destroy a memfd; only close()
+		 * frees it. weston's ro-anonymous-file munmaps its keymap memfd yet keeps the fd
+		 * to hand to clients, so a live fd must keep the region alive. wl_shm's opposite
+		 * pattern (close the pool fd early, keep the mapping) already works: after that
+		 * close no fd holds the region, so munmap here frees it. Region lives until BOTH
+		 * the fds and the mappings are gone. (Non-shm anon mapping: untracked → no-op.) */
 		long h = shm_map_untrack((unsigned long)a1);
-		if (h >= 0)
-			ox_syscall1(OX_SYS_CLOSE, h);
+		if (h >= 0) {
+			int fd_open = 0;
+			for (int i = 0; i < MAXFD; i++)
+				if (fds[i].used && fds[i].kind == K_SHM && fds[i].handle == h) {
+					fd_open = 1;
+					break;
+				}
+			if (!fd_open)
+				ox_syscall1(OX_SYS_CLOSE, h);
+		}
 		return 0;
 	}
 	case NR_mprotect:
@@ -1536,7 +1551,7 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 					return 0; /* unlock: noop */
 			}
 			if (req == TCGETS || req == TCSETS || req == TCSETSW || req == TCSETSF ||
-			    req == TIOCGWINSZ || req == TIOCSWINSZ)
+			    req == TIOCGWINSZ || req == TIOCSWINSZ || req == TIOCSCTTY)
 				return ox_pty_ioctl(h, req, (unsigned long)arg) < 0 ? -E_INVAL : 0;
 			return 0; /* other tty ioctls on a pty: benign success */
 		}
@@ -1952,6 +1967,18 @@ long __oxbow_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 			}
 			return -E_MFILE;
 		}
+		case F_ADD_SEALS:
+			/* §wayland: record memfd seals. weston seals its keymap memfd read-only
+			 * (READONLY_SEALS) so os_ro_anonymous_file_{get,put}_fd hands the SAME fd to
+			 * clients (v7+ PRIVATE path) and does NOT close it before libwayland flushes
+			 * — without this the keymap's SCM_RIGHTS fd is closed early and lost. */
+			if (fd >= 0 && fd < MAXFD && fds[fd].used)
+				fds[fd].seals |= (unsigned int)arg;
+			return 0;
+		case F_GET_SEALS:
+			if (fd >= 0 && fd < MAXFD && fds[fd].used)
+				return (long)fds[fd].seals;
+			return 0;
 		case F_GETFD:
 			return 0; /* no FD_CLOEXEC tracked */
 		case F_SETFD:

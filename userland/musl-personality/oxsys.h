@@ -236,7 +236,9 @@ static __inline long ox_pty_read(unsigned int h, void *buf, unsigned long len)
 	                     : "=a"(rax), "+d"(rdx)
 	                     : "a"((long)OX_SYS_PTY_READ), "D"((long)h), "S"((long)buf)
 	                     : "rcx", "r11", "memory");
-	return rax == 0 ? (long)rdx : -1;
+	if (rax == 0)
+		return (long)rdx;
+	return rax == 9 ? -4L /* EINTR: tty ^C interrupted the read */ : -1;
 }
 static __inline long ox_pty_write(unsigned int h, const void *buf, unsigned long len)
 {

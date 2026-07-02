@@ -71,6 +71,13 @@ pub struct Process {
     /// registered (SYS_SIGDISPATCH), or 0. When set, an async signal injects a frame
     /// redirecting here instead of terminating the process.
     pub sig_dispatch: u64,
+    /// §102 job-control-lite: controlling pty as (index + 1), or 0 = none. Set by
+    /// TIOCSCTTY, inherited on fork (struct copy) AND on spawn (see the spawn hook).
+    /// Ties this process into a pty's foreground handoff.
+    pub ctty: u16,
+    /// The pty foreground pid this process displaced when it became fg (set at spawn),
+    /// restored as fg when this process exits.
+    pub tty_saved_fg: u32,
 }
 
 /// Max immutable ranges per process (a runtime locks text + maybe rodata/got).
@@ -95,6 +102,8 @@ impl Process {
             imm_count: 0,
             name: [0; 16],
             sig_dispatch: 0,
+            ctty: 0,
+            tty_saved_fg: 0,
         }
     }
 
@@ -353,6 +362,14 @@ pub fn kill_pid(pid: usize, code: i32) -> bool {
     true
 }
 
+/// §102 job-control-lite: set a process's controlling tty (as pty index + 1, 0 = none).
+/// Called from TIOCSCTTY; the value is inherited by spawned/forked descendants.
+pub fn set_ctty(pid: usize, ctty: u16) {
+    if pid < MAX_PROCS {
+        PROCESSES.lock()[pid].ctty = ctty;
+    }
+}
+
 /// The async-signal dispatcher a live process registered (0 = none / not alive).
 /// §Phase 9 step 2: used to decide inject-vs-terminate on async Ctrl-C.
 pub fn sig_dispatch_of(pid: usize) -> u64 {
@@ -407,6 +424,20 @@ pub fn kill(id: usize, code: i32) {
             procs[id].spawn_cost,
         )
     };
+    // §102 job-control-lite: if this process was a pty's foreground, hand fg back to
+    // the process it displaced (guarded so an intermediate launcher/waiter that was
+    // never fg is a no-op — see the spawn hook). Outside the PROCESSES lock (pty owns
+    // its own lock; ordering is always PROCESSES → PTYS).
+    let (ctty, saved_fg) = {
+        let procs = PROCESSES.lock();
+        (procs[id].ctty, procs[id].tty_saved_fg)
+    };
+    if ctty != 0 {
+        let t = (ctty - 1) as u8;
+        if crate::pty::fg_pid(t) == id as u32 {
+            crate::pty::set_fg(t, saved_fg);
+        }
+    }
     // Outside the PROCESSES lock: EOF the orphaned pipes + wake their blocked readers.
     for k in 0..eof_n {
         let mut wake = [0usize; 8];
@@ -759,6 +790,18 @@ pub fn create(
         let nb = name.as_bytes();
         let n = core::cmp::min(nb.len(), 15);
         procs[id].name[..n].copy_from_slice(&nb[..n]);
+        // §102 job-control-lite: a spawned program inherits the spawner's controlling
+        // tty and becomes its foreground (the launcher-exec model means every exec is a
+        // fresh proc, so fg follows the spawn chain — the newest leaf is fg). Remember
+        // the pid we displace, to restore it as fg when we exit.
+        let spawner = crate::thread::current_proc();
+        let ctty = if spawner < MAX_PROCS { procs[spawner].ctty } else { 0 };
+        procs[id].ctty = ctty;
+        if ctty != 0 {
+            let t = (ctty - 1) as u8;
+            procs[id].tty_saved_fg = crate::pty::fg_pid(t);
+            crate::pty::set_fg(t, id as u32);
+        }
         (id, dead_pml4)
     };
 

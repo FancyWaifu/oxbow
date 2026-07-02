@@ -944,6 +944,26 @@ fn sys_tty_intr() -> SyscallRet {
     SyscallRet::ok()
 }
 
+/// Deliver a tty-generated signal (SIGINT/SIGQUIT) to a pty's foreground process.
+/// Every musl process registers an async-signal dispatcher (crt_glue), so this injects
+/// a frame that runs the process's handler-or-default action; a non-musl fg with no
+/// dispatcher is terminated directly. Wakes the target so a blocked read/sleep returns
+/// and the pending signal is actually taken (§102).
+fn deliver_tty_sig(pid: usize, sig: i32) {
+    if pid == 0 {
+        return;
+    }
+    if proc::sig_dispatch_of(pid) != 0 {
+        let tid = crate::thread::main_thread_of(pid);
+        if tid != 0 {
+            crate::thread::set_pending_sig(tid, sig as u32);
+            crate::thread::wake(tid);
+        }
+    } else if proc::kill_pid(pid, 128 + sig) {
+        crate::thread::mark_proc_dying(pid);
+    }
+}
+
 /// `sys_sigreturn(ctx_ptr)` — the tail of a userland signal handler. Reads the saved
 /// context `[rip, rflags, rsp, rax]` from the user stack and stashes it; the siginject
 /// hook restores it onto THIS syscall's return frame, resuming the interrupted code.
@@ -1957,6 +1977,14 @@ fn sys_pty_read(h: u64, buf: u64, len: u64) -> SyscallRet {
                 return SyscallRet { rax: 0, rdx: 0 };
             }
             crate::pty::ReadOut::WouldBlock => {
+                // §102: a pending signal (tty ^C to the fg process) interrupts the
+                // blocked read so the injected signal frame runs on syscall return.
+                // rax=9 is EINTR (the personality maps it to -EINTR for read()).
+                if crate::thread::current_has_sig_work() {
+                    crate::thread::cancel_block();
+                    unpark(idx, me);
+                    return SyscallRet { rax: 9, rdx: 0 };
+                }
                 crate::thread::block_current();
             }
         }
@@ -1988,8 +2016,13 @@ fn sys_pty_write(h: u64, buf: u64, len: u64) -> SyscallRet {
         for &t in &ld.wake_slave[..ld.nwake_slave] {
             crate::thread::wake(t);
         }
-        // ld.sig (Ctrl-C/\\) is recognized; async delivery to the fg process is a
-        // separate step (the personality notes async signals aren't wired yet).
+        // §102: deliver the tty-generated signal (^C=SIGINT, ^\=SIGQUIT) to the pty's
+        // foreground process — run its handler (an interactive shell catches SIGINT to
+        // abort the line) or default-terminate it (a plain command dies → the shell's
+        // wait returns to a fresh prompt).
+        if ld.sig != 0 && ld.sig_pid != 0 {
+            deliver_tty_sig(ld.sig_pid as usize, ld.sig);
+        }
     } else {
         let mut wake = [0usize; 8];
         let nwake = crate::pty::slave_write(idx, &kbuf[..total], &mut wake);
@@ -2081,6 +2114,14 @@ fn sys_pty_ioctl(h: u64, op: u64, arg: u64) -> SyscallRet {
             crate::pty::set_winsize(idx, rows, cols);
             SyscallRet { rax: 0, rdx: 0 }
         }
+        0x540e => {
+            // TIOCSCTTY: the caller (a shell after login_tty/setsid) claims this pty as
+            // its controlling terminal and becomes its initial foreground. §102.
+            let pid = crate::thread::current_proc();
+            proc::set_ctty(pid, (idx as u16) + 1);
+            crate::pty::set_fg(idx, pid as u32);
+            SyscallRet { rax: 0, rdx: 0 }
+        }
         _ => SyscallRet { rax: 0, rdx: 0 }, // benign: unsupported tty ioctls
     }
 }
@@ -2142,6 +2183,17 @@ fn sys_channel_send(h: u64, buf: u64, len: u64, caps_ptr: u64, ncaps: u64) -> Sy
     if total > 0 && usermem::check_user(buf, total, false).is_err() {
         return SyscallRet::err(SysError::Fault);
     }
+    // §41: a cap copied into the channel is a NEW reference to its object. Incref each
+    // Shm region NOW so the in-flight cap keeps it alive even if the sender closes its
+    // own handle before the receiver installs the copy (the keymap fd: weston's put_fd
+    // closes it right after the send). The receiver decrefs once after installing; any
+    // cap that never gets enqueued is decref'd below. Without this, a single-ref region
+    // is freed mid-flight and the receiver installs a cap to a dead region.
+    for c in &caps[..ncaps] {
+        if let ObjectRef::Shm(idx) = c.obj {
+            crate::shm::incref(idx);
+        }
+    }
     let me = crate::thread::current();
     let mut done = 0usize;
     let mut caps_left = ncaps;
@@ -2185,6 +2237,15 @@ fn sys_channel_send(h: u64, buf: u64, len: u64, caps_ptr: u64, ncaps: u64) -> Sy
         } else {
             crate::thread::cancel_block(); // made progress — keep sending
             crate::channel::unpark_send(conn, side, me);
+        }
+    }
+    // §41: caps that were increfed above but never enqueued (peer gone before send) —
+    // release their in-flight ref. Enqueued caps stay increfed; the receiver decrefs on
+    // install, or channel teardown decrefs undelivered ones.
+    let enqueued = ncaps - caps_left;
+    for c in &caps[enqueued..ncaps] {
+        if let ObjectRef::Shm(idx) = c.obj {
+            crate::shm::decref(idx);
         }
     }
     SyscallRet { rax: 0, rdx: done as u64 }
@@ -2246,6 +2307,11 @@ fn sys_channel_recv(h: u64, buf: u64, len: u64, caps_out: u64, packed: u64) -> S
                             Err(e) => return SyscallRet::err(e),
                         };
                         unsafe { core::ptr::write((caps_out as *mut u32).add(i), nh as u32) };
+                        // §41: alloc_slot increfed this cap for the receiver; release the
+                        // sender's in-flight incref (from sys_channel_send). Net: +1 (receiver).
+                        if let ObjectRef::Shm(idx) = ents[i].obj {
+                            crate::shm::decref(idx);
+                        }
                     }
                 }
                 return SyscallRet { rax: 0, rdx: (n as u64) | ((nc as u64) << 32) };
@@ -2308,8 +2374,14 @@ fn sys_sleep(ms: u64) -> SyscallRet {
             crate::thread::cancel_block();
             break;
         }
+        // §102: a pending signal (tty ^C to the fg process) interrupts the sleep so the
+        // injected signal frame runs on return (a plain `sleep` dies by default action).
+        if crate::thread::current_has_sig_work() {
+            crate::thread::cancel_block();
+            break;
+        }
         crate::thread::block_current(); // the timer IRQ wakes us at the deadline
-        if crate::thread::timed_out(me, crate::arch::ticks()) {
+        if crate::thread::timed_out(me, crate::arch::ticks()) || crate::thread::current_has_sig_work() {
             break;
         }
     }

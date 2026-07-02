@@ -400,8 +400,17 @@ pub fn slave_can_read(idx: u8) -> bool {
     p.in_use && (p.to_slave.len > 0 || p.eof_pending || p.master_closed)
 }
 
-pub fn set_child(idx: u8, pid: u32) {
+/// Set the pty's foreground pid — the target for tty-generated signals (^C/^\).
+/// Maintained by the kernel spawn/exit hooks (job-control-lite, §102): the newest
+/// process spawned under this controlling tty is fg; on its exit, fg reverts to the
+/// process it displaced.
+pub fn set_fg(idx: u8, pid: u32) {
     PTYS.lock()[idx as usize].child = pid;
+}
+
+/// The pty's current foreground pid (0 = none).
+pub fn fg_pid(idx: u8) -> u32 {
+    PTYS.lock()[idx as usize].child
 }
 
 /// Copy out the termios flags + c_cc (for TCGETS).
