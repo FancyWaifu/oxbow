@@ -83,6 +83,18 @@ static void cursor_draw(int px, int py)
     }
 }
 
+/* Move the software cursor with a direct framebuffer blit: restore the pixels under the
+ * old position, then save+draw at the new one. Called from the input handler on pointer
+ * motion so the cursor tracks WITHOUT scheduling a full compositor repaint (a software
+ * pixman composite of every surface) just to move an 11x17 sprite — the main lag source. */
+void oxbow_cursor_move(int px, int py)
+{
+    if (!oxbow_fb)
+        return;
+    cursor_restore();
+    cursor_draw(px, py);
+}
+
 struct oxbow_backend {
     struct weston_backend base;
     struct weston_compositor *compositor;

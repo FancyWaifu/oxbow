@@ -29,6 +29,7 @@
 
 extern int ox_chan_fd(int slot);           /* personality: wrap a boot channel cap as an fd */
 extern int oxbow_fb_w, oxbow_fb_h;
+extern void oxbow_cursor_move(int px, int py); /* direct-blit cursor (backend) */
 
 static struct weston_seat oxbow_seat;
 static int g_have_kbd;         /* keyboard successfully initialized (has a keymap) */
@@ -73,11 +74,21 @@ static int mouse_handler(int fd, uint32_t mask, void *data)
     now_ts(&ts);
     int moved = 0;
     for (long i = 0; i < n; i++) {
-        g_mpkt[g_mpi++] = buf[i];
+        unsigned char b = buf[i];
+        /* PS/2 resync: byte 0 of every packet has bit 3 set. If the stream has
+         * desynced (a dropped/partial byte, or the first read starting mid-packet),
+         * drop bytes until a valid packet start — otherwise every 3-byte group is
+         * misframed and the cursor teleports ("jumpy"), permanently. */
+        if (g_mpi == 0 && !(b & 0x08))
+            continue;
+        g_mpkt[g_mpi++] = b;
         if (g_mpi < 3)
             continue;
         g_mpi = 0;
         int flags = g_mpkt[0];
+        /* Overflow packets (X/Y overflow bits): the delta is saturated garbage — drop. */
+        if (flags & 0xC0)
+            continue;
         int dx = g_mpkt[1] - ((flags & 0x10) ? 256 : 0);
         int dy = g_mpkt[2] - ((flags & 0x20) ? 256 : 0);
         if (dx || dy) {
@@ -99,10 +110,9 @@ static int mouse_handler(int fd, uint32_t mask, void *data)
     }
     if (moved) {
         notify_motion_absolute(&oxbow_seat, &ts, g_cx, g_cy);
-        /* repaint so the software cursor redraws at the new position even on an idle
-         * desktop (no animating client to drive the frame). */
-        if (oxbow_seat.compositor)
-            weston_compositor_schedule_repaint(oxbow_seat.compositor);
+        /* Move the cursor with a direct fb blit instead of a full compositor repaint —
+         * moving an 11x17 sprite must not re-composite every surface (that was the lag). */
+        oxbow_cursor_move((int)g_cx, (int)g_cy);
     }
     notify_pointer_frame(&oxbow_seat);
     return 0;

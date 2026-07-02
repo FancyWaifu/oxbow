@@ -304,7 +304,7 @@ run-isolation: build build-server-isolation _iso
 # stream to this terminal. 512M for the graphics stack. (Quit: close the window,
 # or Ctrl-A X in this terminal.)
 run-tty: iso
-    qemu-system-x86_64 -M q35 -m 512M -smp 4 -cdrom {{ISO}} -boot d -serial stdio -display cocoa -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive file=oxbow-disk.img,if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0
+    qemu-system-x86_64 -M q35 -m 512M -smp 2 -cdrom {{ISO}} -boot d -serial stdio -display cocoa -no-reboot -no-shutdown -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive file=oxbow-disk.img,if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0
 
 # `just play` — hop into oxbow for hands-on use: a graphical window, your PERSISTENT
 # disk (files survive reboots), and networking. Log in ON SCREEN as root/root2 (Tab
@@ -317,7 +317,7 @@ run-tty: iso
 # SOFTWARE cursor that's visible + lighter under emulation. (On real hw / KVM, either
 # works; the GPU path is only worth it there.)
 play: iso
-    qemu-system-x86_64 -M q35 -m 512M -smp 4 -cdrom {{ISO}} -boot d -serial stdio -display cocoa -no-reboot -no-shutdown -drive file=oxbow-disk.img,if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0 -netdev user,id=net0 -device e1000,netdev=net0
+    qemu-system-x86_64 -M q35 -m 512M -smp 2 -cdrom {{ISO}} -boot d -serial stdio -display cocoa -no-reboot -no-shutdown -drive file=oxbow-disk.img,if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0 -netdev user,id=net0 -device e1000,netdev=net0
 
 # Headless serial-console test target: COM1 routed to a TCP socket so a harness
 # can both TYPE (write) and READ on one stream. server=on,wait=on makes QEMU
